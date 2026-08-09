@@ -4,9 +4,25 @@
 
 同一套 MVCC 事务语义(快照隔离、写冲突检测、vacuum 回收)跑在四种截然不同的存储结构上,可以直观对比 **LSM Tree / B+ Tree / Bitcask / 纯内存** 在读写放大、范围扫描、崩溃恢复上的取舍。
 
-- 约 2.3 万行 Rust,edition 2024
+- 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 166 个单元测试 + 4 个集成测试
+- 许可证:MIT 或 Apache-2.0 任选
+
+---
+
+## 安装
+
+```toml
+[dependencies]
+storage-engines = "0.1"
+```
+
+命令行工具单独装:
+
+```bash
+cargo install storage-engines
+```
 
 ---
 
