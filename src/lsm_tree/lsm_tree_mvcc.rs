@@ -40,6 +40,7 @@ use std::{
 use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
 use crate::lsm_tree::storage::{wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
+pub use crate::common::{ExportRecord, VacuumStats};
 
 /// MVCC 存储引擎（LSM 后端）
 pub struct MVCC {
@@ -299,6 +300,7 @@ impl MVCC {
         Ok(VacuumStats {
             xmin,
             versions_removed: removed,
+            blob_rewritten: None,
         })
     }
 }
@@ -317,23 +319,6 @@ impl Drop for MVCC {
     }
 }
 
-
-/// vacuum 结果统计
-#[derive(Debug, Clone)]
-pub struct VacuumStats {
-    /// 本次使用的回收水位
-    pub xmin: u64,
-    /// 删除的旧版本行数
-    pub versions_removed: usize,
-}
-
-/// 导出用的一条逻辑记录（无 version 后缀）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExportRecord {
-    pub key: Vec<u8>,
-    /// `None` 表示 tombstone（仅当 include_deleted 时出现）
-    pub value: Option<Vec<u8>>,
-}
 
 /// 持久化文件：`dir/MVCC.NEXT`（WAL truncate 后仍保留 next_version）
 fn mvcc_next_path(dir: &Path) -> PathBuf {

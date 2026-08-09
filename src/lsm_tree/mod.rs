@@ -17,7 +17,7 @@ pub mod cf;
 pub mod kv_ops;
 pub mod lsm_tree;
 pub mod mem_wal;
-pub mod mvcc;
+pub mod lsm_tree_mvcc;
 pub mod sst;
 pub mod storage;
 pub mod wal;
@@ -27,5 +27,5 @@ pub use kv_ops::{IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery};
 pub use lsm_tree::{
     spawn_bg_compactor, CompactionFilter, LSMTree, LSMTreeOptions, LsmStats, Snapshot,
 };
-pub use mvcc::{ExportRecord, VacuumStats, MVCC};
+pub use lsm_tree_mvcc::{ExportRecord, VacuumStats, MVCC};
 pub use sst::StoredEntry;

@@ -20,8 +20,8 @@
 
 pub mod kv_ops;
 pub mod mem_store;
-pub mod mvcc;
+pub mod memory_mvcc;
 
 pub use kv_ops::{IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery};
 pub use mem_store::MemStore;
-pub use mvcc::{ExportRecord, MVCC, VacuumStats};
+pub use memory_mvcc::{ExportRecord, MVCC, VacuumStats};

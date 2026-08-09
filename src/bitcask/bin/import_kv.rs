@@ -5,11 +5,8 @@
 //!   --input snapshot.bin --format bin --dir ./imported
 //! ```
 
-#[path = "../tools/kv_snapshot.rs"]
-mod kv_snapshot;
-
-use bitcask::MVCC;
-use kv_snapshot::{read_bin, read_jsonl, IoStats};
+use storage_engines::bitcask::MVCC;
+use storage_engines::common::kv_snapshot::{read_bin, read_jsonl, IoStats, KvRecord};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -68,7 +65,7 @@ import_kv — 导入 JSONL / BPEXP001 到 bitcask-mvcc
     Args { input, dir, format }
 }
 
-fn apply_to_db(mvcc: &MVCC, records: &[kv_snapshot::KvRecord]) -> IoStats {
+fn apply_to_db(mvcc: &MVCC, records: &[KvRecord]) -> IoStats {
     let mut bulk = mvcc.begin_bulk();
     let mut stats = IoStats::default();
     let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(4096);

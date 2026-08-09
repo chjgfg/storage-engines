@@ -1,14 +1,53 @@
-//! Bitcask + MVCC 功能演示
+//! bplus-tree 功能演示
 //!
-//! 覆盖：基础 set/get/delete · 批量 · multi_get
+//! 覆盖：基础 set/get/delete · 大 value(blob) · 批量 · multi_get
 //!       计数器 incr / incr_with_ttl · 范围 scan / prefix / seek
-//!       模糊搜索分页 · 元数据 · TTL · 快照隔离 · bulk · vacuum · 重启校验
-//!
-//! 用法：`cargo run` 或 `cargo run --release`
+//!       模糊搜索分页 · 元数据 · TTL
 
-use bitcask::{kv_ops, SearchQuery, MVCC};
-use std::fs;
+use storage_engines::bplus_tree::{kv_ops, MVCC, SearchQuery};
+use std::{format, fs};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// demo 数据目录（所有 data.db* 落在此目录下，不污染仓库根）
+const DEMO_DIR: &str = "./data/bplus_tree";
+const DEMO_DB_NAME: &str = "./data.db";
+
+fn demo_db_path() -> PathBuf {
+    Path::new(DEMO_DIR).join(DEMO_DB_NAME)
+}
+
+/// 清理某一库路径及其 sidecar（.wal / .dblwr / .lock / .blob / .freelist）
+fn remove_db_files(db_path: &Path) {
+    for suf in ["", ".dblwr", ".wal", ".freelist", ".lock", ".blob"] {
+        let p = if suf.is_empty() {
+            db_path.to_path_buf()
+        } else {
+            PathBuf::from(format!("{}{suf}", db_path.display()))
+        };
+        let _ = fs::remove_file(&p);
+    }
+}
+
+/// 准备 demo 目录：创建 data/，清空其中旧库，并尽量删掉仓库根上遗留的旧文件
+fn prepare_demo_dir() -> PathBuf {
+    let _ = fs::create_dir_all(DEMO_DIR);
+    let db = demo_db_path();
+    remove_db_files(&db);
+
+    // 根目录历史遗留：旧 demo 的 data.db*、一次性导入的 from_lsm.*、临时快照
+    remove_db_files(Path::new("data.db"));
+    remove_db_files(Path::new("from_lsm.db"));
+    for junk in [
+        "snap_mig.bin",
+        "snapshot.bin",
+        "snapshot.json",
+        "verify.bin",
+    ] {
+        let _ = fs::remove_file(junk);
+    }
+    db
+}
 
 fn show_key(k: &[u8]) -> String {
     if k.len() > 40 {
@@ -28,13 +67,11 @@ fn show_val(v: Option<&[u8]>) -> String {
     }
 }
 
-fn cleanup_dir(dir: &str) {
-    let _ = fs::remove_dir_all(dir);
-}
-
-fn main() {
-    let db_dir = "bitcask_mvcc_demo";
-    cleanup_dir(db_dir);
+#[test]
+fn test_bplus_tree() {
+    let db_path = prepare_demo_dir();
+    let db_path_str = db_path.to_string_lossy().into_owned();
+    println!("demo 数据目录: {DEMO_DIR}/  库文件: {db_path_str}");
 
     let large_key = {
         let mut k = b"user:profile:".to_vec();
@@ -42,33 +79,33 @@ fn main() {
         k
     };
     let large_val = {
-        let mut v = b"VAL:".to_vec();
+        let mut v = b"BLOB:".to_vec();
         v.extend(std::iter::repeat(b'A').take(4_000));
         v
     };
 
     // ══════════════════════════════════════════════════════════════
-    // 1. 基础 CRUD + 批量 / 扫描 / 搜索 / TTL
+    // 1. 基础 CRUD + 大 KV + 批量 / 扫描 / 搜索 / TTL
     // ══════════════════════════════════════════════════════════════
     {
-        let mvcc = MVCC::open(db_dir);
+        let mvcc = MVCC::open(&db_path, 16, 64);
 
         // ── 1.1 基础 set / get / delete / 覆盖 ──
         {
             println!("\n========== 1. 基础 set / get / delete ==========");
             let tx = mvcc.begin_transaction();
 
-            assert!(tx.set(b"test", kv_ops::pack_plain(b"test1")));
+            assert!(tx.set(b"test", b"test1".to_vec()));
             println!("[set]  test = test1");
 
-            assert!(tx.set(&large_key, kv_ops::pack_plain(&large_val)));
+            assert!(tx.set(&large_key, large_val.clone()));
             println!(
-                "[set]  large_key(len={}) / large_val(len={})",
+                "[set]  large_key(len={}) / large_val(len={}) → blob",
                 large_key.len(),
                 large_val.len()
             );
 
-            assert!(tx.set(b"to_delete", kv_ops::pack_plain(b"will_gone")));
+            assert!(tx.set(b"to_delete", b"will_gone".to_vec()));
             assert_eq!(tx.get(b"test").as_deref(), Some(b"test1".as_slice()));
             let got_big = tx.get(&large_key).expect("大 value");
             assert_eq!(got_big, large_val);
@@ -82,7 +119,7 @@ fn main() {
             assert_eq!(tx.get(b"to_delete"), None);
             println!("[del]  to_delete → get=None");
 
-            assert!(tx.set(b"test", kv_ops::pack_plain(b"test2")));
+            assert!(tx.set(b"test", b"test2".to_vec()));
             assert_eq!(tx.get(b"test").as_deref(), Some(b"test2".as_slice()));
             println!("[set]  test 覆盖为 test2");
 
@@ -117,17 +154,16 @@ fn main() {
                 println!("  {} => {}", show_key(k), show_val(v.as_deref()));
             }
 
+            // 删掉后半
             let del: Vec<Vec<u8>> = (4..8u8)
                 .map(|i| format!("order:{i:02}").into_bytes())
                 .collect();
             tx.batch_delete(&del).expect("batch_delete");
             println!("[batch_delete] 删除 order:04..07");
             assert_eq!(tx.get(b"order:04"), None);
-            assert_eq!(
-                tx.get(b"order:03").as_deref(),
-                Some(b"order-val-3".as_slice())
-            );
+            assert_eq!(tx.get(b"order:03").as_deref(), Some(b"order-val-3".as_slice()));
 
+            // 再插一些用于扫描/搜索
             let more: Vec<(Vec<u8>, Vec<u8>)> = vec![
                 (b"apple".to_vec(), b"fruit".to_vec()),
                 (b"apply".to_vec(), b"verb".to_vec()),
@@ -238,6 +274,7 @@ fn main() {
             println!("\n========== 5. 计数器 incr / decr / incr_with_ttl ==========");
             let tx = mvcc.begin_transaction();
 
+            // 不存在从 0 起
             let n = tx.incr(b"seq", 1).expect("incr");
             println!("[incr] seq +1 → {n}");
             let n = tx.incr(b"seq", 10).expect("incr");
@@ -245,11 +282,9 @@ fn main() {
             let n = tx.decr(b"seq", 3).expect("decr");
             println!("[decr] seq -3 → {n}");
             assert_eq!(tx.get(b"seq"), Some(b"8".to_vec()));
-            println!(
-                "[get]  seq = {:?}",
-                String::from_utf8_lossy(&tx.get(b"seq").unwrap())
-            );
+            println!("[get]  seq = {:?}", String::from_utf8_lossy(&tx.get(b"seq").unwrap()));
 
+            // 带 TTL 的计数器（序列号 / 限流计数等）
             let n = tx
                 .incr_with_ttl(b"hits", 1, Duration::from_secs(120))
                 .expect("incr_with_ttl");
@@ -264,6 +299,7 @@ fn main() {
                 other => println!("[get_ttl] hits = {other:?}"),
             }
 
+            // 非整数 value 会失败
             assert!(tx.set(b"not_num", kv_ops::pack_plain(b"abc")));
             match tx.incr(b"not_num", 1) {
                 Err(e) => println!("[incr] not_num +1 → Err({e}) （预期 NotInteger）"),
@@ -282,13 +318,13 @@ fn main() {
             assert!(tx.set_with_ttl(b"cache:hot", b"payload".to_vec(), Duration::from_secs(120)));
             assert!(tx.set(b"cache:forever", kv_ops::pack_plain(b"keep")));
 
+            // 直接写一条「已过期」
             let stale = kv_ops::pack_ttl(b"old", kv_ops::now_unix_secs().saturating_sub(5));
             assert!(tx.set(b"cache:stale", stale));
 
             println!(
                 "[get] cache:hot={:?}  cache:stale={:?} (过期应 None)",
-                tx.get(b"cache:hot")
-                    .map(|v| String::from_utf8_lossy(&v).into_owned()),
+                tx.get(b"cache:hot").map(|v| String::from_utf8_lossy(&v).into_owned()),
                 tx.get(b"cache:stale")
             );
             println!(
@@ -310,10 +346,7 @@ fn main() {
             assert!(tx.refresh_ttl(b"cache:hot", Duration::from_secs(300)));
             println!("[refresh_ttl] cache:hot → 300s");
             assert!(tx.persist(b"cache:hot"));
-            println!(
-                "[persist] cache:hot → 永久, get_ttl={:?}",
-                tx.get_ttl(b"cache:hot")
-            );
+            println!("[persist] cache:hot → 永久, get_ttl={:?}", tx.get_ttl(b"cache:hot"));
 
             let n = tx.purge_expired();
             println!("[purge_expired] 清理 {n} 条过期 key");
@@ -328,67 +361,22 @@ fn main() {
             tx.commit();
         }
 
-        // SI + 冲突简要演示
-        {
-            println!("\n========== 6b. 快照隔离 / 写写冲突 ==========");
-            let t_read = mvcc.begin_transaction();
-            let t_write = mvcc.begin_transaction();
-            assert!(t_write.set(b"user:01", kv_ops::pack_plain(b"alice-v2")));
-            assert_eq!(
-                t_read.get(b"user:01").as_deref(),
-                Some(b"alice".as_slice())
-            );
-            println!("[SI] 写事务改 user:01 后，读事务仍见 alice");
-            t_write.commit();
-            t_read.commit();
-
-            let t1 = mvcc.begin_transaction();
-            let t2 = mvcc.begin_transaction();
-            assert!(t1.set(b"conflict", kv_ops::pack_plain(b"t1")));
-            assert!(!t2.set(b"conflict", kv_ops::pack_plain(b"t2")));
-            println!("[WW] t2 写 conflict → false（冲突）");
-            t1.commit();
-            t2.rollback();
-        }
-
-        // bulk load
-        {
-            println!("\n========== 6c. Bulk load ==========");
-            let mut bulk = mvcc.begin_bulk();
-            for i in 0..50u32 {
-                bulk.put(
-                    format!("bulk:{i:03}").as_bytes(),
-                    format!("v{i}").into_bytes(),
-                );
-            }
-            bulk.finish();
-            let tx = mvcc.begin_transaction();
-            assert_eq!(tx.get(b"bulk:042"), Some(b"v42".to_vec()));
-            println!("[bulk] 写入 50 条, bulk:042 = v42");
-            tx.commit();
-        }
-
-        // vacuum
-        {
-            println!("\n========== 6d. Vacuum ==========");
-            let st = mvcc.vacuum().expect("vacuum");
+        let blob_path = PathBuf::from(format!("{db_path_str}.blob"));
+        if let Ok(meta) = fs::metadata(&blob_path) {
             println!(
-                "[vacuum] xmin={} versions_removed={}",
-                st.xmin, st.versions_removed
+                "\n[blob] {} = {} B（大 value 外置）",
+                blob_path.display(),
+                meta.len()
             );
         }
-
-        mvcc.flush();
-        mvcc.checkpoint();
-        println!("\n[engine] flush + checkpoint，dir = {:?}", mvcc.db_dir());
-    }
+    } // drop → 释放锁
 
     // ══════════════════════════════════════════════════════════════
-    // 2. 模拟重启
+    // 2. 模拟重启：校验持久化
     // ══════════════════════════════════════════════════════════════
     {
         println!("\n========== 7. 重启后校验 ==========");
-        let mvcc = MVCC::open(db_dir);
+        let mvcc = MVCC::open(&db_path, 16, 64);
         let tx = mvcc.begin_transaction();
 
         assert_eq!(tx.get(b"test").as_deref(), Some(b"test2".as_slice()));
@@ -397,32 +385,31 @@ fn main() {
             String::from_utf8_lossy(&tx.get(b"test").unwrap())
         );
         assert_eq!(tx.get(b"to_delete"), None);
+        println!("[reopen] to_delete 仍不存在");
 
         let got_big = tx.get(&large_key).expect("重启后大 value");
         assert_eq!(got_big, large_val);
         println!("[reopen] large_key len={} OK", got_big.len());
 
-        assert_eq!(
-            tx.get(b"order:01").as_deref(),
-            Some(b"order-val-1".as_slice())
-        );
+        // 批量/扫描数据仍在
+        assert_eq!(tx.get(b"order:01").as_deref(), Some(b"order-val-1".as_slice()));
         assert_eq!(tx.get(b"order:04"), None);
         assert_eq!(tx.key_count(b"order:"), 4);
         println!("[reopen] order:* 存活 {} 条", tx.key_count(b"order:"));
 
+        // 计数器仍在
         assert_eq!(tx.get(b"seq"), Some(b"8".to_vec()));
         let n = tx.incr(b"seq", 1).expect("reopen incr");
         assert_eq!(n, 9);
         println!("[reopen] seq 仍为 8，再 incr → {n}");
         assert_eq!(tx.get(b"hits"), Some(b"6".to_vec()));
+        println!("[reopen] hits = 6（带 TTL 计数器仍在）");
 
         assert!(tx.exists(b"cache:hot"));
         assert!(!tx.exists(b"cache:stale"));
         println!("[reopen] TTL: hot 在 / stale 已 purge");
 
-        assert_eq!(tx.get(b"bulk:042"), Some(b"v42".to_vec()));
-        println!("[reopen] bulk:042 = v42");
-
+        // 搜索仍可用
         let page = mvcc.search_keys(&SearchQuery::contains(b"pp", 0, 5));
         println!(
             "[reopen] search \"pp\" → {:?}",
@@ -438,14 +425,16 @@ fn main() {
         tx.commit();
     }
 
-    println!("\n—— 磁盘布局 ——");
-    println!("  {db_dir}/");
-    for name in ["data.log", "data.hint", "data.blob", "bitcask.wal", "bitcask.lock"] {
-        let p = format!("{db_dir}/{name}");
+    println!("\n—— 磁盘文件（均在 {DEMO_DIR}/ 下）——");
+    for suf in ["", ".wal", ".dblwr", ".lock", ".blob", ".freelist"] {
+        let p = if suf.is_empty() {
+            db_path.clone()
+        } else {
+            PathBuf::from(format!("{db_path_str}{suf}"))
+        };
         if let Ok(m) = fs::metadata(&p) {
-            println!("    {name:14} {:>8} B", m.len());
+            println!("  {:28} {:>8} B", p.display(), m.len());
         }
     }
-
-    println!("\ndemo 完成（Bitcask + MVCC + kv_ops：批量 / 扫描 / 搜索 / TTL / vacuum / bulk）。");
+    println!("\ndemo 完成。数据文件在 `./{DEMO_DIR}/`，不会再写到仓库根目录。");
 }

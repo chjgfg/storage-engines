@@ -8,11 +8,11 @@
 pub mod bitcask;
 pub mod error;
 pub mod kv_ops;
-pub mod mvcc;
+pub mod bitcask_mvcc;
 pub mod storage;
 pub mod wal;
 
 pub use bitcask::{hint_path_for, Bitcask, KeyDir, KeyLoc, Log, Result as BitcaskResult};
 pub use error::{Error, Result};
 pub use kv_ops::{IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery};
-pub use mvcc::{ExportRecord, VacuumStats, MVCC};
+pub use bitcask_mvcc::{ExportRecord, VacuumStats, MVCC};

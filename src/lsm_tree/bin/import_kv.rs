@@ -1,10 +1,7 @@
 //! 导入 bplus / 通用 JSONL·BPEXP001 到 LSM 目录（迁移工具，非引擎核心）。
 
-#[path = "../tools/kv_snapshot.rs"]
-mod kv_snapshot;
-
-use kv_snapshot::{read_bin, read_jsonl};
-use lsm_tree::LSMTree;
+use storage_engines::common::kv_snapshot::{read_bin, read_jsonl};
+use storage_engines::lsm_tree::LSMTree;
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;

@@ -23,242 +23,19 @@
 //!
 //! 旧数据无 tag 时按「永久裸 value」兼容。
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use crate::memory::mvcc::{ExportRecord, MVCC, Transaction};
+use crate::common::codec::parse_i64_user;
+use crate::memory::memory_mvcc::{MVCC, Transaction};
 
-// ─── TTL 信封 ───────────────────────────────────────────────────────────────
-
-const VAL_META_PLAIN: u8 = 0x00;
-const VAL_META_TTL: u8 = 0x01;
-
-/// 当前 Unix 秒
-pub fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// 用户 value → 永久逻辑 value
-pub fn pack_plain(user: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + user.len());
-    out.push(VAL_META_PLAIN);
-    out.extend_from_slice(user);
-    out
-}
-
-/// 用户 value + 过期时间戳 → 带 TTL 逻辑 value
-pub fn pack_ttl(user: &[u8], expire_unix_secs: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 8 + user.len());
-    out.push(VAL_META_TTL);
-    out.extend_from_slice(&expire_unix_secs.to_le_bytes());
-    out.extend_from_slice(user);
-    out
-}
-
-/// 解析逻辑 value 信封
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ValueMeta {
-    Plain { user: Vec<u8> },
-    Ttl {
-        expire_unix_secs: u64,
-        user: Vec<u8>,
-    },
-}
-
-impl ValueMeta {
-    pub fn user(&self) -> &[u8] {
-        match self {
-            ValueMeta::Plain { user } => user,
-            ValueMeta::Ttl { user, .. } => user,
-        }
-    }
-
-    pub fn expire_unix_secs(&self) -> Option<u64> {
-        match self {
-            ValueMeta::Plain { .. } => None,
-            ValueMeta::Ttl {
-                expire_unix_secs, ..
-            } => Some(*expire_unix_secs),
-        }
-    }
-
-    pub fn is_expired_at(&self, now: u64) -> bool {
-        match self.expire_unix_secs() {
-            Some(e) => now >= e,
-            None => false,
-        }
-    }
-}
-
-/// 解码逻辑 value 字节
-pub fn decode_value_meta(logical: &[u8]) -> ValueMeta {
-    if logical.is_empty() {
-        return ValueMeta::Plain { user: Vec::new() };
-    }
-    match logical[0] {
-        VAL_META_PLAIN => ValueMeta::Plain {
-            user: logical[1..].to_vec(),
-        },
-        VAL_META_TTL if logical.len() >= 9 => {
-            let expire = u64::from_le_bytes(logical[1..9].try_into().unwrap());
-            ValueMeta::Ttl {
-                expire_unix_secs: expire,
-                user: logical[9..].to_vec(),
-            }
-        }
-        _ => ValueMeta::Plain {
-            user: logical.to_vec(),
-        },
-    }
-}
-
-/// 逻辑 value → 用户可见 value；过期返回 None
-pub fn logical_to_user(logical: Vec<u8>) -> Option<Vec<u8>> {
-    let meta = decode_value_meta(&logical);
-    if meta.is_expired_at(now_unix_secs()) {
-        None
-    } else {
-        Some(meta.user().to_vec())
-    }
-}
-
-// ─── 元数据 ─────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyMeta {
-    pub key: Vec<u8>,
-    pub value_len: Option<usize>,
-    pub version: u64,
-    pub expire_unix_secs: Option<u64>,
-    pub expired: bool,
-    pub deleted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IncrError {
-    NotInteger,
-    Overflow,
-    WriteConflict,
-}
-
-impl std::fmt::Display for IncrError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IncrError::NotInteger => write!(f, "value is not a decimal integer"),
-            IncrError::Overflow => write!(f, "i64 overflow"),
-            IncrError::WriteConflict => write!(f, "write conflict"),
-        }
-    }
-}
-
-impl std::error::Error for IncrError {}
-
-fn parse_i64_user(user: &[u8]) -> Result<i64, IncrError> {
-    let s = std::str::from_utf8(user).map_err(|_| IncrError::NotInteger)?;
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(IncrError::NotInteger);
-    }
-    s.parse::<i64>().map_err(|_| IncrError::NotInteger)
-}
-
-// ─── 模糊 / 前缀搜索 + 分页 ─────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KeyMatchMode {
-    #[default]
-    Contains,
-    Prefix,
-}
-
-#[derive(Debug, Clone)]
-pub struct SearchQuery {
-    pub pattern: Vec<u8>,
-    pub page: usize,
-    pub page_size: usize,
-    pub mode: KeyMatchMode,
-    pub include_deleted: bool,
-}
-
-impl SearchQuery {
-    pub fn contains(pattern: impl Into<Vec<u8>>, page: usize, page_size: usize) -> Self {
-        Self {
-            pattern: pattern.into(),
-            page,
-            page_size,
-            mode: KeyMatchMode::Contains,
-            include_deleted: false,
-        }
-    }
-
-    pub fn prefix(pattern: impl Into<Vec<u8>>, page: usize, page_size: usize) -> Self {
-        Self {
-            pattern: pattern.into(),
-            page,
-            page_size,
-            mode: KeyMatchMode::Prefix,
-            include_deleted: false,
-        }
-    }
-
-    pub fn with_deleted(mut self, include: bool) -> Self {
-        self.include_deleted = include;
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SearchPage {
-    pub items: Vec<ExportRecord>,
-    pub total: usize,
-    pub page: usize,
-    pub page_size: usize,
-    pub total_pages: usize,
-}
-
-impl SearchPage {
-    pub fn has_next(&self) -> bool {
-        self.total_pages > 0 && self.page + 1 < self.total_pages
-    }
-
-    pub fn has_prev(&self) -> bool {
-        self.page > 0 && self.total > 0
-    }
-}
-
-pub fn key_matches(key: &[u8], pattern: &[u8], mode: KeyMatchMode) -> bool {
-    if pattern.is_empty() {
-        return true;
-    }
-    match mode {
-        KeyMatchMode::Contains => {
-            if pattern.len() > key.len() {
-                return false;
-            }
-            key.windows(pattern.len()).any(|w| w == pattern)
-        }
-        KeyMatchMode::Prefix => key.starts_with(pattern),
-    }
-}
-
-// ─── 前缀上界 ───────────────────────────────────────────────────────────────
-
-pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    if prefix.is_empty() {
-        return None;
-    }
-    let mut u = prefix.to_vec();
-    while let Some(last) = u.last_mut() {
-        if *last < 0xFF {
-            *last += 1;
-            return Some(u);
-        }
-        u.pop();
-    }
-    None
-}
+/// 公共类型与编解码工具现由 [`crate::common`] 统一定义。
+///
+/// 这里按原路径重导出，保证 `memory::kv_ops::pack_plain` 等既有调用点不变。
+pub use crate::common::{
+    decode_value_meta, key_matches, logical_to_user, now_unix_secs, pack_plain, pack_ttl,
+    prefix_upper_bound, ExportRecord, IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery,
+    ValueMeta,
+};
 
 // ─── Transaction 扩展 ───────────────────────────────────────────────────────
 
@@ -295,7 +72,7 @@ impl Transaction {
     }
 
     fn rollback_keys(&self, keys: &[Vec<u8>]) {
-        use crate::memory::mvcc::encode_key;
+        use crate::memory::memory_mvcc::encode_key;
         if keys.is_empty() {
             return;
         }
@@ -369,35 +146,56 @@ impl Transaction {
 
     // ── 范围遍历 ──
 
+    /// 区间扫描 **[start, end)**：`start ≤ key < end`；`end=None` 表示无上界。
+    ///
+    /// 注意：会物化结果 `Vec`。大数据量请用 [`Transaction::scan_foreach`] 避免 OOM。
     pub fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<ExportRecord> {
+        let mut out = Vec::new();
+        self.scan_foreach(start, end, |rec| {
+            out.push(rec);
+            true
+        });
+        out
+    }
+
+    /// 流式扫描：对每条存活记录调用 `f`；`f` 返回 `false` 提前结束。
+    pub fn scan_foreach(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        mut f: impl FnMut(ExportRecord) -> bool,
+    ) {
         let now = now_unix_secs();
-        self.collect_latest_raw(false)
-            .into_iter()
-            .filter_map(|(key, _ver, raw)| {
-                if let Some(s) = start {
-                    if key.as_slice() < s {
-                        return None;
-                    }
+        for (key, _ver, raw) in self.collect_latest_raw(false) {
+            if let Some(s) = start {
+                if key.as_slice() < s {
+                    continue;
                 }
-                if let Some(e) = end {
-                    if key.as_slice() >= e {
-                        return None;
-                    }
+            }
+            if let Some(e) = end {
+                if key.as_slice() >= e {
+                    break; // key 有序，可提前停
                 }
-                let user = raw.and_then(|b| {
-                    let m = decode_value_meta(&b);
-                    if m.is_expired_at(now) {
-                        None
-                    } else {
-                        Some(m.user().to_vec())
-                    }
-                })?;
-                Some(ExportRecord {
-                    key,
-                    value: Some(user),
-                })
-            })
-            .collect()
+            }
+            let Some(bytes) = raw else { continue };
+            let m = decode_value_meta(&bytes);
+            if m.is_expired_at(now) {
+                continue;
+            }
+            let rec = ExportRecord {
+                key,
+                value: Some(m.user().to_vec()),
+            };
+            if !f(rec) {
+                break;
+            }
+        }
+    }
+
+    /// 前缀流式扫描
+    pub fn prefix_scan_foreach(&self, prefix: &[u8], f: impl FnMut(ExportRecord) -> bool) {
+        let end = prefix_upper_bound(prefix);
+        self.scan_foreach(Some(prefix), end.as_deref(), f);
     }
 
     pub fn prefix_scan(&self, prefix: &[u8]) -> Vec<ExportRecord> {
@@ -893,5 +691,35 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(t2.get(b"a"), None);
         t2.rollback();
+    }
+
+    #[test]
+    fn test_scan_foreach_early_stop() {
+        let mvcc = MVCC::new();
+        let tx = mvcc.begin_transaction();
+        for &(k, v) in &[
+            (&b"k1"[..], &b"1"[..]),
+            (&b"k2"[..], &b"2"[..]),
+            (&b"k3"[..], &b"3"[..]),
+        ] {
+            assert!(tx.set(k, pack_plain(v)));
+        }
+        tx.commit();
+
+        let tx = mvcc.begin_transaction();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        tx.scan_foreach(None, None, |rec| {
+            seen.push(rec.key);
+            seen.len() < 2
+        });
+        assert_eq!(seen, vec![b"k1".to_vec(), b"k2".to_vec()]);
+
+        let mut pref: Vec<Vec<u8>> = Vec::new();
+        tx.prefix_scan_foreach(b"k", |rec| {
+            pref.push(rec.key);
+            true
+        });
+        assert_eq!(pref.len(), 3);
+        tx.commit();
     }
 }

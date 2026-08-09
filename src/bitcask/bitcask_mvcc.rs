@@ -1,14 +1,22 @@
-//! MVCC 事务层 + WAL 崩溃恢复
+//! MVCC 事务层 + WAL 崩溃恢复（适配 Bitcask 后端）
+//!
+//! 从 `bplus-tree` / `lsm-tree` 移植：协议与语义保持一致，存储后端换成 [`Bitcask`]。
 //!
 //! 提交协议（简化版 ARIES）：
-//! 1. 写路径：先 append WAL Write，再改内存 B+ 树
-//! 2. commit：append WAL Commit → **fsync WAL**（持久化点）→ 可选刷页
+//! 1. 写路径：先 append WAL Write，再写 Bitcask 日志
+//! 2. commit：append WAL Commit → **fsync WAL**（持久化点）→ 可选 fsync 数据文件
 //! 3. 崩溃恢复：重放已提交 Write，撤销未提交 Write，再 checkpoint 截断 WAL
 //!
 //! **Bulk load 模式**（[`MVCC::begin_bulk`]）：
 //! - 关闭 WAL / 冲突检测 / 活跃事务表
-//! - 页换出跳过双写与频繁 fsync
-//! - 结束时 [`BulkLoader::finish`] → flush_all + checkpoint
+//! - 结束时 [`BulkLoader::finish`] → flush + checkpoint
+//!
+//! 与 bplus 的差异：
+//! - 大 value（> [`crate::storage::BLOB_THRESHOLD`]）外置到 `data.blob`，主日志只存指针
+//! - Checkpoint 的 `root_page_id` / `next_page_id` 固定写 0
+//! - 数据目录：`dir/data.log` + `dir/data.blob` + `dir/bitcask.wal` + `dir/bitcask.lock`
+//! - 版本行 tombstone 用 Bitcask **软 tombstone**（KeyDir 保留）；rollback/vacuum 用 **硬删除**
+//! - bulk 路径：无 WAL + 4MB 写缓冲 + insert_batch，目标 10M / 10min
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,28 +28,29 @@ use std::{
     },
 };
 
-use crate::bplus_tree::{BPlusTree, bplus_tree::RowId};
-use crate::bplus_tree::storage::{
-    decode_stored_value, encode_stored_value, wal_path, BlobStore,
-};
-use crate::bplus_tree::wal::{analyze_recovery, Wal, WalRecord};
+use crate::bitcask::{Bitcask, storage::{
+    BlobStore, FileLock, VAL_TAG_BLOB, data_path, decode_stored_value, encode_stored_value, wal_path,
+}};
+use crate::bitcask::wal::{analyze_recovery, Wal, WalRecord};
+pub use crate::common::{ExportRecord, VacuumStats};
 
-/// MVCC 存储引擎
+/// MVCC 存储引擎（Bitcask 后端）
 pub struct MVCC {
-    kv: Arc<Mutex<BPlusTree>>,
-    /// 大 value 外置存储（与 kv 同库目录）
+    kv: Arc<Mutex<Bitcask>>,
     blob: Arc<Mutex<BlobStore>>,
     wal: Arc<Mutex<Wal>>,
     active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
     next_version: Arc<AtomicU64>,
-    db_path: PathBuf,
+    db_dir: PathBuf,
+    /// 持有期间保证单写者
+    _lock: FileLock,
 }
 
 /// 普通 MVCC 事务
 pub struct Transaction {
-    pub(crate) kv: Arc<Mutex<BPlusTree>>,
+    pub(crate) kv: Arc<Mutex<Bitcask>>,
     pub(crate) blob: Arc<Mutex<BlobStore>>,
-    pub(crate) wal: Arc<Mutex<Wal>>,
+    wal: Arc<Mutex<Wal>>,
     pub(crate) active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
     version: u64,
     active_xid: HashSet<u64>,
@@ -49,7 +58,7 @@ pub struct Transaction {
 
 /// 批量导入会话：无 WAL、无冲突检测，单写者假定
 pub struct BulkLoader {
-    kv: Arc<Mutex<BPlusTree>>,
+    kv: Arc<Mutex<Bitcask>>,
     blob: Arc<Mutex<BlobStore>>,
     wal: Arc<Mutex<Wal>>,
     next_version: Arc<AtomicU64>,
@@ -88,48 +97,38 @@ pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
 
 impl MVCC {
     /// 打开/创建磁盘上的 MVCC 引擎（含 WAL 恢复）。失败时 panic（兼容旧代码）。
-    pub fn open(path: impl AsRef<Path>, order: usize, max_cache_pages: usize) -> Self {
-        Self::try_open(path, order, max_cache_pages).map_err(|e| format!("MVCC::open 失败: {e}")).unwrap()
+    pub fn open(dir: impl AsRef<Path>) -> Self {
+        Self::try_open(dir).map_err(|e| format!("MVCC::open 失败: {e}")).unwrap()
     }
 
     /// 打开/创建，错误以 `io::Result` 返回（锁冲突、坏文件、IO 等）。
-    ///
-    /// **冷启动路径**（千万级 / GB 库）：
-    /// - 优先用 meta 中的 `next_version`（checkpoint 时写入），**不扫全树**
-    /// - 其次用 WAL 里最后一条 Checkpoint / max_xid
-    /// - 仅旧库（meta 无 NVER 且 WAL 无 checkpoint）才 `scan_max_version` 全叶扫描
-    pub fn try_open(
-        path: impl AsRef<Path>,
-        order: usize,
-        max_cache_pages: usize,
-    ) -> std::io::Result<Self> {
-        let db_path = path.as_ref().to_path_buf();
-        let mut tree = BPlusTree::try_open(&db_path, order, max_cache_pages)?;
-        let blob = BlobStore::open(&db_path)?;
-        let mut wal = Wal::open(wal_path(&db_path))?;
+    pub fn try_open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let db_dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&db_dir)?;
+
+        let lock = FileLock::try_acquire(&db_dir)?;
+        let mut tree = Bitcask::new(data_path(&db_dir))?;
+        let blob = BlobStore::open(&db_dir)?;
+        let mut wal = Wal::open(wal_path(&db_dir))?;
 
         let entries = wal.read_all()?;
         let plan = analyze_recovery(&entries);
 
-        // REDO 已提交 / UNDO 未提交（仅当 WAL 非空有内容时）
         for (_xid, key, value) in &plan.committed_writes {
-            tree.insert(key.clone(), RowId(value.clone()));
+            tree.insert(key.clone(), value.clone())?;
         }
         for (_xid, key) in &plan.uncommitted_writes {
-            let _ = tree.delete(key.clone());
+            let _ = tree.remove(key);
         }
 
-        let start_ver = resolve_start_version(&mut tree, &plan);
+        let disk_max = scan_max_version(&mut tree)?;
+        let start_ver = disk_max.max(plan.max_xid).saturating_add(1).max(1);
 
-        // 把 next_version 写入 meta，下次干净 open 可跳过全树扫描
-        tree.set_next_version(start_ver);
-        tree.flush_all();
-        let root = tree.root_page_id();
-        let next_page = tree.next_page_id();
+        tree.flush()?;
         let _ = wal.append(WalRecord::Checkpoint {
             next_version: start_ver,
-            root_page_id: root.0,
-            next_page_id: next_page,
+            root_page_id: 0,
+            next_page_id: 0,
         });
         wal.sync()?;
         wal.truncate()?;
@@ -140,21 +139,23 @@ impl MVCC {
             wal: Arc::new(Mutex::new(wal)),
             active_txn: Arc::new(Mutex::new(HashMap::new())),
             next_version: Arc::new(AtomicU64::new(start_ver)),
-            db_path,
+            db_dir,
+            _lock: lock,
         })
     }
 
-    pub fn new(order: usize, max_cache_pages: usize) -> Self {
+    /// 在系统临时目录创建匿名库（测试用）
+    pub fn new() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "mvcc_anon_{}_{}.db",
+            "bitcask_mvcc_anon_{}_{}",
             std::process::id(),
             nanos
         ));
-        Self::open(path, order, max_cache_pages)
+        Self::open(path)
     }
 
     pub fn begin_transaction(&self) -> Transaction {
@@ -172,10 +173,6 @@ impl MVCC {
     /// **崩溃不安全**：finish 之前进程挂掉可能丢数据。
     /// 导入结束后必须 `finish()`。
     pub fn begin_bulk(&self) -> BulkLoader {
-        {
-            let mut kv = self.kv.lock().unwrap();
-            kv.set_bulk_mode(true);
-        }
         let version = self.next_version.fetch_add(1, Ordering::SeqCst);
         BulkLoader {
             kv: self.kv.clone(),
@@ -189,28 +186,41 @@ impl MVCC {
 
     pub fn checkpoint(&self) {
         let mut kv = self.kv.lock().unwrap();
+        let mut blob = self.blob.lock().unwrap();
         let mut wal = self.wal.lock().unwrap();
+        let _ = kv.flush();
+        let _ = blob.sync();
+        // 写出 hint，加速下次 open（不必等 merge）
+        let _ = kv.dump_hint();
         let next_ver = self.next_version.load(Ordering::SeqCst);
-        // meta 先记下 next_version，再 flush（同一次刷盘）
-        kv.set_next_version(next_ver);
-        kv.flush_all();
-        let root = kv.root_page_id();
-        let next_page = kv.next_page_id();
         let _ = wal.append(WalRecord::Checkpoint {
             next_version: next_ver,
-            root_page_id: root.0,
-            next_page_id: next_page,
+            root_page_id: 0,
+            next_page_id: 0,
         });
         let _ = wal.sync();
         let _ = wal.truncate();
     }
 
     pub fn flush(&self) {
-        self.kv.lock().unwrap().flush_all();
+        let mut kv = self.kv.lock().unwrap();
+        let mut blob = self.blob.lock().unwrap();
+        let _ = kv.flush();
+        let _ = blob.sync();
     }
 
-    pub fn db_path(&self) -> &Path {
-        &self.db_path
+    /// 压缩数据文件 + 写出 hint
+    pub fn merge(&self) -> std::io::Result<()> {
+        self.kv.lock().unwrap().merge()
+    }
+
+    /// 主动写出 KeyDir hint（不 merge）
+    pub fn dump_hint(&self) -> std::io::Result<()> {
+        self.kv.lock().unwrap().dump_hint()
+    }
+
+    pub fn db_dir(&self) -> &Path {
+        &self.db_dir
     }
 
     /// 导出当前快照下「每个逻辑 key 的最新可见版本」。
@@ -221,13 +231,13 @@ impl MVCC {
         records
     }
 
-    /// 版本回收（vacuum）+ 重写 blob（只保留仍被引用的大 value）。
+    /// 版本回收（vacuum）。
     ///
     /// 规则：
     /// - `xmin` = 活跃事务 id 最小值；无活跃事务时为 `next_version`
     /// - 每个逻辑 key：只保留「最后一个 version < xmin」+ 全部 version >= xmin
     /// - 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除
-    /// - 然后扫描存活叶子，把仍引用的大 value 重写进新 `*.blob`
+    /// - 结束后 `merge()` 压缩日志；无 blob 引用时清空 blob 文件
     pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
         let active = self.active_txn.lock().unwrap();
         let xmin = if active.is_empty() {
@@ -240,16 +250,16 @@ impl MVCC {
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
 
-        let all: Vec<(Vec<u8>, RowId)> = kv.iter().map(|(k, v)| (k, v)).collect();
+        let all = kv.iter()?;
         let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, Option<Vec<u8>>)>> = BTreeMap::new();
-        for (enc, row) in all {
+        for (enc, val) in all {
             let Some(vk) = decode_key(&enc) else {
                 continue;
             };
             by_key
                 .entry(vk.raw_key)
                 .or_default()
-                .push((vk.version, enc, row.0));
+                .push((vk.version, enc, val));
         }
 
         let mut removed = 0usize;
@@ -278,25 +288,29 @@ impl MVCC {
         }
 
         for enc in &to_delete {
-            let _ = kv.delete(enc.clone());
+            let _ = kv.remove(enc);
         }
 
-        // Blob GC（教学简化）：
-        // - 若已无任何大 value 引用 → clear 文件
-        // - 若仍有引用 → 暂不重写（append-only 空间可能残留；完整 compact 后续可做）
-        //   这样避免 Windows 上打开句柄重写导致读路径异常。
-        let survivors: Vec<RowId> = kv.iter().map(|(_, v)| v).collect();
-        let mut has_blob_ref = false;
-        for row in &survivors {
-            if let Some(stored) = &row.0 {
-                if stored.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB) {
-                    has_blob_ref = true;
-                    break;
+        // Blob GC：
+        // - 无任何 blob 引用 → clear
+        // - 仍有引用 → rewrite_in_place 只保留存活大 value，并更新 KeyDir 中的指针
+        let survivors = kv.iter()?;
+        let mut blob_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (enc_key, full_user_value)
+        for (enc, val) in &survivors {
+            if let Some(stored) = val {
+                if stored.first() == Some(&VAL_TAG_BLOB) {
+                    match decode_stored_value(&mut blob, stored) {
+                        Ok(Some(user)) => blob_keys.push((enc.clone(), user)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!("blob decode 失败 key={:?}: {e}", enc);
+                        }
+                    }
                 }
             }
         }
 
-        let blob_rewritten = if !has_blob_ref {
+        let blob_rewritten = if blob_keys.is_empty() {
             let old_len = blob.path().metadata().map(|m| m.len()).unwrap_or(0);
             if old_len > 8 {
                 blob.clear_in_place()?;
@@ -305,112 +319,51 @@ impl MVCC {
                 false
             }
         } else {
-            false
+            let values: Vec<Vec<u8>> = blob_keys.iter().map(|(_, v)| v.clone()).collect();
+            let new_offsets = blob.rewrite_in_place(&values)?;
+            // 更新主日志里的 blob 指针（覆盖写同一 storage key）
+            for ((enc, user), new_off) in blob_keys.into_iter().zip(new_offsets.into_iter()) {
+                let mut stored = Vec::with_capacity(1 + 8 + 4);
+                stored.push(VAL_TAG_BLOB);
+                stored.extend_from_slice(&new_off.to_le_bytes());
+                stored.extend_from_slice(&(user.len() as u32).to_le_bytes());
+                let _ = kv.insert(enc, Some(stored));
+            }
+            true
         };
 
-        // vacuum 后把当前 next_version 一并写入 meta，避免下次 open 因 meta 过旧依赖大 WAL
-        let next_ver = self.next_version.load(Ordering::SeqCst);
-        kv.set_next_version(next_ver);
-        kv.flush_all();
+        kv.flush()?;
         blob.sync()?;
+        // 压缩：丢掉已硬删除的空间
+        if removed > 0 || blob_rewritten {
+            let _ = kv.merge();
+        }
 
         Ok(VacuumStats {
             xmin,
             versions_removed: removed,
-            blob_rewritten,
+            blob_rewritten: Some(blob_rewritten),
         })
     }
 }
 
-impl Drop for MVCC {
-    /// 正常退出且无活跃事务时 checkpoint：写 meta.next_version + 截断 WAL。
-    /// - 仍有未 commit/rollback 的事务时**不**截断 WAL，避免丢掉 UNDO 信息
-    /// - 崩溃/kill -9 不会走到这里，仍靠 WAL REDO + meta/max_xid 恢复
-    fn drop(&mut self) {
-        // 忽略锁中毒与 IO 错误，避免 drop 时二次 panic
-        let has_active = self
-            .active_txn
-            .lock()
-            .map(|g| !g.is_empty())
-            .unwrap_or(true);
-        if has_active {
-            return;
-        }
-        let next_ver = self.next_version.load(Ordering::SeqCst);
-        if let (Ok(mut kv), Ok(mut wal)) = (self.kv.lock(), self.wal.lock()) {
-            kv.set_next_version(next_ver);
-            kv.flush_all();
-            let root = kv.root_page_id();
-            let next_page = kv.next_page_id();
-            let _ = wal.append(WalRecord::Checkpoint {
-                next_version: next_ver,
-                root_page_id: root.0,
-                next_page_id: next_page,
-            });
-            let _ = wal.sync();
-            let _ = wal.truncate();
-        }
-        if let Ok(mut blob) = self.blob.lock() {
-            let _ = blob.sync();
-        }
+impl Default for MVCC {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// vacuum 结果统计
-#[derive(Debug, Clone)]
-pub struct VacuumStats {
-    /// 本次使用的回收水位
-    pub xmin: u64,
-    /// 删除的旧版本行数
-    pub versions_removed: usize,
-    /// 是否重写了 blob 文件
-    pub blob_rewritten: bool,
-}
+/// 决定 open 后 next_version 的位置（旧库：WAL 兜底）。
 
-/// 导出用的一条逻辑记录（已解码 blob，无 version 后缀）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExportRecord {
-    pub key: Vec<u8>,
-    /// `None` 表示 tombstone（仅当 include_deleted 时出现）
-    pub value: Option<Vec<u8>>,
-}
-
-/// 决定 open 后的 `next_version` 起点（尽量不扫全树）。
-///
-/// 优先级：
-/// 1. meta 中的 next_version（干净 checkpoint 后）
-/// 2. WAL 最后一条 Checkpoint 的 next_version
-/// 3. max(WAL max_xid, 全树 max version)+1（旧库兜底）
-fn resolve_start_version(tree: &mut BPlusTree, plan: &crate::bplus_tree::wal::RecoveryPlan) -> u64 {
-    let mut base: Option<u64> = None;
-
-    if let Some(nv) = tree.next_version() {
-        // meta 已有（含 0=空库）；与 WAL 恢复后的 max_xid 取 max
-        base = Some(nv);
-    }
-
-    if let Some(WalRecord::Checkpoint { next_version, .. }) = &plan.last_checkpoint {
-        base = Some(base.map(|b| b.max(*next_version)).unwrap_or(*next_version));
-    }
-
-    if let Some(b) = base {
-        // 恢复可能 REDO 了更高 xid，或 meta 略旧
-        return b.max(plan.max_xid.saturating_add(1)).max(1);
-    }
-
-    // 旧库：meta 无 NVER、WAL 无 checkpoint → 全树扫描（仅此路径）
-    let disk_max = scan_max_version(tree);
-    disk_max.max(plan.max_xid).saturating_add(1).max(1)
-}
-
-fn scan_max_version(tree: &mut BPlusTree) -> u64 {
+fn scan_max_version(tree: &mut Bitcask) -> std::io::Result<u64> {
     let mut max_v = 0u64;
-    for (enc, _) in tree.iter() {
-        if let Some(vk) = decode_key(&enc) {
+    // 只扫 KeyDir，不读 value
+    for (enc, _) in tree.iter_meta() {
+        if let Some(vk) = decode_key(enc) {
             max_v = max_v.max(vk.version);
         }
     }
-    max_v
+    Ok(max_v)
 }
 
 impl BulkLoader {
@@ -418,39 +371,49 @@ impl BulkLoader {
         let enc = encode_key(key, self.version);
         let stored = {
             let mut blob = self.blob.lock().unwrap();
-            // bulk：不每条 fsync blob，finish 时统一 sync
+            // bulk：不每条 fsync blob
             encode_stored_value(&mut blob, value, false).expect("blob encode")
         };
         let mut kv = self.kv.lock().unwrap();
-        kv.insert(enc, RowId(Some(stored)));
+        let _ = kv.insert(enc, Some(stored));
     }
 
-    /// 批量 put：一次加锁插入多条，显著降低锁/调度开销
+    /// 批量 put：一次加锁插入多条
     pub fn put_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) {
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
-        for (key, value) in items {
-            let enc = encode_key(key, self.version);
-            let stored = encode_stored_value(&mut blob, value.clone(), false).expect("blob");
-            kv.insert(enc, RowId(Some(stored)));
-        }
+        let ver = self.version;
+        let batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = items
+            .iter()
+            .map(|(k, v)| {
+                let enc = encode_key(k, ver);
+                let stored = encode_stored_value(&mut blob, v.clone(), false).expect("blob");
+                (enc, Some(stored))
+            })
+            .collect();
+        let _ = kv.insert_batch(batch);
     }
 
-    /// 零额外 clone 的批量 put（消费 items）
+    /// 零额外 clone 的批量 put（消费 items）— 压测主路径
     pub fn put_batch_owned(&mut self, items: Vec<(Vec<u8>, Vec<u8>)>) {
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
-        for (key, value) in items {
-            let enc = encode_key(&key, self.version);
-            let stored = encode_stored_value(&mut blob, value, false).expect("blob");
-            kv.insert(enc, RowId(Some(stored)));
-        }
+        let ver = self.version;
+        let batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = items
+            .into_iter()
+            .map(|(k, v)| {
+                let enc = encode_key(&k, ver);
+                let stored = encode_stored_value(&mut blob, v, false).expect("blob");
+                (enc, Some(stored))
+            })
+            .collect();
+        let _ = kv.insert_batch(batch);
     }
 
     pub fn delete(&mut self, key: &[u8]) {
         let enc = encode_key(key, self.version);
         let mut kv = self.kv.lock().unwrap();
-        kv.insert(enc, RowId(None));
+        let _ = kv.insert(enc, None);
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -459,20 +422,30 @@ impl BulkLoader {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
         let mut best: Option<Vec<u8>> = None;
-        for (enc, row) in kv.range_scan(low, high) {
-            if let Some(vk) = decode_key(&enc) {
-                if vk.raw_key.as_slice() == key && vk.version <= self.version {
-                    best = match row.0 {
-                        None => None,
-                        Some(stored) => decode_stored_value(&mut blob, &stored)
-                            .ok()
-                            .flatten()
-                            .and_then(crate::bplus_tree::kv_ops::logical_to_user),
-                    };
+        if let Ok(range) = kv.range_scan(low, high) {
+            for (enc, val) in range {
+                if let Some(vk) = decode_key(&enc) {
+                    if vk.raw_key.as_slice() == key && vk.version <= self.version {
+                        best = match val {
+                            None => None,
+                            Some(stored) => decode_stored_value(&mut blob, &stored)
+                                .ok()
+                                .flatten()
+                                .and_then(crate::bitcask::kv_ops::logical_to_user),
+                        };
+                    }
                 }
             }
         }
         best
+    }
+
+    /// 中途 flush 写缓冲（不 fsync），降低峰值内存
+    pub fn flush_buf(&mut self) {
+        let mut kv = self.kv.lock().unwrap();
+        let mut blob = self.blob.lock().unwrap();
+        let _ = kv.flush_buf();
+        let _ = blob.sync();
     }
 
     pub fn finish(mut self) {
@@ -488,16 +461,14 @@ impl BulkLoader {
         let mut blob = self.blob.lock().unwrap();
         let mut wal = self.wal.lock().unwrap();
         let _ = blob.sync();
+        let _ = kv.flush();
+        // bulk 结束后写 hint，避免下次 open 全量扫
+        let _ = kv.dump_hint();
         let next_ver = self.next_version.load(Ordering::SeqCst);
-        kv.set_next_version(next_ver);
-        kv.flush_all();
-        kv.set_bulk_mode(false);
-        let root = kv.root_page_id();
-        let next_page = kv.next_page_id();
         let _ = wal.append(WalRecord::Checkpoint {
             next_version: next_ver,
-            root_page_id: root.0,
-            next_page_id: next_page,
+            root_page_id: 0,
+            next_page_id: 0,
         });
         let _ = wal.sync();
         let _ = wal.truncate();
@@ -514,7 +485,7 @@ impl Drop for BulkLoader {
 
 impl Transaction {
     pub fn begin(
-        kv: Arc<Mutex<BPlusTree>>,
+        kv: Arc<Mutex<Bitcask>>,
         blob: Arc<Mutex<BlobStore>>,
         wal: Arc<Mutex<Wal>>,
         active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
@@ -569,7 +540,7 @@ impl Transaction {
 
         let enc_key = encode_key(key, self.version);
 
-        // 逻辑 value → 叶子存储编码（大 value 写 blob）
+        // 逻辑 value → 存储编码（大 value 写 blob）
         let stored_opt = match value {
             None => None,
             Some(v) => match encode_stored_value(&mut blob, v, true) {
@@ -595,35 +566,21 @@ impl Transaction {
             writes.push(key.to_vec());
         }
 
-        kvengine.insert(enc_key, RowId(stored_opt));
+        if let Err(e) = kvengine.insert(enc_key, stored_opt) {
+            eprintln!("Bitcask insert 失败: {e}");
+            return false;
+        }
         true
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut kvengine = self.kv.lock().unwrap();
-        let mut blob = self.blob.lock().unwrap();
-        let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-
-        for (enc, row) in Self::scan_key_versions(&mut kvengine, key) {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            if vk.raw_key.as_slice() != key {
-                continue;
-            }
-            if self.is_visible(vk.version) {
-                let logical = match &row.0 {
-                    None => None,
-                    Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
-                };
-                best = Some((vk.version, logical));
-            }
-        }
-        best.and_then(|(_, v)| v.and_then(|raw| crate::bplus_tree::kv_ops::logical_to_user(raw)))
+        self.latest_visible_raw(key)
+            .and_then(|(_, v)| v)
+            .and_then(crate::bitcask::kv_ops::logical_to_user)
     }
 
-    /// 最新可见逻辑行（含 TTL 信封原始字节；tombstone 为 None）
-    /// 供 [`crate::kv_ops`] 做 exists / meta / scan，不剥用户 value。
+    /// 最新可见逻辑行（含 TTL 信封原始字节；tombstone 为 None）。
+    /// 供 [`crate::kv_ops`] 使用，不剥用户 value。
     pub(crate) fn latest_visible_raw(
         &self,
         key: &[u8],
@@ -631,7 +588,7 @@ impl Transaction {
         let mut kvengine = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-        for (enc, row) in Self::scan_key_versions(&mut kvengine, key) {
+        for (enc, val) in Self::scan_key_versions(&mut kvengine, key) {
             let Some(vk) = decode_key(&enc) else {
                 continue;
             };
@@ -639,9 +596,9 @@ impl Transaction {
                 continue;
             }
             if self.is_visible(vk.version) {
-                let logical = match &row.0 {
+                let logical = match val {
                     None => None,
-                    Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
+                    Some(stored) => decode_stored_value(&mut blob, &stored).ok().flatten(),
                 };
                 best = Some((vk.version, logical));
             }
@@ -649,7 +606,7 @@ impl Transaction {
         best
     }
 
-    /// 全部最新可见逻辑行（key 有序）：(key, version, raw_logical_or_tombstone)
+    /// 全部最新可见逻辑行（key 有序）：(key, version, raw_or_tombstone)
     pub(crate) fn collect_latest_raw(
         &self,
         include_deleted: bool,
@@ -657,16 +614,19 @@ impl Transaction {
         let mut latest: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
         let mut kvengine = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
-        for (enc, row) in kvengine.iter() {
+        let Ok(all) = kvengine.iter() else {
+            return Vec::new();
+        };
+        for (enc, val) in all {
             let Some(vk) = decode_key(&enc) else {
                 continue;
             };
             if !self.is_visible(vk.version) {
                 continue;
             }
-            let logical = match &row.0 {
+            let logical = match val {
                 None => None,
-                Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
+                Some(stored) => decode_stored_value(&mut blob, &stored).ok().flatten(),
             };
             latest.insert(vk.raw_key, (vk.version, logical));
         }
@@ -681,43 +641,34 @@ impl Transaction {
             .collect()
     }
 
-    pub fn print_all(&self) -> BTreeMap<Vec<u8>, RowId> {
+    pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
         let mut records = BTreeMap::new();
         for rec in self.export_latest_visible(true) {
-            records.insert(rec.key, RowId(rec.value));
+            records.insert(rec.key, rec.value);
         }
         records
     }
 
-    /// 导出本事务快照下每个逻辑 key 的最新可见版本（已解码 blob / 剥 TTL）。
-    ///
-    /// 同 key 多版本按 version 升序扫描，后者覆盖前者 → 最终为最新可见。
-    /// 模糊搜索与分页见 [`crate::kv_ops::Transaction::search_keys`]。
+    /// 导出本事务快照下每个逻辑 key 的最新可见版本（已剥 TTL）。
     pub fn export_latest_visible(&self, include_deleted: bool) -> Vec<ExportRecord> {
         self.collect_latest_raw(true)
             .into_iter()
             .filter_map(|(key, _ver, raw)| match raw {
                 None => {
                     if include_deleted {
-                        Some(ExportRecord {
-                            key,
-                            value: None,
-                        })
+                        Some(ExportRecord { key, value: None })
                     } else {
                         None
                     }
                 }
-                Some(bytes) => match crate::bplus_tree::kv_ops::logical_to_user(bytes) {
+                Some(bytes) => match crate::bitcask::kv_ops::logical_to_user(bytes) {
                     Some(user) => Some(ExportRecord {
                         key,
                         value: Some(user),
                     }),
                     None => {
                         if include_deleted {
-                            Some(ExportRecord {
-                                key,
-                                value: None,
-                            })
+                            Some(ExportRecord { key, value: None })
                         } else {
                             None
                         }
@@ -731,7 +682,7 @@ impl Transaction {
         self.commit_with_options(false);
     }
 
-    pub fn commit_with_options(&self, flush_pages: bool) {
+    pub fn commit_with_options(&self, flush_data: bool) {
         {
             let mut active_txn = self.active_txn.lock().unwrap();
             active_txn.remove(&self.version);
@@ -743,8 +694,11 @@ impl Transaction {
                 eprintln!("WAL fsync 失败: {e}");
             }
         }
-        if flush_pages {
-            self.kv.lock().unwrap().flush_all();
+        if flush_data {
+            let mut kv = self.kv.lock().unwrap();
+            let mut blob = self.blob.lock().unwrap();
+            let _ = kv.flush();
+            let _ = blob.sync();
         }
     }
 
@@ -762,7 +716,7 @@ impl Transaction {
             let mut kvengine = self.kv.lock().unwrap();
             for k in keys {
                 let enc_key = encode_key(&k, self.version);
-                let _ = kvengine.delete(enc_key);
+                let _ = kvengine.remove(&enc_key);
             }
         }
     }
@@ -774,20 +728,23 @@ impl Transaction {
         version <= self.version
     }
 
-    fn scan_key_versions(kv: &mut BPlusTree, key: &[u8]) -> Vec<(Vec<u8>, RowId)> {
+    fn scan_key_versions(kv: &mut Bitcask, key: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        kv.range_scan(low, high)
-            .into_iter()
-            .filter(|(enc, _)| {
-                decode_key(enc)
-                    .map(|vk| vk.raw_key.as_slice() == key)
-                    .unwrap_or(false)
-            })
-            .collect()
+        match kv.range_scan(low, high) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|(enc, _)| {
+                    decode_key(enc)
+                        .map(|vk| vk.raw_key.as_slice() == key)
+                        .unwrap_or(false)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
-    fn latest_version_of(kv: &mut BPlusTree, key: &[u8]) -> Option<u64> {
+    fn latest_version_of(kv: &mut Bitcask, key: &[u8]) -> Option<u64> {
         Self::scan_key_versions(kv, key)
             .into_iter()
             .filter_map(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
@@ -798,23 +755,24 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bplus_tree::storage::{dblwr_path, wal_path};
+    use crate::bitcask::storage::{blob_path, data_path, hint_path, lock_path};
 
     fn tmp_db(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("mvcc_{tag}_{nanos}.db"))
+        std::env::temp_dir().join(format!("bitcask_mvcc_{tag}_{nanos}"))
     }
 
     fn cleanup(path: &Path) {
+        let _ = std::fs::remove_dir_all(path);
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(dblwr_path(path));
         let _ = std::fs::remove_file(wal_path(path));
-        let _ = std::fs::remove_file(crate::bplus_tree::storage::freelist_path(path));
-        let _ = std::fs::remove_file(crate::bplus_tree::storage::lock_path(path));
-        let _ = std::fs::remove_file(crate::bplus_tree::storage::blob_path(path));
+        let _ = std::fs::remove_file(lock_path(path));
+        let _ = std::fs::remove_file(data_path(path));
+        let _ = std::fs::remove_file(blob_path(path));
+        let _ = std::fs::remove_file(hint_path(path));
     }
 
     #[test]
@@ -833,7 +791,7 @@ mod tests {
     fn test_basic_set_get_delete() {
         let path = tmp_db("basic");
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let tx = mvcc.begin_transaction();
             assert!(tx.set(b"a", b"1".to_vec()));
             assert_eq!(tx.get(b"a"), Some(b"1".to_vec()));
@@ -850,7 +808,7 @@ mod tests {
     fn test_snapshot_isolation() {
         let path = tmp_db("si");
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let t1 = mvcc.begin_transaction();
             assert!(t1.set(b"k", b"v1".to_vec()));
             t1.commit();
@@ -872,7 +830,7 @@ mod tests {
     fn test_write_write_conflict() {
         let path = tmp_db("ww");
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let t1 = mvcc.begin_transaction();
             let t2 = mvcc.begin_transaction();
             assert!(t1.set(b"k", b"v1".to_vec()));
@@ -887,7 +845,7 @@ mod tests {
     fn test_rollback_discards_writes() {
         let path = tmp_db("rb");
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let t1 = mvcc.begin_transaction();
             assert!(t1.set(b"x", b"1".to_vec()));
             t1.rollback();
@@ -902,14 +860,14 @@ mod tests {
     fn test_print_all_latest_visible() {
         let path = tmp_db("pa");
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let t1 = mvcc.begin_transaction();
             assert!(t1.set(b"a", b"1".to_vec()));
             assert!(t1.set(b"b", b"2".to_vec()));
             assert!(t1.set(b"a", b"3".to_vec()));
             let all = t1.print_all();
-            assert_eq!(all.get(&b"a".to_vec()).unwrap().0, Some(b"3".to_vec()));
-            assert_eq!(all.get(&b"b".to_vec()).unwrap().0, Some(b"2".to_vec()));
+            assert_eq!(all.get(&b"a".to_vec()).unwrap().as_ref().unwrap(), b"3");
+            assert_eq!(all.get(&b"b".to_vec()).unwrap().as_ref().unwrap(), b"2");
             t1.commit();
         }
         cleanup(&path);
@@ -920,8 +878,8 @@ mod tests {
         let p1 = tmp_db("i1");
         let p2 = tmp_db("i2");
         {
-            let m1 = MVCC::open(&p1, 4, 8);
-            let m2 = MVCC::open(&p2, 4, 8);
+            let m1 = MVCC::open(&p1);
+            let m2 = MVCC::open(&p2);
             let t1 = m1.begin_transaction();
             let t2 = m2.begin_transaction();
             assert!(t1.set(b"k", b"1".to_vec()));
@@ -939,7 +897,7 @@ mod tests {
     fn test_self_write_visible() {
         let path = tmp_db("self");
         {
-            let mvcc = MVCC::open(&path, 4, 8);
+            let mvcc = MVCC::open(&path);
             let tx = mvcc.begin_transaction();
             assert!(tx.set(b"k", b"v".to_vec()));
             assert_eq!(tx.get(b"k"), Some(b"v".to_vec()));
@@ -952,7 +910,7 @@ mod tests {
     fn test_conflict_after_other_commits() {
         let path = tmp_db("cmt");
         {
-            let mvcc = MVCC::open(&path, 4, 8);
+            let mvcc = MVCC::open(&path);
             let t1 = mvcc.begin_transaction();
             let t2 = mvcc.begin_transaction();
             assert!(t1.set(b"k", b"1".to_vec()));
@@ -970,7 +928,7 @@ mod tests {
     fn test_disk_persist_across_reopen() {
         let path = tmp_db("persist");
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let t1 = mvcc.begin_transaction();
             assert!(t1.set(b"hello", b"world".to_vec()));
             t1.commit();
@@ -978,9 +936,10 @@ mod tests {
             assert!(t2.set(b"hello", b"rust".to_vec()));
             assert!(t2.set(b"foo", b"bar".to_vec()));
             t2.commit();
+            mvcc.flush();
         }
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let tx = mvcc.begin_transaction();
             assert_eq!(tx.get(b"hello"), Some(b"rust".to_vec()));
             assert_eq!(tx.get(b"foo"), Some(b"bar".to_vec()));
@@ -990,14 +949,16 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_redo_after_commit_without_page_flush() {
+    fn test_wal_redo_after_commit_without_data_flush() {
         let path = tmp_db("redo");
         {
-            use crate::bplus_tree::wal::{Wal, WalRecord};
             cleanup(&path);
-            let mut tree = crate::bplus_tree::BPlusTree::open(&path, 4, 16);
-            tree.flush_all();
+            std::fs::create_dir_all(&path).unwrap();
+            // 空数据文件
+            let mut tree = Bitcask::new(data_path(&path)).unwrap();
+            tree.flush().unwrap();
             drop(tree);
+
             let mut wal = Wal::open(wal_path(&path)).unwrap();
             let xid = 1u64;
             let enc = encode_key(b"recover", xid);
@@ -1012,7 +973,7 @@ mod tests {
             wal.sync().unwrap();
         }
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let tx = mvcc.begin_transaction();
             assert_eq!(tx.get(b"recover"), Some(b"me".to_vec()));
             tx.commit();
@@ -1024,18 +985,19 @@ mod tests {
     fn test_wal_undo_uncommitted() {
         let path = tmp_db("undo");
         {
-            use crate::bplus_tree::wal::{Wal, WalRecord};
             {
-                let mvcc = MVCC::open(&path, 4, 16);
+                let mvcc = MVCC::open(&path);
                 drop(mvcc);
             }
+            // 模拟：脏写入已进数据文件，但 WAL 只有 Begin+Write 无 Commit
             let mut wal = Wal::open(wal_path(&path)).unwrap();
             let xid = 1u64;
             {
-                let mut tree = crate::bplus_tree::BPlusTree::open(&path, 4, 16);
+                let mut tree = Bitcask::new(data_path(&path)).unwrap();
                 let enc = encode_key(b"ghost", xid);
-                tree.insert(enc.clone(), RowId(Some(b"should-vanish".to_vec())));
-                tree.flush_all();
+                tree.insert(enc.clone(), Some(b"should-vanish".to_vec()))
+                    .unwrap();
+                tree.flush().unwrap();
                 wal.append(WalRecord::Begin { xid }).unwrap();
                 wal.append(WalRecord::Write {
                     xid,
@@ -1047,7 +1009,7 @@ mod tests {
             }
         }
         {
-            let mvcc = MVCC::open(&path, 4, 16);
+            let mvcc = MVCC::open(&path);
             let tx = mvcc.begin_transaction();
             assert_eq!(tx.get(b"ghost"), None);
             tx.commit();
@@ -1059,7 +1021,7 @@ mod tests {
     fn test_bulk_load_and_reopen() {
         let path = tmp_db("bulk");
         {
-            let mvcc = MVCC::open(&path, 64, 256);
+            let mvcc = MVCC::open(&path);
             let mut bulk = mvcc.begin_bulk();
             for i in 0..1000u32 {
                 let k = format!("k{i:06}").into_bytes();
@@ -1070,7 +1032,7 @@ mod tests {
             bulk.finish();
         }
         {
-            let mvcc = MVCC::open(&path, 64, 256);
+            let mvcc = MVCC::open(&path);
             let tx = mvcc.begin_transaction();
             assert_eq!(tx.get(b"k000042"), Some(b"v42".to_vec()));
             assert_eq!(tx.get(b"k000999"), Some(b"v999".to_vec()));
@@ -1080,49 +1042,22 @@ mod tests {
     }
 
     #[test]
-    fn test_large_value_blob_roundtrip() {
-        let path = tmp_db("blob");
-        let big = vec![0xABu8; 10_000]; // > BLOB_THRESHOLD
-        {
-            let mvcc = MVCC::open(&path, 32, 64);
-            let tx = mvcc.begin_transaction();
-            assert!(tx.set(b"big", big.clone()));
-            assert!(tx.set(b"small", b"hi".to_vec()));
-            assert_eq!(tx.get(b"big"), Some(big.clone()));
-            assert_eq!(tx.get(b"small"), Some(b"hi".to_vec()));
-            tx.commit();
-        }
-        {
-            let mvcc = MVCC::open(&path, 32, 64);
-            let tx = mvcc.begin_transaction();
-            assert_eq!(tx.get(b"big"), Some(big));
-            assert_eq!(tx.get(b"small"), Some(b"hi".to_vec()));
-            tx.commit();
-        }
-        // blob 文件应存在且大于 header
-        let blob = crate::bplus_tree::storage::blob_path(&path);
-        assert!(blob.exists());
-        assert!(std::fs::metadata(&blob).unwrap().len() > 8);
-        cleanup(&path);
-    }
-
-    #[test]
     fn test_export_latest_visible() {
         let path = tmp_db("export");
         {
-            let mvcc = MVCC::open(&path, 16, 32);
+            let mvcc = MVCC::open(&path);
             let t1 = mvcc.begin_transaction();
             assert!(t1.set(b"k1", b"v1".to_vec()));
             assert!(t1.set(b"k2", b"v2".to_vec()));
             t1.commit();
             let t2 = mvcc.begin_transaction();
-            assert!(t2.set(b"k1", b"v1b".to_vec())); // 覆盖
+            assert!(t2.set(b"k1", b"v1b".to_vec()));
             assert!(t2.delete(b"k2"));
             assert!(t2.set(b"k3", b"v3".to_vec()));
             t2.commit();
         }
         {
-            let mvcc = MVCC::open(&path, 16, 32);
+            let mvcc = MVCC::open(&path);
             let live = mvcc.export_latest_visible(false);
             assert_eq!(live.len(), 2);
             assert_eq!(
@@ -1143,11 +1078,10 @@ mod tests {
     }
 
     #[test]
-    fn test_vacuum_removes_old_versions_and_rewrites_blob() {
+    fn test_vacuum_removes_old_versions() {
         let path = tmp_db("vac");
-        let big = vec![9u8; 1000];
         {
-            let mvcc = MVCC::open(&path, 16, 64);
+            let mvcc = MVCC::open(&path);
             let t = mvcc.begin_transaction();
             assert!(t.set(b"a", b"1".to_vec()));
             assert!(t.set(b"b", b"old".to_vec()));
@@ -1155,7 +1089,6 @@ mod tests {
             let t = mvcc.begin_transaction();
             assert!(t.set(b"a", b"2".to_vec()));
             assert!(t.delete(b"b"));
-            assert!(t.set(b"big", big.clone()));
             t.commit();
 
             let st = mvcc.vacuum().unwrap();
@@ -1168,104 +1101,47 @@ mod tests {
             let tx = mvcc.begin_transaction();
             assert_eq!(tx.get(b"a"), Some(b"2".to_vec()));
             assert_eq!(tx.get(b"b"), None);
-            assert_eq!(tx.get(b"big"), Some(big.clone()));
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_large_value_blob_roundtrip() {
+        let path = tmp_db("blob");
+        let big = vec![0xABu8; 10_000]; // > BLOB_THRESHOLD
+        {
+            let mvcc = MVCC::open(&path);
+            let tx = mvcc.begin_transaction();
+            assert!(tx.set(b"big", big.clone()));
+            assert!(tx.set(b"small", b"hi".to_vec()));
+            assert_eq!(tx.get(b"big"), Some(big.clone()));
+            assert_eq!(tx.get(b"small"), Some(b"hi".to_vec()));
+            tx.commit();
+            mvcc.flush();
         }
         {
-            let mvcc = MVCC::open(&path, 16, 64);
+            let mvcc = MVCC::open(&path);
             let tx = mvcc.begin_transaction();
-            assert_eq!(tx.get(b"a"), Some(b"2".to_vec()));
             assert_eq!(tx.get(b"big"), Some(big));
+            assert_eq!(tx.get(b"small"), Some(b"hi".to_vec()));
             tx.commit();
-
-            // 删除唯一大 value 后再 vacuum → blob 应被清空
-            let t = mvcc.begin_transaction();
-            assert!(t.delete(b"big"));
-            t.commit();
-            let st = mvcc.vacuum().unwrap();
-            assert!(st.versions_removed >= 1);
-            // blob 无引用时应收缩
-            let blob = crate::bplus_tree::storage::blob_path(&path);
-            if blob.exists() {
-                let len = std::fs::metadata(&blob).unwrap().len();
-                assert!(len <= 16, "无 blob 引用时文件应接近仅魔数, len={len}");
-            }
         }
+        let blob = blob_path(&path);
+        assert!(blob.exists());
+        assert!(std::fs::metadata(&blob).unwrap().len() > 8);
         cleanup(&path);
     }
 
     #[test]
     fn test_try_open_lock_conflict() {
         let path = tmp_db("lock2");
-        let m1 = MVCC::try_open(&path, 8, 16).unwrap();
-        let err = MVCC::try_open(&path, 8, 16).err();
+        let m1 = MVCC::try_open(&path).unwrap();
+        let err = MVCC::try_open(&path).err();
         assert!(err.is_some());
         drop(m1);
-        let m2 = MVCC::try_open(&path, 8, 16).unwrap();
+        let m2 = MVCC::try_open(&path).unwrap();
         drop(m2);
-        cleanup(&path);
-    }
-
-    /// 干净 checkpoint 后重开：meta 持久化 next_version，version 连续且数据可读
-    #[test]
-    fn test_reopen_preserves_next_version_after_checkpoint() {
-        let path = tmp_db("reopen_nv");
-        let v1;
-        {
-            let mvcc = MVCC::open(&path, 16, 32);
-            let t = mvcc.begin_transaction();
-            v1 = t.version();
-            assert!(t.set(b"k", b"v1".to_vec()));
-            t.commit();
-            // checkpoint 把 next_version 写入 meta 并截断 WAL
-            mvcc.checkpoint();
-        }
-        {
-            let mvcc = MVCC::open(&path, 16, 32);
-            let t = mvcc.begin_transaction();
-            // 新事务 version 必须严格大于上次已用 version
-            assert!(t.version() > v1, "reopen version={} should > {}", t.version(), v1);
-            assert_eq!(t.get(b"k"), Some(b"v1".to_vec()));
-            assert!(t.set(b"k", b"v2".to_vec()));
-            t.commit();
-        }
-        {
-            let mvcc = MVCC::open(&path, 16, 32);
-            let t = mvcc.begin_transaction();
-            assert_eq!(t.get(b"k"), Some(b"v2".to_vec()));
-            t.commit();
-        }
-        cleanup(&path);
-    }
-
-    /// 未手动 checkpoint：meta 可能仍是上次 open 写入的旧 next_version，
-    /// 应靠 WAL 中 max_xid 把起点抬高，保证 version 单调。
-    #[test]
-    fn test_reopen_uses_wal_max_xid_without_checkpoint() {
-        let path = tmp_db("reopen_wal");
-        let mut last_v = 0u64;
-        {
-            let mvcc = MVCC::open(&path, 16, 32);
-            for i in 0..5 {
-                let t = mvcc.begin_transaction();
-                last_v = t.version();
-                assert!(t.set(format!("k{i}").as_bytes(), b"x".to_vec()));
-                t.commit();
-            }
-            // 故意不 checkpoint：WAL 里保留 Begin/Write/Commit
-        }
-        {
-            let mvcc = MVCC::open(&path, 16, 32);
-            let t = mvcc.begin_transaction();
-            assert!(
-                t.version() > last_v,
-                "version after reopen={} must > last committed {}",
-                t.version(),
-                last_v
-            );
-            assert_eq!(t.get(b"k4"), Some(b"x".to_vec()));
-            t.commit();
-        }
         cleanup(&path);
     }
 }

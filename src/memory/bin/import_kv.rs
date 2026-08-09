@@ -11,11 +11,8 @@
 //!   --input snapshot.bin --format bin --export roundtrip.bin
 //! ```
 
-#[path = "../tools/kv_snapshot.rs"]
-mod kv_snapshot;
-
-use kv_snapshot::{read_bin, read_jsonl, write_bin, write_jsonl, IoStats, KvRecord};
-use memory::MVCC;
+use storage_engines::common::kv_snapshot::{read_bin, read_jsonl, write_bin, write_jsonl, IoStats, KvRecord};
+use storage_engines::memory::MVCC;
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -160,10 +157,7 @@ fn main() {
         let recs: Vec<KvRecord> = mvcc
             .export_latest_visible(false)
             .into_iter()
-            .map(|r| KvRecord {
-                key: r.key,
-                value: r.value,
-            })
+            .map(|r| KvRecord::new(r.key, r.value))
             .collect();
         let st = match args.format {
             Format::Bin => write_bin(out, &recs).expect("re-export bin"),
@@ -179,7 +173,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kv_snapshot::{write_bin, KvRecord};
+    use storage_engines::common::kv_snapshot::{write_bin, KvRecord};
 
     fn tmp(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -195,14 +189,8 @@ mod tests {
         write_bin(
             &bin,
             &[
-                KvRecord {
-                    key: b"k".to_vec(),
-                    value: Some(b"v42".to_vec()),
-                },
-                KvRecord {
-                    key: b"d".to_vec(),
-                    value: None,
-                },
+                KvRecord::new(b"k".to_vec(), Some(b"v42".to_vec())),
+                KvRecord::new(b"d".to_vec(), None),
             ],
         )
         .unwrap();
@@ -227,14 +215,8 @@ mod tests {
         write_bin(
             &bin_in,
             &[
-                KvRecord {
-                    key: b"x".to_vec(),
-                    value: Some(b"1".to_vec()),
-                },
-                KvRecord {
-                    key: b"y".to_vec(),
-                    value: Some(b"2".to_vec()),
-                },
+                KvRecord::new(b"x".to_vec(), Some(b"1".to_vec())),
+                KvRecord::new(b"y".to_vec(), Some(b"2".to_vec())),
             ],
         )
         .unwrap();
@@ -244,10 +226,7 @@ mod tests {
         let out: Vec<KvRecord> = mvcc
             .export_latest_visible(false)
             .into_iter()
-            .map(|r| KvRecord {
-                key: r.key,
-                value: r.value,
-            })
+            .map(|r| KvRecord::new(r.key, r.value))
             .collect();
         write_bin(&bin_out, &out).unwrap();
         let (back, st) = read_bin(&bin_out).unwrap();

@@ -1,10 +1,7 @@
 //! 导出 lsm-tree 为 JSONL / BPEXP001|002（可选带 seq）。
 
-#[path = "../tools/kv_snapshot.rs"]
-mod kv_snapshot;
-
-use kv_snapshot::{write_bin, write_jsonl, KvRecord};
-use lsm_tree::LSMTree;
+use storage_engines::common::kv_snapshot::{write_bin, write_jsonl, KvRecord};
+use storage_engines::lsm_tree::LSMTree;
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -63,20 +60,12 @@ fn main() {
     let records: Vec<KvRecord> = if with_seq {
         db.export_records_with_seq(include_deleted)
             .into_iter()
-            .map(|(k, v, seq)| KvRecord {
-                key: k,
-                value: v,
-                seq: Some(seq),
-            })
+            .map(|(k, v, seq)| KvRecord::with_seq(k, v, seq))
             .collect()
     } else {
         db.export_records(include_deleted)
             .into_iter()
-            .map(|(k, v)| KvRecord {
-                key: k,
-                value: v,
-                seq: None,
-            })
+            .map(|(k, v)| KvRecord::new(k, v))
             .collect()
     };
     let stats = match format {

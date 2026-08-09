@@ -13,3 +13,65 @@ memmap2 = "0.9"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# ── 可执行文件 ────────────────────────────────────────────────────────────
+#
+# 门面层示例
+[[bin]]
+name = "storage-engines"
+path = "src/main.rs"
+
+# 数据搬运与压测工具。Cargo 不认 src/<模块>/bin/ 这个路径，必须显式声明。
+# 四个引擎各有同名的 import_kv / export_kv，而 [[bin]] 的 name 要求全局唯一，
+# 所以统一加引擎前缀。
+#
+#   cargo run --release --bin bitcask-export-kv -- --dir ./db -o snap.bin
+#   cargo run --release --bin lsm-import-kv     -- --dir ./lsm -i snap.bin
+
+[[bin]]
+name = "bitcask-bench-bulk"
+path = "src/bitcask/bin/bench_bulk.rs"
+
+[[bin]]
+name = "bitcask-import-kv"
+path = "src/bitcask/bin/import_kv.rs"
+
+[[bin]]
+name = "bitcask-export-kv"
+path = "src/bitcask/bin/export_kv.rs"
+
+[[bin]]
+name = "bplus-bench"
+path = "src/bplus_tree/bin/bench.rs"
+
+[[bin]]
+name = "bplus-import-kv"
+path = "src/bplus_tree/bin/import_kv.rs"
+
+[[bin]]
+name = "bplus-export-kv"
+path = "src/bplus_tree/bin/export_kv.rs"
+
+[[bin]]
+name = "lsm-bench-bulk"
+path = "src/lsm_tree/bin/bench_bulk.rs"
+
+[[bin]]
+name = "lsm-import-kv"
+path = "src/lsm_tree/bin/import_kv.rs"
+
+[[bin]]
+name = "lsm-export-kv"
+path = "src/lsm_tree/bin/export_kv.rs"
+
+[[bin]]
+name = "memory-bench"
+path = "src/memory/bin/bench.rs"
+
+[[bin]]
+name = "memory-import-kv"
+path = "src/memory/bin/import_kv.rs"
+
+[[bin]]
+name = "memory-export-kv"
+path = "src/memory/bin/export_kv.rs"

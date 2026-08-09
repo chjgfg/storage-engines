@@ -1,4 +1,13 @@
-//! 迁移快照编解码（仅供 export_kv / import_kv 使用，不属于 LSM 引擎核心）。
+//! 迁移快照编解码：四个引擎的 `import_kv` / `export_kv` 共用。
+//!
+//! 不属于任何引擎核心，只服务于跨引擎搬数据。两种格式：
+//!
+//! - **JSONL**：每行 `{"key":"<base64>","value":"<base64>"|null[,"seq":N]}`
+//! - **二进制**：magic + 重复 `(key_len, key, val_len|tombstone, value?[, seq])`
+//!
+//! 二进制有两个魔数：`BPEXP001` 不带 seq，`BPEXP002` 每条多 8 字节 seq。
+//! [`write_bin`] 按记录里是否有 `seq` 自动选择，所以不带 seq 的导出与
+//! 旧版 `BPEXP001` **逐字节一致**；[`read_bin`] 两种都认。
 
 use std::{
     fs::File,
@@ -10,14 +19,36 @@ pub const BIN_MAGIC: &[u8; 8] = b"BPEXP001";
 pub const BIN_MAGIC_V2: &[u8; 8] = b"BPEXP002";
 pub const TOMBSTONE_LEN: u32 = u32::MAX;
 
+/// 一条快照记录。`value: None` 是 tombstone。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvRecord {
     pub key: Vec<u8>,
     pub value: Option<Vec<u8>>,
-    /// LSM write seq when known (export with --with-seq)
+    /// LSM 的写入 seq，仅 `--with-seq` 导出时有值；其他引擎一律 `None`
     pub seq: Option<u64>,
 }
 
+impl KvRecord {
+    /// 不带 seq，三个非 LSM 引擎用这个
+    pub fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        Self {
+            key,
+            value,
+            seq: None,
+        }
+    }
+
+    /// 带 LSM 写入 seq
+    pub fn with_seq(key: Vec<u8>, value: Option<Vec<u8>>, seq: u64) -> Self {
+        Self {
+            key,
+            value,
+            seq: Some(seq),
+        }
+    }
+}
+
+/// 读写条数统计
 #[derive(Debug, Clone, Default)]
 pub struct IoStats {
     pub records: usize,
@@ -35,6 +66,10 @@ impl IoStats {
         }
     }
 }
+
+// ─── Base64 ─────────────────────────────────────────────────────────────────
+//
+// 自己实现是为了不引第三方依赖（全项目只有 5 个 dep）。
 
 pub fn b64_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -111,6 +146,8 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+// ─── 写 ─────────────────────────────────────────────────────────────────────
+
 pub fn write_bin(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats> {
     let with_seq = records.iter().any(|r| r.seq.is_some());
     let f = File::create(path)?;
@@ -164,6 +201,8 @@ pub fn write_jsonl(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats
     w.flush()?;
     Ok(stats)
 }
+
+// ─── 读 ─────────────────────────────────────────────────────────────────────
 
 pub fn read_bin(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
     let data = std::fs::read(path)?;
@@ -283,25 +322,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_roundtrip() {
-        let path = std::env::temp_dir().join(format!("lsm_kv_snap_{}.bin", std::process::id()));
+    fn test_b64_known() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_decode("Zm9v").unwrap(), b"foo");
+    }
+
+    #[test]
+    fn test_bin_roundtrip() {
+        let path = std::env::temp_dir().join(format!("kv_snap_{}.bin", std::process::id()));
         let recs = vec![
-            KvRecord {
-                key: b"a".to_vec(),
-                value: Some(b"1".to_vec()),
-                seq: None,
-            },
-            KvRecord {
-                key: b"b".to_vec(),
-                value: None,
-                seq: None,
-            },
+            KvRecord::new(b"a".to_vec(), Some(b"1".to_vec())),
+            KvRecord::new(b"b".to_vec(), None),
         ];
         write_bin(&path, &recs).unwrap();
         let (back, st) = read_bin(&path).unwrap();
         assert_eq!(st.live, 1);
         assert_eq!(st.deleted, 1);
         assert_eq!(back, recs);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_bin_v2_roundtrip() {
+        let path = std::env::temp_dir().join(format!("kv_snap_v2_{}.bin", std::process::id()));
+        let recs = vec![
+            KvRecord::with_seq(b"k".to_vec(), Some(b"v".to_vec()), 42),
+            KvRecord::with_seq(b"d".to_vec(), None, 99),
+        ];
+        write_bin(&path, &recs).unwrap();
+        let (back, _) = read_bin(&path).unwrap();
+        assert_eq!(back, recs);
+        // v2 每条多 8 字节 seq；v1 不写
+        assert_eq!(back[0].seq, Some(42));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_jsonl_roundtrip() {
+        let path = std::env::temp_dir().join(format!("kv_snap_{}.jsonl", std::process::id()));
+        let recs = vec![
+            KvRecord::new(b"k".to_vec(), Some(b"v".to_vec())),
+            KvRecord::new(b"d".to_vec(), None),
+        ];
+        write_jsonl(&path, &recs).unwrap();
+        let (back, st) = read_jsonl(&path).unwrap();
+        assert_eq!(st.live, 1);
+        assert_eq!(st.deleted, 1);
+        assert_eq!(back, recs);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 不带 seq 的导出与旧版 BPEXP001 逐字节一致
+    #[test]
+    fn test_plain_is_bpexp001() {
+        let path = std::env::temp_dir().join(format!("kv_snap_plain_{}.bin", std::process::id()));
+        let recs = vec![KvRecord::new(b"k".to_vec(), Some(b"v".to_vec()))];
+        write_bin(&path, &recs).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(&data[..8], b"BPEXP001");
         let _ = std::fs::remove_file(&path);
     }
 }

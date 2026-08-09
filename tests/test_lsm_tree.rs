@@ -6,8 +6,8 @@
 //!
 //! 用法：`cargo run --release --bin lsm-tree`
 
-use lsm_tree::{kv_ops, MVCC, SearchQuery};
-use std::fs;
+use storage_engines::lsm_tree::{kv_ops, MVCC, SearchQuery};
+use std::{format, fs};
 use std::time::Duration;
 
 fn show_key(k: &[u8]) -> String {
@@ -32,8 +32,9 @@ fn cleanup_dir(dir: &str) {
     let _ = fs::remove_dir_all(dir);
 }
 
-fn main() {
-    let db_dir = "lsm_mvcc_demo";
+#[test]
+fn test_lsm_tree() {
+    let db_dir = "./data/lsm_tree";
     cleanup_dir(db_dir);
 
     let large_key = {

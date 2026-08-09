@@ -5,11 +5,8 @@
 //! cargo run --release --bin export_kv -- --dir ./data --out snapshot.jsonl --format jsonl
 //! ```
 
-#[path = "../tools/kv_snapshot.rs"]
-mod kv_snapshot;
-
-use bitcask::MVCC;
-use kv_snapshot::{write_bin, write_jsonl, IoStats, KvRecord};
+use storage_engines::bitcask::MVCC;
+use storage_engines::common::kv_snapshot::{write_bin, write_jsonl, IoStats, KvRecord};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -101,10 +98,7 @@ fn main() {
     let records: Vec<KvRecord> = mvcc
         .export_latest_visible(args.include_deleted)
         .into_iter()
-        .map(|r| KvRecord {
-            key: r.key,
-            value: r.value,
-        })
+        .map(|r| KvRecord::new(r.key, r.value))
         .collect();
     let export_elapsed = t0.elapsed();
 

@@ -5,11 +5,8 @@
 //!   --input ../lsm-tree/snap.bin --format bin --db ./from_lsm.db
 //! ```
 
-#[path = "../tools/kv_snapshot.rs"]
-mod kv_snapshot;
-
-use bplus_tree::MVCC;
-use kv_snapshot::{read_bin, read_jsonl, IoStats};
+use storage_engines::bplus_tree::MVCC;
+use storage_engines::common::kv_snapshot::{read_bin, read_jsonl, IoStats, KvRecord};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -82,7 +79,7 @@ import_kv — 导入 JSONL / BPEXP001 到 bplus-tree（工具，非库 API）
     }
 }
 
-fn apply_to_db(mvcc: &MVCC, records: &[kv_snapshot::KvRecord]) -> IoStats {
+fn apply_to_db(mvcc: &MVCC, records: &[KvRecord]) -> IoStats {
     let mut bulk = mvcc.begin_bulk();
     let mut stats = IoStats::default();
     for rec in records {
@@ -146,7 +143,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kv_snapshot::{write_bin, KvRecord};
+    use storage_engines::common::kv_snapshot::{write_bin, KvRecord};
     use std::path::Path;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -176,14 +173,8 @@ mod tests {
         write_bin(
             &bin,
             &[
-                KvRecord {
-                    key: b"k".to_vec(),
-                    value: Some(b"v42".to_vec()),
-                },
-                KvRecord {
-                    key: b"d".to_vec(),
-                    value: None,
-                },
+                KvRecord::new(b"k".to_vec(), Some(b"v42".to_vec())),
+                KvRecord::new(b"d".to_vec(), None),
             ],
         )
         .unwrap();

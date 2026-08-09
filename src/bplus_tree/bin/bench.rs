@@ -8,7 +8,7 @@
 //! cargo run --release --bin bench -- --n 10000000 --order 256 --cache 8192 --bulk --value-size 16
 //! ```
 
-use bplus_tree::MVCC;
+use storage_engines::bplus_tree::MVCC;
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;

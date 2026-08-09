@@ -7,11 +7,8 @@
 //! cargo run --release --bin export_kv -- --db data.db --out snapshot.jsonl --format jsonl
 //! ```
 
-#[path = "../tools/kv_snapshot.rs"]
-mod kv_snapshot;
-
-use bplus_tree::MVCC;
-use kv_snapshot::{write_bin, write_jsonl, IoStats, KvRecord};
+use storage_engines::bplus_tree::MVCC;
+use storage_engines::common::kv_snapshot::{write_bin, write_jsonl, IoStats, KvRecord};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -112,10 +109,7 @@ fn main() {
     let records: Vec<KvRecord> = mvcc
         .export_latest_visible(args.include_deleted)
         .into_iter()
-        .map(|r| KvRecord {
-            key: r.key,
-            value: r.value,
-        })
+        .map(|r| KvRecord::new(r.key, r.value))
         .collect();
     let export_elapsed = t0.elapsed();
 
@@ -150,7 +144,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kv_snapshot::{read_bin, write_bin, write_jsonl};
+    use storage_engines::common::kv_snapshot::{read_bin, write_bin, write_jsonl};
 
     fn tmp(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -187,20 +181,14 @@ mod tests {
             let live: Vec<_> = mvcc
                 .export_latest_visible(false)
                 .into_iter()
-                .map(|r| KvRecord {
-                    key: r.key,
-                    value: r.value,
-                })
+                .map(|r| KvRecord::new(r.key, r.value))
                 .collect();
             assert_eq!(live.len(), 1);
             write_jsonl(&jsonl, &live).unwrap();
             let all: Vec<_> = mvcc
                 .export_latest_visible(true)
                 .into_iter()
-                .map(|r| KvRecord {
-                    key: r.key,
-                    value: r.value,
-                })
+                .map(|r| KvRecord::new(r.key, r.value))
                 .collect();
             write_bin(&bin, &all).unwrap();
             let (back, st) = read_bin(&bin).unwrap();

@@ -5,7 +5,7 @@
 //! cargo run --release --bin bench -- --n 100000 --bulk
 //! ```
 
-use memory::MVCC;
+use storage_engines::memory::MVCC;
 use std::env;
 use std::time::Instant;
 

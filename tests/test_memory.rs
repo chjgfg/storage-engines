@@ -4,8 +4,10 @@
 //!       计数器 incr / incr_with_ttl · 范围 scan / prefix / seek
 //!       模糊搜索分页 · 元数据 · TTL · vacuum · bulk
 
-use memory::{kv_ops, MVCC, SearchQuery};
-use std::time::Duration;
+// use memory::{kv_ops, MVCC, SearchQuery};
+use std::{format, time::Duration};
+
+use storage_engines::memory::{MVCC, SearchQuery, kv_ops};
 
 fn show_key(k: &[u8]) -> String {
     if k.len() > 40 {
@@ -25,7 +27,9 @@ fn show_val(v: Option<&[u8]>) -> String {
     }
 }
 
-fn main() {
+
+#[test]
+fn test_memory() {
     println!("========== memory 纯内存 KV 演示 ==========");
     println!("架构对标 bplus-tree：MVCC + kv_ops，存储为 BTreeMap 多版本\n");
 

@@ -16,6 +16,7 @@ use std::{
     },
 };
 
+pub use crate::common::{ExportRecord, VacuumStats};
 use crate::memory::mem_store::MemStore;
 
 /// MVCC 引擎（单进程内存）
@@ -68,21 +69,6 @@ pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
         raw_key: enc[..split].to_vec(),
         version: u64::from_be_bytes(ver_bytes),
     })
-}
-
-/// vacuum 结果
-#[derive(Debug, Clone)]
-pub struct VacuumStats {
-    pub xmin: u64,
-    pub versions_removed: usize,
-}
-
-/// 导出一条逻辑记录
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExportRecord {
-    pub key: Vec<u8>,
-    /// `None` 表示 tombstone（仅 include_deleted 时出现）
-    pub value: Option<Vec<u8>>,
 }
 
 impl MVCC {
@@ -178,6 +164,7 @@ impl MVCC {
         VacuumStats {
             xmin,
             versions_removed: removed,
+            blob_rewritten: None,
         }
     }
 
