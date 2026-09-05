@@ -225,18 +225,50 @@ impl MVCC {
     /// 版本回收（vacuum）+ 重写 blob（只保留仍被引用的大 value）。
     ///
     /// 规则：
-    /// - `xmin` = 活跃事务 id 最小值；无活跃事务时为 `next_version`
+    /// - **有任何活跃事务时整轮跳过**（`skipped_active_txn = true`），原因见下
+    /// - 无活跃事务时 `xmin = next_version`
     /// - 每个逻辑 key：只保留「最后一个 version < xmin」+ 全部 version >= xmin
     /// - 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除
     /// - 然后扫描存活叶子，把仍引用的大 value 重写进新 `*.blob`
+    ///
+    /// # 为什么有活跃事务就必须跳过
+    ///
+    /// 「`xmin` = 活跃事务 id 最小值」这个水位线**不安全**：它没有考虑活跃事务 begin 时的
+    /// 快照集（`active_xid`）里那些**后来提交了**的事务。
+    ///
+    /// ```text
+    /// t1 写 K=v2 未提交 → t2 begin（快照排除 t1，应读 v1）→ t1 提交
+    /// → 活跃表只剩 t2 → 旧水位线 xmin = t2.version
+    /// → K 的 v1/v2 都 < xmin → 只留最新的 v2
+    /// → 而 v2 对 t2 不可见，v1 已删 → t2 读到 None
+    /// ```
+    ///
+    /// 要精确算安全水位线，得把每个活跃事务的 `active_xid` 也纳入计算（还要改共享结构）。
+    /// 这里选择**用「少裁一轮」换「绝不裁错」**：裁错版本是**静默读到旧值**，
+    /// 而漏裁一轮只是把回收推到下一轮。短事务（begin → 几次读写 → commit）下
+    /// 活跃表绝大多数时刻是空的，代价可以忽略。
+    ///
+    /// # 锁
+    ///
+    /// 全程持 `active_txn` 锁：
+    /// - 确认活跃表为空之后不会有新事务拿到快照（`begin` 也要这把锁）
+    /// - `write` 的锁序是 `active_txn → wal → blob → kv`，本函数是 `active_txn → kv → blob`，
+    ///   `kv`/`blob` 顺序相反。持住 `active_txn` 能挡住 `write` 进入，从而不可能形成环
+    ///
+    /// 代价是 vacuum 期间存储层暂停。链压到 1 之后每轮只扫存活行；
+    /// **首轮在已膨胀的库上很贵，应离线跑**。
     pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
+        // 全程持有：既是水位线正确性的前提，也是与 write 锁序共存的前提
         let active = self.active_txn.lock().unwrap();
-        let xmin = if active.is_empty() {
-            self.next_version.load(Ordering::SeqCst)
-        } else {
-            *active.keys().min().unwrap()
-        };
-        drop(active);
+        if !active.is_empty() {
+            return Ok(VacuumStats {
+                xmin: 0,
+                versions_removed: 0,
+                blob_rewritten: Some(false),
+                skipped_active_txn: true,
+            });
+        }
+        let xmin = self.next_version.load(Ordering::SeqCst);
 
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
@@ -319,6 +351,7 @@ impl MVCC {
             xmin,
             versions_removed: removed,
             blob_rewritten: Some(blob_rewritten),
+            skipped_active_txn: false,
         })
     }
 }

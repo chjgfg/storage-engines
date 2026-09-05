@@ -170,7 +170,8 @@ fn is_visible(&self, version: u64) -> bool {
 
 ### vacuum 版本回收
 
-回收水位 `xmin` = 最小活跃事务 id(无活跃事务时取 `next_version`)。保留策略:
+**有任何活跃事务时整轮跳过**(`skipped_active_txn = true`,什么都不裁);
+无活跃事务时回收水位 `xmin` = `next_version`。保留策略:
 
 > 每个 key 只保留「**最后一个** `version < xmin`」+ 全部 `version >= xmin`;
 > 若 xmin 之前最终是 tombstone 且无更新版本 → 整个 key 删除。
@@ -179,7 +180,20 @@ fn is_visible(&self, version: u64) -> bool {
 
 最后一条规则是墓碑的最终回收,否则 tombstone 会永久累积。
 
-⚠️ **事务必须 commit 或 rollback**,否则它一直挂在活跃表里,`xmin` 上不去,vacuum 什么都回收不掉。
+#### 为什么不是「xmin = 最小活跃事务 id」
+
+那是本项目早期的实现,**而它是错的**。它只看当前活跃表,漏掉了活跃事务 begin 时的快照集(`active_xid`)里那些**后来提交了**的事务:
+
+```text
+t1 写 K=v2 未提交 → t2 begin(快照排除 t1,应读 v1)→ t1 提交
+→ 活跃表只剩 t2 → 旧水位线 xmin = t2.version
+→ K 的 v1/v2 都 < xmin → 只留最新的 v2
+→ 而 v2 对 t2 不可见,v1 已删 → t2 读到 None
+```
+
+要精确算安全水位线,得把每个活跃事务的快照集也纳入计算。这里选择**用「少裁一轮」换「绝不裁错」**:漏裁只是把回收推到下一轮,裁错则是**静默读到旧值**。回归测试见 `tests/test_vacuum.rs`(安全性 / 有效性 / 可观测三条 × 四引擎)。
+
+⚠️ **事务必须 commit 或 rollback**,否则它一直挂在活跃表里,vacuum 每轮都会跳过,什么都回收不掉。定时调用 vacuum 的使用方应当把「连续多轮 `skipped_active_txn`」当成告警条件 —— 它和「没东西可裁」的 `versions_removed` 都是 0,不区分开就看不出 vacuum 其实没在工作。
 
 ### WAL 与崩溃恢复
 
@@ -502,12 +516,15 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:166 单元 + 4 集成 + 2 文档测试
+cargo test                    # 全部:171 单元 + 7 集成 + 2 文档测试
 cargo test --lib engine::     # 只跑门面层(12 个,四引擎全覆盖)
+cargo test --test test_vacuum # vacuum 语义:安全性 / 有效性 / 可观测,四引擎各一遍
 cargo test --test test_lsm_tree
 ```
 
 门面层的测试是**四个引擎跑同一套断言**的,覆盖增删查、批量与扫描、写冲突、bulk 导入、TTL 与元数据、vacuum 与 flush —— 这也是验证「四引擎行为一致」的地方。
+
+`tests/test_vacuum.rs` 是**语义**测试而不是 demo:它钉住「vacuum 不得破坏已开始事务的快照读」「空闲时必须真把链压到 1」「跳过 ≠ 没东西可裁」三条。前者是早期水位线实现的真实 bug(见上文 vacuum 一节),后两条防止修安全性时把正常路径一起关掉。
 
 集成测试会在 `./data/<引擎名>/` 下建演示库,不污染仓库根目录。
 

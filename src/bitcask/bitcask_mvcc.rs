@@ -234,18 +234,28 @@ impl MVCC {
     /// 版本回收（vacuum）。
     ///
     /// 规则：
-    /// - `xmin` = 活跃事务 id 最小值；无活跃事务时为 `next_version`
+    /// - **有任何活跃事务时整轮跳过**（`skipped_active_txn = true`）
+    /// - 无活跃事务时 `xmin = next_version`
     /// - 每个逻辑 key：只保留「最后一个 version < xmin」+ 全部 version >= xmin
     /// - 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除
     /// - 结束后 `merge()` 压缩日志；无 blob 引用时清空 blob 文件
+    ///
+    /// 「跳过而不是算精确水位线」的理由与锁序说明见
+    /// [`crate::bplus_tree::MVCC::vacuum`]（四个引擎同一套语义）。
+    /// 一句话：旧的「xmin = 活跃事务 id 最小值」会裁掉活跃事务快照仍需要的版本，
+    /// 而**裁错版本是静默读到旧值**，比多跑一轮 vacuum 危险得多。
     pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
+        // 全程持有：确认活跃表为空后不会有新事务拿到快照
         let active = self.active_txn.lock().unwrap();
-        let xmin = if active.is_empty() {
-            self.next_version.load(Ordering::SeqCst)
-        } else {
-            *active.keys().min().unwrap()
-        };
-        drop(active);
+        if !active.is_empty() {
+            return Ok(VacuumStats {
+                xmin: 0,
+                versions_removed: 0,
+                blob_rewritten: Some(false),
+                skipped_active_txn: true,
+            });
+        }
+        let xmin = self.next_version.load(Ordering::SeqCst);
 
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
@@ -343,6 +353,7 @@ impl MVCC {
             xmin,
             versions_removed: removed,
             blob_rewritten: Some(blob_rewritten),
+            skipped_active_txn: false,
         })
     }
 }

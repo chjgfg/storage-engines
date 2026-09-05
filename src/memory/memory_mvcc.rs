@@ -110,14 +110,23 @@ impl MVCC {
 
     /// 版本回收：每个逻辑 key 只保留「最后一个 version < xmin」+ 全部 version >= xmin；
     /// 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除。
+    ///
+    /// **有任何活跃事务时整轮跳过**（`skipped_active_txn = true`），无活跃事务时
+    /// `xmin = next_version`。「跳过而不是算精确水位线」的理由与锁序说明见
+    /// [`crate::bplus_tree::MVCC::vacuum`]（四个引擎同一套语义）。
     pub fn vacuum(&self) -> VacuumStats {
+        // 全程持有：确认活跃表为空后不会有新事务拿到快照。
+        // `write` 的锁序也是 active_txn → store，方向一致，不会成环。
         let active = self.active_txn.lock().unwrap();
-        let xmin = if active.is_empty() {
-            self.next_version.load(Ordering::SeqCst)
-        } else {
-            *active.keys().min().unwrap()
-        };
-        drop(active);
+        if !active.is_empty() {
+            return VacuumStats {
+                xmin: 0,
+                versions_removed: 0,
+                blob_rewritten: None,
+                skipped_active_txn: true,
+            };
+        }
+        let xmin = self.next_version.load(Ordering::SeqCst);
 
         let mut store = self.store.lock().unwrap();
         let all: Vec<(Vec<u8>, Option<Vec<u8>>)> = store.iter().collect();
@@ -165,6 +174,7 @@ impl MVCC {
             xmin,
             versions_removed: removed,
             blob_rewritten: None,
+            skipped_active_txn: false,
         }
     }
 
