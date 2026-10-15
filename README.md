@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 227 个单元测试 + 4 个集成测试
+- 231 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -249,8 +249,19 @@ cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline 
 
 | 自动回收 | `max_chain` | `total_rows` | 点读均耗时（前 250 次 / 后 250 次） |
 |---|---|---|---|
-| 开（片宽 2048 行） | **3 817** | **4 017** | 1166 µs / 1122 µs |
-| 关 | 20 000 | 20 200 | 1121 µs / 1081 µs |
+| 开（片宽 2048 行） | **3 817** | **4 017** | 45 µs / 39 µs |
+| 关 | 20 000 | 20 200 | 45 µs / 72 µs |
+
+另一次同批量的实测把读路径本身也量了出来（`只读事务 = begin + get + commit`）：
+
+| | 每次耗时 | 每次落 WAL |
+|---|---|---|
+| 改之前 | 2265.8 µs | 56 字节 |
+| 改之后（`Begin` 推迟到第一次写；只读 commit 不 fsync） | **15.8 µs** | **0 字节** |
+
+上表里那 ~1.1 ms 就是这件事：读事务原来**每次**都 append `Begin` + `Commit` 并 fsync 一次
+（`Wal::append` 是直接 `file.append`，不是缓冲）。也就是说混合负载里的点读耗时 **97% 是 WAL fsync**，
+跟查找无关 —— 这条改完点读从 ~1130 µs 掉到 ~45 µs。
 
 三个结论，顺序即重要性:
 
@@ -260,8 +271,9 @@ cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline 
 2. **点读耗时与链长无关,两条通道是独立的**：关掉回收那列链涨到 2 万行,点读耗时**没有变差**
    （前/后 250 次几乎一样）。所以"修了反向早停"与"修了回收"各断各的通道 —— 只修一条,
    另一条照样恶化;反过来,回收偶尔落后也不会再把 CPU 顶上去。
-3. 表里的点读是**读事务**:它照样 append `Begin`/`Commit` 并 fsync 一次 ⇒ 毫秒级主要是
-   WAL fsync,不是查找。只读事务该走更轻的路径,这条尚未做(见「已知局限」)。
+3. **点读耗时主要是 WAL fsync,不是查找**：读事务当时同样 append `Begin`/`Commit` 并 fsync。
+   这条已在同批改掉（见上表"改之前/改之后"），教训留下：**耗时数字要先归因再动手**，
+   否则很容易拿"点读 1 ms"去怀疑本来已经修好的查找路径。
 
 ### WAL 与崩溃恢复
 
@@ -481,7 +493,7 @@ data.db.lock       单写者锁(内含 pid)
 - `page_id` 在页头里被截断成 u32
 
 **其他**
-- **只读事务也要付一次 WAL fsync**:`begin_transaction` append `Begin`、`commit` append `Commit` 并 sync —— 上面基线表里那 ~1.1 ms 的点读主要是这个,不是查找。只读路径(不写任何 key 的事务)本可以不进 WAL,这条尚未做
+- ~~只读事务也要付一次 WAL fsync~~ → 已改:`Begin` 推迟到第一次 `write()` 才补,只读事务的 `commit` 不写 `Commit`、不 fsync(实测 2265.8µs/次 → **15.8µs/次**,WAL 落字节 56 → **0**)。策略只有一份实现:[`crate::common::WalPolicy`]
 - ~~`FileLock` 在三个引擎里各有一份近乎逐字重复的实现~~ → 已收成 `src/common/disk.rs` 一份(`DiskFile` / `FileLock` / `crc32` 三样都是崩溃语义的载体,`diff` 实测原先 bitcask 与 lsm 的 FileLock 差 0 行)。各引擎只保留自己的**锁文件路径规则**(dir/bitcask.lock、`<stem>.lock`、dir/lsm.lock)
 - ~~三份 `wal.rs` 仍是各自一份~~ → 已收成 `src/common/wal.rs` 一份(原先 `diff` 只差 14–16 行注释与 import,`WAL_MAGIC` 与帧头本来就更相同:同一格式的三份复制)。各引擎的 `wal.rs` 现在只是 re-export + 自己的 WAL 路径规则
 - bulk load 路径**崩溃不安全**:`finish()` 之前进程挂掉可能丢数据(它关掉了 WAL 和 fsync,这正是它快的原因)。`import_kv` 走的就是这条路径
@@ -590,7 +602,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:227 单元 + 4 集成 + 2 文档测试
+cargo test                    # 全部:231 单元 + 4 集成 + 2 文档测试
 cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```

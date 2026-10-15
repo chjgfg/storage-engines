@@ -150,6 +150,45 @@ impl VacuumScheduler {
     }
 }
 
+/// 只读事务不进 WAL —— 策略的一份实现（三个磁盘引擎共用）。
+///
+/// 为什么要专门管这件事：**读路径原来是写路径**。`Transaction::begin` 无条件 append
+/// 一条 `Begin`、`commit` 无条件 append `Commit` 并 **fsync** —— 而 `Wal::append` 是
+/// `file.append`（立刻落盘，不是缓冲）。实测一次纯只读事务 2.27 ms、往 WAL 落 56 字节：
+/// 对一个要轮询存储的交易进程来说这不是"慢一点"，是每秒四百次读的天花板，
+/// 外加只读负载把 WAL 撑到阈值、去触发本该由写入才做的 checkpoint。
+///
+/// 规矩：**begin 时还不该进 WAL**（此时不知道会不会写）；第一次 `write()` 时补一条
+/// `Begin`，`commit` 只在"真的开过 WAL"时才写 `Commit` + fsync。
+///
+/// 为什么少一条 `Begin` 不影响恢复：`analyze_recovery` 的 `max_xid` 是从
+/// `Begin`/`Write`/`Commit`/`Abort` **四种记录一起**取的，写过的事务必然带 `Write`，
+/// 所以版本号起点不会回退；而没写过的事务本来就没有需要 REDO/UNDO 的东西。
+/// 重启后 `start_ver = max(checkpoint.next_version, max_xid + 1)`，
+/// 存活行的版本都 ≤ `max_xid` ⇒ 新事务的编号不会和已有行撞上。
+#[derive(Debug, Default)]
+pub struct WalPolicy {
+    opened: std::cell::Cell<bool>,
+}
+
+impl WalPolicy {
+    /// 第一次写之前调用：返回 `true` 表示"这条事务还没进过 WAL，调用方该补 `Begin`"。
+    /// 幂等 —— 只有第一次返回 `true`。
+    pub fn open_on_first_write(&self) -> bool {
+        if self.opened.get() {
+            false
+        } else {
+            self.opened.set(true);
+            true
+        }
+    }
+
+    /// 本事务是否进过 WAL ⇒ `commit` 要不要写 `Commit` 并 fsync、`rollback` 要不要写 `Abort`
+    pub fn opened(&self) -> bool {
+        self.opened.get()
+    }
+}
+
 /// 漏网事务的判据：活跃表里还留着"自己"，就说明既没 `commit` 也没 `rollback`。
 ///
 /// 为什么用成员关系而不是额外标志位：`commit` / `rollback` 都以 `remove` 收尾，
@@ -228,6 +267,16 @@ mod tests {
         assert_eq!(s.cursor().as_deref(), Some(&b"k1"[..]));
         s.set_cursor(None);
         assert_eq!(s.cursor(), None);
+    }
+
+    /// 只读事务不许进 WAL；写过一次之后，整条事务的 `Commit`/fsync 都要回来。
+    #[test]
+    fn wal_policy_opens_only_on_first_write() {
+        let p = WalPolicy::default();
+        assert!(!p.opened(), "刚 begin 的事务不该写 Commit、也不该 fsync");
+        assert!(p.open_on_first_write(), "第一次写必须补 Begin");
+        assert!(!p.open_on_first_write(), "第二次写不该再补一条 Begin");
+        assert!(p.opened(), "写过就得写 Commit + fsync，否则持久化点丢了");
     }
 
     #[test]

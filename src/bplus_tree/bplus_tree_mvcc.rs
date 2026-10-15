@@ -53,6 +53,8 @@ pub struct Transaction {
     wal_limit: Arc<AtomicU64>,
     /// 提交时把本事务写的版本行数记到自动回收的账上
     vac: Arc<VacuumScheduler>,
+    /// 本事务是否已经进过 WAL（第一次写时才补 `Begin`）—— 见 [`crate::common::WalPolicy`]
+    wal_policy: crate::common::WalPolicy,
     version: u64,
     active_xid: HashSet<u64>,
 }
@@ -674,10 +676,8 @@ impl Transaction {
         guard.insert(version, Vec::new());
         drop(guard);
 
-        {
-            let mut w = wal.lock().unwrap();
-            let _ = w.append(WalRecord::Begin { xid: version });
-        }
+        // begin 不进 WAL：此刻还不知道会不会写；第一次 write() 才补 `Begin`
+        // （只读事务因此一个字节都不落，详见 [`crate::common::WalPolicy`]）
 
         Transaction {
             kv,
@@ -687,6 +687,7 @@ impl Transaction {
             next_version,
             wal_limit,
             vac,
+            wal_policy: crate::common::WalPolicy::default(),
             version,
             active_xid,
         }
@@ -730,6 +731,9 @@ impl Transaction {
             },
         };
 
+        if self.wal_policy.open_on_first_write() {
+            let _ = wal.append(WalRecord::Begin { xid: self.version });
+        }
         if let Err(e) = wal.append(WalRecord::Write {
             xid: self.version,
             key: enc_key.clone(),
@@ -877,7 +881,7 @@ impl Transaction {
         };
         // 给自动回收记一笔账（近似：算逻辑 key 数，宁可少算也不为了精确再走一遍写集）
         self.vac.on_commit(rows_written as u64);
-        {
+        if self.wal_policy.opened() {
             let mut wal = self.wal.lock().unwrap();
             let _ = wal.append(WalRecord::Commit { xid: self.version });
             if let Err(e) = wal.sync() {
@@ -903,7 +907,7 @@ impl Transaction {
         let mut active_txn = self.active_txn.lock().unwrap();
         let keys = active_txn.remove(&self.version).unwrap_or_default();
 
-        {
+        if self.wal_policy.opened() {
             let mut wal = self.wal.lock().unwrap();
             let _ = wal.append(WalRecord::Abort { xid: self.version });
             let _ = wal.sync();
@@ -1748,6 +1752,46 @@ mod tests {
             for k in KEYS {
                 assert_eq!(tx.get(k), Some(format!("v{}", CHAIN - 1).into_bytes()));
             }
+            tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// 只读事务不许往 WAL 落一个字节，也不许付 fsync 的代价。
+    ///
+    /// 反向那半同样重要：**写过就必须有 `Commit` 记录 + fsync** —— 不然这条优化会悄悄
+    /// 把"提交的持久化点"一起省掉，那比慢一千倍严重。
+    #[test]
+    fn test_read_only_transaction_touches_no_wal() {
+        const READS: u64 = 200;
+
+        let path = tmp_db("ro_wal");
+        {
+            let mvcc = MVCC::open(&path, 16, 32);
+            let tx = mvcc.begin_transaction();
+            assert!(tx.set(b"k", b"v".to_vec()));
+            tx.commit();
+
+            let wal = wal_path(&path);
+            let size0 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            for _ in 0..READS {
+                let tx = mvcc.begin_transaction();
+                assert_eq!(tx.get(b"k"), Some(b"v".to_vec()));
+                tx.commit();
+            }
+            let size1 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(size1, size0, "{READS} 次只读事务往 WAL 落了 {} 字节", size1 - size0);
+
+            // 写过的事务照旧进 WAL
+            let tx = mvcc.begin_transaction();
+            assert!(tx.set(b"k", b"w".to_vec()));
+            tx.commit();
+            let size2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            assert!(size2 > size1, "写入必须留下 Begin/Write/Commit 记录，持久化点不能被省掉");
+
+            // 只读事务也不能把数据读坏（版本号照旧推进，快照语义不变）
+            let tx = mvcc.begin_transaction();
+            assert_eq!(tx.get(b"k"), Some(b"w".to_vec()));
             tx.commit();
         }
         cleanup(&path);

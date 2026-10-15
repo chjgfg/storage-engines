@@ -20,4 +20,6 @@ pub use types::{
     SearchQuery, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use version::{decode_key, encode_key, vacuum_plan, VersionedKey};
-pub use kernel::{is_unfinished, visible_at, HealthFold, VacuumScheduler};
+pub use kernel::{
+    is_unfinished, visible_at, HealthFold, VacuumScheduler, WalPolicy,
+};
