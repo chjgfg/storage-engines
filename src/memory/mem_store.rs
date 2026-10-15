@@ -96,6 +96,14 @@ impl MemStore {
         rows
     }
 
+    /// 只遍历键（**不克隆 value**），供上层折叠「每个逻辑 key 的胜出行」用。
+    ///
+    /// `iter` 会把每一行的键与 value 都克隆出来；全库折叠只需要先比键、最后才取
+    /// 少数几行的 value，所以这里刻意提供一个不带 value 的视图。
+    pub fn iter_keys(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.data.keys()
+    }
+
     /// 全表有序迭代（克隆 value，教学清晰）
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + '_ {
         self.data.iter().map(|(k, v)| (k.clone(), v.clone()))

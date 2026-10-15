@@ -355,26 +355,32 @@ impl Transaction {
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        let mut latest: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
+        // 两段式（同 bitcask）：先只比键折叠出每个 raw_key 的胜出版本行，
+        // 再只为这批行取 value。旧实现用 `store.iter()` 把每一行的键与 value 都克隆一遍。
         let store = self.store.lock().unwrap();
-        for (enc, row) in store.iter() {
-            let Some(vk) = decode_key(&enc) else {
+        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        for enc in store.iter_keys() {
+            let Some(vk) = decode_key(enc) else {
                 continue;
             };
             if !self.is_visible(vk.version) {
                 continue;
             }
-            latest.insert(vk.raw_key, (vk.version, row));
+            winners.insert(vk.raw_key, (vk.version, enc.clone()));
         }
-        latest
-            .into_iter()
-            .filter_map(|(key, (ver, value))| {
-                if value.is_none() && !include_deleted {
-                    return None;
-                }
-                Some((key, ver, value))
-            })
-            .collect()
+
+        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
+        for (key, (ver, enc)) in winners {
+            let Some(row) = store.get(&enc) else {
+                continue;
+            };
+            let row = row.clone();
+            if row.is_none() && !include_deleted {
+                continue;
+            }
+            out.push((key, ver, row));
+        }
+        out
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
