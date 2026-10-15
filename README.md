@@ -239,6 +239,30 @@ loop {
 判据、记账、折叠这些纯逻辑一旦复制,就会长成"一个 bug 四个实例"—— 自动回收那回我把 `swap`
 当成取账写进了四份代码,四家一起静默停摆。所以合的是**判定与记账**,不是扫描。
 
+### 长跑基线（事故形状，实测）
+
+一条 `#[ignore]` 的守卫把现场形状跑成可复现的对照：一把热点 key 持续更新 2 万次 + 每 4 次一次点读 + 200 把稳定 key。
+
+```bash
+cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline -- --ignored --nocapture
+```
+
+| 自动回收 | `max_chain` | `total_rows` | 点读均耗时（前 250 次 / 后 250 次） |
+|---|---|---|---|
+| 开（片宽 2048 行） | **3 817** | **4 017** | 1166 µs / 1122 µs |
+| 关 | 20 000 | 20 200 | 1121 µs / 1081 µs |
+
+三个结论，顺序即重要性:
+
+1. **链长有界，但不是"贴着 1"**：稳态上界实测是 **2 × 切片宽度**。一片的截断只能落在逻辑 key
+   边界，热点 key 那一组太大时会把整片吃满 ⇒ 它每两小轮才被轮到一次。默认片 16 Ki 行时
+   稳态链 ≲ 32 Ki —— 现场那条 23.8 万版是它的 7 倍多，量级差在这里，但别把界说成 1。
+2. **点读耗时与链长无关,两条通道是独立的**：关掉回收那列链涨到 2 万行,点读耗时**没有变差**
+   （前/后 250 次几乎一样）。所以"修了反向早停"与"修了回收"各断各的通道 —— 只修一条,
+   另一条照样恶化;反过来,回收偶尔落后也不会再把 CPU 顶上去。
+3. 表里的点读是**读事务**:它照样 append `Begin`/`Commit` 并 fsync 一次 ⇒ 毫秒级主要是
+   WAL fsync,不是查找。只读事务该走更轻的路径,这条尚未做(见「已知局限」)。
+
 ### WAL 与崩溃恢复
 
 WAL 有 5 种记录:`Begin` / `Write` / `Commit` / `Abort` / `Checkpoint`,帧格式带 CRC32,损坏或不完整的尾部会被直接丢弃(模拟崩溃截断)。
@@ -457,6 +481,7 @@ data.db.lock       单写者锁(内含 pid)
 - `page_id` 在页头里被截断成 u32
 
 **其他**
+- **只读事务也要付一次 WAL fsync**:`begin_transaction` append `Begin`、`commit` append `Commit` 并 sync —— 上面基线表里那 ~1.1 ms 的点读主要是这个,不是查找。只读路径(不写任何 key 的事务)本可以不进 WAL,这条尚未做
 - ~~`FileLock` 在三个引擎里各有一份近乎逐字重复的实现~~ → 已收成 `src/common/disk.rs` 一份(`DiskFile` / `FileLock` / `crc32` 三样都是崩溃语义的载体,`diff` 实测原先 bitcask 与 lsm 的 FileLock 差 0 行)。各引擎只保留自己的**锁文件路径规则**(dir/bitcask.lock、`<stem>.lock`、dir/lsm.lock)
 - ~~三份 `wal.rs` 仍是各自一份~~ → 已收成 `src/common/wal.rs` 一份(原先 `diff` 只差 14–16 行注释与 import,`WAL_MAGIC` 与帧头本来就更相同:同一格式的三份复制)。各引擎的 `wal.rs` 现在只是 re-export + 自己的 WAL 路径规则
 - bulk load 路径**崩溃不安全**:`finish()` 之前进程挂掉可能丢数据(它关掉了 WAL 和 fsync,这正是它快的原因)。`import_kv` 走的就是这条路径

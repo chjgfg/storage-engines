@@ -1095,6 +1095,114 @@ mod tests {
         assert_eq!(s_short, s_long, "点写的读盘次数不应随版本链长度增长（它只需要版本号）");
     }
 
+    /// 长跑基线：**事故形状**（一把热点 key 被持续更新 + 稳定点读），自动回收开着 vs 关着。
+    ///
+    /// 跑法（release，几十秒）：
+    /// ```text
+    /// cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline -- --ignored --nocapture
+    /// ```
+    ///
+    /// 三条断言，一条比一条重要：
+    /// 1. 开着自动回收 ⇒ 链长与总行数**不随 uptime 增长**（贴着切片宽度）—— I1 + I2。
+    /// 2. 关着自动回收 ⇒ 链长必须涨到接近写入次数。这条是**反向证据**：同一份读代码、
+    ///    同一个负载，只是不开回收，`max_chain` 就一路涨 ⇒ 说明这条守卫真的咬得到东西。
+    /// 3. 两阶段的点读耗时**都不该随链长涨**（通道 ① 已断）。耗时只打印不断言 ——
+    ///    在共享机器上做时间断言会 flaky；而"关掉回收后时间也不爆、只有行数涨"本身就是结论：
+    ///    **点读成本与垃圾回收是两条独立通道**，修了一条不等于修了另一条。
+    ///
+    /// 实测出来的界（不是推出来的）：链的稳态上界是 **2 × 切片宽度**，不是 1 ×。
+    /// 原因：一片的截断只能落在逻辑 key 边界，热点 key 那一组太大时会把这一整片吃满，
+    /// 于是它被"轮到"的频率是每两小轮一次 ⇒ 平均攒到 1×、最坏 2×。默认片 16 Ki 行时
+    /// 稳态链 ≲ 32 Ki —— 对 23.8 万版的现场来说是数量级的差距，但别误报成"贴着 1"。
+    #[test]
+    #[ignore = "长跑基线：手动 cargo test --release -- --ignored"]
+    fn test_long_run_baseline() {
+        use std::time::Instant;
+
+        const N: u64 = 20_000;
+        const SLICE: u64 = 2_048;
+        const OTHER: u64 = 200;
+        const READ_EVERY: u64 = 4;
+        const READ_SAMPLES: usize = 250;
+
+        fn run_workload(path: &Path, auto_slice: u64) -> (MvccHealth, f64, f64) {
+            let mut reads: Vec<u128> = Vec::with_capacity((N / READ_EVERY) as usize + 1);
+            let mvcc = MVCC::open(path);
+            mvcc.set_vacuum_auto_slice(auto_slice);
+
+            for k in 0..OTHER {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(format!("other{k}").as_bytes(), b"v".to_vec()));
+                tx.commit();
+            }
+
+            for i in 0..N {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()));
+                tx.commit();
+                if i % READ_EVERY == 0 {
+                    let t0 = Instant::now();
+                    let tx = mvcc.begin_transaction();
+                    let hit = tx.get(b"hot");
+                    tx.commit();
+                    assert!(hit.is_some(), "第 {i} 次采样读不到热点 key");
+                    reads.push(t0.elapsed().as_micros());
+                }
+            }
+            let head = reads[..READ_SAMPLES].iter().sum::<u128>() as f64 / READ_SAMPLES as f64;
+            let tail =
+                reads[reads.len() - READ_SAMPLES..].iter().sum::<u128>() as f64 / READ_SAMPLES as f64;
+            (mvcc.health(), head, tail)
+        }
+
+        let on_path = tmp_db("baseline_on");
+        let off_path = tmp_db("baseline_off");
+
+        let (h_on, head_on, tail_on) = run_workload(&on_path, SLICE);
+        let (h_off, head_off, tail_off) = run_workload(&off_path, 0);
+
+        println!("负载：{N} 次热点更新 + 每 {READ_EVERY} 次一次点读 + {OTHER} 把稳定 key");
+        println!(
+            "自动回收 开(片={SLICE})  max_chain={:>6}  total_rows={:>6}  点读均耗 前 {head_on:>7.1}µs / 后 {tail_on:>7.1}µs",
+            h_on.max_chain, h_on.total_rows
+        );
+        println!(
+            "自动回收 关             max_chain={:>6}  total_rows={:>6}  点读均耗 前 {head_off:>7.1}µs / 后 {tail_off:>7.1}µs",
+            h_off.max_chain, h_off.total_rows
+        );
+
+        // 1) 开着：链与行数都贴住切片宽度（稳态上界 2×，理由见函数头），不随 2 万次更新增长
+        assert!(
+            h_on.max_chain <= 2 * SLICE + 2,
+            "开着自动回收链却涨到 {} 行（界 {}）—— 回收没跟上产生速度",
+            h_on.max_chain,
+            2 * SLICE
+        );
+        assert!(
+            h_on.total_rows <= 2 * SLICE + OTHER + 8,
+            "开着自动回收总行数却到 {}",
+            h_on.total_rows
+        );
+        assert_eq!(h_on.live_keys, OTHER + 1);
+        // 2) 关着：链必须一路涨到接近写入次数（反向证据，守卫咬得到）
+        assert!(
+            h_off.max_chain >= N - 2,
+            "关掉自动回收后链只有 {} 行？那这条基线什么都没测到",
+            h_off.max_chain
+        );
+        // 3) 两者的行数差就是回收在干的事：实测比值 ≈ 5.0（N / 2×切片），
+        //    界取 3× 留余量 —— 别把比值写成断言，跑一次没红不代表它对
+        assert!(
+            h_off.total_rows > 3 * h_on.total_rows,
+            "同样负载，关回收才 {} 行、开回收 {} 行，差距不该这么小",
+            h_off.total_rows,
+            h_on.total_rows
+        );
+
+        cleanup(&on_path);
+        cleanup(&off_path);
+    }
+
     /// 泄漏事务（既不 commit 也不 rollback 就丢弃）**不得**永久卡死 vacuum 的水位线。
     ///
     /// 没有 `impl Drop for Transaction` 时，漏网的 xid 会一直挂在 `active_txn` 里，
