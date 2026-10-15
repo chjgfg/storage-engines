@@ -7,23 +7,37 @@
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 236 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ 这个版本号只在本仓库,**crates.io 上最新仍是 0.3.0(出事故那版)**,要引修复版得走 path/git 依赖 —— 见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
 
-## 安装
+## 引入方式
+
+⚠️ **先看这条**:crates.io 上目前最新只到 **0.3.0**,而 0.3.0 正是"版本链随 uptime 爬升"那次事故
+所在的版本 —— 点读仍沿版本链全扫(O(链长))、没有自动回收、没有有界 vacuum、`KvEngine` 不是
+`Send + Sync`、WAL 不会自己收口、LSM 的大 value 读回裸指针、bitcask merge 崩了认不回残骸。
+所以**要拿修复版,现在只能用 path / git 依赖**,`"0.3"` 拿到的是旧行为。
+0.4.0 发布之后本段会改写(发布到 crates.io 不可逆,只能 yank ⇒ 由作者手动执行)。
 
 ```toml
-[dependencies]
-storage-engines = "0.1"
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 0.4.0 的全部修复
+storage-engines = { path = "../storage-engines" }
+
+# (b) 走远端:git 依赖(gitee 与 github 内容一致)
+storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branch = "master" }
+
+# (c) crates.io —— 只有 0.3.0,缺以上修复
+storage-engines = "0.3"
 ```
 
-命令行工具单独装:
+命令行工具也可以单独装(注意装到的仍是已发布的版本):
 
 ```bash
 cargo install storage-engines
 ```
+
+MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
 
 ---
 
@@ -63,6 +77,9 @@ tx.set(b"key", b"value".to_vec());
 tx.commit();
 ```
 
+起库之外还要知道的:目录形状、事务的冲突/回滚语义、跨线程能做什么不能做什么、长跑进程的观测面,
+以及**目前还不能指望库做的事** —— 都在下面[下游接入使用说明](#下游接入使用说明)。
+
 引擎名大小写不敏感,`-` 和 `_` 等价,并接受别名:
 
 | 规范名 | 别名 | 需要路径 |
@@ -71,6 +88,163 @@ tx.commit();
 | `bplus_tree` | `bplus` / `btree` | 是 |
 | `lsm_tree` | `lsm` | 是 |
 | `memory` | `mem` | 否 |
+
+---
+
+## 下游接入使用说明
+
+这一节是给"引进来直接用、不再自己包一层"的读者写的。入口名字在 **crate 根**就能 import
+(`use storage_engines::{open_engine, EngineKind, ...}`),全路径 `storage_engines::engine::*` 同样可用。
+方法全集(含 `scan` / `search_keys` / TTL 三态 / 计数器)在[门面层设计](#门面层设计)。
+
+### 1. 起库:四种写法
+
+```rust
+use std::path::{Path, PathBuf};
+use storage_engines::{open_engine, open_from_env, EngineConfig, EngineKind, StorageConfig};
+
+// (a) 编译期就定死用哪家,路径自己给
+let db = open_engine(EngineKind::BPlusTree, Some(Path::new("data/bplus_tree/bplus.db")))?;
+
+// (b) 引擎名来自配置文件/环境变量:同一个入口,入参换成字符串(别名、大小写不敏感)
+let db = open_engine("bplus", Some(Path::new("data/bplus_tree/bplus.db")))?;
+
+// (c) 连目录规则一起交给库:位置恒为 data_dir/<engine>/,父目录自动建好
+let db = StorageConfig {
+    kind: EngineKind::BPlusTree,
+    data_dir: PathBuf::from("data"),
+    engine: EngineConfig::default(), // order=64 / max_cache_pages=1024,只有 B+ 树用得到
+}
+.open()?;
+
+// (d) 读环境变量 STORAGE_ENGINE / STORAGE_DATA_DIR
+let db = open_from_env()?;
+```
+
+四种写法返回的都是 `Box<dyn KvEngine>`。第一个参数的类型是 `EngineName` trait:`EngineKind` /
+`&str` / `String` / `&String` 都能直接传,拿着枚举不必自己 `.as_str()`。
+
+各家"一个库"的形状不同 —— `StorageConfig::open()` 替你抹平了这条差异,手写路径时得自己对上:
+
+| 引擎 | 磁盘上是什么 | 实际文件 | `open_engine` 该传 |
+|---|---|---|---|
+| `bitcask` | 一个**目录** | `data.log`(active) + `data.{id}.log`(密封分片) + `data.hint` + `data.blob` + `bitcask.lock` | 目录 |
+| `bplus_tree` | 一个**文件** + 同 stem 的伴生文件 | `x.db` + `x.db.wal` / `.dblwr` / `.freelist` / `.lock` / `.blob` | 文件路径 |
+| `lsm_tree` | 一个**目录** | WAL + 各层 SST + `blobs/{seq}.blob` | 目录 |
+| `memory` | 无 | — | `None`(给了也忽略) |
+
+`STORAGE_ENGINE` 写了但名字不认识 ⇒ **报错** `EngineError::UnknownEngine`,不静默退回默认值
+("以为在跑 bitcask、其实跑的是 memory"不能靠默认值发生)。磁盘引擎漏给路径 ⇒ `PathRequired`。
+
+错误只有一个类型:`EngineError { UnknownEngine(String), Unsupported{engine,op}, PathRequired(&str), Io(io::Error) }`,
+`Display` 直接可读。`Unsupported` 目前只有一个来源:`merge()` 仅 bitcask 支持(其余三家调它返回这个错,
+不是 panic)。内存引擎的 `flush()` / `checkpoint()` 是 **no-op**,不会报错 —— 别把它当"落盘成功"。
+
+### 2. 读写:事务是唯一入口
+
+```rust
+use std::time::Duration;
+
+let tx = db.begin();                       // Box<dyn KvTxn + '_>,借用 db
+if !tx.set(b"order:1", b"payload".to_vec()) {
+    tx.rollback();                         // false = 写冲突,不是"没写进去"
+}
+let token = b"session-token".to_vec();
+tx.set_with_ttl(b"session:abc", token, Duration::from_secs(600));
+let _ = tx.get(b"order:1");                // 已剥 TTL 信封;过期/已删/不存在都是 None
+tx.commit();                               // 落 WAL + fsync(只读事务两者都不做)
+```
+
+四条必须知道的语义:
+
+- `set` / `delete` 返回 `false`、`batch_set` / `batch_delete` 返回 `Err(key)` 都只表示**写冲突**
+  (别的事务在你之后改了同一个 key),此时应该 `rollback()` 整个事务重试,而不是继续写。
+- **不用保证收尾**:事务对象丢弃而未 `commit` ⇒ 自动回滚。这条是刻意设计的 —— 一次疏忽若留下
+  "漏网活跃事务",`vacuum` 就会从此整轮跳过,垃圾永久累积。
+- **只读事务不写 WAL、`commit` 不 fsync**(实测 2265.8µs/次 → 15.8µs/次)。所以"每 tick 做一次
+  快照读"这种用法不会把磁盘拖成瓶颈。
+- `value` 是打过信封的**逻辑值**:直接存裸字节要先 `pack_plain`(见第 7 条与「已知局限」)。
+
+### 3. 跨线程
+
+```rust
+use std::sync::Arc;
+let db = Arc::from(open_engine(EngineKind::Bitcask, Some(&dir))?); // KvEngine: Send + Sync
+```
+
+`Arc<dyn KvEngine>` 直接可用:典型形态是"主线程开库 + 心跳线程 `checkpoint()` + 工作线程读写"。
+事务只要求 `Send`(`KvTxn: Send`,**不要求 `Sync`**):可以整个搬去别的线程,但两个线程共用一个
+事务对象没有语义(内部有 `Cell` 与写集)。
+
+要区分清楚两件事:**门面 `Send + Sync` 让句柄能被多线程持有,不等于并发写**。四个引擎都是
+**单写者**模型(进程内 `Mutex` 串行化,进程间靠文件锁 —— 同一目录被两个进程打开,第二个直接
+`WouldBlock`)。多线程共用一个句柄得到的是"排队",不是吞吐提升。
+
+### 4. 批量导入(冷启动灌数据)
+
+```rust
+let mut bulk = db.begin_bulk();            // 无冲突检测、无 WAL —— 快,但崩溃不安全
+bulk.put_batch_owned(rows);                // Vec<(Vec<u8>, Vec<u8>)>
+bulk.finish();                             // 必须收尾(Drop 也兜底,但不保证 flush 顺序)
+```
+
+导入期间别并发读写。`import_kv` 那批 CLI 走的就是这条路。
+
+### 5. 观测与维护:长跑进程要盯的两个数
+
+```rust
+let h = db.health();                       // total_rows / live_keys / max_chain / rows_above_one / active_txns
+if h.max_chain > 64 {
+    eprintln!("版本链在涨: {:?}", h);      // 事故的唯一先行指标
+}
+db.set_vacuum_auto_slice(8 * 1024);        // 调切片宽度;**设 0 才是关闭**(默认 16 Ki 行,四引擎同值)
+let _ = db.vacuum()?;                      // 全库轮次:唯一会顺手做 merge() / blob 重写的入口
+db.checkpoint()?;                          // WAL 涨过阈值其实会自动做(默认 16 MiB)
+println!("{}", db.durability_profile());   // Display 只报缺口
+```
+
+- `health()` 是 **O(物理行数)**(引擎内部只走元数据/键,不物化 value),按分钟级采样足够,
+  **别放进热路径**。
+- 正常形态:`max_chain` 贴着 `1 ~ 2×切片宽度`。它单调爬升就说明回收没在干活,先看
+  `active_txns` —— 有活跃事务时 `vacuum()` **整轮跳过**(返回 `skipped_active_txn = true`,
+  和"扫了但没得裁"是两种结论完全不同的 0)。
+- 自动回收默认开着,提交时记账、`begin()` 时取账,触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率
+  1:1。手动 `vacuum()` 留给"要立刻收文件空间"的场景。
+
+### 6. 选型:别只看速度
+
+```rust
+use storage_engines::{EngineError, EngineKind};
+
+// 从配置字符串解析:`EngineKind` 是同一套别名规则,不认识就 Err(不退回默认值)
+let kind = EngineKind::parse("lsm").ok_or_else(|| EngineError::UnknownEngine("lsm".into()))?;
+if !kind.is_production_ok() {
+    // 只有 memory 是 false:它没有任何持久化(无事务 WAL、无校验和),是对照实验,
+    // 不是"更快的选项"。上实盘之前就把它挡住,别等掉电。
+    return Err(EngineError::Unsupported { engine: kind.as_str(), op: "production use" });
+}
+let profile = db.durability_profile();     // 四家崩溃安全不等价,差异做成数据吐出来
+println!("{profile}");                     // 只报缺口:少了 WAL / 校验和 / 双写缓冲
+```
+
+写密集 → `lsm_tree`(顺序写最快);范围查询密集 → `bplus_tree`(叶子链表);读密集且 key 数可控
+→ `bitcask`(点查恒定 1 次 seek,但全量 keydir 常驻内存,key 数受内存限制);测试/对照 → `memory`。
+引擎之间怎么换、数据搬不搬得动,看下面第 7 条与[命令行工具](#命令行工具数据搬运与压测)。形态差异详见[四个引擎对比](#四个引擎对比)。
+
+### 7. 目前还不能指望库做的事(接入前必看)
+
+- **换引擎不搬数据**:`open_engine` 只是换了一家,原来那家的数据不会跟过来。跨引擎搬运只有 CLI
+  ([`export_kv` → `import_kv`](#命令行工具数据搬运与压测));库 API 侧只有
+  `export_latest_visible()` + `begin_bulk()` 这两块积木,没有 `migrate()`。
+- **调参只开了 B+ 树**:`EngineConfig` 目前只有 `order` / `max_cache_pages`。bitcask 的分片上限、
+  LSM 的 memtable/blob 阈值、WAL 收口阈值都还在各引擎的 `MVCC` 上
+  (如 `crate::lsm_tree::MVCC::set_wal_checkpoint_limit`),门面没转发。
+- **有界回收不在门面上**:`vacuum_bounded(after, budget_rows)` 只在各引擎的 `MVCC` 上
+  (`crate::bitcask::MVCC::vacuum_bounded`),`KvEngine::vacuum()` 是全库那一轮。
+- **值信封要业务侧自己守**:`set` 把 `value` 当**已打信封**的逻辑值存,`get` 一律剥标签,
+  所以裸字节直接存会踩坑(`0x00` 打头少 1 字节,`0x01` 打头被当 TTL 信封)。约定是
+  `use storage_engines::common::pack_plain;` 先打再 `set`。⚠️ 这条靠人不靠编译器,修法待定
+  —— 见[已知局限](#已知局限)。
 
 ---
 
@@ -483,7 +657,10 @@ data.db.lock       单写者锁(内含 pid)
 
 **并发**
 - 四个引擎都是**单写者**模型,靠 `Arc<Mutex<...>>` 单锁 + 文件锁保证。没有行级锁、没有并发写入
-- 事务不是 `Send`/`Sync` 友好的多线程设计
+- ~~事务不是 `Send`/`Sync` 友好的多线程设计~~ → 已改:`KvEngine: Send + Sync`(句柄能进 `Arc`、能跨
+  线程),`KvTxn: Send`(事务能整个搬去别的线程,**刻意不要求 `Sync`** —— 内部有 `Cell` 与写集,
+  两个线程共用一个事务对象没有语义)。这条是"下游不必再自己包一层门面"的前提(M9)。
+  但"句柄可共享"不等于"并发写" —— 上面那条单写者没变。
 
 **LSM**
 - `fix_level_overlaps` 发现层内 key range 重叠**只打印警告,不修复**
@@ -504,6 +681,9 @@ data.db.lock       单写者锁(内含 pid)
 - ⚠️ **值信封不对称**:`set(key, value)` 把 `value` 当**已经打过信封**的逻辑值存,而 `get` 一律走 `logical_to_user` 剥标签。
   于是**直接用门面存裸字节**时:值以 `0x00` 打头会少 1 字节,以 `0x01` 打头会被当成 TTL 信封少 9 字节、甚至被判定"已过期"而读成 `None`。
   约定是"业务侧先 `pack_plain` 再 `set`"(TTL 类 API 内部已打),但这靠人守不靠编译器 —— 要么让 `set` 自己打信封(对现有按约定打过的调用点是破坏性变更),要么加 `set_raw`/`get_raw`。尚未定
+- **门面还缺的三项**(全部列在「下游接入使用说明」第 7 条,接入前先看那里):跨引擎 `migrate()` 没有库
+  API(只有 CLI)、`EngineConfig` 只暴露 B+ 树的两个旋钮、`vacuum_bounded` 不在 `KvEngine` 上。
+  这三项都是**下游 wrapper 里真在干活**的部分,缺一项就多一层该被删掉的复制
 - ~~只读事务也要付一次 WAL fsync~~ → 已改:`Begin` 推迟到第一次 `write()` 才补,只读事务的 `commit` 不写 `Commit`、不 fsync(实测 2265.8µs/次 → **15.8µs/次**,WAL 落字节 56 → **0**)。策略只有一份实现:[`crate::common::WalPolicy`]
 - ~~`FileLock` 在三个引擎里各有一份近乎逐字重复的实现~~ → 已收成 `src/common/disk.rs` 一份(`DiskFile` / `FileLock` / `crc32` 三样都是崩溃语义的载体,`diff` 实测原先 bitcask 与 lsm 的 FileLock 差 0 行)。各引擎只保留自己的**锁文件路径规则**(dir/bitcask.lock、`<stem>.lock`、dir/lsm.lock)
 - ~~三份 `wal.rs` 仍是各自一份~~ → 已收成 `src/common/wal.rs` 一份(原先 `diff` 只差 14–16 行注释与 import,`WAL_MAGIC` 与帧头本来就更相同:同一格式的三份复制)。各引擎的 `wal.rs` 现在只是 re-export + 自己的 WAL 路径规则
