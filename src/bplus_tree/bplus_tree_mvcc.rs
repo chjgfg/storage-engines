@@ -287,40 +287,56 @@ impl MVCC {
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
 
-        let all: Vec<(Vec<u8>, RowId)> = kv.iter().map(|(k, v)| (k, v)).collect();
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, Option<Vec<u8>>)>> = BTreeMap::new();
-        for (enc, row) in all {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
+        // ① 一趟按引用的全表遍历。判「留哪一版」只需要三样：版本号、这行是不是墓碑、
+        //    这行是不是 blob 指针 —— 全都在叶子条目手里就能读到，不必把 value 克隆出来。
+        //    旧实现在这里有两趟 `kv.iter()`（每行克隆一次 value），第二趟纯粹为查 blob 引用。
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, bool)>> = BTreeMap::new();
+        kv.scan_entries_with(|enc, row| {
+            let Some(vk) = decode_key(enc) else {
+                return;
             };
+            let is_tomb = row.is_none();
+            let refs_blob = row
+                .as_ref()
+                .is_some_and(|s| s.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB));
             by_key
-                .entry(vk.raw_key)
+                .entry(vk.raw_key.clone())
                 .or_default()
-                .push((vk.version, enc, row.0));
-        }
+                .push((vk.version, enc.to_vec(), is_tomb, refs_blob));
+        });
 
         let mut removed = 0usize;
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        // Blob GC 的判据顺手在同一次遍历里凑齐（留下来的行有没有引用 blob）
+        let mut has_blob_ref = false;
 
         for (_raw, mut versions) in by_key {
-            versions.sort_by_key(|(v, _, _)| *v);
+            versions.sort_by_key(|(v, _, _, _)| *v);
             let mut last_old: Option<usize> = None;
-            for (i, (ver, _, _)) in versions.iter().enumerate() {
+            for (i, (ver, _, _, _)) in versions.iter().enumerate() {
                 if *ver < xmin {
                     last_old = Some(i);
                 }
             }
+            let mut keep_from = 0usize;
             if let Some(keep_old) = last_old {
                 for i in 0..keep_old {
                     to_delete.push(versions[i].1.clone());
                     removed += 1;
                 }
-                let old_is_tomb = versions[keep_old].2.is_none();
-                let has_newer = versions.iter().any(|(v, _, _)| *v >= xmin);
+                let old_is_tomb = versions[keep_old].2;
+                let has_newer = versions.iter().any(|(v, _, _, _)| *v >= xmin);
                 if old_is_tomb && !has_newer {
+                    // 墓碑的最终回收：否则 tombstone 会永久累积
                     to_delete.push(versions[keep_old].1.clone());
                     removed += 1;
+                } else {
+                    has_blob_ref |= versions[keep_old].3;
                 }
+                keep_from = keep_old + 1;
+            }
+            for i in keep_from..versions.len() {
+                has_blob_ref |= versions[i].3;
             }
         }
 
@@ -332,16 +348,6 @@ impl MVCC {
         // - 若已无任何大 value 引用 → clear 文件
         // - 若仍有引用 → 暂不重写（append-only 空间可能残留；完整 compact 后续可做）
         //   这样避免 Windows 上打开句柄重写导致读路径异常。
-        let survivors: Vec<RowId> = kv.iter().map(|(_, v)| v).collect();
-        let mut has_blob_ref = false;
-        for row in &survivors {
-            if let Some(stored) = &row.0 {
-                if stored.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB) {
-                    has_blob_ref = true;
-                    break;
-                }
-            }
-        }
 
         let blob_rewritten = if !has_blob_ref {
             let old_len = blob.path().metadata().map(|m| m.len()).unwrap_or(0);
@@ -1030,6 +1036,46 @@ mod tests {
                 KEYS * VERSIONS
             );
             tx.rollback();
+        }
+        cleanup(&path);
+    }
+
+    /// vacuum 期间不该发生任何「把某行的 value 克隆出来」—— 它只需要版本号，
+    /// 加上「是不是墓碑 / 是不是 blob 指针」两个标志位，而这三样按引用就能读到。
+    ///
+    /// 量尺选的是 value 克隆次数而不是页读取次数：B+ 树没有独立键索引，走一遍全库的
+    /// 页读取本来就省不掉，用页计数会量不到这次改动的任何东西。
+    #[test]
+    fn test_vacuum_does_not_clone_values() {
+        const CHAIN: u64 = 300;
+        const KEYS: u64 = 4;
+
+        let path = tmp_db("vacuum_clone");
+        {
+            let mvcc = MVCC::open(&path, 4, 16);
+            for i in 0..CHAIN {
+                for k in 0..KEYS {
+                    let key = format!("k{k}");
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(key.as_bytes(), format!("v{i}").into_bytes()));
+                    tx.commit();
+                }
+            }
+
+            let base = crate::bplus_tree::page::value_clones();
+            let stats = mvcc.vacuum().unwrap();
+            let used = crate::bplus_tree::page::value_clones() - base;
+            eprintln!(
+                "vacuum 期间 value 克隆次数：{used}（裁掉 {} 行，历史行数 {}）",
+                stats.versions_removed,
+                CHAIN * KEYS
+            );
+            assert_eq!(
+                stats.versions_removed,
+                ((CHAIN - 1) * KEYS) as usize,
+                "每 key 留一版，其余都该裁掉"
+            );
+            assert_eq!(used, 0, "vacuum 只需版本号与两个标志位，不该克隆任何 value");
         }
         cleanup(&path);
     }

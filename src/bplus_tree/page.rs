@@ -111,6 +111,28 @@ pub(crate) fn page_reads() -> u64 {
     PAGE_READS.with(|c| c.get())
 }
 
+// 测试专用：本线程「把某行的 value 克隆出来」的次数。
+//
+// B+ 树没有独立键索引，全库走一遍的**页读取**省不掉；能省的是把每一行的 value
+// 克隆出来（`iter()` 会做，按引用的 `scan_entries_with` 不会）。所以 vacuum 与
+// 全库折叠这两条都用这个量来守。
+#[cfg(test)]
+thread_local! {
+    static VALUE_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已发生的 value 克隆次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn value_clones() -> u64 {
+    VALUE_CLONES.with(|c| c.get())
+}
+
+/// 记一次 value 克隆（重量路径调用；轻量路径不该调用）
+#[cfg(test)]
+pub(crate) fn note_value_clone() {
+    VALUE_CLONES.with(|c| c.set(c.get() + 1));
+}
+
 impl PageManager {
     /// 打开或创建数据文件（同时获取单写者锁、打开 dblwr，并做 torn-page 恢复）
     pub fn open(path: impl AsRef<Path>, max_cache_pages: usize) -> std::io::Result<Self> {

@@ -1002,15 +1002,13 @@ pub struct BPlusTreeIterator<'a> {
 }
 
 impl BPlusTree {
-    /// 全表流式遍历，**只把键交给回调**（不克隆 value、不解码、不碰 blob 文件）。
+    /// 全表流式遍历，按**引用**把 `(键, value)` 交给回调 —— 不克隆任何 value。
     ///
     /// B+ 树的 value 就住在叶子条目里，没有 Bitcask `KeyDir` 那种独立键索引，所以
-    /// 「折叠出每个逻辑 key 的胜出版本行」这一遍必然要过每一行、把整页反序列化出来 ——
-    /// **页读取次数省不掉**，这点和 Bitcask 不一样，别指望一样。
-    ///
-    /// 真正能省的是「对每一行都做 value 解码」：内联值是一次 Vec 分配，大 value 更是
-    /// 一次 blob 读盘。本方法让折叠的第一遍只比键，value 留给第二遍按胜出行去取。
-    pub fn scan_keys_with(&mut self, mut f: impl FnMut(&[u8])) {
+    /// 「过每一行、把整页反序列化出来」这一遍省不掉（页读取次数不变）—— 这点和
+    /// Bitcask 不一样，别指望一样。真正能省的是**把每行 value 克隆出来**：
+    /// `iter()` 每行克隆一次，本方法一次都不克隆。全库折叠与 vacuum 都改用它。
+    pub fn scan_entries_with(&mut self, mut f: impl FnMut(&[u8], &Option<Vec<u8>>)) {
         // 先下降到最左叶子
         let mut current = self.root;
         loop {
@@ -1039,14 +1037,19 @@ impl BPlusTree {
                 break;
             };
             if let BTreeNode::Leaf { entries, next_leaf } = node {
-                for (k, _rid) in &entries {
-                    f(k);
+                for (k, rid) in &entries {
+                    f(k, &rid.0);
                 }
                 leaf = next_leaf;
             } else {
                 break;
             }
         }
+    }
+
+    /// 只要键的场合（代价与理由见 [`Self::scan_entries_with`]）。
+    pub fn scan_keys_with(&mut self, mut f: impl FnMut(&[u8])) {
+        self.scan_entries_with(|k, _row| f(k));
     }
 
     pub fn iter(&mut self) -> BPlusTreeIterator<'_> {
@@ -1085,6 +1088,8 @@ impl<'a> Iterator for BPlusTreeIterator<'a> {
         if let BTreeNode::Leaf { entries, next_leaf } = node {
             if self.current_idx < entries.len() {
                 // 返回当前条目并自增索引
+                #[cfg(test)]
+                crate::bplus_tree::page::note_value_clone();
                 let item = entries[self.current_idx].clone();
                 self.current_idx += 1;
                 Some(item)
