@@ -95,6 +95,12 @@ pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
     })
 }
 
+/// 链尾反向查找的首轮预算，不够再翻倍重试。
+///
+/// 常态下一个逻辑 key 只有个位数版本，32 足够一次命中；翻倍只在
+/// 「整条链没有一个可见」的退化场景才付到 O(链长)，与旧的整链扫描同阶。
+const VERSION_BACK_STEP: usize = 32;
+
 impl MVCC {
     /// 打开/创建磁盘上的 MVCC 引擎（含 WAL 恢复）。失败时 panic（兼容旧代码）。
     pub fn open(dir: impl AsRef<Path>) -> Self {
@@ -614,23 +620,16 @@ impl Transaction {
     ) -> Option<(u64, Option<Vec<u8>>)> {
         let mut kvengine = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
-        let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-        for (enc, val) in Self::scan_key_versions(&mut kvengine, key) {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            if vk.raw_key.as_slice() != key {
-                continue;
-            }
-            if self.is_visible(vk.version) {
-                let logical = match val {
-                    None => None,
-                    Some(stored) => decode_stored_value(&mut blob, &stored).ok().flatten(),
-                };
-                best = Some((vk.version, logical));
-            }
-        }
-        best
+        // 从链尾往回走，第一个可见版本就是答案 —— 只对那一行读盘解码
+        let enc = Self::find_version_back(&mut kvengine, key, |v| self.is_visible(v))?;
+        let version = decode_key(&enc)?.version;
+        // 外层 None：索引里没有这行；内层 None：软墓碑（逻辑值为 None）
+        let stored = kvengine.get_entry(&enc).ok()??;
+        let logical = match stored {
+            None => None,
+            Some(s) => decode_stored_value(&mut blob, &s).ok().flatten(),
+        };
+        Some((version, logical))
     }
 
     /// 全部最新可见逻辑行（key 有序）：(key, version, raw_or_tombstone)
@@ -755,27 +754,42 @@ impl Transaction {
         version <= self.version
     }
 
-    fn scan_key_versions(kv: &mut Bitcask, key: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键（原始 enc 字节）。
+    ///
+    /// 版本键是 `raw_key ‖ version.to_be_bytes()`，大端 ⇒ 同一 key 的所有版本在字节序里
+    /// 相邻且按版本号升序，所以**链尾就是最新版本**：往回走第一个满足条件的即可停。
+    ///
+    /// `raw_key` 仍是 `key` 前缀的其它逻辑 key 会落进同一个字节区间，因此必须逐条核对
+    /// `raw_key == key`（旧实现靠 `filter` 做这件事，这里保留同样的判定）。
+    fn find_version_back(
+        kv: &mut Bitcask,
+        key: &[u8],
+        accept: impl Fn(u64) -> bool,
+    ) -> Option<Vec<u8>> {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        match kv.range_scan(low, high) {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|(enc, _)| {
-                    decode_key(enc)
-                        .map(|vk| vk.raw_key.as_slice() == key)
-                        .unwrap_or(false)
-                })
-                .collect(),
-            Err(_) => Vec::new(),
+        let mut budget = VERSION_BACK_STEP;
+        loop {
+            // 只取索引元数据，不碰 value；条数不足预算即说明已扫到区间下界
+            let rows = kv.range_meta_back(&low, &high, budget);
+            let reached_bottom = rows.len() < budget;
+            for (enc, _) in rows {
+                if let Some(vk) = decode_key(&enc) {
+                    if vk.raw_key.as_slice() == key && accept(vk.version) {
+                        return Some(enc);
+                    }
+                }
+            }
+            if reached_bottom {
+                return None;
+            }
+            budget = budget.saturating_mul(2);
         }
     }
 
     fn latest_version_of(kv: &mut Bitcask, key: &[u8]) -> Option<u64> {
-        Self::scan_key_versions(kv, key)
-            .into_iter()
-            .filter_map(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
-            .max()
+        Self::find_version_back(kv, key, |_| true)
+            .and_then(|enc| decode_key(&enc).map(|vk| vk.version))
     }
 }
 
@@ -812,7 +826,6 @@ mod tests {
     ///
     /// 这条断言在当前代码上**必然失败**，失败信息里的两个数字就是这个 bug 的量级证明。
     #[test]
-    #[ignore = "M1 用于复现量级；M2（链尾反向早停）落地后解除 ignore 变成回归守卫"]
     fn test_point_op_cost_independent_of_chain_length() {
         fn probe(chain_len: u64) -> (u64, u64) {
             let path = tmp_db(&format!("probe_{chain_len}"));

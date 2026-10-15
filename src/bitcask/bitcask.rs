@@ -1107,6 +1107,19 @@ impl Bitcask {
         Ok(out)
     }
 
+    /// 闭区间 `[low, high]` 内**从大到小**最多取 `max` 条索引项，**不读 value**。
+    ///
+    /// 返回条数 `< max` 说明已走到区间下界 —— 调用方由此可以断定「整段都看过了」，
+    /// 于是在只需要区间末尾几条时提前退出，而不必像 [`Self::range_scan`] 那样物化整段并逐行读盘。
+    pub fn range_meta_back(&self, low: &[u8], high: &[u8], max: usize) -> Vec<(Vec<u8>, KeyLoc)> {
+        self.key_dir
+            .range(low.to_vec()..=high.to_vec())
+            .rev()
+            .take(max)
+            .map(|(k, loc)| (k.clone(), loc.clone()))
+            .collect()
+    }
+
     /// 全量扫描（含软 tombstone）
     pub fn iter(&mut self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
         self.active.flush_buf()?;
