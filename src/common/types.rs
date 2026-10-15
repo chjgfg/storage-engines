@@ -27,6 +27,11 @@ pub struct VacuumStats {
     /// 但前者说明回收**根本没工作**（时机不对，或有事务忘了 commit），
     /// 后者说明版本链已经压到 1 —— 结论完全相反。
     pub skipped_active_txn: bool,
+    /// 本轮读了多少物理行（元数据/键，不含 value）。
+    ///
+    /// 自动回收要拿它当「这一小轮有多贵」的读数；手动 `vacuum()` 就是全库一轮，
+    /// 这个数等于 [`MvccHealth::total_rows`]。
+    pub rows_scanned: u64,
 }
 
 /// 全库健康度快照 —— 让库自己说得出「版本链到底有多长」。
@@ -51,6 +56,19 @@ pub struct MvccHealth {
     pub rows_above_one: u64,
     /// 当前活跃事务数：> 0 时 vacuum 会整轮跳过
     pub active_txns: u64,
+}
+
+/// [`vacuum_bounded`](crate::bitcask::MVCC::vacuum_bounded) 的一轮结果。
+///
+/// 手动 `vacuum()` = 一次 `budget_rows = u64::MAX` 的轮次，两者共用同一份保留规则。
+#[derive(Debug, Clone)]
+pub struct VacuumRound {
+    pub stats: VacuumStats,
+    /// 本轮停在哪个逻辑 key 上：原样作为下一轮的 `after` 传回即可接着扫。
+    ///
+    /// `None` ⇒ **已经扫完全库**，这一轮才是最后一轮 —— blob 回收与日志压缩只在这里做
+    /// （两者都是全库代价，放进中间轮等于每轮重写一遍库）。
+    pub next_cursor: Option<Vec<u8>>,
 }
 
 /// 解析逻辑 value 信封

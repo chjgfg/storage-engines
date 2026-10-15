@@ -32,7 +32,7 @@ use crate::bitcask::{Bitcask, storage::{
     BlobStore, FileLock, VAL_TAG_BLOB, data_path, decode_stored_value, encode_stored_value, wal_path,
 }};
 use crate::bitcask::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{ExportRecord, MvccHealth, VacuumStats};
+pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
 
 /// MVCC 存储引擎（Bitcask 后端）
 pub struct MVCC {
@@ -341,14 +341,28 @@ impl MVCC {
         records
     }
 
-    /// 版本回收（vacuum）。
+    /// 版本回收：一次扫完全库。
     ///
-    /// 规则：
-    /// - **有任何活跃事务 ⇒ 整轮跳过**（`skipped_active_txn = true`），什么都不裁
-    /// - 无活跃事务时 `xmin = next_version`
-    /// - 每个逻辑 key：只保留「最后一个 version < xmin」+ 全部 version >= xmin
-    /// - 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除
-    /// - 结束后 `merge()` 压缩日志；无 blob 引用时清空 blob 文件
+    /// 就是 `vacuum_bounded(None, u64::MAX)`；保留规则、「有活跃事务就整轮跳过」的理由和
+    /// 锁序说明都在 [`MVCC::vacuum_bounded`] 那边。
+    pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
+        Ok(self.vacuum_bounded(None, u64::MAX)?.stats)
+    }
+
+    /// 有界版本回收：从逻辑 key `after`（**不含**）之后开始扫，最多读 `budget_rows` 行物理行。
+    ///
+    /// 保留规则和 [`MVCC::vacuum`] 完全一致，只是作用范围是一段而不是全库。
+    ///
+    /// **截断只发生在逻辑 key 边界**：半条链不能收 —— 「留哪一版」的判据要求整组版本都在手上。
+    /// 所以一轮实际读的行数可能超出 `budget_rows`，超出量就是那一条链的长度：某把热点 key
+    /// 堆了 23.8 万版时，裁它这一下就得一次读 23.8 万行元数据（走 KeyDir，不读 value）。
+    /// 这是本设计明确接受的代价。
+    ///
+    /// blob 回收与日志压缩只在**最后一轮**（`next_cursor == None`）做：两者都是全库代价，
+    /// 放进中间轮等于每轮重写一遍库。
+    ///
+    /// 为什么要切片：自动回收要能在单核机器上跑，而 [`MVCC::vacuum`] 会把 kv 锁按到整库
+    /// 扫完 —— 那期间点读点写全在排队。切片后每轮只按住一小段。
     ///
     /// 为什么是「整轮跳过」而不是旧的 `xmin = min(活跃事务 id)`：那个水位线**会裁掉
     /// 活跃事务快照仍需要的版本**。T 的可见判据是「v ≤ T.version 且 v ∉ T.active_xid」，
@@ -359,14 +373,23 @@ impl MVCC {
     /// 活跃表这把锁**全程持有**：确认它为空之后不会有新事务抢先拿到快照。
     /// 锁序 `active_txn → kv → blob` 与 [`Transaction::write`] 一致（那边是
     /// active_txn → wal → blob → kv，都在真正动手前拿齐，不会与这里交叉等待）。
-    pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
+    pub fn vacuum_bounded(
+        &self,
+        after: Option<&[u8]>,
+        budget_rows: u64,
+    ) -> std::io::Result<VacuumRound> {
         let _active_guard = self.active_txn.lock().unwrap();
         if !_active_guard.is_empty() {
-            return Ok(VacuumStats {
-                xmin: 0,
-                versions_removed: 0,
-                blob_rewritten: Some(false),
-                skipped_active_txn: true,
+            return Ok(VacuumRound {
+                stats: VacuumStats {
+                    xmin: 0,
+                    versions_removed: 0,
+                    blob_rewritten: Some(false),
+                    skipped_active_txn: true,
+                    rows_scanned: 0,
+                },
+                // 游标原样退回：跳过不丢进度，下一轮从同一处接着扫
+                next_cursor: after.map(|k| k.to_vec()),
             });
         }
         let xmin = self.next_version.load(Ordering::SeqCst);
@@ -377,16 +400,36 @@ impl MVCC {
         // ① 分组只走 KeyDir 元数据：判「留哪一版」只需要版本号 + 是不是软墓碑，不需要 value。
         //    旧实现是两次 `kv.iter()`（每一行连 value 全部读出来），于是 vacuum 自己成了
         //    全库最重的一条路径 —— 在单核机器上「开自动回收」反而会在回收那一刻制造新事故。
+        let budget_rows = budget_rows.max(1);
         let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
-        for (enc, loc) in kv.iter_meta() {
+        let mut scanned = 0u64;
+        let mut cur_raw: Option<Vec<u8>> = None;
+        let mut truncated = false;
+        for (enc, loc) in kv.iter_meta_from(after) {
             let Some(vk) = decode_key(enc) else {
                 continue;
             };
+            // 下界落在 enc 域，而 `raw_key ≤ after` 的那些行（包括 `after` 自己那一整组）
+            // 都还在范围内 —— 显式跳过，游标才是逻辑 key 域的。
+            if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                continue;
+            }
+            let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
+            if at_group_start && scanned >= budget_rows {
+                // 破在这里时 `cur_raw` 那一组已经收齐（刚看到了它的后继）⇒ 游标就是它
+                truncated = true;
+                break;
+            }
+            if at_group_start {
+                cur_raw = Some(vk.raw_key.clone());
+            }
+            scanned += 1;
             by_key
                 .entry(vk.raw_key.clone())
                 .or_default()
                 .push((vk.version, enc.clone(), loc.is_soft_tombstone()));
         }
+        let next_cursor = if truncated { cur_raw } else { None };
 
         let mut removed = 0usize;
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
@@ -428,66 +471,77 @@ impl MVCC {
         for enc in &to_delete {
             let _ = kv.remove(enc);
         }
+        kv.flush()?;
+        blob.sync()?;
 
+        // Blob GC / 日志压缩都是**全库代价**，只在这一轮扫到库尾时才做 ——
+        // 放进中间轮等于每轮重写一遍库。
+        //
         // Blob GC：
         // - 无任何 blob 引用 → clear
         // - 仍有引用 → rewrite_in_place 只保留存活大 value，并更新 KeyDir 中的指针
         //
         // 只读上面 `keep` 里的行（旧实现这里又走一遍全库 iter()）。
-        let mut blob_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (enc_key, full_user_value)
-        for enc in &keep {
-            let Ok(Some(stored)) = kv.get_entry(enc) else {
-                continue;
-            };
-            let Some(stored) = stored else {
-                continue; // 软墓碑没有 value
-            };
-            if stored.first() != Some(&VAL_TAG_BLOB) {
-                continue;
-            }
-            match decode_stored_value(&mut blob, &stored) {
-                Ok(Some(user)) => blob_keys.push((enc.clone(), user)),
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!("blob decode 失败 key={enc:?}: {e}");
+        let blob_rewritten = if next_cursor.is_some() {
+            false
+        } else {
+            let mut blob_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (enc_key, full_user_value)
+            for enc in &keep {
+                let Ok(Some(stored)) = kv.get_entry(enc) else {
+                    continue;
+                };
+                let Some(stored) = stored else {
+                    continue; // 软墓碑没有 value
+                };
+                if stored.first() != Some(&VAL_TAG_BLOB) {
+                    continue;
+                }
+                match decode_stored_value(&mut blob, &stored) {
+                    Ok(Some(user)) => blob_keys.push((enc.clone(), user)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::warn!("blob decode 失败 key={enc:?}: {e}");
+                    }
                 }
             }
-        }
 
-        let blob_rewritten = if blob_keys.is_empty() {
-            let old_len = blob.path().metadata().map(|m| m.len()).unwrap_or(0);
-            if old_len > 8 {
-                blob.clear_in_place()?;
-                true
+            if blob_keys.is_empty() {
+                let old_len = blob.path().metadata().map(|m| m.len()).unwrap_or(0);
+                if old_len > 8 {
+                    blob.clear_in_place()?;
+                    true
+                } else {
+                    false
+                }
             } else {
-                false
+                let values: Vec<Vec<u8>> = blob_keys.iter().map(|(_, v)| v.clone()).collect();
+                let new_offsets = blob.rewrite_in_place(&values)?;
+                // 更新主日志里的 blob 指针（覆盖写同一 storage key）
+                for ((enc, user), new_off) in blob_keys.into_iter().zip(new_offsets.into_iter()) {
+                    let mut stored = Vec::with_capacity(1 + 8 + 4);
+                    stored.push(VAL_TAG_BLOB);
+                    stored.extend_from_slice(&new_off.to_le_bytes());
+                    stored.extend_from_slice(&(user.len() as u32).to_le_bytes());
+                    let _ = kv.insert(enc, Some(stored));
+                }
+                true
             }
-        } else {
-            let values: Vec<Vec<u8>> = blob_keys.iter().map(|(_, v)| v.clone()).collect();
-            let new_offsets = blob.rewrite_in_place(&values)?;
-            // 更新主日志里的 blob 指针（覆盖写同一 storage key）
-            for ((enc, user), new_off) in blob_keys.into_iter().zip(new_offsets.into_iter()) {
-                let mut stored = Vec::with_capacity(1 + 8 + 4);
-                stored.push(VAL_TAG_BLOB);
-                stored.extend_from_slice(&new_off.to_le_bytes());
-                stored.extend_from_slice(&(user.len() as u32).to_le_bytes());
-                let _ = kv.insert(enc, Some(stored));
-            }
-            true
         };
 
-        kv.flush()?;
-        blob.sync()?;
         // 压缩：丢掉已硬删除的空间
-        if removed > 0 || blob_rewritten {
+        if next_cursor.is_none() && (removed > 0 || blob_rewritten) {
             let _ = kv.merge();
         }
 
-        Ok(VacuumStats {
-            xmin,
-            versions_removed: removed,
-            blob_rewritten: Some(blob_rewritten),
-            skipped_active_txn: false,
+        Ok(VacuumRound {
+            stats: VacuumStats {
+                xmin,
+                versions_removed: removed,
+                blob_rewritten: Some(blob_rewritten),
+                skipped_active_txn: false,
+                rows_scanned: scanned,
+            },
+            next_cursor,
         })
     }
 }
@@ -1289,6 +1343,85 @@ mod tests {
             let t2 = mvcc.begin_transaction();
             assert_eq!(t2.get(b"hot"), Some(b"v2".to_vec()), "裁完应读到最新版本");
             t2.rollback();
+        }
+        cleanup(&path);
+    }
+
+    /// 有界回收：每轮只碰一小段，多轮跑完必须和一次全库 vacuum 得到**同样**的结果。
+    ///
+    /// `vacuum()` 把 kv 锁按到整库扫完 —— 单核机器上「开自动回收」就会在回收那一刻
+    /// 制造新事故。切片后每轮读的行数有上限（偏差 = 一条链的长度：截断只能落在逻辑 key
+    /// 边界，半条链没法判「留哪一版」），而游标每轮必须真的前进（`rounds` 的上界就是这条）。
+    ///
+    /// 键里刻意放了前缀嵌套的 `k1` / `k1x`：版本键是 `raw ‖ 8B`，真前缀会让两把 key 的
+    /// 版本区间互相穿插，切片最容易在这里切错。
+    #[test]
+    fn test_vacuum_bounded_slices_and_converges() {
+        const CHAIN: u64 = 120;
+        const KEYS: [&[u8]; 6] = [b"k1", b"k1x", b"k2", b"k3", b"k4", b"k5"];
+        const SLICE: u64 = 40;
+
+        fn fill(mvcc: &MVCC) {
+            for i in 0..CHAIN {
+                for k in KEYS {
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(k, format!("v{i}").into_bytes()), "写入被拒：{k:?}");
+                    tx.commit();
+                }
+            }
+        }
+
+        // 对照组：一次全库 vacuum 裁掉多少
+        let full_path = tmp_db("bounded_full");
+        let full_removed;
+        {
+            let mvcc = MVCC::open(&full_path);
+            fill(&mvcc);
+            full_removed = mvcc.vacuum().unwrap().versions_removed;
+        }
+        cleanup(&full_path);
+
+        let path = tmp_db("bounded_slice");
+        {
+            let mvcc = MVCC::open(&path);
+            fill(&mvcc);
+
+            let mut cursor: Option<Vec<u8>> = None;
+            let mut rounds = 0usize;
+            let mut removed = 0usize;
+            loop {
+                let round = mvcc.vacuum_bounded(cursor.as_deref(), SLICE).unwrap();
+                assert!(!round.stats.skipped_active_txn, "第 {rounds} 轮不该被活跃事务挡住");
+                assert!(
+                    round.stats.rows_scanned <= SLICE + CHAIN,
+                    "第 {rounds} 轮读了 {} 行（预算 {SLICE} + 一条链 {CHAIN}）",
+                    round.stats.rows_scanned
+                );
+                assert!(round.stats.versions_removed > 0, "第 {rounds} 轮必须裁掉东西，否则游标没前进");
+                removed += round.stats.versions_removed;
+                rounds += 1;
+                match round.next_cursor {
+                    Some(c) => {
+                        assert_ne!(cursor.as_ref(), Some(&c), "游标必须前进（第 {rounds} 轮）");
+                        cursor = Some(c);
+                    }
+                    None => break,
+                }
+                assert!(rounds < 60, "切片应在有限轮内收敛，别是原地打转：已 {rounds} 轮");
+            }
+
+            assert!(rounds > 1, "6 把 key × {CHAIN} 版不该一轮就扫完：{rounds} 轮");
+            assert_eq!(removed, full_removed, "分片裁的总行数应与整库一轮一致");
+
+            let h = mvcc.health();
+            assert_eq!(h.max_chain, 1, "分片跑完后链必须压平");
+            assert_eq!(h.total_rows, KEYS.len() as u64);
+
+            let tx = mvcc.begin_transaction();
+            for k in KEYS {
+                assert_eq!(tx.get(k), Some(format!("v{}", CHAIN - 1).into_bytes()));
+            }
+            tx.commit();
         }
         cleanup(&path);
     }

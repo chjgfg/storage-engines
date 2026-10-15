@@ -13,8 +13,8 @@ use std::{
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
-    merge_latest_streaming, merge_streaming, merge_to_ssts, BlockCache, EntryValue, LightEntry,
-    SstBuilder, SstFile, StoredEntry,
+    merge_latest_streaming, merge_streaming, merge_to_ssts, same_group, BlockCache, EntryValue,
+    LightEntry, SstBuilder, SstFile, StoredEntry,
 };
 
 // ─── Options ─────────────────────────────────────────────────────────────────
@@ -882,6 +882,166 @@ impl LSMTree {
         let mut out = Vec::new();
         merge_streaming(sources, |_, _| true, |k, le| out.push((k, le)));
         out
+    }
+
+    /// memtable 的轻量视图 + 「够 `max_rows` 行就准备收手，但把当前这一组读完才停」。
+    ///
+    /// 组的定义见 [`same_group`]：MVCC 层传 `group_suffix = 8`，一组 = 一把逻辑 key 的
+    /// 整条版本链。返回的第二位是「本源后面还有行吗」。
+    fn mem_view_light_break(
+        map: &MemMap,
+        snap_seq: u64,
+        from: Option<&[u8]>,
+        max_rows: usize,
+        group_suffix: usize,
+    ) -> (Vec<(Vec<u8>, LightEntry)>, bool) {
+        use std::ops::Bound;
+        let lo = match from {
+            Some(k) => Bound::Included(k),
+            None => Bound::Unbounded,
+        };
+        let mut out: Vec<(Vec<u8>, LightEntry)> = Vec::new();
+        let mut over_budget = false;
+        for (k, vers) in map.range::<[u8], _>((lo, Bound::Unbounded)) {
+            if over_budget
+                && !out.last().is_some_and(|(pk, _)| same_group(pk, k, group_suffix))
+            {
+                return (out, true);
+            }
+            if let Some((seq, ev)) = vers.iter().rev().find(|(s, _)| **s <= snap_seq) {
+                out.push((
+                    k.clone(),
+                    LightEntry {
+                        seq: *seq,
+                        kind: ev.kind_byte(),
+                    },
+                ));
+                if out.len() >= max_rows {
+                    over_budget = true;
+                }
+            }
+        }
+        (out, false)
+    }
+
+    /// 「从 `from`（**含**，键的字节域）起的一扇窗口」的轻量视图：每个源最多读
+    /// `max_rows_per_source` 行，返回 `(窗口内的胜出行, 右界)`。
+    ///
+    /// 右界 `None` ⇒ 已经读到库尾；`Some(B)` ⇒ 窗口只覆盖到 `enc < B` 附近，后面还有行。
+    /// 每个源都只在**组边界**收手（见 [`Self::mem_view_light_break`]、
+    /// [`SstFile::light_view_break_from`]），B 取各被截断源「最后一个整组起点」的最小值。
+    ///
+    /// ⚠️ B 只保证「窗口里至少有 2 组」，**不保证** B 正好落在组边界上：真前缀嵌套
+    /// （`"a"` 与 `"a\0…"`）会让两把 key 的版本区间互相穿插，所以最后一组可能只收到一半。
+    /// 调用方必须自己盯组边界 —— 只有「看到了下一组的第一行」才算上一组收齐（各引擎
+    /// `vacuum_bounded` 都是这个写法）。保证 ≥2 组就是为了让它每轮至少前进一组。
+    /// 单把热点 key 的链长到能吃满预算时，这里按 4 倍放大窗口重试（几何 ⇒ 总代价仍是
+    /// 最终窗口的常数倍），直到某个源见底为止 —— 所以本函数一定前进。
+    ///
+    /// 取胜规则与 [`Self::scan_latest_light`] 完全一致，只是范围是一扇窗。存在的理由是锁：
+    /// `LSMTree` 挂在 `Mutex` 后面，全库扫描会把这把锁按到归并走完，期间读写全部排队。
+    pub fn scan_latest_light_window(
+        &self,
+        from: Option<&[u8]>,
+        snap_seq: u64,
+        max_rows_per_source: usize,
+        group_suffix: usize,
+    ) -> (Vec<(Vec<u8>, LightEntry)>, Option<Vec<u8>>) {
+        fn count_groups(rows: &[(Vec<u8>, LightEntry)], suffix: usize) -> usize {
+            let mut n = 0usize;
+            let mut prev: Option<&Vec<u8>> = None;
+            for (k, _) in rows {
+                if prev.is_none_or(|p| !same_group(p, k, suffix)) {
+                    n += 1;
+                }
+                prev = Some(k);
+            }
+            n
+        }
+
+        let mut cap = max_rows_per_source.max(8);
+        loop {
+            let (out, boundary) = self.window_once(from, snap_seq, cap, group_suffix);
+            if boundary.is_none() || count_groups(&out, group_suffix) >= 2 || cap >= usize::MAX / 4
+            {
+                return (out, boundary);
+            }
+            cap *= 4;
+        }
+    }
+
+    /// [`Self::scan_latest_light_window`] 的一次尝试：按 `cap` 向每个源取一段、定右界、归并。
+    fn window_once(
+        &self,
+        from: Option<&[u8]>,
+        snap_seq: u64,
+        cap: usize,
+        group_suffix: usize,
+    ) -> (Vec<(Vec<u8>, LightEntry)>, Option<Vec<u8>>) {
+        fn note(
+            sources: &mut Vec<Vec<(Vec<u8>, LightEntry)>>,
+            boundary: &mut Option<Vec<u8>>,
+            part: Vec<(Vec<u8>, LightEntry)>,
+            truncated: bool,
+            group_suffix: usize,
+        ) {
+            if part.is_empty() {
+                return;
+            }
+            if truncated {
+                // 该源最后一个整组的起点
+                let last = part.last().map(|(k, _)| k.clone()).unwrap_or_default();
+                let mut start = last.clone();
+                for (k, _) in part.iter().rev() {
+                    if !same_group(k, &last, group_suffix) {
+                        break;
+                    }
+                    start = k.clone();
+                }
+                match boundary {
+                    Some(b) if *b <= start => {}
+                    _ => *boundary = Some(start),
+                }
+            }
+            sources.push(part);
+        }
+
+        let mut sources: Vec<Vec<(Vec<u8>, LightEntry)>> = Vec::new();
+        let mut boundary: Option<Vec<u8>> = None;
+
+        if !self.mem.is_empty() {
+            let (part, tr) = Self::mem_view_light_break(&self.mem, snap_seq, from, cap, group_suffix);
+            note(&mut sources, &mut boundary, part, tr, group_suffix);
+        }
+        for imm in &self.immutables {
+            let (part, tr) = Self::mem_view_light_break(imm, snap_seq, from, cap, group_suffix);
+            note(&mut sources, &mut boundary, part, tr, group_suffix);
+        }
+        // 源顺序必须与 scan_latest_light / merge_all_at 一致：levels[0] 是旧→新，反转成新→旧
+        if let Some(l0) = self.levels.first() {
+            for sst in l0.iter().rev() {
+                let (part, tr) = sst.light_view_break_from(from, snap_seq, cap, group_suffix);
+                note(&mut sources, &mut boundary, part, tr, group_suffix);
+            }
+        }
+        for level in self.levels.iter().skip(1) {
+            for sst in level {
+                let (part, tr) = sst.light_view_break_from(from, snap_seq, cap, group_suffix);
+                note(&mut sources, &mut boundary, part, tr, group_suffix);
+            }
+        }
+
+        let bound = boundary.clone();
+        let mut out = Vec::new();
+        merge_streaming(
+            sources,
+            |k, _| match &bound {
+                Some(b) => k < b.as_slice(),
+                None => true,
+            },
+            |k, le| out.push((k, le)),
+        );
+        (out, boundary)
     }
 
     fn maybe_flush_mem(&mut self) {

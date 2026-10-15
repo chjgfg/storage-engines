@@ -13,5 +13,5 @@ pub use codec::{
 };
 pub use types::{
     ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage, SearchQuery,
-    VacuumStats, ValueMeta,
+    VacuumRound, VacuumStats, ValueMeta,
 };

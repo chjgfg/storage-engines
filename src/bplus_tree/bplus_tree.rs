@@ -1052,6 +1052,43 @@ impl BPlusTree {
         self.scan_entries_with(|k, _row| f(k));
     }
 
+    /// 从 `from`（**含**，落在键的字节域上）起的流式遍历，按引用交给 `(键, value)`；
+    /// 回调返回 `true` 表示「够了，止步于此」。
+    ///
+    /// 与 [`Self::scan_entries_with`] 的差别只有两件事：**起点**（下降到Containing叶子，
+    /// 前面的叶子一篇都不读）和**止步**（回调喊停就不再往右）。起点是键域下界而不是逻辑
+    /// key，所以调用方要「跳过某个逻辑 key 的整组」得自己按 `raw_key > from` 过滤。
+    ///
+    /// 存在的理由是锁：`BPlusTree` 挂在 `Mutex` 后面，全表遍历会把这把锁按到整库扫完，
+    /// 期间点读点写全部排队。有界回收（`vacuum_bounded`）靠它把每一轮按住一小段。
+    pub fn scan_entries_break_from(
+        &mut self,
+        from: Option<&[u8]>,
+        mut f: impl FnMut(&[u8], &Option<Vec<u8>>) -> bool,
+    ) {
+        // 空键 ≤ 一切 ⇒ 没有起点时下降到的就是最左叶子
+        let mut leaf = self.find_leaf_for_key(self.root, from.unwrap_or(&[]).to_vec());
+        while let Some(id) = leaf {
+            let Some(data) = self.page_manager.read_page(id) else {
+                break;
+            };
+            let Ok(node) = bincode::deserialize::<BTreeNode>(&data) else {
+                break;
+            };
+            match node {
+                BTreeNode::Leaf { entries, next_leaf } => {
+                    for (k, rid) in &entries {
+                        if f(k, &rid.0) {
+                            return;
+                        }
+                    }
+                    leaf = next_leaf;
+                }
+                _ => break,
+            }
+        }
+    }
+
     pub fn iter(&mut self) -> BPlusTreeIterator<'_> {
         // 找到最左边的叶子节点
         let mut current = self.root;

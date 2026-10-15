@@ -121,6 +121,29 @@ impl MemStore {
         }
     }
 
+    /// 从 `from`（**含**，落在键的字节域上）起的有序遍历，按引用交给回调；
+    /// 回调返回 `true` 表示「够了，停在这里」。
+    ///
+    /// 起点是键域下界而不是逻辑 key：调用方若要「跳过某个逻辑 key 的整组」，
+    /// 得自己按 `raw_key > from` 过滤。给有界回收（`vacuum_bounded`）用 ——
+    /// 全表遍历会把 store 锁按到整库扫完，切片之后每轮只按一小段。
+    pub fn scan_entries_from(
+        &self,
+        from: Option<&[u8]>,
+        mut f: impl FnMut(&[u8], &Option<Vec<u8>>) -> bool,
+    ) {
+        use std::ops::Bound;
+        let lo = match from {
+            Some(k) => Bound::Included(k),
+            None => Bound::Unbounded,
+        };
+        for (k, v) in self.data.range::<[u8], _>((lo, Bound::Unbounded)) {
+            if f(k, v) {
+                break;
+            }
+        }
+    }
+
     /// 只遍历键（**不克隆 value**），供上层折叠「每个逻辑 key 的胜出行」用。
     ///
     /// `iter` 会把每一行的键与 value 都克隆出来；全库折叠只需要先比键、最后才取

@@ -1161,6 +1161,20 @@ impl Bitcask {
         self.key_dir.iter()
     }
 
+    /// 从 `from`（**含**）起的 KeyDir 元数据升序视图，不读 value。
+    ///
+    /// 下界落在 enc 域（`raw_key ‖ version`），不是逻辑 key 域：以 `from` 为真前缀
+    /// 的其它 key 可能排在 `from` 之前，所以想「跳过某个逻辑 key 的整组」必须由调用方
+    /// 自己按 `raw_key > from` 过滤，光靠这个下界会漏行。
+    pub fn iter_meta_from(&self, from: Option<&[u8]>) -> impl Iterator<Item = (&Vec<u8>, &KeyLoc)> {
+        let lo = match from {
+            Some(k) => std::ops::Bound::Included(k),
+            None => std::ops::Bound::Unbounded,
+        };
+        self.key_dir
+            .range::<[u8], _>((lo, std::ops::Bound::Unbounded))
+    }
+
     pub fn len(&self) -> usize {
         self.key_dir.len()
     }

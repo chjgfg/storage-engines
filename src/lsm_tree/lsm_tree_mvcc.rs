@@ -40,7 +40,7 @@ use std::{
 use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
 use crate::lsm_tree::storage::{wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{ExportRecord, MvccHealth, VacuumStats};
+pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
 
 /// MVCC 存储引擎（LSM 后端）
 pub struct MVCC {
@@ -308,24 +308,49 @@ impl MVCC {
         h
     }
 
-    /// 版本回收（vacuum）。
+    /// 版本回收：一次扫完全库。
     ///
-    /// 规则：
-    /// - **有任何活跃事务 ⇒ 整轮跳过**（`skipped_active_txn = true`）
+    /// 就是 `vacuum_bounded(None, u64::MAX)`；保留规则、跳过条件、游标语义都在
+    /// [`MVCC::vacuum_bounded`] 那边。
+    pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
+        Ok(self.vacuum_bounded(None, u64::MAX)?.stats)
+    }
+
+    /// 有界版本回收：从逻辑 key `after`（**不含**）之后开始扫，最多读 `budget_rows` 行。
+    ///
+    /// 保留规则和 [`MVCC::vacuum`] 完全一致：
+    /// - **有任何活跃事务 ⇒ 整轮跳过**（`skipped_active_txn = true`），游标原样退回
     /// - 无活跃事务时 `xmin = next_version`
     /// - 每个逻辑 key：只保留「最后一个 version < xmin」+ 全部 version >= xmin
     /// - 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除
     ///
+    /// 遍历用 [`LSMTree::scan_latest_light_window`]（每源封顶的窗口式归并），所以一轮的
+    /// 代价与库总量无关。`kind == 2`（`EntryValue::Drop`，已被硬删的行）整行不参与，
+    /// 语义与 `iter()` 一致；`Put(None)` 才是「逻辑删除行」。**最后一组只在看到后继组的
+    /// 第一行之后才算收齐**，没收齐的那一组本轮不裁（版本区间的穿插可能把它切断），
+    /// 留给下一轮从同一个游标重读。
+    ///
+    /// `set_mvcc_xmin_filter` 只在扫到尾的那一轮下发：它影响 compact 丢哪些旧墓碑，
+    /// 语义是「全库已按这个 xmin 裁过」。
+    ///
     /// 为什么跳过而不是用旧的 `min(活跃事务 id)`：理由与锁序见
-    /// [`crate::bitcask::MVCC::vacuum`]（四引擎同一套语义）。
-    pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
+    /// [`crate::bitcask::MVCC::vacuum_bounded`]（四引擎同一套语义）。
+    pub fn vacuum_bounded(
+        &self,
+        after: Option<&[u8]>,
+        budget_rows: u64,
+    ) -> std::io::Result<VacuumRound> {
         let _active_guard = self.active_txn.lock().unwrap();
         if !_active_guard.is_empty() {
-            return Ok(VacuumStats {
-                xmin: 0,
-                versions_removed: 0,
-                blob_rewritten: None,
-                skipped_active_txn: true,
+            return Ok(VacuumRound {
+                stats: VacuumStats {
+                    xmin: 0,
+                    versions_removed: 0,
+                    blob_rewritten: None,
+                    skipped_active_txn: true,
+                    rows_scanned: 0,
+                },
+                next_cursor: after.map(|k| k.to_vec()),
             });
         }
         let xmin = self.next_version.load(Ordering::SeqCst);
@@ -335,23 +360,83 @@ impl MVCC {
         // 分组走 M3a 为折叠引入的轻量视图：判「留哪一版」只需要版本号 + 是不是墓碑。
         // 旧实现用 `kv.iter()`，而它会先把**每个源整个 collect() 进内存（连 value）**
         // ⇒ 一次 vacuum 的峰值内存约等于整个库。
-        //
-        // 语义与 `iter()` 严格对齐：`kind == 2`（EntryValue::Drop）整行不参与
-        // （iter 的 filter_map 就是把它丢掉）；`Put(None)` 才是「逻辑删除行」，
-        // 对应旧代码的 `val.is_none()`。
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
-        for (enc, le) in kv.scan_latest_light(u64::MAX) {
-            if le.kind == 2 {
+        let budget_rows = budget_rows.max(1);
+        let mut cap = if budget_rows >= (usize::MAX as u64) {
+            usize::MAX
+        } else {
+            budget_rows as usize
+        };
+        // 版本键 = raw_key ‖ 8 字节大端 ⇒ 组宽度 8；窗口只在组边界收手
+        const VERSION_SUFFIX: usize = 8;
+
+        // 窗口右界只保证「窗口里 ≥2 组」，而 `after` 之前那几组会被过滤掉 —— 极端情况下
+        // 过滤后只剩一组、且正是被右界切断的那组，本轮就一个能裁的完整组都没有。
+        // 这时把窗口放大 4 倍重试（几何 ⇒ 总代价仍是最终窗口的常数倍），最坏退化成一轮
+        // 读完剩余全库；不重试就会原地打转（游标退回 `after`，下一轮读到一模一样的窗口）。
+        let (by_key, scanned, next_cursor) = loop {
+            let (rows, boundary) =
+                kv.scan_latest_light_window(after, u64::MAX, cap, VERSION_SUFFIX);
+
+            let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
+            let mut scanned = 0u64;
+            let mut cur_raw: Option<Vec<u8>> = None;
+            let mut last_done_raw: Option<Vec<u8>> = None;
+            let mut budget_cut = false;
+            for (enc, le) in &rows {
+                let Some(vk) = decode_key(enc) else {
+                    continue;
+                };
+                if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                    continue;
+                }
+                let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
+                if at_group_start && scanned >= budget_rows {
+                    // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）
+                    budget_cut = true;
+                    break;
+                }
+                if at_group_start {
+                    last_done_raw = cur_raw.replace(vk.raw_key.clone());
+                }
+                scanned += 1;
+                // Drop 行也参与「换组」的判定（它照样推进键序），只是不作为裁剪候选
+                if le.kind == 2 {
+                    continue;
+                }
+                by_key
+                    .entry(vk.raw_key.clone())
+                    .or_default()
+                    .push((vk.version, enc.clone(), le.kind == 1));
+            }
+            // 窗口被定界 或 预算截断 ⇒ 后面还有没看完的行
+            let truncated = boundary.is_some() || budget_cut;
+            // 两种截法对「最后一组收齐没有」的答案不一样：
+            // - 预算截断：是「看到了下一组的第一行」才破的圈 ⇒ `cur_raw` 那一组已经收齐，
+            //   可以裁，游标就是它。
+            // - 窗口定界：循环自然结束 ⇒ `cur_raw` 这一组可能被右界切断，本轮不裁，
+            //   游标退回上一个收齐的组。
+            let (cursor, open_group) = if budget_cut {
+                (cur_raw.clone(), None)
+            } else if boundary.is_some() {
+                (last_done_raw.clone(), cur_raw.clone())
+            } else {
+                (None, None)
+            };
+            if let Some(open) = open_group {
+                by_key.remove(&open);
+            }
+            let next_cursor = if truncated { cursor } else { None };
+
+            // 一轮什么都没裁、又还没到库尾 ⇒ 窗口太窄，放大重试（见上面注释）
+            if next_cursor.is_none() && truncated && by_key.is_empty() {
+                if cap >= usize::MAX / 4 {
+                    break (by_key, scanned, None);
+                }
+                cap = cap.saturating_mul(4).max(1);
                 continue;
             }
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            by_key
-                .entry(vk.raw_key)
-                .or_default()
-                .push((vk.version, enc, le.kind == 1));
-        }
+            break (by_key, scanned, next_cursor);
+        };
 
         let mut removed = 0usize;
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
@@ -383,14 +468,20 @@ impl MVCC {
         }
 
         kv.flush()?;
-        // 后续 compact 丢弃 ver < xmin 的 tombstone 版本键
-        kv.set_mvcc_xmin_filter(xmin);
+        if next_cursor.is_none() {
+            // 后续 compact 丢弃 ver < xmin 的 tombstone 版本键
+            kv.set_mvcc_xmin_filter(xmin);
+        }
 
-        Ok(VacuumStats {
-            xmin,
-            versions_removed: removed,
-            blob_rewritten: None,
-            skipped_active_txn: false,
+        Ok(VacuumRound {
+            stats: VacuumStats {
+                xmin,
+                versions_removed: removed,
+                blob_rewritten: None,
+                skipped_active_txn: false,
+                rows_scanned: scanned,
+            },
+            next_cursor,
         })
     }
 }
@@ -1500,6 +1591,86 @@ mod tests {
         drop(m1);
         let m2 = MVCC::try_open(&path).unwrap();
         drop(m2);
+        cleanup(&path);
+    }
+
+    /// 有界回收：每轮只碰一小段，多轮跑完必须和一次全库 vacuum 得到**同样**的结果。
+    ///
+    /// LSM 的切片比另外三家麻烦：一扇窗口要横跨 memtable 和若干 SST，而**只有每个源都
+    /// 读满了这段窗口**，归并结果才敢在窗口尾截断。所以这里中途 `flush()` 一次，
+    /// 让版本行同时分布在 memtable 和 SST 里，逼这条路径真的被走到。
+    /// 键里放了前缀嵌套的 `k1` / `k1x`：版本键 `raw ‖ 8B` 下两把 key 的区间会互相穿插，
+    /// 这是窗口右界最容易切在组中间的情形。
+    #[test]
+    fn test_vacuum_bounded_slices_and_converges() {
+        const CHAIN: u64 = 120;
+        const KEYS: [&[u8]; 6] = [b"k1", b"k1x", b"k2", b"k3", b"k4", b"k5"];
+        const SLICE: u64 = 40;
+
+        fn fill(mvcc: &MVCC) {
+            for i in 0..CHAIN {
+                for k in KEYS {
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(k, format!("v{i}").into_bytes()), "写入被拒：{k:?}");
+                    tx.commit();
+                }
+                if i == CHAIN / 2 {
+                    mvcc.flush();
+                }
+            }
+        }
+
+        // 对照组
+        let full_path = tmp_db("bounded_full");
+        let full_removed;
+        {
+            let mvcc = MVCC::open(&full_path);
+            fill(&mvcc);
+            full_removed = mvcc.vacuum().unwrap().versions_removed;
+        }
+        cleanup(&full_path);
+
+        let path = tmp_db("bounded_slice");
+        {
+            let mvcc = MVCC::open(&path);
+            fill(&mvcc);
+
+            let mut cursor: Option<Vec<u8>> = None;
+            let mut rounds = 0usize;
+            let mut removed = 0usize;
+            loop {
+                let round = mvcc.vacuum_bounded(cursor.as_deref(), SLICE).unwrap();
+                assert!(!round.stats.skipped_active_txn, "第 {rounds} 轮不该被活跃事务挡住");
+                assert!(
+                    round.stats.rows_scanned <= SLICE + CHAIN,
+                    "第 {rounds} 轮读了 {} 行（预算 {SLICE} + 一条链 {CHAIN}）",
+                    round.stats.rows_scanned
+                );
+                assert!(round.stats.versions_removed > 0, "第 {rounds} 轮必须裁掉东西");
+                removed += round.stats.versions_removed;
+                rounds += 1;
+                match round.next_cursor {
+                    Some(c) => {
+                        assert_ne!(cursor.as_ref(), Some(&c), "游标必须前进（第 {rounds} 轮）");
+                        cursor = Some(c);
+                    }
+                    None => break,
+                }
+                assert!(rounds < 60, "切片应在有限轮内收敛，别是原地打转：已 {rounds} 轮");
+            }
+
+            assert!(rounds > 1, "6 把 key × {CHAIN} 版不该一轮就扫完：{rounds} 轮");
+            assert_eq!(removed, full_removed, "分片裁的总行数应与整库一轮一致");
+            let h = mvcc.health();
+            assert_eq!(h.max_chain, 1, "分片跑完后链必须压平");
+            assert_eq!(h.total_rows, KEYS.len() as u64);
+
+            let tx = mvcc.begin_transaction();
+            for k in KEYS {
+                assert_eq!(tx.get(k), Some(format!("v{}", CHAIN - 1).into_bytes()));
+            }
+            tx.commit();
+        }
         cleanup(&path);
     }
 
