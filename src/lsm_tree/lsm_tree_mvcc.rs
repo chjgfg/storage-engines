@@ -37,7 +37,7 @@ use std::{
 };
 
 use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
-use crate::lsm_tree::storage::{wal_path, FileLock};
+use crate::lsm_tree::storage::{lock_path, wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{
     DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
@@ -130,7 +130,9 @@ impl MVCC {
         let db_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&db_dir)?;
 
-        let lock = FileLock::try_acquire(&db_dir)?;
+        // 锁文件路径规则是各引擎自己的（lsm: `dir/lsm.lock`），锁的**语义**在
+        // [`crate::common::disk::FileLock`]（四引擎共用的一份实现）
+        let lock = FileLock::try_acquire_at(&lock_path(&db_dir))?;
         let mut tree = LSMTree::open_with_config(&db_dir, LSMTreeOptions::for_mvcc())?;
         let mut wal = Wal::open(wal_path(&db_dir))?;
 

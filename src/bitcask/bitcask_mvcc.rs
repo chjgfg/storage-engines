@@ -27,7 +27,7 @@ use std::{
     },
 };
 
-use crate::bitcask::{Bitcask, storage::{
+use crate::bitcask::{Bitcask, storage::{lock_path,
     BlobStore, FileLock, VAL_TAG_BLOB, data_path, decode_stored_value, encode_stored_value, wal_path,
 }};
 use crate::bitcask::wal::{analyze_recovery, Wal, WalRecord};
@@ -192,7 +192,9 @@ impl MVCC {
         let db_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&db_dir)?;
 
-        let lock = FileLock::try_acquire(&db_dir)?;
+        // 锁文件路径规则是各引擎自己的（bitcask: `dir/bitcask.lock`），锁的**语义**在
+        // [`crate::common::disk::FileLock`]（四引擎共用的一份实现）
+        let lock = FileLock::try_acquire_at(&lock_path(&db_dir))?;
         let mut tree = Bitcask::new(data_path(&db_dir))?;
         let blob = BlobStore::open(&db_dir)?;
         let mut wal = Wal::open(wal_path(&db_dir))?;

@@ -12,7 +12,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::bplus_tree::storage::{
-    dblwr_path, freelist_path, pack_page, read_freelist, unpack_page, write_freelist, DiskFile,
+    dblwr_path, freelist_path, lock_path, pack_page, read_freelist, unpack_page, write_freelist, DiskFile,
+    PAGE_SIZE,
     DoubleWriteBuffer, FileLock, PAGE_PAYLOAD_SIZE,
 };
 
@@ -138,8 +139,9 @@ impl PageManager {
     pub fn open(path: impl AsRef<Path>, max_cache_pages: usize) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         // 先抢锁，避免两个进程同时恢复/写入
-        let lock = FileLock::try_acquire(&path)?;
-        let mut file = DiskFile::open(&path)?;
+        let lock = FileLock::try_acquire_at(&lock_path(&path))?;
+        // 主数据文件是定宽页布局 ⇒ 声明块大小，read_page/write_page 才算得对偏移
+        let mut file = DiskFile::open_paged(&path, PAGE_SIZE)?;
         let mut dblwr = DoubleWriteBuffer::open(dblwr_path(&path))?;
 
         // 1) 双写恢复：把 dblwr 中 CRC 合法的页覆盖回主文件
@@ -864,8 +866,11 @@ mod tests {
 
         // 模拟 torn page：破坏主文件 page 1 的 payload，但在 dblwr 放一份好页
         {
-            use crate::bplus_tree::storage::{pack_page, DoubleWriteBuffer};
-            let mut file = crate::bplus_tree::storage::DiskFile::open(&path).unwrap();
+            use crate::bplus_tree::storage::{pack_page, DoubleWriteBuffer, PAGE_SIZE};
+            // 必须用 open_paged：主文件是定宽页布局，共享的 DiskFile 在没声明块大小时
+            // 会直接拒绝 read_page/write_page（猜一个页大小 = 把数据写到错误偏移上）
+            let mut file = crate::bplus_tree::storage::DiskFile::open_paged(&path, PAGE_SIZE)
+                .unwrap();
             let mut bad = file.read_page(page_id.0).unwrap();
             // 破坏 payload
             if bad.len() > 100 {

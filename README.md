@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 225 个单元测试 + 4 个集成测试
+- 230 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -76,7 +76,8 @@ tx.commit();
 ```
 src/
 ├── engine.rs          统一门面:KvEngine / KvTxn / KvBulk 三个对象安全 trait
-├── common/            四引擎共享:公共类型、版本键与 vacuum 判定(version)、事务内核共用件(kernel)、TTL/快照编解码
+├── common/            四引擎共享:字节级文件工具(disk)、版本键与 vacuum 判定(version)、
+│                      事务内核共用件(kernel)、TTL/快照编解码
 ├── main.rs            使用示例
 │
 ├── lsm_tree/          LSM 树:MemTable + 分层 SST + leveled compaction
@@ -456,7 +457,8 @@ data.db.lock       单写者锁(内含 pid)
 - `page_id` 在页头里被截断成 u32
 
 **其他**
-- `FileLock` 在三个引擎里各有一份近乎逐字重复的实现
+- ~~`FileLock` 在三个引擎里各有一份近乎逐字重复的实现~~ → 已收成 `src/common/disk.rs` 一份(`DiskFile` / `FileLock` / `crc32` 三样都是崩溃语义的载体,`diff` 实测原先 bitcask 与 lsm 的 FileLock 差 0 行)。各引擎只保留自己的**锁文件路径规则**(dir/bitcask.lock、`<stem>.lock`、dir/lsm.lock)
+- 三份 `wal.rs` 仍是各自一份(逐字重复度约 95%),尚未合并
 - bulk load 路径**崩溃不安全**:`finish()` 之前进程挂掉可能丢数据(它关掉了 WAL 和 fsync,这正是它快的原因)。`import_kv` 走的就是这条路径
 - 非 Windows / 非 Unix 平台上文件锁退化为无保护
 
@@ -563,7 +565,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:225 单元 + 4 集成 + 2 文档测试
+cargo test                    # 全部:230 单元 + 4 集成 + 2 文档测试
 cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```

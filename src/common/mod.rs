@@ -4,6 +4,7 @@
 //! 独立定义，是不同的 nominal type，无法被统一 trait 返回。这里收敛为唯一定义。
 
 pub mod codec;
+pub mod disk;
 pub mod kernel;
 pub mod kv_snapshot;
 pub mod types;

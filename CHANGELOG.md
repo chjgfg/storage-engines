@@ -53,6 +53,20 @@
   `HealthFold` 链长折叠、`VacuumScheduler` 自动回收的记账/取账/游标、`is_unfinished` 漏网事务判据）。
   内部 API，不影响调用方；收敛的边界是"是否涉及存储布局"——遍历原语、早停方式、各引擎的量尺
   仍然一家一份（README 的「哪些只剩一份,哪些必须四份」有表）。
+- **`src/common/disk.rs`：三份逐字重复的字节级文件工具收成一份** —— `DiskFile`、`FileLock`、
+  `crc32`（`diff` 实测原先 bitcask 与 lsm 的 FileLock 差 **0 行**，crc32 差 0 行）。
+  合并的理由是这三样恰好都是**崩溃语义**的载体：`sync()` 是不是 `sync_all`、Windows 的
+  `share_mode(0)` 与 unix 的 `flock(LOCK_EX|LOCK_NB)` 谁在挡第二个进程、锁文件里写不写 pid ——
+  修一处漏两处就是"一个 bug 四个实例"。各引擎仍然只保留自己的**锁文件路径规则**。
+  顺带把 `read_page`/`write_page` 从"隐含 4096"改成显式声明：文件要用
+  `DiskFile::open_paged(path, block_size)` 声明定宽块，没声明就按 page_index 读写会
+  **明确报错**而不是猜一个页大小（猜错 = 把数据写到错误偏移，看起来一切正常）。
+  这条立刻在 dblwr 撕裂用例上抓到一处未声明的构造。引擎侧路径
+  `crate::<引擎>::storage::DiskFile` 等通过 re-export 保持不变。
+
+  `HealthFold` 链长折叠、`VacuumScheduler` 自动回收的记账/取账/游标、`is_unfinished` 漏网事务判据）。
+  内部 API，不影响调用方；收敛的边界是"是否涉及存储布局"——遍历原语、早停方式、各引擎的量尺
+  仍然一家一份（README 的「哪些只剩一份,哪些必须四份」有表）。
 - **`KvEngine::durability_profile()` / `MVCC::durability_profile()`**：把四家崩溃安全的差异作为
   数据吐出来（`DurabilityProfile`：有无事务 WAL、commit 是否 fsync、数据记录/大 value 有无校验和、
   是否原地页写与双写缓冲、全库重写残骸能否认回），`Display` 只报缺口。
@@ -96,7 +110,7 @@
 
 ### 测试
 
-225 个单元测试 + 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆次数），不用计时：
+230 个单元测试 + 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆次数），不用计时：
 原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
 并且复杂度守卫都先验证过"它会红"（临时短路被测代码跑一遍）才算数。
 

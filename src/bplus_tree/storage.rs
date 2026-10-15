@@ -1,12 +1,16 @@
-//! 底层文件操作 + 页头 CRC
+//! B+ 树的磁盘布局：页头 pack/unpack、双写缓冲、路径辅助、blob 旁路、空闲页表。
 //!
-//! 所有真正的磁盘 IO 集中在本模块，上层（page / wal）只调用这里的接口。
+//! 字节级工具（`DiskFile` / `FileLock` / `crc32`）不在这里 —— 三个引擎各有一份逐字重复的
+//! 实现（bitcask 与 lsm 的 FileLock `diff` 差 0 行），而它们恰恰是崩溃语义的载体
+//! （sync 是不是 sync_all、谁在挡第二个进程）。已收进 [`crate::common::disk`]，这里 re-export
+//! 以保持 `crate::bplus_tree::storage::DiskFile` 这类既有路径不断。
+//!
+//! 唯一和引擎绑在一起的是**布局**：主数据文件用 `DiskFile::open_paged(path, PAGE_SIZE)`
+//! 声明定宽页，`read_page` / `write_page` 才算得对偏移。
 
-use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
+
+pub use crate::common::disk::{crc32, DiskFile, FileLock};
 
 /// 页大小（含页头）
 pub const PAGE_SIZE: usize = 4096;
@@ -18,39 +22,6 @@ pub const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 /// 页头魔数 "BPG1"
 pub const PAGE_MAGIC: u32 = u32::from_le_bytes(*b"BPG1");
 
-// ─── CRC32 (IEEE / Ethernet, poly 0xEDB88320) ───────────────────────────────
-
-/// 计算 CRC-32（IEEE 802.3）
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        let idx = ((crc ^ u32::from(b)) & 0xFF) as usize;
-        crc = CRC32_TABLE[idx] ^ (crc >> 8);
-    }
-    !crc
-}
-
-const CRC32_TABLE: [u32; 256] = make_crc32_table();
-
-const fn make_crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut n = 0;
-    while n < 256 {
-        let mut c = n as u32;
-        let mut k = 0;
-        while k < 8 {
-            if c & 1 != 0 {
-                c = 0xEDB8_8320 ^ (c >> 1);
-            } else {
-                c >>= 1;
-            }
-            k += 1;
-        }
-        table[n] = c;
-        n += 1;
-    }
-    table
-}
 
 // ─── 页头 pack / unpack ─────────────────────────────────────────────────────
 
@@ -108,100 +79,6 @@ pub fn verify_page(raw: &[u8]) -> bool {
     unpack_page(raw).is_ok()
 }
 
-// ─── 底层文件封装 ───────────────────────────────────────────────────────────
-
-/// 可定位读写的磁盘文件封装
-pub struct DiskFile {
-    file: File,
-    path: PathBuf,
-}
-
-impl DiskFile {
-    /// 打开或创建文件（读写）
-    pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)?;
-        Ok(Self { file, path })
-    }
-
-    /// 仅当文件已存在时打开（不存在返回 None）
-    pub fn open_existing(path: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(None);
-        }
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        Ok(Some(Self {
-            file,
-            path: path.to_path_buf(),
-        }))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn len(&self) -> std::io::Result<u64> {
-        Ok(self.file.metadata()?.len())
-    }
-
-    pub fn set_len(&mut self, len: u64) -> std::io::Result<()> {
-        self.file.set_len(len)
-    }
-
-    /// 从 offset 读满 buf
-    pub fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(buf)
-    }
-
-    /// 从 offset 写满 data
-    pub fn write_all_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(data)
-    }
-
-    /// 追加写，返回写入前的 offset
-    pub fn append(&mut self, data: &[u8]) -> std::io::Result<u64> {
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(data)?;
-        Ok(offset)
-    }
-
-    /// fsync：数据 + 元数据落盘
-    pub fn sync(&mut self) -> std::io::Result<()> {
-        self.file.sync_all()
-    }
-
-    /// 读一整页（不足 PAGE_SIZE 的部分填 0）
-    pub fn read_page(&mut self, page_index: u64) -> std::io::Result<Vec<u8>> {
-        let offset = page_index * PAGE_SIZE as u64;
-        let file_len = self.len()?;
-        let mut buf = vec![0u8; PAGE_SIZE];
-        if offset >= file_len {
-            return Ok(buf);
-        }
-        let available = (file_len - offset).min(PAGE_SIZE as u64) as usize;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut buf[..available])?;
-        Ok(buf)
-    }
-
-    /// 写一整页（必须正好 PAGE_SIZE）
-    pub fn write_page(&mut self, page_index: u64, data: &[u8]) -> std::io::Result<()> {
-        assert_eq!(data.len(), PAGE_SIZE);
-        self.write_all_at(page_index * PAGE_SIZE as u64, data)
-    }
-}
 
 // ─── 双写缓冲（Double Write Buffer）────────────────────────────────────────
 //
@@ -349,120 +226,6 @@ pub fn blob_path(db_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-// ─── 单写者文件锁 ───────────────────────────────────────────────────────────
-//
-// Windows：对 .lock 以 share_mode=0 独占打开（其它进程 open 失败）。
-// Unix：flock(LOCK_EX|LOCK_NB)；进程退出内核自动释放。
-
-/// 数据库单写者锁（持有期间其它进程无法 open 同一库）
-pub struct FileLock {
-    file: File,
-    path: PathBuf,
-}
-
-impl FileLock {
-    /// 尝试获取独占锁；失败返回错误（库已被占用）
-    pub fn try_acquire(db_path: &Path) -> std::io::Result<Self> {
-        let path = lock_path(db_path);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
-
-        #[cfg(windows)]
-        let file = {
-            use std::os::windows::fs::OpenOptionsExt;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .share_mode(0) // 禁止其它进程共享读写
-                .open(&path)
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::PermissionDenied
-                        || e.raw_os_error() == Some(32)
-                    {
-                        std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            format!(
-                                "数据库锁被占用: {} — 可能原因：\
-(1) 同进程内仍有未 drop 的 MVCC/Transaction（Transaction 持有 Arc 会保住锁）; \
-(2) 另一个进程正在使用该库。请先释放全部句柄再 open。",
-                                path.display()
-                            ),
-                        )
-                    } else {
-                        e
-                    }
-                })?
-        };
-
-        #[cfg(unix)]
-        let file = {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&path)?;
-            use std::os::unix::io::AsRawFd;
-            // LOCK_EX=2, LOCK_NB=4
-            let rc = unsafe { libc_flock(file.as_raw_fd(), 2 | 4) };
-            if rc != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    format!(
-                        "数据库已被其它进程打开（无法获取锁）: {}",
-                        path.display()
-                    ),
-                ));
-            }
-            file
-        };
-
-        #[cfg(not(any(windows, unix)))]
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)?;
-
-        // 写入 pid 便于排查
-        let mut f = file;
-        let _ = f.set_len(0);
-        let _ = f.write_all(format!("pid={}\n", std::process::id()).as_bytes());
-        let _ = f.sync_all();
-        Ok(Self { file: f, path })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // LOCK_UN = 8
-            unsafe {
-                let _ = libc_flock(self.file.as_raw_fd(), 8);
-            }
-        }
-        // Windows：关闭句柄即释放 share 独占
-        let _ = &self.file;
-    }
-}
-
-#[cfg(unix)]
-unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
-    // 避免额外依赖：直接声明 flock
-    extern "C" {
-        fn flock(fd: i32, op: i32) -> i32;
-    }
-    flock(fd, op)
-}
 
 // ─── 大 value Blob 存储（append-only）──────────────────────────────────────
 //
