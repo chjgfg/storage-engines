@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 220 个单元测试 + 4 个集成测试
+- 225 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -76,7 +76,7 @@ tx.commit();
 ```
 src/
 ├── engine.rs          统一门面:KvEngine / KvTxn / KvBulk 三个对象安全 trait
-├── common/            四引擎共享:公共类型、TTL 编解码、快照编解码(kv_snapshot)
+├── common/            四引擎共享:公共类型、版本键与 vacuum 判定(version)、事务内核共用件(kernel)、TTL/快照编解码
 ├── main.rs            使用示例
 │
 ├── lsm_tree/          LSM 树:MemTable + 分层 SST + leveled compaction
@@ -224,6 +224,19 @@ loop {
 `max_chain` 就是那次 CPU 事故唯一的先行指标:某把热点 key 堆到 23.8 万个版本时,点读要点走 23.8 万行。此前这个数只能靠人工数日志得到,现在库自己报。
 
 实现只走元数据/键视图,不物化任何 value(每个引擎都有对应的守卫测试),但代价仍是 **O(物理行数)**——属管理面调用:按分钟级采样足够,别放进热路径。
+
+### 哪些只剩一份,哪些必须四份
+
+这次事故的结构性根因是"同一套语义写了四遍"。收敛的边界按**是否涉及存储布局**划:
+
+| 已收成一份(`src/common/`) | 必须每引擎一份 |
+|---|---|
+| `version.rs`:版本键编解码 + vacuum「留哪一版」判定 | 遍历原语:`iter_meta_from` / `scan_entries_break_from` / `scan_latest_light_window` / `scan_entries_from` —— KeyDir、叶子链、SST 分层、BTreeMap 根本不是一种东西 |
+| `kernel.rs`:可见性判据 `visible_at`、`HealthFold`、`VacuumScheduler`(含"取账不能 swap")、`is_unfinished` | 有界遍历的**早停与起点**:谁能反向走、谁只有单向 `next_leaf`、谁的窗口要按源封顶 |
+| `types.rs`:`MvccHealth` / `VacuumStats` / `VacuumRound` / `DurabilityProfile` | 各自的守卫测试:同一条通道在不同引擎的**量尺不同**(读盘次数 / value 解码次数 / 物化次数 / 克隆次数),拿一把尺量不到另外三家 |
+
+判据、记账、折叠这些纯逻辑一旦复制,就会长成"一个 bug 四个实例"—— 自动回收那回我把 `swap`
+当成取账写进了四份代码,四家一起静默停摆。所以合的是**判定与记账**,不是扫描。
 
 ### WAL 与崩溃恢复
 
@@ -550,7 +563,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:220 单元 + 4 集成 + 2 文档测试
+cargo test                    # 全部:225 单元 + 4 集成 + 2 文档测试
 cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```

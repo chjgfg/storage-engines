@@ -4,6 +4,7 @@
 //! 独立定义，是不同的 nominal type，无法被统一 trait 返回。这里收敛为唯一定义。
 
 pub mod codec;
+pub mod kernel;
 pub mod kv_snapshot;
 pub mod types;
 pub mod version;
@@ -17,3 +18,4 @@ pub use types::{
     SearchQuery, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use version::{decode_key, encode_key, vacuum_plan, VersionedKey};
+pub use kernel::{is_unfinished, visible_at, HealthFold, VacuumScheduler};

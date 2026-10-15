@@ -42,6 +42,7 @@ use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{
     DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
+use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
 
 /// MVCC 存储引擎（LSM 后端）
@@ -52,12 +53,8 @@ pub struct MVCC {
     next_version: Arc<AtomicU64>,
     /// WAL 增长到多少字节就在下一次提交后自动 checkpoint（0 = 关闭自动触发）
     wal_limit: Arc<AtomicU64>,
-    /// 自动回收：切片宽度（行数），同时是「攒多少行新版本才触发一轮」。0 = 关闭
-    vac_slice: Arc<AtomicU64>,
-    /// 自动回收：自上一轮以来新写入的版本行数
-    vac_pending: Arc<AtomicU64>,
-    /// 自动回收：下一片从哪个逻辑 key 之后继续（`None` = 从头）
-    vac_cursor: Arc<Mutex<Option<Vec<u8>>>>,
+    /// 自动回收：切片宽度 / 记账 / 游标（策略与实现在 [`crate::common::VacuumScheduler`]）
+    vac: Arc<VacuumScheduler>,
     /// Arc 包裹是因为事务也要能拿到它：阈值触发时得顺手落一份 `MVCC.NEXT`
     db_dir: Arc<PathBuf>,
     /// 持有期间保证单写者
@@ -72,7 +69,7 @@ pub struct Transaction {
     next_version: Arc<AtomicU64>,
     wal_limit: Arc<AtomicU64>,
     /// 提交时把本事务写的版本行数记到自动回收的账上
-    vac_pending: Arc<AtomicU64>,
+    vac: Arc<VacuumScheduler>,
     db_dir: Arc<PathBuf>,
     version: u64,
     active_xid: HashSet<u64>,
@@ -161,9 +158,7 @@ impl MVCC {
             active_txn: Arc::new(Mutex::new(HashMap::new())),
             next_version: Arc::new(AtomicU64::new(start_ver)),
             wal_limit: Arc::new(AtomicU64::new(MVCC::WAL_CHECKPOINT_BYTES_DEFAULT)),
-            vac_slice: Arc::new(AtomicU64::new(MVCC::VACUUM_AUTO_SLICE_DEFAULT)),
-            vac_pending: Arc::new(AtomicU64::new(0)),
-            vac_cursor: Arc::new(Mutex::new(None)),
+            vac: Arc::new(VacuumScheduler::new(MVCC::VACUUM_AUTO_SLICE_DEFAULT)),
             db_dir: Arc::new(db_dir),
             _lock: lock,
         })
@@ -191,12 +186,12 @@ impl MVCC {
             self.active_txn.clone(),
             self.next_version.clone(),
             self.wal_limit.clone(),
-            self.vac_pending.clone(),
+            self.vac.clone(),
             self.db_dir.clone(),
         )
     }
 
-    /// 自动回收的一小步：攒够 `vac_slice` 行新版本，就裁同样宽度的**一片**。
+    /// 自动回收的一小步：攒够一个切片宽度的新版本，就裁同样宽度的**一片**。
     ///
     /// 挂在 `begin_transaction` 而不是 commit 上：这一处还没有本线程的活跃事务，
     /// `vacuum_bounded` 的「有活跃事务就整轮跳过」不会被自己的调用方踩中；而且每个
@@ -205,26 +200,12 @@ impl MVCC {
     /// 触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率 1:1，这是「跟得上」的下界。
     /// LSM 的一片是「每个源各读 slice 行」的窗口，块读取代价由稀疏索引压住。
     fn tick_auto_vacuum(&self) {
-        let slice = self.vac_slice.load(Ordering::SeqCst);
-        if slice == 0 {
+        let Some(slice) = self.vac.take_tick() else {
             return;
-        }
-        // 注意不能 swap：tick 每次 begin 都会跑，swap 会把还没攒够的账清零 ⇒ 永远到不了阈值
-        let seen = self.vac_pending.load(Ordering::SeqCst);
-        if seen < slice {
-            return;
-        }
-        // CAS 失败说明别的线程已经取走这笔账并在裁，本轮让给它（单写者模型下走不到）
-        if self
-            .vac_pending
-            .compare_exchange(seen, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        let after = self.vac_cursor.lock().unwrap().clone();
+        };
+        let after = self.vac.cursor();
         if let Ok(round) = self.vacuum_bounded(after.as_deref(), slice) {
-            *self.vac_cursor.lock().unwrap() = round.next_cursor;
+            self.vac.set_cursor(round.next_cursor);
         }
     }
 
@@ -233,11 +214,11 @@ impl MVCC {
     /// 默认 [`MVCC::VACUUM_AUTO_SLICE_DEFAULT`]；**设 0 关闭自动回收**，那时版本行只增不减，
     /// 得靠手动 `vacuum()`。当年就是 LSM 先撑不住（一天），这条通道必须默认是通的。
     pub fn set_vacuum_auto_slice(&self, rows: u64) {
-        self.vac_slice.store(rows, Ordering::SeqCst);
+        self.vac.set_slice(rows);
     }
 
     pub fn vacuum_auto_slice(&self) -> u64 {
-        self.vac_slice.load(Ordering::SeqCst)
+        self.vac.slice()
     }
 
     /// 默认切片宽度 = 16 Ki 行。一片的代价是「每个源读不超过这么多行」的窗口，
@@ -345,10 +326,9 @@ impl MVCC {
         // 嵌套持有会和 [`MVCC::vacuum`]（`active_txn → kv`）构成反向嵌套。
         let active_txns = self.active_txn.lock().unwrap().len() as u64;
         let kv = self.kv.lock().unwrap();
-        let mut h = MvccHealth { active_txns, ..Default::default() };
-        let mut prev_raw: Option<Vec<u8>> = None;
-        let mut cur_chain = 0u64;
-        // merge_streaming 按 enc 升序输出 ⇒ 同一逻辑 key 的版本块相邻 ⇒ 顺序分组，一趟就够
+        // 分组折叠用四引擎共用的 [`HealthFold`]：按 enc 升序 ⇒ 同 key 相邻成块 ⇒ 一趟数得出链长
+        let mut fold = HealthFold::default();
+        // merge_streaming 按 enc 升序输出 ⇒ 同一逻辑 key 的版本块相邻
         for (enc, le) in kv.scan_latest_light(u64::MAX) {
             if le.kind == 2 {
                 continue;
@@ -356,19 +336,9 @@ impl MVCC {
             let Some(vk) = decode_key(&enc) else {
                 continue;
             };
-            h.total_rows += 1;
-            if prev_raw.as_ref() == Some(&vk.raw_key) {
-                cur_chain += 1;
-            } else {
-                h.max_chain = h.max_chain.max(cur_chain);
-                h.live_keys += 1;
-                cur_chain = 1;
-                prev_raw = Some(vk.raw_key);
-            }
+            fold.push(&vk.raw_key);
         }
-        h.max_chain = h.max_chain.max(cur_chain);
-        h.rows_above_one = h.total_rows.saturating_sub(h.live_keys);
-        h
+        fold.finish(active_txns)
     }
 
     /// 版本回收：一次扫完全库。
@@ -748,12 +718,9 @@ impl Drop for BulkLoader {
 /// 判据用「活跃表里是否还有自己」——`commit`/`rollback` 都以 `remove` 收尾，成员关系即充要条件。
 impl Drop for Transaction {
     fn drop(&mut self) {
-        let unfinished = match self.active_txn.lock() {
-            Ok(guard) => guard.contains_key(&self.version),
-            // 锁中毒（别的线程 panic 过）：不能在这里 panic —— Drop 里 panic 直接 abort 进程
-            Err(_) => return,
-        };
-        if !unfinished {
+        // 判据与"只查不删"的理由见 [`crate::common::is_unfinished`]：
+        // 删除必须留给下面的 rollback()，它要按表里那份 key 列表把本事务写过的版本行清掉
+        if !crate::common::is_unfinished(&self.active_txn, self.version) {
             return;
         }
         if self.wal.lock().is_err() {
@@ -771,7 +738,7 @@ impl Transaction {
         active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
         next_version: Arc<AtomicU64>,
         wal_limit: Arc<AtomicU64>,
-        vac_pending: Arc<AtomicU64>,
+        vac: Arc<VacuumScheduler>,
         db_dir: Arc<PathBuf>,
     ) -> Self {
         let version = next_version.fetch_add(1, Ordering::SeqCst);
@@ -793,7 +760,7 @@ impl Transaction {
             active_txn: active_txn_arc,
             next_version,
             wal_limit,
-            vac_pending,
+            vac,
             db_dir,
             version,
             active_xid,
@@ -961,11 +928,8 @@ impl Transaction {
             let mut active_txn = self.active_txn.lock().unwrap();
             active_txn.remove(&self.version).map(|k| k.len()).unwrap_or(0)
         };
-        // 给自动回收记一笔账：本事务写了多少个版本行。用「逻辑 key 数」近似行数
-        // （一个 key 在同事务里覆写多次只计 1）—— 宁可少算，也不要为了精确再走一遍写集。
-        if rows_written > 0 {
-            self.vac_pending.fetch_add(rows_written as u64, Ordering::SeqCst);
-        }
+        // 给自动回收记一笔账（近似：算逻辑 key 数，宁可少算也不为了精确再走一遍写集）
+        self.vac.on_commit(rows_written as u64);
         {
             let mut wal = self.wal.lock().unwrap();
             let _ = wal.append(WalRecord::Commit { xid: self.version });
@@ -1008,10 +972,8 @@ impl Transaction {
     }
 
     fn is_visible(&self, version: u64) -> bool {
-        if self.active_xid.contains(&version) {
-            return false;
-        }
-        version <= self.version
+        // 判据在 [`crate::common::visible_at`]（四引擎共用的一份）
+        crate::common::visible_at(version, self.version, &self.active_xid)
     }
 
     /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键与逻辑 value。
