@@ -105,11 +105,41 @@ pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
 /// 「整条链没有一个可见」的退化场景才付到 O(链长)，与旧的整链扫描同阶。
 const VERSION_BACK_STEP: usize = 32;
 
+// 测试专用：本线程调用 `scan_max_version`（O(总行数) 的全库 KeyDir 扫描）的次数。
+// 用来守住冷启动的三级优先：有 Checkpoint 时就不该再全库扫。
+#[cfg(test)]
+thread_local! {
+    static SCAN_MAX_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程发生过几次「全库扫求最大版本」（测试探针用）
+#[cfg(test)]
+pub(crate) fn scan_max_calls() -> u64 {
+    SCAN_MAX_CALLS.with(|c| c.get())
+}
+
+/// 把 WAL 收口成「只剩一条 Checkpoint」。
+///
+/// 顺序反直觉但必须这样：原先是 `append(Checkpoint) → sync → truncate()`，而 `truncate()`
+/// 只留 header —— **刚写的 Checkpoint 被自己抹掉了**，于是下次 open 无从知道 `next_version`，
+/// 只能退回 O(总行数) 的全库 KeyDir 重扫。改成先截断、再把 Checkpoint 写成新 WAL 的第一条。
+///
+/// 崩在截断之后、写入之前也不影响正确性：那时 WAL 为空，open 走全库扫拿起点，只是慢。
+fn seal_wal_checkpoint(wal: &mut Wal, next_version: u64) -> std::io::Result<()> {
+    wal.truncate()?;
+    wal.append(WalRecord::Checkpoint {
+        next_version,
+        root_page_id: 0,
+        next_page_id: 0,
+    })?;
+    wal.sync()
+}
+
 /// checkpoint 的实体：手动 `MVCC::checkpoint()` 与提交时的 WAL 阈值触发共用同一份实现。
 ///
 /// 顺序不能换：`Commit` 记录落盘 = 事务持久，数据页可以之后慢慢刷；但 WAL 一旦被截断，
-/// 未落盘的数据就再无重放来源 —— 所以先 flush 数据与 blob，再写 Checkpoint 并 sync，
-/// 最后才 truncate。顺手 `dump_hint` 是为了下次 open 不必全量扫日志。
+/// 未落盘的数据就再无重放来源 —— 所以先 flush 数据与 blob，最后才收口 WAL。
+/// 顺手 `dump_hint` 是为了下次 open 不必全量扫日志。
 fn run_checkpoint(
     kv: &Mutex<Bitcask>,
     blob: &Mutex<BlobStore>,
@@ -123,13 +153,7 @@ fn run_checkpoint(
     let _ = blob.sync();
     let _ = kv.dump_hint();
     let next_ver = next_version.load(Ordering::SeqCst);
-    let _ = wal.append(WalRecord::Checkpoint {
-        next_version: next_ver,
-        root_page_id: 0,
-        next_page_id: 0,
-    });
-    let _ = wal.sync();
-    let _ = wal.truncate();
+    let _ = seal_wal_checkpoint(&mut wal, next_ver);
 }
 
 impl MVCC {
@@ -158,17 +182,31 @@ impl MVCC {
             let _ = tree.remove(key);
         }
 
-        let disk_max = scan_max_version(&mut tree)?;
-        let start_ver = disk_max.max(plan.max_xid).saturating_add(1).max(1);
+        // 冷启动的起始版本号，三级优先（照 bplus 的口径，别让同一个优化在三处有三种成熟度）：
+        // 1. WAL 里最后一个 Checkpoint 的 next_version —— checkpoint 先 flush 数据再截断 WAL，
+        //    所以它之前的版本行都已落盘、编号必然小于它，它之后的记录才是新增写入；
+        // 2. 没有 Checkpoint 就用 WAL 见过的最大 xid；
+        // 3. 两者都没有（首次打开/老库）才退化到全库扫 KeyDir 求最大版本。
+        //
+        // 走 1 才让「库越大 open 越慢」这条通道断开：`scan_max_version` 是 O(总行数)。
+        // 注意这里省的是**启动开销**而不是正确性 —— 即便退化到 3，扫出来的最大值也不会
+        // 小于某个仍存活的行，所以不会发生版本号复用。
+        let ckpt_nv = match plan.last_checkpoint.as_ref() {
+            Some(WalRecord::Checkpoint { next_version, .. }) => Some(*next_version),
+            _ => None,
+        };
+        let start_ver = match ckpt_nv {
+            Some(nv) => nv.max(plan.max_xid.saturating_add(1)).max(1),
+            None => {
+                let disk_max = scan_max_version(&mut tree)?;
+                disk_max.max(plan.max_xid).saturating_add(1).max(1)
+            }
+        };
 
         tree.flush()?;
-        let _ = wal.append(WalRecord::Checkpoint {
-            next_version: start_ver,
-            root_page_id: 0,
-            next_page_id: 0,
-        });
-        wal.sync()?;
-        wal.truncate()?;
+        // 同样要「先截断再写 Checkpoint」，否则这次 open 留下的起点信息会被截断抹掉，
+        // 下次 open 只能再全库扫一遍（首次打开的库尤其需要这条快路）。
+        seal_wal_checkpoint(&mut wal, start_ver)?;
 
         Ok(Self {
             kv: Arc::new(Mutex::new(tree)),
@@ -397,6 +435,8 @@ impl Default for MVCC {
 /// 决定 open 后 next_version 的位置（旧库：WAL 兜底）。
 
 fn scan_max_version(tree: &mut Bitcask) -> std::io::Result<u64> {
+    #[cfg(test)]
+    SCAN_MAX_CALLS.with(|c| c.set(c.get() + 1));
     let mut max_v = 0u64;
     // 只扫 KeyDir，不读 value
     for (enc, _) in tree.iter_meta() {
@@ -1074,6 +1114,49 @@ mod tests {
                     Some(format!("v{i}").into_bytes()),
                     "第 {i} 条已提交写入在 WAL 被截断后仍应读到"
                 );
+            }
+            tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// 冷启动三级优先：WAL 里有 Checkpoint 时**不该**再做 O(总行数) 的全库 KeyDir 扫描。
+    ///
+    /// 守的是「启动一次比一次慢」那条通道：`scan_max_version` 随总行数线性，而
+    /// `checkpoint()` 早已把 `next_version` 写进 WAL（且 `try_open` 收尾也会补一条），
+    /// 之前却完全没读它。这里用调用计数证明快路真的走到了，而不只是代码看起来对。
+    #[test]
+    fn test_reopen_uses_checkpoint_instead_of_full_scan() {
+        const KEYS: u32 = 60;
+        let path = tmp_db("ckpt_start_ver");
+        let before;
+        {
+            let mvcc = MVCC::open(&path);
+            mvcc.set_wal_checkpoint_limit(0); // 关掉自动触发，本用例只测手动 checkpoint
+            for i in 0..KEYS {
+                let key = format!("k{i}");
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key.as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+            before = mvcc.next_version.load(Ordering::SeqCst);
+            mvcc.checkpoint();
+        }
+
+        {
+            let base = scan_max_calls();
+            let mvcc = MVCC::open(&path);
+            assert_eq!(
+                scan_max_calls() - base,
+                0,
+                "有 Checkpoint 时重开不应再全库扫 KeyDir"
+            );
+            let after = mvcc.next_version.load(Ordering::SeqCst);
+            assert!(after >= before, "重开后 next_version 不应回退（{after} < {before}）");
+            let tx = mvcc.begin_transaction();
+            for i in 0..KEYS {
+                let key = format!("k{i}");
+                assert_eq!(tx.get(key.as_bytes()), Some(format!("v{i}").into_bytes()));
             }
             tx.commit();
         }
