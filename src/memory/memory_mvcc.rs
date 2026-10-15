@@ -251,6 +251,27 @@ impl Drop for BulkLoader {
     }
 }
 
+/// 未终结（既没 commit 也没 rollback）就被丢弃的事务在此自动回滚。
+///
+/// 漏网事务会永久留在 `active_txn` 里：`xmin = min(活跃事务 id)` 被一个已死的 id 压住
+/// ⇒ 版本回收永久停摆，且之后每次 `begin` 的可见性快照随漏网数线性变大。
+/// 判据用「活跃表里是否还有自己」——`commit`/`rollback` 都以 `remove` 收尾，成员关系即充要条件。
+/// 本引擎无 WAL，所以没有磁盘侧的 Abort 记录，只撤销内存行。
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        let unfinished = match self.active_txn.lock() {
+            Ok(guard) => guard.contains_key(&self.version),
+            // 锁中毒（别的线程 panic 过）：不能在这里 panic —— Drop 里 panic 直接 abort 进程
+            Err(_) => return,
+        };
+        if !unfinished {
+            return;
+        }
+        log::warn!("事务 {} 未 commit/rollback 即被丢弃，已自动回滚", self.version);
+        self.rollback();
+    }
+}
+
 impl Transaction {
     pub fn begin(
         store: Arc<Mutex<MemStore>>,

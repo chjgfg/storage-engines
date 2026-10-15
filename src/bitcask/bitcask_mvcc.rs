@@ -483,6 +483,33 @@ impl Drop for BulkLoader {
     }
 }
 
+/// 未终结事务的兜底回滚。
+///
+/// 「未终结」= 既没 `commit` 也没 `rollback` 就被丢弃（提前 `return`、panic、或纯粹忘了）。
+/// 这不是便利功能，是止血：漏网的事务会**永久留在 `active_txn`**，于是
+/// 1. `xmin = min(活跃事务 id)` 被一个已经死掉的 id 压住 ⇒ **版本回收从此永久停摆**；
+/// 2. 之后每次 `begin` 的可见性快照 `keys().cloned().collect()` 随漏网数线性变大。
+///
+/// 判据用「活跃表里是否还有自己」而不是额外标志位：`commit`/`rollback` 都以 `remove` 收尾，
+/// 所以成员关系本身就是「未终结」的充要条件。
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        let unfinished = match self.active_txn.lock() {
+            Ok(guard) => guard.contains_key(&self.version),
+            // 锁中毒（别的线程 panic 过）：不能在这里 panic —— Drop 里 panic 直接 abort 进程
+            Err(_) => return,
+        };
+        if !unfinished {
+            return;
+        }
+        if self.wal.lock().is_err() {
+            return;
+        }
+        log::warn!("事务 {} 未 commit/rollback 即被丢弃，已自动回滚", self.version);
+        self.rollback();
+    }
+}
+
 impl Transaction {
     pub fn begin(
         kv: Arc<Mutex<Bitcask>>,
@@ -773,6 +800,99 @@ mod tests {
         let _ = std::fs::remove_file(data_path(path));
         let _ = std::fs::remove_file(blob_path(path));
         let _ = std::fs::remove_file(hint_path(path));
+    }
+
+    /// 探针：一次点读 / 一次点写到底读了几行盘。
+    ///
+    /// 版本键 `raw_key ‖ version.to_be_bytes()` 大端有序 ⇒ 最新版本必然在链尾，
+    /// 定位到它就够 —— 所以**读盘次数不该随链长增长**。
+    /// 当前实现走 `scan_key_versions` → `range_scan` → 每行一次 `read_live`，
+    /// 于是链长 N 就付 N 次 pread；点写更冤：`latest_version_of` 只要一个版本号，
+    /// 却把 N 个 value 全读出来丢掉。
+    ///
+    /// 这条断言在当前代码上**必然失败**，失败信息里的两个数字就是这个 bug 的量级证明。
+    #[test]
+    #[ignore = "M1 用于复现量级；M2（链尾反向早停）落地后解除 ignore 变成回归守卫"]
+    fn test_point_op_cost_independent_of_chain_length() {
+        fn probe(chain_len: u64) -> (u64, u64) {
+            let path = tmp_db(&format!("probe_{chain_len}"));
+            let (get_reads, set_reads);
+            {
+                let mvcc = MVCC::open(&path);
+                for i in 0..chain_len {
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(b"hot", format!("v{i}").into_bytes()), "第 {i} 次写入被拒");
+                    tx.commit();
+                }
+
+                let tx = mvcc.begin_transaction();
+                let before = crate::bitcask::bitcask::read_value_calls();
+                assert_eq!(tx.get(b"hot"), Some(format!("v{}", chain_len - 1).into_bytes()));
+                get_reads = crate::bitcask::bitcask::read_value_calls() - before;
+
+                let before = crate::bitcask::bitcask::read_value_calls();
+                assert!(tx.set(b"hot", b"newer".to_vec()));
+                set_reads = crate::bitcask::bitcask::read_value_calls() - before;
+                tx.rollback();
+            }
+            cleanup(&path);
+            (get_reads, set_reads)
+        }
+
+        let (g_short, s_short) = probe(50);
+        let (g_long, s_long) = probe(2000);
+        eprintln!(
+            "点读读盘次数：链长 50 → {g_short} 次，链长 2000 → {g_long} 次\n\
+             点写读盘次数：链长 50 → {s_short} 次，链长 2000 → {s_long} 次"
+        );
+        assert_eq!(g_short, g_long, "点读的读盘次数不应随版本链长度增长");
+        assert_eq!(s_short, s_long, "点写的读盘次数不应随版本链长度增长（它只需要版本号）");
+    }
+
+    /// 泄漏事务（既不 commit 也不 rollback 就丢弃）**不得**永久卡死 vacuum 的水位线。
+    ///
+    /// 没有 `impl Drop for Transaction` 时，漏网的 xid 会一直挂在 `active_txn` 里，
+    /// `xmin = min(活跃事务 id)` 因此永久停在它身上 —— 它之后的每一次写入都变成
+    /// 「比 xmin 新、永远不能裁」，于是版本回收**整体停摆**，且之后每个事务的
+    /// 可见性快照都多带一个死 id。
+    ///
+    /// 故意把泄漏放在造旧版本**之前**：这样漏网 id 是全场最小，`xmin` 被它钉死，
+    /// 去掉 Drop 兜底这条测试就会红（顺序反过来则仍能裁掉，断言咬不住）。
+    #[test]
+    fn test_leaked_transaction_does_not_block_vacuum() {
+        let path = tmp_db("leak_vacuum");
+        {
+            let mvcc = MVCC::open(&path);
+
+            // 先泄漏：只 begin + 写，然后直接丢弃
+            {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"leak", b"x".to_vec()));
+            }
+
+            for i in 0..3u64 {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"k", format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+
+            assert!(
+                mvcc.active_txn.lock().unwrap().is_empty(),
+                "泄漏事务应已被 Drop 回收，而不是永久留在活跃表里"
+            );
+
+            let stats = mvcc.vacuum().unwrap();
+            assert!(
+                stats.versions_removed > 0,
+                "xmin 应能推进到 next_version 并裁掉 k 的旧版本；裁不动说明活跃表里有死 id 事务"
+            );
+
+            let tx = mvcc.begin_transaction();
+            assert_eq!(tx.get(b"leak"), None, "泄漏事务的写入应已被回滚");
+            assert_eq!(tx.get(b"k"), Some(b"v2".to_vec()));
+            tx.rollback();
+        }
+        cleanup(&path);
     }
 
     #[test]

@@ -82,6 +82,21 @@ pub enum KeyLoc {
 
 /// 内存索引：key → 最新位置
 pub type KeyDir = std::collections::BTreeMap<Vec<u8>, KeyLoc>;
+
+/// 测试专用：本线程 `Log::read_value` 的调用次数，即**真实读盘行数**。
+///
+/// 用来把「一次操作的代价不随版本链长度增长」这条不变量钉成断言 —— 计时断言在不同
+/// 机器上会飘，读盘次数不会。做成 thread_local 是为了不和 `cargo test` 的并行用例互相计数。
+#[cfg(test)]
+thread_local! {
+    static READ_VALUE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已发生的「读一行盘」次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn read_value_calls() -> u64 {
+    READ_VALUE_CALLS.with(|c| c.get())
+}
 /// IO 结果
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -446,6 +461,8 @@ impl Log {
     }
 
     fn read_value(&mut self, value_pos: u64, value_len: u32) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        READ_VALUE_CALLS.with(|c| c.set(c.get() + 1));
         // 读路径前必须 flush，offset 才落在真实文件上
         self.flush_buf()?;
         let mut value = vec![0; value_len as usize];
