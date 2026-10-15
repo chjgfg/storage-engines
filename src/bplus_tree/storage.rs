@@ -537,7 +537,7 @@ impl BlobStore {
                 "blob 长度异常",
             ));
         }
-        let mut data = vec![0u8; len];
+        let mut data: Vec<u8> = vec![0u8; len];
         if len > 0 {
             self.file.read_exact_at(offset + 8, &mut data)?;
         }
