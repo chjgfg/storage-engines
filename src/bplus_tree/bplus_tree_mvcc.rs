@@ -35,6 +35,8 @@ pub struct MVCC {
     wal: Arc<Mutex<Wal>>,
     active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
     next_version: Arc<AtomicU64>,
+    /// WAL 增长到多少字节就在下一次提交后自动 checkpoint（0 = 关闭自动触发）
+    wal_limit: Arc<AtomicU64>,
     db_path: PathBuf,
 }
 
@@ -44,6 +46,8 @@ pub struct Transaction {
     pub(crate) blob: Arc<Mutex<BlobStore>>,
     pub(crate) wal: Arc<Mutex<Wal>>,
     pub(crate) active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
+    next_version: Arc<AtomicU64>,
+    wal_limit: Arc<AtomicU64>,
     version: u64,
     active_xid: HashSet<u64>,
 }
@@ -87,6 +91,43 @@ pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
     })
 }
 
+/// 把 WAL 收口成「只剩一条 Checkpoint」。
+///
+/// 顺序反直觉但必须这样：原先是 `append(Checkpoint) → sync → truncate()`，而 `truncate()`
+/// 只留 header —— **刚写的 Checkpoint 被自己抹掉了**。bplus 的起点另有 `NVER` meta 兜着，
+/// 但 README 写的「其次用 WAL 的 checkpoint」那一级因此永远走不到；改成先截断再写回。
+///
+/// 崩在截断之后、写入之前不影响正确性：那时 WAL 为空，open 退回 meta/全树扫描拿起点，只是慢。
+fn seal_wal_checkpoint(
+    wal: &mut Wal,
+    next_version: u64,
+    root_page_id: u64,
+    next_page_id: u64,
+) -> std::io::Result<()> {
+    wal.truncate()?;
+    wal.append(WalRecord::Checkpoint {
+        next_version,
+        root_page_id,
+        next_page_id,
+    })?;
+    wal.sync()
+}
+
+/// checkpoint 的实体：手动 `MVCC::checkpoint()` 与提交时的 WAL 阈值触发共用一份实现。
+///
+/// 顺序不能换：先把 `next_version` 记进 meta（`NVER`）再 flush 页，最后才收口 WAL ——
+/// WAL 一旦被截断，未落盘的页就再无重放来源。
+fn run_checkpoint(kv: &Mutex<BPlusTree>, wal: &Mutex<Wal>, next_version: &AtomicU64) {
+    let mut kv = kv.lock().unwrap();
+    let mut wal = wal.lock().unwrap();
+    let next_ver = next_version.load(Ordering::SeqCst);
+    kv.set_next_version(next_ver);
+    kv.flush_all();
+    let root = kv.root_page_id();
+    let next_page = kv.next_page_id();
+    let _ = seal_wal_checkpoint(&mut wal, next_ver, root.0, next_page);
+}
+
 impl MVCC {
     /// 打开/创建磁盘上的 MVCC 引擎（含 WAL 恢复）。失败时 panic（兼容旧代码）。
     pub fn open(path: impl AsRef<Path>, order: usize, max_cache_pages: usize) -> Self {
@@ -127,13 +168,9 @@ impl MVCC {
         tree.flush_all();
         let root = tree.root_page_id();
         let next_page = tree.next_page_id();
-        let _ = wal.append(WalRecord::Checkpoint {
-            next_version: start_ver,
-            root_page_id: root.0,
-            next_page_id: next_page,
-        });
-        wal.sync()?;
-        wal.truncate()?;
+        // 先截断、再把 Checkpoint 写成新 WAL 的第一条。原先的顺序是 append→sync→truncate，
+        // 而 truncate 只留 header ⇒ 刚写的 Checkpoint 被自己抹掉，下次 open 想靠它拿起点也拿不到。
+        seal_wal_checkpoint(&mut wal, start_ver, root.0, next_page)?;
 
         Ok(Self {
             kv: Arc::new(Mutex::new(tree)),
@@ -141,6 +178,7 @@ impl MVCC {
             wal: Arc::new(Mutex::new(wal)),
             active_txn: Arc::new(Mutex::new(HashMap::new())),
             next_version: Arc::new(AtomicU64::new(start_ver)),
+            wal_limit: Arc::new(AtomicU64::new(MVCC::WAL_CHECKPOINT_BYTES_DEFAULT)),
             db_path,
         })
     }
@@ -165,6 +203,7 @@ impl MVCC {
             self.wal.clone(),
             self.active_txn.clone(),
             self.next_version.clone(),
+            self.wal_limit.clone(),
         )
     }
 
@@ -188,22 +227,22 @@ impl MVCC {
         }
     }
 
+    /// 默认 WAL 阈值：16 MiB。现场见过 WAL 长到几十 MB 仍无人截断，而恢复是**全量扫描**
+    /// WAL ⇒ 不截断等于启动一次比一次慢。
+    pub const WAL_CHECKPOINT_BYTES_DEFAULT: u64 = 16 << 20;
+
+    /// WAL 字节阈值可配置项：增长到这么多字节就在**下一次提交后**自动 checkpoint。
+    /// 设 0 关闭自动触发（只能手动调 `checkpoint()`）。
+    pub fn set_wal_checkpoint_limit(&self, bytes: u64) {
+        self.wal_limit.store(bytes, Ordering::SeqCst);
+    }
+
+    pub fn wal_checkpoint_limit(&self) -> u64 {
+        self.wal_limit.load(Ordering::SeqCst)
+    }
+
     pub fn checkpoint(&self) {
-        let mut kv = self.kv.lock().unwrap();
-        let mut wal = self.wal.lock().unwrap();
-        let next_ver = self.next_version.load(Ordering::SeqCst);
-        // meta 先记下 next_version，再 flush（同一次刷盘）
-        kv.set_next_version(next_ver);
-        kv.flush_all();
-        let root = kv.root_page_id();
-        let next_page = kv.next_page_id();
-        let _ = wal.append(WalRecord::Checkpoint {
-            next_version: next_ver,
-            root_page_id: root.0,
-            next_page_id: next_page,
-        });
-        let _ = wal.sync();
-        let _ = wal.truncate();
+        run_checkpoint(&self.kv, &self.wal, &self.next_version);
     }
 
     pub fn flush(&self) {
@@ -524,6 +563,7 @@ impl Transaction {
         wal: Arc<Mutex<Wal>>,
         active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
         next_version: Arc<AtomicU64>,
+        wal_limit: Arc<AtomicU64>,
     ) -> Self {
         let version = next_version.fetch_add(1, Ordering::SeqCst);
         let active_txn_arc = Arc::clone(&active_txn);
@@ -543,6 +583,8 @@ impl Transaction {
             blob,
             wal,
             active_txn: active_txn_arc,
+            next_version,
+            wal_limit,
             version,
             active_xid,
         }
@@ -727,6 +769,16 @@ impl Transaction {
         if flush_pages {
             self.kv.lock().unwrap().flush_all();
         }
+
+        // WAL 超阈值就顺带 checkpoint。放在提交之后是因为此刻本事务已持久、
+        // 也已从活跃表摘除，checkpoint 记到的 next_version 是干净的。
+        let limit = self.wal_limit.load(Ordering::SeqCst);
+        if limit > 0 {
+            let size = self.wal.lock().unwrap().size_bytes().unwrap_or(0);
+            if size >= limit {
+                run_checkpoint(&self.kv, &self.wal, &self.next_version);
+            }
+        }
     }
 
     pub fn rollback(&self) {
@@ -854,6 +906,69 @@ mod tests {
             s_long <= s_short + 8,
             "点写的页数不应随版本链长度线性增长（短链 {s_short}，长链 {s_long}）"
         );
+    }
+
+    /// WAL 阈值触发必须真的把文件截住（对照「关闭自动触发」），且截断之后重开仍能读到
+    /// 全部已提交数据 —— 后半段守的是「先把 next_version 记进 meta 并 flush 页、
+    /// 最后才收口 WAL」这个顺序：顺序反了就是**丢已提交写入**。
+    #[test]
+    fn test_wal_auto_checkpoint_bounds_file_and_keeps_data() {
+        const WRITES: u32 = 40;
+
+        // 注意量测时机：本引擎有 `impl Drop for MVCC`（析构时自带一次 checkpoint），
+        // 所以必须在实例还活着的时候量，否则两种配置都会被 drop 截成 header 大小，
+        // 断言就变成了空转（第一版我就踩了这个坑：量到 32 对 32）。
+        fn wal_bytes_after(tag: &str, limit: u64) -> u64 {
+            let path = tmp_db(tag);
+            let size;
+            {
+                let mvcc = MVCC::open(&path, 4, 16);
+                mvcc.set_wal_checkpoint_limit(limit);
+                for i in 0..WRITES {
+                    let key = format!("k{i}");
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(key.as_bytes(), vec![b'x'; 200]));
+                    tx.commit();
+                }
+                size = std::fs::metadata(wal_path(&path)).map(|m| m.len()).unwrap_or(0);
+            }
+            cleanup(&path);
+            size
+        }
+
+        let manual = wal_bytes_after("wal_manual", 0);
+        let auto = wal_bytes_after("wal_auto", 1);
+        eprintln!("WAL 体积：关闭自动 checkpoint {manual} 字节 vs 阈值触发 {auto} 字节");
+        assert!(
+            auto * 4 <= manual,
+            "阈值触发应把 WAL 截住（自动 {auto}，手动 {manual}）"
+        );
+
+        let path = tmp_db("wal_reopen");
+        {
+            let mvcc = MVCC::open(&path, 4, 16);
+            mvcc.set_wal_checkpoint_limit(1);
+            for i in 0..WRITES {
+                let key = format!("r{i}");
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key.as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+        }
+        {
+            let mvcc = MVCC::open(&path, 4, 16);
+            let tx = mvcc.begin_transaction();
+            for i in 0..WRITES {
+                let key = format!("r{i}");
+                assert_eq!(
+                    tx.get(key.as_bytes()),
+                    Some(format!("v{i}").into_bytes()),
+                    "第 {i} 条已提交写入在 WAL 被截断后仍应读到"
+                );
+            }
+            tx.commit();
+        }
+        cleanup(&path);
     }
 
     #[test]

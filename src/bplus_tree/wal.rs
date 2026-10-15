@@ -173,6 +173,12 @@ impl Wal {
         self.next_lsn
     }
 
+    /// 当前 WAL 占用字节数（含 header）。用来判断是否该 checkpoint 截断了 ——
+    /// WAL 只有被截断才不会无限增长，而恢复路径是**全量扫描**它。
+    pub fn size_bytes(&self) -> std::io::Result<u64> {
+        self.file.len()
+    }
+
     pub fn path(&self) -> &Path {
         self.file.path()
     }
