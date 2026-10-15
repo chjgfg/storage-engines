@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::common::{
-    ExportRecord, IncrError, KeyMeta, MvccHealth, SearchPage, SearchQuery, VacuumStats,
+    DurabilityProfile, ExportRecord, IncrError, KeyMeta, MvccHealth, SearchPage, SearchQuery,
+    VacuumStats,
 };
 
 /// 门面层错误
@@ -249,6 +250,13 @@ pub trait KvEngine {
     /// 读回当前的自动回收切片宽度（`0` = 已关闭）
     fn vacuum_auto_slice(&self) -> u64;
 
+    /// 崩溃安全画像：哪些构件在、哪些不在。
+    ///
+    /// 四家**不等价**，而且差异不是"等级高低"能表达的：Bitcask 缺数据记录校验和（静默损坏
+    /// 发现不了）、LSM 的大 value 旁路是裸文件、只有 B+ 树有原地页写 + 双写缓冲、memory
+    /// 干脆不持久。选引擎之前先看它 —— 别再靠"换个引擎"当成修好了。
+    fn durability_profile(&self) -> DurabilityProfile;
+
     /// 落盘数据（内存引擎为 no-op）
     fn flush(&self) -> Result<()>;
 
@@ -390,6 +398,10 @@ macro_rules! impl_engine {
 
             fn vacuum_auto_slice(&self) -> u64 {
                 self.inner.vacuum_auto_slice()
+            }
+
+            fn durability_profile(&self) -> DurabilityProfile {
+                self.inner.durability_profile()
             }
 
             impl_engine!(@vacuum $vacuum);
@@ -940,6 +952,56 @@ mod tests {
             assert_eq!(after.total_rows, 3, "{name}: vacuum 后应只剩每 key 一行");
 
             drop(db);
+        }
+        cleanup(dirs);
+    }
+
+    /// 崩溃安全差异必须**写在断言里**，不能只写在文档里。
+    ///
+    /// 选引擎的人最终看的是代码给的答案：文档会过期，这张表不会。哪天 bitcask 补了记录
+    /// 校验和、或 LSM 给 `blobs/` 加了 CRC，用例会红，逼作者同步更新画像与 CHANGELOG ——
+    /// 而不是让下游继续照着过期的"已知局限"做取舍。
+    #[test]
+    fn durability_profiles_are_honestly_different() {
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        let mut seen: Vec<(&'static str, DurabilityProfile)> = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            let p = db.durability_profile();
+            assert_eq!(p.engine, name, "画像里的引擎名必须和门面名一致");
+            match name {
+                // 唯一没有数据记录校验和的一家：data.log 坏一个字节不报错，只读出错值
+                "bitcask" => {
+                    assert!(!p.data_checksum, "bitcask 主日志仍然是裸记录");
+                    assert!(p.blob_checksum && p.merge_artifact_recovery);
+                    let text = p.to_string();
+                    assert!(text.contains("数据记录无校验和"), "缺口必须报出来：{text}");
+                    assert!(!text.contains("无事务 WAL"), "没缺的不许瞎报：{text}");
+                }
+                // 唯一做原地页写的一家 ⇒ 也只有它有 torn page 问题，dblwr 兜着
+                "bplus_tree" => {
+                    assert!(p.data_checksum && p.in_place_page_writes && p.torn_page_guard);
+                }
+                // SST 块有 CRC，blobs/ 却是裸文件
+                "lsm_tree" => {
+                    assert!(p.data_checksum);
+                    assert!(!p.blob_checksum, "blobs/*.blob 至今是 fs::write 的裸文件");
+                }
+                // 不持久化是设计，不是疏漏
+                "memory" => {
+                    assert!(!p.transaction_wal && !p.fsync_on_commit);
+                    assert!(p.to_string().contains("无事务 WAL"));
+                }
+                other => panic!("未知引擎 {other}"),
+            }
+            seen.push((name, p));
+        }
+        // 画像必须两两不同 —— 差异存在却报成一样，才是真问题
+        for (i, a) in seen.iter().enumerate() {
+            for b in seen.iter().skip(i + 1) {
+                assert_ne!(a.1, b.1, "{} 与 {} 的崩溃安全画像不该相同", a.0, b.0);
+            }
         }
         cleanup(dirs);
     }

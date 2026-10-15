@@ -24,7 +24,7 @@ use crate::bplus_tree::storage::{
     decode_stored_value, encode_stored_value, wal_path, BlobStore,
 };
 use crate::bplus_tree::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+pub use crate::common::{DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats};
 use crate::common::vacuum_plan;
 
 /// MVCC 存储引擎
@@ -301,6 +301,24 @@ impl MVCC {
         let records = tx.export_latest_visible(include_deleted);
         tx.commit();
         records
+    }
+
+    /// 崩溃安全画像 —— 四家里构件最全的一个，但"最全"不等于"没问题"：
+    /// 页有 magic + CRC32、原地页写有双写缓冲兜底（防半页撕裂），freelist/blob 各自成文件。
+    /// `merge_artifact_recovery` 这里**不适用**（设 false 不是缺陷）：B+ 树没有全库重写式
+    /// merge，回收是原地页操作，被 dblwr 覆盖。
+    pub fn durability_profile(&self) -> DurabilityProfile {
+        DurabilityProfile {
+            engine: "bplus_tree",
+            transaction_wal: true,
+            fsync_on_commit: true,
+            // 页头带 magic + CRC32（pack_page）
+            data_checksum: true,
+            blob_checksum: true,
+            in_place_page_writes: true,
+            torn_page_guard: true,
+            merge_artifact_recovery: false,
+        }
     }
 
     /// 全库健康度快照。**只遍历叶子键**（`scan_keys_with`），一趟、不克隆 value、不碰 blob。

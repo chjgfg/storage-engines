@@ -58,6 +58,67 @@ pub struct MvccHealth {
     pub active_txns: u64,
 }
 
+/// 引擎的崩溃安全画像。
+///
+/// 四个引擎**不等价**，所以这里给的是"哪些构件在/不在"，而不是一个 `Level(1..=5)`：
+/// 一个整数会把"数据记录没校验和"与"根本没有 WAL"糊成同一个数字，而这两件事对下游
+/// 的含义完全不同 —— 前者是**静默损坏无法发现**，后者是**提交点不存在**。
+///
+/// ⚠️ `false` 不一定是缺陷，要看那条能力对这个布局有没有意义：比如 `torn_page_guard`
+/// 只有做**原地页写**的引擎才需要（B+ 树），Bitcask / LSM 是追加式布局，天生没有
+/// torn page 这个问题 —— 所以另外还给了 `in_place_page_writes`，防止把 `false`
+/// 误读成"少了个防护"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurabilityProfile {
+    pub engine: &'static str,
+    /// 有没有事务 WAL（Begin / Write / Commit / Abort + 帧 CRC32 + 可截断）
+    pub transaction_wal: bool,
+    /// commit 是否 fsync WAL —— 「Commit 记录落盘 = 事务持久」那个持久化点
+    pub fsync_on_commit: bool,
+    /// 数据侧记录/块是否自带校验和。
+    /// **只有 Bitcask 的主日志没有**：`data.log` 的裸记录是 `key_len | flag | key | value`，
+    /// 坏一个字节不会报错，只会读出一个错值。补 CRC 要改磁盘格式，本仓库明确不采纳。
+    pub data_checksum: bool,
+    /// 外置大 value 是否带校验和（Bitcask / B+ 树的 blob 记录有；LSM 的 `blobs/*.blob`
+    /// 是 `fs::write` 的裸文件 ⇒ 损坏同样是静默的）
+    pub blob_checksum: bool,
+    /// 是否存在原地页写（决定 `torn_page_guard` 这条能力有没有意义）
+    pub in_place_page_writes: bool,
+    /// 原地页写是否有双写缓冲兜底（半页撕裂能被 dblwr 复原）
+    pub torn_page_guard: bool,
+    /// 全库重写（merge / compact）中途崩掉，下次 open 能不能认回产物而不是当成空库
+    pub merge_artifact_recovery: bool,
+}
+
+impl std::fmt::Display for DurabilityProfile {
+    /// 只把**缺口**说成人话：全绿的部分不必占用读者注意力。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut gaps: Vec<String> = Vec::new();
+        if !self.transaction_wal {
+            gaps.push("无事务 WAL ⇒ 没有持久化点".into());
+        }
+        if !self.fsync_on_commit && self.transaction_wal {
+            gaps.push("commit 不 fsync ⇒ 断电可丢最近提交".into());
+        }
+        if !self.data_checksum {
+            gaps.push("数据记录无校验和 ⇒ 静默损坏无法发现".into());
+        }
+        if !self.blob_checksum {
+            gaps.push("大 value 旁路无校验和".into());
+        }
+        if self.in_place_page_writes && !self.torn_page_guard {
+            gaps.push("有原地页写但无双写缓冲 ⇒ 半页撕裂不可复原".into());
+        }
+        if !self.merge_artifact_recovery {
+            gaps.push("全库重写中途崩掉无人认回产物".into());
+        }
+        if gaps.is_empty() {
+            return write!(f, "{}: 崩溃安全构件齐全", self.engine);
+        }
+        write!(f, "{}: {}", self.engine, gaps.join("；"))
+    }
+}
+
 /// [`vacuum_bounded`](crate::bitcask::MVCC::vacuum_bounded) 的一轮结果。
 ///
 /// 手动 `vacuum()` = 一次 `budget_rows = u64::MAX` 的轮次，两者共用同一份保留规则。

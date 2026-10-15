@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 219 个单元测试 + 4 个集成测试
+- 220 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -356,7 +356,7 @@ blob:   [0x01] offset(u64 LE) len(u32 LE)   —— 共 13 字节
 
 | trait | 用途 |
 |---|---|
-| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `health` / `set_vacuum_auto_slice` / `flush` / `checkpoint` / `merge` |
+| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `health` / `set_vacuum_auto_slice` / `durability_profile` / `flush` / `checkpoint` / `merge` |
 | `KvTxn` | 读写 / 批量 / 扫描 / 搜索分页 / TTL / `commit` / `rollback` |
 | `KvBulk` | 批量导入,无冲突检测、不写 WAL |
 
@@ -421,6 +421,8 @@ data.db.lock       单写者锁(内含 pid)
 
 这是教学项目,以下都是**有意的简化**或已知待改进项,不建议用于生产:
 
+四家的崩溃安全**不等价**,而差异不是"等级高低":`KvEngine::durability_profile()` 把"哪些构件在、哪些不在"作为数据吐出来(位 + 一句 `Display` 只报缺口),并由 `durability_profiles_are_honestly_different` 逐家钉住 —— 下面这份清单是它的人读版,过期了会被测试抓到。
+
 **并发**
 - 四个引擎都是**单写者**模型,靠 `Arc<Mutex<...>>` 单锁 + 文件锁保证。没有行级锁、没有并发写入
 - 事务不是 `Send`/`Sync` 友好的多线程设计
@@ -433,7 +435,7 @@ data.db.lock       单写者锁(内含 pid)
 
 **Bitcask**
 - 数据记录**没有 CRC**,存在静默损坏风险(blob 和 WAL 有 CRC)
-- merge **不是原子的**:删旧文件与 rename 新文件之间崩溃会丢数据
+- merge **不是原子的**(删旧文件与 rename 新文件之间有时间窗),但**可恢复**:崩在改名之前留下的 `data.merge` 会在下次 open 被认回(见 `durability_profile().merge_artifact_recovery`)。改名顺序不能反过来 —— 旧 active 句柄还挂着时 Windows 的共享锁会挡住覆盖
 - 全量 key 常驻内存,key 数量受内存限制
 
 **B+ 树**
@@ -548,7 +550,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:219 单元 + 4 集成 + 2 文档测试
+cargo test                    # 全部:220 单元 + 4 集成 + 2 文档测试
 cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```

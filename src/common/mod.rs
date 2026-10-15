@@ -13,7 +13,7 @@ pub use codec::{
     prefix_upper_bound,
 };
 pub use types::{
-    ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage, SearchQuery,
-    VacuumRound, VacuumStats, ValueMeta,
+    DurabilityProfile, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage,
+    SearchQuery, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use version::{decode_key, encode_key, vacuum_plan, VersionedKey};

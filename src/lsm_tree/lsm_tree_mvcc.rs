@@ -39,7 +39,9 @@ use std::{
 use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
 use crate::lsm_tree::storage::{wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+pub use crate::common::{
+    DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
+};
 use crate::common::vacuum_plan;
 
 /// MVCC 存储引擎（LSM 后端）
@@ -307,6 +309,29 @@ impl MVCC {
         let records = tx.export_latest_visible(include_deleted);
         tx.commit();
         records
+    }
+
+    /// 崩溃安全画像。SST 块带 CRC32、MANIFEST 是「写 tmp 再改名」的原子换，所以
+    /// compaction 中途崩掉不会丢数据（旧文件集仍然有效）—— 但会留下没人引用的孤儿 SST
+    /// 占空间，这条 [`MVCC::vacuum`] / compact 都不收，属于已知代价。
+    ///
+    /// 两条要说清的缺口：
+    /// - `blobs/*.blob` 是 `fs::write` 的**裸文件、没有校验和** ⇒ 大 value 的静默损坏发现不了
+    ///   （SST 里那条指针本身在块里、有 CRC，所以"指针没坏、内容坏了"这种最难查）。
+    /// - MVCC 路径**关掉了 mem.wal**（`LSMTreeOptions::for_mvcc` 里 `enable_mem_wal = false`）：
+    ///   持久化完全靠上面这层事务 WAL 重放，不是"两层都开着"。
+    pub fn durability_profile(&self) -> DurabilityProfile {
+        DurabilityProfile {
+            engine: "lsm_tree",
+            transaction_wal: true,
+            fsync_on_commit: true,
+            data_checksum: true,
+            blob_checksum: false,
+            // SST 不可变，只有追加式写 ⇒ 没有 torn page 这条能力
+            in_place_page_writes: false,
+            torn_page_guard: false,
+            merge_artifact_recovery: true,
+        }
     }
 
     /// 全库健康度快照。**只走轻量视图**（`scan_latest_light`：版本号 + 是不是墓碑），

@@ -16,7 +16,9 @@ use std::{
     },
 };
 
-pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+pub use crate::common::{
+    DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
+};
 use crate::common::vacuum_plan;
 use crate::memory::mem_store::MemStore;
 
@@ -142,6 +144,22 @@ impl MVCC {
         let records = tx.export_latest_visible(include_deleted);
         tx.commit();
         records
+    }
+
+    /// 崩溃安全画像：**全空，这是设计而非疏漏** —— 纯内存引擎没有任何持久化，
+    /// 进程一exit 数据就没了。它存在的意义是让四家能用同一套断言比对语义
+    /// （门面层 `open_engine("memory")` 也就能被测试/演示用）。
+    pub fn durability_profile(&self) -> DurabilityProfile {
+        DurabilityProfile {
+            engine: "memory",
+            transaction_wal: false,
+            fsync_on_commit: false,
+            data_checksum: false,
+            blob_checksum: false,
+            in_place_page_writes: false,
+            torn_page_guard: false,
+            merge_artifact_recovery: false,
+        }
     }
 
     /// 全库健康度快照。**只按引用遍历键**（`scan_entries_with`），一趟、不克隆 value。

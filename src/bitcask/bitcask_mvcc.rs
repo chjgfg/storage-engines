@@ -31,7 +31,7 @@ use crate::bitcask::{Bitcask, storage::{
     BlobStore, FileLock, VAL_TAG_BLOB, data_path, decode_stored_value, encode_stored_value, wal_path,
 }};
 use crate::bitcask::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+pub use crate::common::{DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats};
 use crate::common::vacuum_plan;
 
 /// MVCC 存储引擎（Bitcask 后端）
@@ -142,6 +142,29 @@ fn run_checkpoint(
 }
 
 impl MVCC {
+    /// 崩溃安全画像 —— 本引擎**如实**的构件清单，跨引擎不等价（见 [`MvccHealth`] 同层的
+    /// [`DurabilityProfile`] 说明）。
+    ///
+    /// Bitcask 唯一的缺口是主日志记录没有校验和：`data.log` 的裸记录是
+    /// `key_len | flag | key | value`，坏一个字节不会报错，只会读出一个错值。
+    /// 补 CRC 要改磁盘格式 —— 本仓库明确不采纳破坏性格式改动，所以把它**说清楚**而不是藏起来。
+    pub fn durability_profile(&self) -> DurabilityProfile {
+        DurabilityProfile {
+            engine: "bitcask",
+            transaction_wal: true,
+            fsync_on_commit: true,
+            // ⚠️ 见上面的说明：data.log 裸记录
+            data_checksum: false,
+            // blob 记录是 `len | crc32 | data`
+            blob_checksum: true,
+            // 追加式布局：没有原地页写 ⇒ 不存在 torn page 这条能力
+            in_place_page_writes: false,
+            torn_page_guard: false,
+            // M6a：open 会认回崩在改名之前的 data.merge / 清掉残骸
+            merge_artifact_recovery: true,
+        }
+    }
+
     /// 全库健康度快照。**只走 KeyDir 元数据**（`iter_meta`），不读 value、不碰 blob。
     ///
     /// 代价是 O(物理行数) 的内存遍历，属管理面调用：别放进热路径，长跑里按分钟级采样就够。
