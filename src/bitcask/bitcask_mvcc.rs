@@ -43,6 +43,12 @@ pub struct MVCC {
     next_version: Arc<AtomicU64>,
     /// WAL 增长到多少字节就在下一次提交后自动 checkpoint（0 = 关闭自动触发）
     wal_limit: Arc<AtomicU64>,
+    /// 自动回收：切片宽度（行数），同时是「攒多少行新版本才触发一轮」。0 = 关闭
+    vac_slice: Arc<AtomicU64>,
+    /// 自动回收：自上一轮以来新写入的版本行数
+    vac_pending: Arc<AtomicU64>,
+    /// 自动回收：下一片从哪个逻辑 key 之后继续（`None` = 从头）
+    vac_cursor: Arc<Mutex<Option<Vec<u8>>>>,
     db_dir: PathBuf,
     /// 持有期间保证单写者
     _lock: FileLock,
@@ -56,6 +62,8 @@ pub struct Transaction {
     pub(crate) active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
     next_version: Arc<AtomicU64>,
     wal_limit: Arc<AtomicU64>,
+    /// 提交时把本事务写的版本行数记到自动回收的账上
+    vac_pending: Arc<AtomicU64>,
     version: u64,
     active_xid: HashSet<u64>,
 }
@@ -246,6 +254,9 @@ impl MVCC {
             active_txn: Arc::new(Mutex::new(HashMap::new())),
             next_version: Arc::new(AtomicU64::new(start_ver)),
             wal_limit: Arc::new(AtomicU64::new(MVCC::WAL_CHECKPOINT_BYTES_DEFAULT)),
+            vac_slice: Arc::new(AtomicU64::new(MVCC::VACUUM_AUTO_SLICE_DEFAULT)),
+            vac_pending: Arc::new(AtomicU64::new(0)),
+            vac_cursor: Arc::new(Mutex::new(None)),
             db_dir,
             _lock: lock,
         })
@@ -266,6 +277,7 @@ impl MVCC {
     }
 
     pub fn begin_transaction(&self) -> Transaction {
+        self.tick_auto_vacuum();
         Transaction::begin(
             self.kv.clone(),
             self.blob.clone(),
@@ -273,8 +285,61 @@ impl MVCC {
             self.active_txn.clone(),
             self.next_version.clone(),
             self.wal_limit.clone(),
+            self.vac_pending.clone(),
         )
     }
+
+    /// 自动回收的一小步：攒够 `vac_slice` 行新版本，就裁同样宽度的**一片**。
+    ///
+    /// 挂在 `begin_transaction` 而不是 commit 上：这一处还没有本线程的活跃事务，
+    /// `vacuum_bounded` 的「有活跃事务就整轮跳过」不会被自己的调用方踩中；而且每个
+    /// 事务至少 begin 一次，攒账的节奏和写路径一样。
+    ///
+    /// 触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率 1:1，这是「跟得上」的下界；
+    /// 一片的代价 = 读 `slice` 行元数据（不读 value），锁也就按这么久。
+    /// 长尾那一片（库尾之后）会自动从头开始下一遍。
+    fn tick_auto_vacuum(&self) {
+        let slice = self.vac_slice.load(Ordering::SeqCst);
+        if slice == 0 {
+            return;
+        }
+        // 注意不能 swap：tick 每次 begin 都会跑，swap 会把还没攒够的账清零 ⇒ 永远到不了阈值
+        let seen = self.vac_pending.load(Ordering::SeqCst);
+        if seen < slice {
+            return;
+        }
+        // CAS 失败说明别的线程已经取走这笔账并在裁，本轮让给它（单写者模型下走不到）
+        if self
+            .vac_pending
+            .compare_exchange(seen, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let after = self.vac_cursor.lock().unwrap().clone();
+        if let Ok(round) = self.vacuum_bounded(after.as_deref(), slice) {
+            *self.vac_cursor.lock().unwrap() = round.next_cursor;
+        }
+    }
+
+    /// 自动回收的切片宽度（行数）：每攒够这么多行新版本，就裁一片这么多行。
+    ///
+    /// 默认 [`MVCC::VACUUM_AUTO_SLICE_DEFAULT`]；**设 0 关闭自动回收**，那时版本行只增不减，
+    /// 得靠手动 `vacuum()` —— 也就是回到「热点 key 堆二十万版、点读陪跑整条链」的状态。
+    pub fn set_vacuum_auto_slice(&self, rows: u64) {
+        self.vac_slice.store(rows, Ordering::SeqCst);
+    }
+
+    pub fn vacuum_auto_slice(&self) -> u64 {
+        self.vac_slice.load(Ordering::SeqCst)
+    }
+
+    /// 默认切片宽度 = 16 Ki 行。
+    ///
+    /// 依据：一片的代价是读 16 Ki 行元数据（KeyDir 内存遍历，不读 value），单核机器上
+    /// 亚毫秒级；而事故现场那条链有 23.8 万行 —— 默认值开着他就会在自己被需要之前
+    /// 被裁掉。设这么小是为了「每次只挡一小下」，不是省总开销。
+    pub const VACUUM_AUTO_SLICE_DEFAULT: u64 = 16 * 1024;
 
     /// 开启 bulk load：单写者、无 WAL、无冲突检测。
     ///
@@ -358,8 +423,9 @@ impl MVCC {
     /// 堆了 23.8 万版时，裁它这一下就得一次读 23.8 万行元数据（走 KeyDir，不读 value）。
     /// 这是本设计明确接受的代价。
     ///
-    /// blob 回收与日志压缩只在**最后一轮**（`next_cursor == None`）做：两者都是全库代价，
-    /// 放进中间轮等于每轮重写一遍库。
+    /// blob 回收与日志压缩只在**全库轮次**（`budget_rows == u64::MAX`，也就是手动
+    /// [`MVCC::vacuum`]）做：两者都是全库代价。判据不能是「游标回到 None」—— 一把 key 的
+    /// 小库任何一片都正好读到库尾，那样自动回收每轮都会重写一遍库。
     ///
     /// 为什么要切片：自动回收要能在单核机器上跑，而 [`MVCC::vacuum`] 会把 kv 锁按到整库
     /// 扫完 —— 那期间点读点写全在排队。切片后每轮只按住一小段。
@@ -474,15 +540,18 @@ impl MVCC {
         kv.flush()?;
         blob.sync()?;
 
-        // Blob GC / 日志压缩都是**全库代价**，只在这一轮扫到库尾时才做 ——
-        // 放进中间轮等于每轮重写一遍库。
+        // Blob GC / 日志压缩都是**全库代价**，只在这一次调用本来就是全库扫描时才做。
+        // 判据用 `budget_rows` 而不是「游标回到 None」：一个只有一把 key 的小库，任何
+        // 有界轮次都会正好读到库尾 —— 用游标判断会让自动回收每轮都重写一遍库。
+        // 也就是说：有界轮次只裁行，全库收尾（blob 重写 + merge）归手动 `vacuum()`。
         //
         // Blob GC：
         // - 无任何 blob 引用 → clear
         // - 仍有引用 → rewrite_in_place 只保留存活大 value，并更新 KeyDir 中的指针
         //
         // 只读上面 `keep` 里的行（旧实现这里又走一遍全库 iter()）。
-        let blob_rewritten = if next_cursor.is_some() {
+        let full_sweep = budget_rows == u64::MAX;
+        let blob_rewritten = if !full_sweep {
             false
         } else {
             let mut blob_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (enc_key, full_user_value)
@@ -528,8 +597,8 @@ impl MVCC {
             }
         };
 
-        // 压缩：丢掉已硬删除的空间
-        if next_cursor.is_none() && (removed > 0 || blob_rewritten) {
+        // 压缩：丢掉已硬删除的空间（同样只在全库轮次）
+        if full_sweep && (removed > 0 || blob_rewritten) {
             let _ = kv.merge();
         }
 
@@ -719,6 +788,7 @@ impl Transaction {
         active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
         next_version: Arc<AtomicU64>,
         wal_limit: Arc<AtomicU64>,
+        vac_pending: Arc<AtomicU64>,
     ) -> Self {
         let version = next_version.fetch_add(1, Ordering::SeqCst);
         let active_txn_arc = Arc::clone(&active_txn);
@@ -740,6 +810,7 @@ impl Transaction {
             active_txn: active_txn_arc,
             next_version,
             wal_limit,
+            vac_pending,
             version,
             active_xid,
         }
@@ -921,9 +992,14 @@ impl Transaction {
     }
 
     pub fn commit_with_options(&self, flush_data: bool) {
-        {
+        let rows_written = {
             let mut active_txn = self.active_txn.lock().unwrap();
-            active_txn.remove(&self.version);
+            active_txn.remove(&self.version).map(|k| k.len()).unwrap_or(0)
+        };
+        // 给自动回收记一笔账：本事务写了多少个版本行。用「逻辑 key 数」近似行数
+        // （一个 key 在同事务里覆写多次只计 1）—— 宁可少算，也不要为了精确再走一遍写集。
+        if rows_written > 0 {
+            self.vac_pending.fetch_add(rows_written as u64, Ordering::SeqCst);
         }
         {
             let mut wal = self.wal.lock().unwrap();
@@ -1343,6 +1419,70 @@ mod tests {
             let t2 = mvcc.begin_transaction();
             assert_eq!(t2.get(b"hot"), Some(b"v2".to_vec()), "裁完应读到最新版本");
             t2.rollback();
+        }
+        cleanup(&path);
+    }
+
+    /// 长跑进程不喊 vacuum，版本链也不能无限涨（I2：垃圾必须自己回来）。
+    ///
+    /// 事故那条曲线的本质就是版本行只增不减 —— 一天/一个多月里 CPU 慢慢爬。
+    /// 这里把切片宽度调到 8 行，写 200 版热点 key，断言：
+    /// 1. 没人叫过 vacuum，链也被压住（自动回收到位在跑）；
+    /// 2. 最新值始终读得到 —— 自动裁的是旧版本，不是可见版本；
+    /// 3. 默认是**开着**的（关掉它就等于把这次事故原样留给下一个项目）。
+    #[test]
+    fn test_auto_vacuum_reclaims_without_being_asked() {
+        const CHAIN: u64 = 200;
+        const SLICE: u64 = 8;
+
+        let path = tmp_db("auto_vac");
+        {
+            let mvcc = MVCC::open(&path);
+            assert_eq!(
+                mvcc.vacuum_auto_slice(),
+                MVCC::VACUUM_AUTO_SLICE_DEFAULT,
+                "自动回收默认必须开着"
+            );
+            mvcc.set_vacuum_auto_slice(SLICE);
+
+            for i in 0..CHAIN {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+
+            let h = mvcc.health();
+            assert!(
+                h.max_chain <= SLICE + 2,
+                "没人喊 vacuum，链却涨到 {} 行 —— 自动回收没在工作",
+                h.max_chain
+            );
+
+            let tx = mvcc.begin_transaction();
+            assert_eq!(tx.get(b"hot"), Some(format!("v{}", CHAIN - 1).into_bytes()));
+            tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// 关掉的开关必须真关掉：自动回收不能是「没法关掉的那种」。
+    ///
+    /// 有了它就允许上层把回收完全交给自己调度（比如只在交易空档跑），
+    /// 也保证默认值不是「悄悄多做了一件事」。
+    #[test]
+    fn test_auto_vacuum_off_switch() {
+        const CHAIN: u64 = 60;
+
+        let path = tmp_db("auto_off");
+        {
+            let mvcc = MVCC::open(&path);
+            mvcc.set_vacuum_auto_slice(0);
+            for i in 0..CHAIN {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+            assert_eq!(mvcc.health().max_chain, CHAIN, "关闭后不该裁掉任何一版");
         }
         cleanup(&path);
     }

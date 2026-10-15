@@ -239,6 +239,16 @@ pub trait KvEngine {
     /// 按分钟级采样足够。
     fn health(&self) -> MvccHealth;
 
+    /// 自动回收的切片宽度（版本行数）：每攒够这么多行新版本，引擎自己裁一片这么多行。
+    ///
+    /// 默认开着（四引擎同一个默认值 16 Ki 行）。**设 0 才是关闭** —— 那时版本行只增不减，
+    /// 得靠上层定时调 [`KvEngine::vacuum`]。关掉是有意的取舍（比如只想在交易空档回收），
+    /// 但不是缺省：这次的事故本质就是「没人喊，于是垃圾永久累积」。
+    fn set_vacuum_auto_slice(&self, rows: u64);
+
+    /// 读回当前的自动回收切片宽度（`0` = 已关闭）
+    fn vacuum_auto_slice(&self) -> u64;
+
     /// 落盘数据（内存引擎为 no-op）
     fn flush(&self) -> Result<()>;
 
@@ -372,6 +382,14 @@ macro_rules! impl_engine {
 
             fn health(&self) -> MvccHealth {
                 self.inner.health()
+            }
+
+            fn set_vacuum_auto_slice(&self, rows: u64) {
+                self.inner.set_vacuum_auto_slice(rows)
+            }
+
+            fn vacuum_auto_slice(&self) -> u64 {
+                self.inner.vacuum_auto_slice()
             }
 
             impl_engine!(@vacuum $vacuum);
@@ -921,6 +939,56 @@ mod tests {
             assert_eq!(after.max_chain, 1, "{name}: vacuum 后最长链应降到 1");
             assert_eq!(after.total_rows, 3, "{name}: vacuum 后应只剩每 key 一行");
 
+            drop(db);
+        }
+        cleanup(dirs);
+    }
+
+    /// 自动回收必须**默认开着**，而且四引擎都开着 —— 只有一家开就等于把事故留给换引擎的那天。
+    ///
+    /// 上层只通过门面打交道，所以这条走的是 `KvEngine::{vacuum_auto_slice,
+    /// set_vacuum_auto_slice, health}`：不叫 vacuum，链也不能无限涨；关掉的开关要真能关掉。
+    #[test]
+    fn all_engines_auto_reclaim_by_default() {
+        const CHAIN: u64 = 200;
+        const SLICE: u64 = 8;
+
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            assert_eq!(
+                db.vacuum_auto_slice(),
+                16 * 1024,
+                "{name}: 自动回收默认必须开着"
+            );
+            db.set_vacuum_auto_slice(SLICE);
+
+            for i in 0..CHAIN {
+                let tx = db.begin();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()), "{name} 第 {i} 次写入被拒");
+                tx.commit();
+            }
+            let h = db.health();
+            assert!(
+                h.max_chain <= SLICE + 2,
+                "{name}: 没人喊 vacuum，链却涨到 {} 行 —— 自动回收没在工作",
+                h.max_chain
+            );
+
+            // 关掉的开关必须真关掉
+            db.set_vacuum_auto_slice(0);
+            for i in 0..30 {
+                let tx = db.begin();
+                assert!(tx.set(b"cold", format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+            let off = db.health();
+            assert_eq!(off.live_keys, h.live_keys + 1, "{name}: 应多出 cold 这把 key");
+            assert_eq!(
+                off.max_chain, 30,
+                "{name}: 关闭自动回收后不该裁掉任何一版（链应等于写入次数）"
+            );
             drop(db);
         }
         cleanup(dirs);

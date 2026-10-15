@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 166 个单元测试 + 4 个集成测试
+- 210 个单元测试 + 4 个集成测试
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -183,6 +183,31 @@ fn is_visible(&self, version: u64) -> bool {
 
 ⚠️ 挂着的活跃事务会让回收永久停摆,所以 `Transaction` 实现了 `Drop`:忘了 commit/rollback 的事务在离开作用域时自动回滚并退出活跃表,不再钉住 `xmin`。
 
+### 自动回收(默认开着)
+
+上面那套规则如果只能靠人喊 `vacuum()`,就等于什么都没修 —— 事故的本质正是「没人喊,于是垃圾永久累积」。所以四引擎都自带回收:
+
+- 提交时按事务写集给 `vac_pending` 记一笔账(近似:算逻辑 key 数)
+- `begin_transaction()` 检查这笔账:攒够一个切片宽度,就当场裁**一片**同样宽度的行
+- 切片宽度默认 **16 Ki 行**,四引擎同一个值;`set_vacuum_auto_slice(0)` 关闭
+
+触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率 1:1,这是「跟得上」的下界。挂在 begin 而不是 commit:那一处还没有本线程的活跃事务,不会被自己的「有活跃事务就跳过」踩中。
+
+一片的代价是读 16 Ki 行元数据(不物化 value),单核机器上亚毫秒级,锁也只按这么久。**有界轮次不做全库收尾**(Bitcask 的 blob 重写与 `merge()`、B+ 树的 blob 清空、LSM 的 `set_mvcc_xmin_filter`)——判据是「这次调用是不是全库扫描」(`budget_rows == u64::MAX`),而不是「游标有没有回到库尾」:一把 key 的小库任何一片都正好读到库尾,用游标判断会让自动回收每轮都重写一遍库。
+
+### 有界回收 `vacuum_bounded(after, budget_rows)`
+
+```rust
+let mut cursor = None;
+loop {
+    let round = mvcc.vacuum_bounded(cursor.as_deref(), 100_000)?;
+    // round.stats.rows_scanned / versions_removed / round.next_cursor
+    match round.next_cursor { Some(c) => cursor = Some(c), None => break }
+}
+```
+
+`vacuum()` 就是 `budget_rows = u64::MAX` 的一轮,两者共用同一份保留规则。截断只发生在**逻辑 key 边界**:半条链不能收,因为「留哪一版」的判据要求整组版本都在手上 —— 所以一片实际读的行数可能超出预算,超出量 = 那一条链的长度。这是本设计明确接受的代价(也是游标前进的下界:每轮至少前进一组)。
+
 ### health 观测
 
 `MVCC::health()`(四引擎同名同口径,门面层 `KvEngine::health()` 直接转发)返回 `MvccHealth`:
@@ -330,7 +355,7 @@ blob:   [0x01] offset(u64 LE) len(u32 LE)   —— 共 13 字节
 
 | trait | 用途 |
 |---|---|
-| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `flush` / `checkpoint` / `merge` |
+| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `health` / `set_vacuum_auto_slice` / `flush` / `checkpoint` / `merge` |
 | `KvTxn` | 读写 / 批量 / 扫描 / 搜索分页 / TTL / `commit` / `rollback` |
 | `KvBulk` | 批量导入,无冲突检测、不写 WAL |
 
@@ -522,12 +547,12 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:166 单元 + 4 集成 + 2 文档测试
-cargo test --lib engine::     # 只跑门面层(12 个,四引擎全覆盖)
+cargo test                    # 全部:210 单元 + 4 集成 + 2 文档测试
+cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```
 
-门面层的测试是**四个引擎跑同一套断言**的,覆盖增删查、批量与扫描、写冲突、bulk 导入、TTL 与元数据、vacuum 与 flush —— 这也是验证「四引擎行为一致」的地方。
+门面层的测试是**四个引擎跑同一套断言**的,覆盖增删查、批量与扫描、写冲突、bulk 导入、TTL 与元数据、vacuum 与 flush、`health()` 读数一致、自动回收默认开着且能被关掉 —— 这也是验证「四引擎行为一致」的地方。换引擎只改变涨速,不变的是要盯的那些指标,所以这一层必须按「四家同尺度」断言。
 
 集成测试会在 `./data/<引擎名>/` 下建演示库,不污染仓库根目录。
 
