@@ -170,7 +170,7 @@ fn is_visible(&self, version: u64) -> bool {
 
 ### vacuum 版本回收
 
-回收水位 `xmin` = 最小活跃事务 id(无活跃事务时取 `next_version`)。保留策略:
+回收水位 `xmin`:**只要还有活跃事务就整轮跳过**(`VacuumStats::skipped_active_txn = true`),没有活跃事务时取 `next_version`。保留策略:
 
 > 每个 key 只保留「**最后一个** `version < xmin`」+ 全部 `version >= xmin`;
 > 若 xmin 之前最终是 tombstone 且无更新版本 → 整个 key 删除。
@@ -179,7 +179,25 @@ fn is_visible(&self, version: u64) -> bool {
 
 最后一条规则是墓碑的最终回收,否则 tombstone 会永久累积。
 
-⚠️ **事务必须 commit 或 rollback**,否则它一直挂在活跃表里,`xmin` 上不去,vacuum 什么都回收不掉。
+为什么是「整轮跳过」而不是按 `min(活跃事务 id)` 精确算水位:精确算法一旦漏算任何一个活跃事务,裁掉的正是那个事务快照还需要的版本 ⇒ 它**静默读到旧值**——不报错、不 panic,只在下游对不上账时才发现。保守跳过最多让回收推迟一轮,而错误的水位线是不可逆的数据错误。两害相权,宁可慢一轮。
+
+⚠️ 挂着的活跃事务会让回收永久停摆,所以 `Transaction` 实现了 `Drop`:忘了 commit/rollback 的事务在离开作用域时自动回滚并退出活跃表,不再钉住 `xmin`。
+
+### health 观测
+
+`MVCC::health()`(四引擎同名同口径,门面层 `KvEngine::health()` 直接转发)返回 `MvccHealth`:
+
+| 字段 | 含义 |
+|------|------|
+| `total_rows` | 物理行数(含历史版本与墓碑) |
+| `live_keys` | 逻辑 key 个数 |
+| `max_chain` | 单个逻辑 key 的最长版本链 |
+| `rows_above_one` | `total_rows - live_keys`,即「超出每 key 一行」的多余行数 |
+| `active_txns` | 当前活跃事务数,> 0 时 vacuum 会整轮跳过 |
+
+`max_chain` 就是那次 CPU 事故唯一的先行指标:某把热点 key 堆到 23.8 万个版本时,点读要点走 23.8 万行。此前这个数只能靠人工数日志得到,现在库自己报。
+
+实现只走元数据/键视图,不物化任何 value(每个引擎都有对应的守卫测试),但代价仍是 **O(物理行数)**——属管理面调用:按分钟级采样足够,别放进热路径。
 
 ### WAL 与崩溃恢复
 
@@ -194,6 +212,8 @@ rollback: append Abort → fsync → 物理删本事务版本行
 ```
 
 恢复时 `analyze_recovery` 单趟扫描分出两个集合:有 `Commit` 的 **REDO**,有 `Abort` 的和崩溃时进行中的 **UNDO**(无提交记录即视为回滚)。REDO 靠版本键天然幂等(同键覆盖),重放多次结果一致。
+
+WAL 不需要手动收口:增长到阈值(默认 16 MiB,`set_wal_checkpoint_limit` 可改,设 0 关闭)就在**下一次提交后**自动 checkpoint——写回一条 `Checkpoint` 记录并截断文件。`memory` 引擎无 WAL。阈值触发和手动 `checkpoint()` 走同一份实现,顺序都是「先落数据/页,最后才截 WAL」:WAL 一旦被截,未落盘的行就再无重放来源。
 
 ---
 

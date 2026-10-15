@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::common::{
-    ExportRecord, IncrError, KeyMeta, SearchPage, SearchQuery, VacuumStats,
+    ExportRecord, IncrError, KeyMeta, MvccHealth, SearchPage, SearchQuery, VacuumStats,
 };
 
 /// 门面层错误
@@ -230,6 +230,15 @@ pub trait KvEngine {
     /// 回收旧版本
     fn vacuum(&self) -> Result<VacuumStats>;
 
+    /// 全库健康度快照：物理行数、逻辑 key 数、**最长版本链**、活跃事务数。
+    ///
+    /// 这是给长跑进程做采样用的观测面 —— 这次事故的唯一征兆就是「某把热点 key 的
+    /// 版本链长度」，而它此前只能靠人工数日志得到。四引擎口径一致，换引擎时指标可直接对比。
+    ///
+    /// 代价是 O(物理行数)（引擎内部只走元数据/键，不物化 value），所以**别放进热路径**，
+    /// 按分钟级采样足够。
+    fn health(&self) -> MvccHealth;
+
     /// 落盘数据（内存引擎为 no-op）
     fn flush(&self) -> Result<()>;
 
@@ -359,6 +368,10 @@ macro_rules! impl_engine {
 
             fn export_latest_visible(&self, include_deleted: bool) -> Vec<ExportRecord> {
                 self.inner.export_latest_visible(include_deleted)
+            }
+
+            fn health(&self) -> MvccHealth {
+                self.inner.health()
             }
 
             impl_engine!(@vacuum $vacuum);
@@ -630,12 +643,18 @@ mod tests {
     use super::*;
 
     /// 在临时目录里跑一遍所有磁盘引擎 + memory
+    ///
+    /// 计数器不可省：Windows 上 `SystemTime` 的粒度约 15.6ms，而 `open_all()` 生成的
+    /// 目录名只带 tag —— 并发跑的两个用同一 tag 的测试会拿到**同一个目录、同一把 .lock**，
+    /// 后来者直接 `WouldBlock`（表现为随机的偶发红）。
     fn tmp_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("se_engine_{tag}_{nanos}"));
+        let dir = std::env::temp_dir().join(format!("se_engine_{tag}_{nanos}_{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -865,5 +884,45 @@ mod tests {
         }
         drop(engines);
         cleanup(dirs.into_iter().map(Some).collect());
+    }
+
+    /// 门面必须让上层**不看引擎源码**就能问出「最长版本链有多长」。
+    ///
+    /// 换引擎只是换了涨速（LSM 一天、Bitcask 一个多月），盯的指标是同一个 ——
+    /// 所以四家在这一组断言上必须给出完全相同的读数，否则跨引擎对比没有意义。
+    #[test]
+    fn all_engines_report_the_same_health() {
+        const CHAIN: u64 = 100;
+
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            for i in 0..CHAIN {
+                let tx = db.begin();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()), "{name} 第 {i} 次写入被拒");
+                tx.commit();
+            }
+            for k in 0..2u64 {
+                let tx = db.begin();
+                assert!(tx.set(format!("other{k}").as_bytes(), b"x".to_vec()));
+                tx.commit();
+            }
+
+            let h = db.health();
+            assert_eq!(h.live_keys, 3, "{name}: 逻辑 key 数");
+            assert_eq!(h.total_rows, CHAIN + 2, "{name}: 物理行数（含历史版本）");
+            assert_eq!(h.max_chain, CHAIN, "{name}: 最长版本链应由库自己报出来");
+            assert_eq!(h.rows_above_one, CHAIN - 1, "{name}: 多余行数");
+            assert_eq!(h.active_txns, 0, "{name}: 无活跃事务");
+
+            db.vacuum().expect("vacuum");
+            let after = db.health();
+            assert_eq!(after.max_chain, 1, "{name}: vacuum 后最长链应降到 1");
+            assert_eq!(after.total_rows, 3, "{name}: vacuum 后应只剩每 key 一行");
+
+            drop(db);
+        }
+        cleanup(dirs);
     }
 }

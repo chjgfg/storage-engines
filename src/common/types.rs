@@ -29,6 +29,30 @@ pub struct VacuumStats {
     pub skipped_active_txn: bool,
 }
 
+/// 全库健康度快照 —— 让库自己说得出「版本链到底有多长」。
+///
+/// 这次事故的量化核心（某个热点 key 堆了 23.8 万个版本）从头到尾是靠
+/// `grep data.log | uniq -c` 数出来的；一个当基座用的库不该靠这个诊断自己。
+///
+/// 四个引擎共用同一份定义：`health()` 的口径必须跨引擎可比 —— 换引擎只是换了
+/// 涨速，盯的指标是同一个。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MvccHealth {
+    /// 物理行数（含历史版本与墓碑）
+    pub total_rows: u64,
+    /// 不同逻辑 key 的个数
+    pub live_keys: u64,
+    /// 单个逻辑 key 的最长版本链
+    pub max_chain: u64,
+    /// 超出「每 key 一行」的多余行数 = total_rows - live_keys。
+    ///
+    /// 这是「链没被裁过」的量级指标，**不等于** vacuum 能裁掉多少
+    /// （vacuum 还要留「最后一个 < xmin」那一版，墓碑另有规则）。
+    pub rows_above_one: u64,
+    /// 当前活跃事务数：> 0 时 vacuum 会整轮跳过
+    pub active_txns: u64,
+}
+
 /// 解析逻辑 value 信封
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueMeta {

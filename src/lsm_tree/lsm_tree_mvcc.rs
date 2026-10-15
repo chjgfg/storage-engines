@@ -40,7 +40,7 @@ use std::{
 use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
 use crate::lsm_tree::storage::{wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{ExportRecord, VacuumStats};
+pub use crate::common::{ExportRecord, MvccHealth, VacuumStats};
 
 /// MVCC 存储引擎（LSM 后端）
 pub struct MVCC {
@@ -269,6 +269,43 @@ impl MVCC {
         let records = tx.export_latest_visible(include_deleted);
         tx.commit();
         records
+    }
+
+    /// 全库健康度快照。**只走轻量视图**（`scan_latest_light`：版本号 + 是不是墓碑），
+    /// 一趟、不物化任何 value。
+    ///
+    /// `kind == 2`（[`crate::lsm_tree::lsm_tree::EntryValue::Drop`]，已被硬删的行）不计入
+    /// —— 和 [`MVCC::vacuum`] 看到的行集合严格一致，否则「vacuum 把 max_chain 压到 1」
+    /// 这条守卫会对不上。口径与 [`crate::bitcask::MVCC::health`] 一致。
+    pub fn health(&self) -> MvccHealth {
+        // 一次只持一把锁：先读完 `active_txn` 计数就放，再拿 `kv`。
+        // 嵌套持有会和 [`MVCC::vacuum`]（`active_txn → kv`）构成反向嵌套。
+        let active_txns = self.active_txn.lock().unwrap().len() as u64;
+        let kv = self.kv.lock().unwrap();
+        let mut h = MvccHealth { active_txns, ..Default::default() };
+        let mut prev_raw: Option<Vec<u8>> = None;
+        let mut cur_chain = 0u64;
+        // merge_streaming 按 enc 升序输出 ⇒ 同一逻辑 key 的版本块相邻 ⇒ 顺序分组，一趟就够
+        for (enc, le) in kv.scan_latest_light(u64::MAX) {
+            if le.kind == 2 {
+                continue;
+            }
+            let Some(vk) = decode_key(&enc) else {
+                continue;
+            };
+            h.total_rows += 1;
+            if prev_raw.as_ref() == Some(&vk.raw_key) {
+                cur_chain += 1;
+            } else {
+                h.max_chain = h.max_chain.max(cur_chain);
+                h.live_keys += 1;
+                cur_chain = 1;
+                prev_raw = Some(vk.raw_key);
+            }
+        }
+        h.max_chain = h.max_chain.max(cur_chain);
+        h.rows_above_one = h.total_rows.saturating_sub(h.live_keys);
+        h
     }
 
     /// 版本回收（vacuum）。
@@ -1463,6 +1500,56 @@ mod tests {
         drop(m1);
         let m2 = MVCC::try_open(&path).unwrap();
         drop(m2);
+        cleanup(&path);
+    }
+
+    /// 库必须能自己报出「最长版本链」。
+    ///
+    /// 这次事故的核心数字（某把热点 key 堆了多少个版本）一直是靠数日志行数得出来的 ——
+    /// 一个当基座用的库不该靠这个诊断自己。四引擎共用同一份 `MvccHealth`，
+    /// 所以换引擎时这两组断言必须照样成立（涨速不同，指标是同一个）。
+    ///
+    /// 先 `flush()` 让版本行落在 SST 里：这样走的是 `light_view` + 跨源归并那条路，
+    /// 而不是全在 memtable 里读内存。
+    #[test]
+    fn test_health_reports_chain_length() {
+        const CHAIN: u64 = 500;
+
+        let path = tmp_db("health");
+        {
+            let mvcc = MVCC::open(&path);
+            for i in 0..CHAIN {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()), "第 {i} 次写入被拒");
+                tx.commit();
+            }
+            for k in 0..3u64 {
+                let key = format!("other{k}");
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key.as_bytes(), b"x".to_vec()));
+                tx.commit();
+            }
+            mvcc.flush();
+
+            let base = crate::lsm_tree::sst::value_materializations();
+            let h = mvcc.health();
+            let used = crate::lsm_tree::sst::value_materializations() - base;
+            assert_eq!(h.live_keys, 4, "逻辑 key 数");
+            assert_eq!(h.total_rows, CHAIN + 3, "物理行数（含历史版本）");
+            assert_eq!(h.max_chain, CHAIN, "最长版本链应由库自己报出来");
+            assert_eq!(h.rows_above_one, CHAIN - 1);
+            assert_eq!(h.active_txns, 0);
+            // 采样链长这件事本身不该物化任何 value
+            assert_eq!(used, 0, "health 期间 value 物化次数：{used}（历史行数 {}）", h.total_rows);
+
+            let stats = mvcc.vacuum().unwrap();
+            assert!(!stats.skipped_active_txn, "无活跃事务时不该跳过");
+            let after = mvcc.health();
+            assert_eq!(after.max_chain, 1, "vacuum 后最长链应降到 1");
+            assert_eq!(after.total_rows, 4, "vacuum 后应只剩每 key 一行");
+            assert_eq!(after.live_keys, 4);
+            assert_eq!(after.rows_above_one, 0);
+        }
         cleanup(&path);
     }
 }

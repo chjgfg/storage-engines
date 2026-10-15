@@ -12,5 +12,6 @@ pub use codec::{
     prefix_upper_bound,
 };
 pub use types::{
-    ExportRecord, IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery, VacuumStats, ValueMeta,
+    ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage, SearchQuery,
+    VacuumStats, ValueMeta,
 };
