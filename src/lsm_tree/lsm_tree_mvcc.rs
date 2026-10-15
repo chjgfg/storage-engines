@@ -295,16 +295,25 @@ impl MVCC {
 
         let mut kv = self.kv.lock().unwrap();
 
-        let all: Vec<(Vec<u8>, Option<Vec<u8>>)> = kv.iter().collect();
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, Option<Vec<u8>>)>> = BTreeMap::new();
-        for (enc, val) in all {
+        // 分组走 M3a 为折叠引入的轻量视图：判「留哪一版」只需要版本号 + 是不是墓碑。
+        // 旧实现用 `kv.iter()`，而它会先把**每个源整个 collect() 进内存（连 value）**
+        // ⇒ 一次 vacuum 的峰值内存约等于整个库。
+        //
+        // 语义与 `iter()` 严格对齐：`kind == 2`（EntryValue::Drop）整行不参与
+        // （iter 的 filter_map 就是把它丢掉）；`Put(None)` 才是「逻辑删除行」，
+        // 对应旧代码的 `val.is_none()`。
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
+        for (enc, le) in kv.scan_latest_light(u64::MAX) {
+            if le.kind == 2 {
+                continue;
+            }
             let Some(vk) = decode_key(&enc) else {
                 continue;
             };
             by_key
                 .entry(vk.raw_key)
                 .or_default()
-                .push((vk.version, enc, val));
+                .push((vk.version, enc, le.kind == 1));
         }
 
         let mut removed = 0usize;
@@ -323,7 +332,7 @@ impl MVCC {
                     to_delete.push(versions[i].1.clone());
                     removed += 1;
                 }
-                let old_is_tomb = versions[keep_old].2.is_none();
+                let old_is_tomb = versions[keep_old].2;
                 let has_newer = versions.iter().any(|(v, _, _)| *v >= xmin);
                 if old_is_tomb && !has_newer {
                     to_delete.push(versions[keep_old].1.clone());
@@ -1034,6 +1043,53 @@ mod tests {
                 KEYS * VERSIONS
             );
             tx.rollback();
+        }
+        cleanup(&path);
+    }
+
+    /// vacuum 的分组阶段不该再把每行的 value 物化出来。
+    ///
+    /// 量尺用「带 value 的条目物化次数」（挂在 `SstEntryIter::next` / `mem_view_at` 上）。
+    /// 注意 vacuum 尾部的 flush→compact 本来就要把**存活行**读一遍重写 SST，那部分是
+    /// compaction 的本职、不是 vacuum 的浪费 —— 所以界按存活行数量级给（`KEYS × 8`），
+    /// 不按历史行数。实测 0 次（未修前是 1200 次）。
+    #[test]
+    fn test_vacuum_does_not_materialize_values() {
+        const CHAIN: u64 = 300;
+        const KEYS: u64 = 4;
+
+        let path = tmp_db("vacuum_mat");
+        {
+            let mvcc = MVCC::open(&path);
+            for i in 0..CHAIN {
+                for k in 0..KEYS {
+                    let key = format!("k{k}");
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(key.as_bytes(), format!("v{i}").into_bytes()));
+                    tx.commit();
+                }
+            }
+            // 落到 SST，让重量路径有机会被走到
+            mvcc.flush();
+
+            let base = crate::lsm_tree::sst::value_materializations();
+            let stats = mvcc.vacuum().unwrap();
+            let used = crate::lsm_tree::sst::value_materializations() - base;
+            eprintln!(
+                "vacuum 期间带 value 条目物化次数：{used}（裁掉 {} 行，历史行数 {}）",
+                stats.versions_removed,
+                CHAIN * KEYS
+            );
+            assert_eq!(
+                stats.versions_removed,
+                ((CHAIN - 1) * KEYS) as usize,
+                "每 key 留一版，其余都该裁掉"
+            );
+            assert!(
+                used <= (KEYS * 8) as u64,
+                "vacuum 分组不该物化每行 value：实际 {used} 次，而历史行数是 {}",
+                CHAIN * KEYS
+            );
         }
         cleanup(&path);
     }
