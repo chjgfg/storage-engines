@@ -13,6 +13,26 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
+// 测试专用：本线程被访问的**行数**（`range_scan` / `range_back` 返回的行数累加）。
+//
+// 内存引擎没有磁盘读，所以「代价」的对应物就是扫过多少行 —— 用来把
+// 「一次点操作的代价不随版本链长度增长」这条不变量钉成断言。
+#[cfg(test)]
+thread_local! {
+    static ROWS_TOUCHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已访问的行数（测试探针用）
+#[cfg(test)]
+pub(crate) fn rows_touched() -> u64 {
+    ROWS_TOUCHED.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn count_rows(n: usize) {
+    ROWS_TOUCHED.with(|c| c.set(c.get() + n as u64));
+}
+
 /// 内存有序多版本表
 #[derive(Debug, Default, Clone)]
 pub struct MemStore {
@@ -46,10 +66,34 @@ impl MemStore {
     ///
     /// 与 bplus `range_scan` 对齐：调用方用 `encode(key,0)` / `encode(key,MAX)` 圈住同 raw_key 的全部版本。
     pub fn range_scan(&self, low: &[u8], high: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-        self.data
+        let rows = self
+            .data
             .range((Bound::Included(low.to_vec()), Bound::Included(high.to_vec())))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        count_rows(rows.len());
+        rows
+    }
+
+    /// **[low, high] 内从大到小最多取 `max` 行**（区间末尾，不物化整段）。
+    ///
+    /// 返回行数 `< max` 说明已走到区间下界 —— 调用方由此可以断定「整段都看过了」，
+    /// 从而在只需要区间末尾几行时提前退出。
+    ///
+    /// MVCC 用它取版本链的**链尾**：版本键 `raw_key ‖ version.to_be_bytes()` 大端有序，
+    /// 所以同一逻辑 key 的最新版本一定排在最后。
+    pub fn range_back(&self, low: &[u8], high: &[u8], max: usize) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let rows = self
+            .data
+            .range((Bound::Included(low.to_vec()), Bound::Included(high.to_vec())))
+            .rev()
+            .take(max)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        count_rows(rows.len());
+        rows
     }
 
     /// 全表有序迭代（克隆 value，教学清晰）

@@ -251,6 +251,12 @@ impl Drop for BulkLoader {
     }
 }
 
+/// 链尾反向查找的首轮预算，不够再翻倍重试。
+///
+/// 常态下一个逻辑 key 只有个位数版本，32 足够一次命中；翻倍只在
+/// 「整条链没有一个满足条件」的退化场景才付到 O(链长)，与旧的整链扫描同阶。
+const VERSION_BACK_STEP: usize = 32;
+
 /// 未终结（既没 commit 也没 rollback）就被丢弃的事务在此自动回滚。
 ///
 /// 漏网事务会永久留在 `active_txn` 里：`xmin = min(活跃事务 id)` 被一个已死的 id 压住
@@ -328,39 +334,20 @@ impl Transaction {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let store = self.store.lock().unwrap();
-        let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-
-        for (enc, row) in Self::scan_key_versions(&store, key) {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            if vk.raw_key.as_slice() != key {
-                continue;
-            }
-            if self.is_visible(vk.version) {
-                best = Some((vk.version, row));
-            }
-        }
-        best.and_then(|(_, v)| v.and_then(crate::memory::kv_ops::logical_to_user))
+        // 转发给 latest_visible_raw：以前这里复制过一份同样的循环，
+        // 于是「改了事务层却漏了点读」成为必然 —— 结构与 bitcask 保持一致。
+        self.latest_visible_raw(key)
+            .and_then(|(_, v)| v)
+            .and_then(crate::memory::kv_ops::logical_to_user)
     }
 
     /// 最新可见逻辑行（含 TTL 信封；tombstone 为 None）
     pub(crate) fn latest_visible_raw(&self, key: &[u8]) -> Option<(u64, Option<Vec<u8>>)> {
         let store = self.store.lock().unwrap();
-        let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-        for (enc, row) in Self::scan_key_versions(&store, key) {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            if vk.raw_key.as_slice() != key {
-                continue;
-            }
-            if self.is_visible(vk.version) {
-                best = Some((vk.version, row));
-            }
-        }
-        best
+        // 从链尾往回走，第一个可见版本就是答案
+        let enc = Self::find_version_back(&store, key, |v| self.is_visible(v))?;
+        let version = decode_key(&enc)?.version;
+        Some((version, store.get(&enc).cloned()?))
     }
 
     /// 全部最新可见逻辑行（key 有序）
@@ -452,25 +439,39 @@ impl Transaction {
         version <= self.version
     }
 
-    fn scan_key_versions(store: &MemStore, key: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键。
+    ///
+    /// 版本键大端有序 ⇒ 同一 key 的版本相邻且按版本号升序 ⇒ **链尾就是最新版本**。
+    /// `raw_key` 仍是 `key` 前缀的其它逻辑 key 会落进同一个字节区间（版本号首字节 0x00
+    /// 小于任何 ASCII 字节），所以只能**跳过**而不是「见到别的 key 就停」。
+    fn find_version_back(
+        store: &MemStore,
+        key: &[u8],
+        accept: impl Fn(u64) -> bool,
+    ) -> Option<Vec<u8>> {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        store
-            .range_scan(&low, &high)
-            .into_iter()
-            .filter(|(enc, _)| {
-                decode_key(enc)
-                    .map(|vk| vk.raw_key.as_slice() == key)
-                    .unwrap_or(false)
-            })
-            .collect()
+        let mut budget = VERSION_BACK_STEP;
+        loop {
+            let rows = store.range_back(&low, &high, budget);
+            let reached_bottom = rows.len() < budget;
+            for (enc, _) in rows {
+                if let Some(vk) = decode_key(&enc) {
+                    if vk.raw_key.as_slice() == key && accept(vk.version) {
+                        return Some(enc);
+                    }
+                }
+            }
+            if reached_bottom {
+                return None;
+            }
+            budget = budget.saturating_mul(2);
+        }
     }
 
     fn latest_version_of(store: &MemStore, key: &[u8]) -> Option<u64> {
-        Self::scan_key_versions(store, key)
-            .into_iter()
-            .filter_map(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
-            .max()
+        Self::find_version_back(store, key, |_| true)
+            .and_then(|enc| decode_key(&enc).map(|vk| vk.version))
     }
 }
 
@@ -501,6 +502,46 @@ mod tests {
         assert!(tx.delete(b"a"));
         assert_eq!(tx.get(b"a"), None);
         tx.commit();
+    }
+
+    /// 探针：一次点读 / 一次点写访问了多少行。
+    ///
+    /// 断言的是**代价不随链长增长**：版本链的链尾就是最新版本，往回一步就该停。
+    /// 内存引擎没有磁盘读，所以代价的对应物是「扫过多少行」。
+    /// 修复前这里是 50 vs 2000（严格 1:1 线性）。
+    #[test]
+    fn test_point_op_cost_independent_of_chain_length() {
+        fn probe(chain_len: u64) -> (u64, u64) {
+            let mvcc = MVCC::new();
+            for i in 0..chain_len {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()), "第 {i} 次写入被拒");
+                tx.commit();
+            }
+
+            let tx = mvcc.begin_transaction();
+            let before = crate::memory::mem_store::rows_touched();
+            assert_eq!(
+                tx.get(b"hot"),
+                Some(format!("v{}", chain_len - 1).into_bytes())
+            );
+            let get_rows = crate::memory::mem_store::rows_touched() - before;
+
+            let before = crate::memory::mem_store::rows_touched();
+            assert!(tx.set(b"hot", b"newer".to_vec()));
+            let set_rows = crate::memory::mem_store::rows_touched() - before;
+            tx.rollback();
+            (get_rows, set_rows)
+        }
+
+        let (g_short, s_short) = probe(50);
+        let (g_long, s_long) = probe(2000);
+        eprintln!(
+            "点读访问行数：链长 50 → {g_short} 行，链长 2000 → {g_long} 行\n\
+             点写访问行数：链长 50 → {s_short} 行，链长 2000 → {s_long} 行"
+        );
+        assert_eq!(g_short, g_long, "点读访问的行数不应随版本链长度增长");
+        assert_eq!(s_short, s_long, "点写访问的行数不应随版本链长度增长（它只需要版本号）");
     }
 
     #[test]

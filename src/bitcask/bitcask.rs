@@ -83,10 +83,10 @@ pub enum KeyLoc {
 /// 内存索引：key → 最新位置
 pub type KeyDir = std::collections::BTreeMap<Vec<u8>, KeyLoc>;
 
-/// 测试专用：本线程 `Log::read_value` 的调用次数，即**真实读盘行数**。
-///
-/// 用来把「一次操作的代价不随版本链长度增长」这条不变量钉成断言 —— 计时断言在不同
-/// 机器上会飘，读盘次数不会。做成 thread_local 是为了不和 `cargo test` 的并行用例互相计数。
+// 测试专用：本线程 `Log::read_value` 的调用次数，即**真实读盘行数**。
+//
+// 用来把「一次操作的代价不随版本链长度增长」这条不变量钉成断言 —— 计时断言在不同
+// 机器上会飘，读盘次数不会。做成 thread_local 是为了不和 `cargo test` 的并行用例互相计数。
 #[cfg(test)]
 thread_local! {
     static READ_VALUE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -268,7 +268,7 @@ pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
                     "hint key_len 异常",
                 ));
             }
-            let mut key = vec![0u8; key_len];
+            let mut key: Vec<u8> = vec![0u8; key_len];
             r.read_exact(&mut key)?;
             match flag {
                 HINT_FLAG_LIVE => {
@@ -307,7 +307,7 @@ pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
             let pos = u64::from_le_bytes(pbuf);
             r.read_exact(&mut nbuf)?;
             let len = u32::from_le_bytes(nbuf);
-            let mut key = vec![0u8; key_len];
+            let mut key: Vec<u8> = vec![0u8; key_len];
             r.read_exact(&mut key)?;
             match flag {
                 HINT_FLAG_LIVE => {
@@ -406,7 +406,7 @@ impl Log {
                 let flag = i32::from_be_bytes(len_buf);
                 let value_pos = pos + KEY_VAL_HEADER_LEN as u64 * 2 + key_len as u64;
 
-                let mut key = vec![0; key_len as usize];
+                let mut key: Vec<u8> = vec![0; key_len as usize];
                 r.read_exact(&mut key)?;
 
                 let value_len = if flag >= 0 { flag as u32 } else { 0 };
@@ -465,7 +465,7 @@ impl Log {
         READ_VALUE_CALLS.with(|c| c.set(c.get() + 1));
         // 读路径前必须 flush，offset 才落在真实文件上
         self.flush_buf()?;
-        let mut value = vec![0; value_len as usize];
+        let mut value: Vec<u8> = vec![0; value_len as usize];
         self.file.seek(SeekFrom::Start(value_pos))?;
         self.file.read_exact(&mut value)?;
         Ok(value)
