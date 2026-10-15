@@ -666,26 +666,42 @@ impl Transaction {
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        let mut latest: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
+        // ① 轻量全库视图：每个 enc key 只拿到「胜者的 seq + 种类」，**不克隆任何 value**。
+        //    旧实现走 `iter()`，而它会先把每个源（含每个 SST 的每行）连 value 一起
+        //    `collect()` 进内存 ⇒ 一次全库折叠的峰值内存约等于整个库。
+        //    kind==2 即 EntryValue::Drop：与 `iter()` 的 filter 一致，整行不可见
+        //    （注意是「该 key 不可见」，不是「回退到更旧源里同 key 的 Put」）。
+        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        {
+            let kvengine = self.kv.lock().unwrap();
+            for (enc, le) in kvengine.scan_latest_light(u64::MAX) {
+                if le.kind == 2 {
+                    continue;
+                }
+                let Some(vk) = decode_key(&enc) else {
+                    continue;
+                };
+                if !self.is_visible(vk.version) {
+                    continue;
+                }
+                // enc 升序 ⇒ 同一 raw_key 最后一次覆盖即最大可见版本
+                winners.insert(vk.raw_key, (vk.version, enc));
+            }
+        }
+
+        // ② 只给胜出行取值：跨源点查，取胜规则与归并一致
         let kvengine = self.kv.lock().unwrap();
-        for (enc, val) in kvengine.iter() {
-            let Some(vk) = decode_key(&enc) else {
+        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
+        for (key, (ver, enc)) in winners {
+            let Some(val) = kvengine.get_raw_key_at(&enc, u64::MAX) else {
                 continue;
             };
-            if !self.is_visible(vk.version) {
+            if val.is_none() && !include_deleted {
                 continue;
             }
-            latest.insert(vk.raw_key, (vk.version, val));
+            out.push((key, ver, val));
         }
-        latest
-            .into_iter()
-            .filter_map(|(key, (ver, value))| {
-                if value.is_none() && !include_deleted {
-                    return None;
-                }
-                Some((key, ver, value))
-            })
-            .collect()
+        out
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
@@ -968,6 +984,48 @@ mod tests {
                 );
             }
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// ② 全库折叠：不该再物化「带 value 的条目」。
+    ///
+    /// 计数挂在重量路径上（`SstEntryIter::next` 与 `mem_view_at`），所以这条一旦变红
+    /// 就说明折叠又被改回 `iter()` —— 那意味着一次扫描的峰值内存约等于整个库。
+    #[test]
+    fn test_collect_latest_does_not_materialize_values() {
+        const KEYS: u64 = 8;
+        const VERSIONS: u64 = 120;
+
+        let path = tmp_db("collect_light");
+        {
+            let mvcc = MVCC::open(&path);
+            for v in 0..VERSIONS {
+                for k in 0..KEYS {
+                    let key = format!("k{k}");
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(key.as_bytes(), format!("v{v}").into_bytes()));
+                    tx.commit();
+                }
+            }
+            // 落到 SST，让重量路径真的有机会被走到
+            mvcc.flush();
+
+            let tx = mvcc.begin_transaction();
+            let base = crate::lsm_tree::sst::value_materializations();
+            let recs = tx.export_latest_visible(false);
+            let used = crate::lsm_tree::sst::value_materializations() - base;
+            eprintln!(
+                "折叠期重量条目物化次数：{used}（存活 key {KEYS}，历史行数 {}）",
+                KEYS * VERSIONS
+            );
+            assert_eq!(recs.len() as u64, KEYS, "存活 key 数应等于 {KEYS}");
+            assert!(
+                used <= KEYS + 4,
+                "折叠只该为胜出行取值：重量条目物化 {used} 次，而历史行数是 {}",
+                KEYS * VERSIONS
+            );
+            tx.rollback();
         }
         cleanup(&path);
     }

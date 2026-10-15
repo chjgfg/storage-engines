@@ -106,6 +106,28 @@ pub(crate) fn block_reads() -> u64 {
     BLOCK_READS.with(|c| c.get())
 }
 
+// 测试专用：本线程「把带 value 的条目整个物化出来」的次数。
+//
+// 这是全库折叠那条通道真正的代价单位：重量路径（`iter_all` / `mem_view_at`）每行都要
+// 克隆 value；轻量路径（`light_view` / `mem_view_light`）只带 seq 与种类。所以 ② 用这个
+// 量来守，而不是用块读取次数（块是省不掉的，value 才省得掉）。
+#[cfg(test)]
+thread_local! {
+    static VALUE_MATERIALIZATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已物化过多少个带 value 的条目（测试探针用）
+#[cfg(test)]
+pub(crate) fn value_materializations() -> u64 {
+    VALUE_MATERIALIZATIONS.with(|c| c.get())
+}
+
+/// 记一次「带 value 的条目被物化」；轻量路径不该调用它
+#[cfg(test)]
+pub(crate) fn note_value_materialization() {
+    VALUE_MATERIALIZATIONS.with(|c| c.set(c.get() + 1));
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct CacheKey {
     /// 区分不同 CF / 目录（避免共享 cache 时 sst_id 碰撞）
@@ -402,6 +424,48 @@ impl SstFile {
         }
     }
 
+    /// 本文件在 `snap_seq` 下的**轻量视图**：每个键一条 `(key, LightEntry{seq, kind})`，
+    /// 按引用读块，**不克隆任何 value**。
+    ///
+    /// 磁盘顺序即 key 非降序 ⇒ 相邻同键折叠即可；可见性规则与 [`Self::range_at`] 一致
+    /// （同键取 `seq <= snap_seq` 中最大的那个）。
+    pub fn light_view(&self, snap_seq: u64) -> Vec<(Vec<u8>, LightEntry)> {
+        let mut out: Vec<(Vec<u8>, LightEntry)> = Vec::new();
+        let mut feed = |k: &[u8], se: &StoredEntry| {
+            if !se.visible_at(snap_seq) {
+                return;
+            }
+            let le = LightEntry::of(se);
+            match out.last_mut() {
+                Some((pk, p)) if pk.as_slice() == k => {
+                    if le.seq >= p.seq {
+                        *p = le;
+                    }
+                }
+                _ => out.push((k.to_vec(), le)),
+            }
+        };
+
+        if let Some(all) = &self.entries_cache {
+            for (k, se) in all {
+                feed(k, se);
+            }
+        } else {
+            for i in 0..self.index.len() {
+                match self.load_block(i) {
+                    Ok(b) => {
+                        for (k, se) in &b.entries {
+                            feed(k, se);
+                        }
+                    }
+                    // 与 iter_all 一致：坏块即止
+                    Err(_) => break,
+                }
+            }
+        }
+        out
+    }
+
     /// 流式迭代全部 entry（按磁盘顺序）
     pub fn iter_all(&self) -> SstEntryIter<'_> {
         SstEntryIter {
@@ -543,6 +607,8 @@ impl Iterator for SstEntryIter<'_> {
             if self.cache_i >= cache.len() {
                 return None;
             }
+            #[cfg(test)]
+            note_value_materialization();
             let item = cache[self.cache_i].clone();
             self.cache_i += 1;
             return Some(item);
@@ -550,6 +616,8 @@ impl Iterator for SstEntryIter<'_> {
         loop {
             if let Some(block) = &self.cur {
                 if self.entry_i < block.entries.len() {
+                    #[cfg(test)]
+                    note_value_materialization();
                     let item = block.entries[self.entry_i].clone();
                     self.entry_i += 1;
                     return Some(item);
@@ -1059,35 +1127,82 @@ impl SstBuilder {
 
 // ─── Streaming merge ─────────────────────────────────────────────────────────
 
+/// 归并核心只用到「键 + 序号 + 谁赢」，不需要知道 value 长什么样。
+///
+/// 所以把归并泛型化：`StoredEntry`（带 value 字节）和 [`LightEntry`]（只有 seq 与种类）
+/// 走**同一份**实现。这样"只想按键折叠全库"不必再抄一份归并 —— 抄一份就是给
+/// 「四份复制」那种病再添一份。
+pub trait MergeSeq: Clone {
+    fn seq(&self) -> u64;
+}
+
+impl MergeSeq for StoredEntry {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// 轻量归并项：**只有 seq 与种类字节，不带 value 字节**。
+///
+/// `kind` 与 [`EntryValue::kind_byte`] 对齐：`0=Put(Some)`、`1=Put(None)`、`2=Drop`。
+/// 全库折叠（`collect_latest_raw` 那一类）只需要选出「每个键的胜者」，
+/// value 留给少数胜出行再点查 —— 于是一次扫描的峰值内存从 O(库字节) 降到 O(键字节)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LightEntry {
+    pub seq: u64,
+    pub kind: u8,
+}
+
+impl MergeSeq for LightEntry {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl LightEntry {
+    fn of(se: &StoredEntry) -> Self {
+        LightEntry {
+            seq: se.seq,
+            kind: se.value.kind_byte(),
+        }
+    }
+}
+
 /// 多路归并：sources 新→旧；同 key 取最高优先级中 `seq` 最大者；流式回调。
-pub fn merge_streaming<F, K>(sources: Vec<Vec<(Vec<u8>, StoredEntry)>>, mut keep: K, mut emit: F)
+pub fn merge_streaming<T, F, K>(sources: Vec<Vec<(Vec<u8>, T)>>, mut keep: K, mut emit: F)
 where
-    F: FnMut(Vec<u8>, StoredEntry),
-    K: FnMut(&[u8], &StoredEntry) -> bool,
+    T: MergeSeq,
+    F: FnMut(Vec<u8>, T),
+    K: FnMut(&[u8], &T) -> bool,
 {
-    #[derive(Eq, PartialEq)]
-    struct Node {
+    struct Node<T> {
         key: Vec<u8>,
-        se: StoredEntry,
+        se: T,
         src: usize,
         idx: usize,
     }
-    impl Ord for Node {
+    impl<T: MergeSeq> Ord for Node<T> {
         fn cmp(&self, other: &Self) -> CmpOrdering {
             match other.key.cmp(&self.key) {
                 CmpOrdering::Equal => match other.src.cmp(&self.src) {
-                    CmpOrdering::Equal => self.se.seq.cmp(&other.se.seq), // 同 src 更大 seq 优先
+                    CmpOrdering::Equal => self.se.seq().cmp(&other.se.seq()), // 同 src 更大 seq 优先
                     o => o,
                 },
                 o => o,
             }
         }
     }
-    impl PartialOrd for Node {
+    impl<T: MergeSeq> PartialOrd for Node<T> {
         fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
             Some(self.cmp(other))
         }
     }
+    impl<T: MergeSeq> PartialEq for Node<T> {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other) == CmpOrdering::Equal
+        }
+    }
+    impl<T: MergeSeq> Eq for Node<T> {}
 
     let mut heap = BinaryHeap::new();
     for (s, src) in sources.iter().enumerate() {
@@ -1102,8 +1217,8 @@ where
     }
     let mut last_key: Option<Vec<u8>> = None;
     while let Some(n) = heap.pop() {
-        let push_next = |heap: &mut BinaryHeap<Node>,
-                         sources: &[Vec<(Vec<u8>, StoredEntry)>],
+        let push_next = |heap: &mut BinaryHeap<Node<T>>,
+                         sources: &[Vec<(Vec<u8>, T)>],
                          src: usize,
                          idx: usize| {
             let next_idx = idx + 1;
@@ -1131,7 +1246,7 @@ where
         while heap.peek().map(|p| p.key == key).unwrap_or(false) {
             let m = heap.pop().unwrap();
             push_next(&mut heap, &sources, m.src, m.idx);
-            if m.src < best_src || (m.src == best_src && m.se.seq > best.seq) {
+            if m.src < best_src || (m.src == best_src && m.se.seq() > best.seq()) {
                 best_src = m.src;
                 best = m.se.clone();
             }

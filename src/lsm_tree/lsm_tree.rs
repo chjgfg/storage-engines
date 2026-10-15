@@ -13,8 +13,8 @@ use std::{
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
-    merge_latest_streaming, merge_to_ssts, BlockCache, EntryValue, SstBuilder, SstFile,
-    StoredEntry,
+    merge_latest_streaming, merge_streaming, merge_to_ssts, BlockCache, EntryValue, LightEntry,
+    SstBuilder, SstFile, StoredEntry,
 };
 
 // ─── Options ─────────────────────────────────────────────────────────────────
@@ -821,9 +821,66 @@ impl LSMTree {
                     value: v.clone(),
                 })
             {
+                // 重量路径：value 被整个克隆出来。全库折叠不该走这里 ——
+                // 计数探针就是用来发现「不知不觉又用回重量路径」。
+                #[cfg(test)]
+                crate::lsm_tree::sst::note_value_materialization();
                 out.push((k.clone(), se));
             }
         }
+        out
+    }
+
+    /// 内存表的**轻量**视图：每个键只带 `seq` 与种类字节，**不克隆 value**。
+    fn mem_view_light(map: &MemMap, snap_seq: u64) -> Vec<(Vec<u8>, LightEntry)> {
+        let mut out = Vec::new();
+        for (k, vers) in map {
+            if let Some((seq, ev)) = vers.iter().rev().find(|(s, _)| **s <= snap_seq) {
+                out.push((
+                    k.clone(),
+                    LightEntry {
+                        seq: *seq,
+                        kind: ev.kind_byte(),
+                    },
+                ));
+            }
+        }
+        out
+    }
+
+    /// 全库「每个 enc key 的胜者」的**轻量**视图（跨源取胜规则与 [`Self::iter`] 一致：
+    /// 源新→旧优先，同 src 取更大 seq）。
+    ///
+    /// 与 `iter()` 的差别就在**不克隆 value**：`iter()` 会把每个源的条目整个 `collect()`
+    /// 进内存（连 value），所以一次全库扫描的峰值内存约等于整个库；这里的峰值只有键字节。
+    /// 需要 value 的调用方对少数胜出行再点查 [`Self::get_raw_key_at`]，语义与归并取胜一致。
+    pub fn scan_latest_light(&self, snap_seq: u64) -> Vec<(Vec<u8>, LightEntry)> {
+        let mut sources: Vec<Vec<(Vec<u8>, LightEntry)>> = Vec::new();
+        if !self.mem.is_empty() {
+            let part = Self::mem_view_light(&self.mem, snap_seq);
+            if !part.is_empty() {
+                sources.push(part);
+            }
+        }
+        for imm in &self.immutables {
+            let part = Self::mem_view_light(imm, snap_seq);
+            if !part.is_empty() {
+                sources.push(part);
+            }
+        }
+        // 源顺序必须与 merge_all_at 一致：levels[0] 的 vec 是旧→新，反转成新→旧
+        if let Some(l0) = self.levels.first() {
+            for sst in l0.iter().rev() {
+                sources.push(sst.light_view(snap_seq));
+            }
+        }
+        for level in self.levels.iter().skip(1) {
+            for sst in level {
+                sources.push(sst.light_view(snap_seq));
+            }
+        }
+        let mut out = Vec::new();
+        merge_streaming(sources, |_, _| true, |k, le| out.push((k, le)));
         out
     }
 
@@ -1013,7 +1070,7 @@ impl LSMTree {
     /// 外层 `None` = `Drop` 或根本不存在（该 key 不可见）；
     /// `Some(None)` = `Put(None)`，即「行存在但逻辑 value 为 None」—— 与 `range_scan` 的
     /// `(k, None)` 表示一致，两者不能混。
-    fn get_raw_key_at(&self, key: &[u8], snap_seq: u64) -> Option<Option<Vec<u8>>> {
+    pub(crate) fn get_raw_key_at(&self, key: &[u8], snap_seq: u64) -> Option<Option<Vec<u8>>> {
         match self.get_entry_at(key, snap_seq)? {
             StoredEntry { value: EntryValue::Put(v), .. } => Some(v),
             StoredEntry { value: EntryValue::Drop, .. } => None,
