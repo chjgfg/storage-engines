@@ -633,38 +633,52 @@ impl Transaction {
     }
 
     /// 全部最新可见逻辑行（key 有序）：(key, version, raw_or_tombstone)
+    ///
+    /// 两段式：① 只走 KeyDir 元数据（`iter_meta`，不碰 value）按 enc 升序折叠出每个逻辑
+    /// key 的「最后一个可见版本」那一行；② 只对这批胜出行各读一次盘并解码。
+    ///
+    /// 旧实现是 `kv.iter()` 把**每一行连 value** 全读出来再挑，于是走它的公开面 ——
+    /// 扫描 / 搜索分页 / `exists` / `export` / `purge_expired` / `print_all` ——
+    /// 每次调用都是 O(总行数) 次读盘，跟版本链有没有被回收无关。现在读盘次数 =
+    /// O(存活 key 数)。
     pub(crate) fn collect_latest_raw(
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        let mut latest: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
+        // ① 元数据折叠：enc 升序 ⇒ 同一 raw_key 最后一次 insert 就是最大可见版本
+        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        {
+            let kvengine = self.kv.lock().unwrap();
+            for (enc, _loc) in kvengine.iter_meta() {
+                let Some(vk) = decode_key(enc) else {
+                    continue;
+                };
+                if !self.is_visible(vk.version) {
+                    continue;
+                }
+                winners.insert(vk.raw_key, (vk.version, enc.clone()));
+            }
+        }
+
+        // ② 只给胜出行读盘。软墓碑 → logical None，与旧实现一致；
+        //    两阶段之间索引若已不含该行（单写者模型下不会发生）就跳过该行。
         let mut kvengine = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
-        let Ok(all) = kvengine.iter() else {
-            return Vec::new();
-        };
-        for (enc, val) in all {
-            let Some(vk) = decode_key(&enc) else {
+        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
+        for (key, (ver, enc)) in winners {
+            let Ok(Some(stored)) = kvengine.get_entry(&enc) else {
                 continue;
             };
-            if !self.is_visible(vk.version) {
+            let logical = match stored {
+                None => None,
+                Some(s) => decode_stored_value(&mut blob, &s).ok().flatten(),
+            };
+            if logical.is_none() && !include_deleted {
                 continue;
             }
-            let logical = match val {
-                None => None,
-                Some(stored) => decode_stored_value(&mut blob, &stored).ok().flatten(),
-            };
-            latest.insert(vk.raw_key, (vk.version, logical));
+            out.push((key, ver, logical));
         }
-        latest
-            .into_iter()
-            .filter_map(|(key, (ver, value))| {
-                if value.is_none() && !include_deleted {
-                    return None;
-                }
-                Some((key, ver, value))
-            })
-            .collect()
+        out
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
@@ -904,6 +918,57 @@ mod tests {
             assert_eq!(tx.get(b"leak"), None, "泄漏事务的写入应已被回滚");
             assert_eq!(tx.get(b"k"), Some(b"v2".to_vec()));
             tx.rollback();
+        }
+        cleanup(&path);
+    }
+
+    /// 全库类 API（`print_all` / 扫描 / 搜索 / `exists` / `export` / `purge_expired` 都走
+    /// `collect_latest_raw`）的读盘次数必须只与**存活 key 数**相关，与历史行数无关。
+    ///
+    /// 旧实现把每一行连 value 全读出来再挑最后一个，所以这里刻意让「历史行数」远大于
+    /// 「存活 key 数」，这样断言才有区分力（旧实现会读 KEYS×VERSIONS 次）。
+    #[test]
+    fn test_collect_latest_reads_scale_with_live_keys_not_rows() {
+        const KEYS: u64 = 8;
+        const VERSIONS: u64 = 120;
+
+        let path = tmp_db("collect_cost");
+        {
+            let mvcc = MVCC::open(&path);
+            for v in 0..VERSIONS {
+                for k in 0..KEYS {
+                    let key = format!("k{k}");
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(key.as_bytes(), format!("v{v}").into_bytes()));
+                    tx.commit();
+                }
+            }
+
+            let tx = mvcc.begin_transaction();
+            let before = crate::bitcask::bitcask::read_value_calls();
+            let all = tx.print_all();
+            let used = crate::bitcask::bitcask::read_value_calls() - before;
+            assert_eq!(all.len() as u64, KEYS, "存活 key 数应等于 {KEYS}");
+            assert!(
+                used <= KEYS + 4,
+                "只应按存活 key 读盘：实际读 {} 次，而历史行数是 {}",
+                used,
+                KEYS * VERSIONS
+            );
+            tx.rollback();
+
+            // 参照：旧实现走的就是「全行物化」（`Bitcask::iter` 每行连 value 读出来再挑），
+            // 这条原语现在还在，所以「改前」是实测而不是推断。
+            let before = crate::bitcask::bitcask::read_value_calls();
+            let rows = mvcc.kv.lock().unwrap().iter().unwrap().len() as u64;
+            let old_style = crate::bitcask::bitcask::read_value_calls() - before;
+            eprintln!(
+                "全库折叠读盘：新实现 {used} 次 vs 旧路径（全行物化）{old_style} 次，历史行数 {rows}"
+            );
+            assert!(
+                used * 10 <= old_style,
+                "折叠读盘应比全行物化便宜一个量级以上（{used} vs {old_style}）"
+            );
         }
         cleanup(&path);
     }
