@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 233 个单元测试 + 4 个集成测试
+- 236 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -47,12 +47,15 @@ cargo run --release --bin lsm-import-kv     -- --input snap.bin --dir ./data/lsm
 
 ### 核心用法
 
-换引擎只改一个字符串,下面的代码一个字不用动:
+换引擎只改入口那一行,下面的代码一个字不用动:
 
 ```rust
-use storage_engines::engine::open_engine;
+use storage_engines::{open_engine, EngineKind};   // 这些名字在 crate 根也可直接 import
 use std::path::Path;
 
+// 编译期就定死用哪家
+let db = open_engine(EngineKind::LsmTree, Some(Path::new("./data/lsm")))?;
+// 引擎名来自配置文件/环境变量时,同一个入口换成字符串
 let db = open_engine("lsm", Some(Path::new("./data/lsm")))?;
 
 let tx = db.begin();
@@ -413,7 +416,7 @@ blob:   [0x01] offset(u64 LE) len(u32 LE)   —— 共 13 字节
 两条**必须**遵守的上界(都是被下游真实需求逼出来的,不是设计洁癖):
 
 - `KvEngine: Send + Sync`、`KvTxn: Send`(不要求 `Sync`)。少了前者,`Box<dyn KvEngine>` 进不了 `Arc`、也搬不到别的线程,而交易进程的常态就是"开库线程 + 心跳线程 checkpoint + 工作线程读写"。事务刻意不要求 `Sync`:内部有 `Cell`(WAL 是否已开)与写集,跨线程共享一个事务对象本身没有语义。
-- 选型是类型: [`EngineKind`](`parse`/`as_str`/`needs_disk`/`is_production_ok`) + [`StorageConfig`](`STORAGE_ENGINE` / `STORAGE_DATA_DIR`,落盘 `data_dir/<engine>/`),入口 [`open_from_env()`]。**`STORAGE_ENGINE` 写了但不认识时报错**,不静默退回默认值 —— "以为在跑 bitcask、其实跑的是 memory"不能靠默认值发生。
+- 选型是类型: [`EngineKind`](`parse`/`as_str`/`needs_disk`/`is_production_ok`) + [`StorageConfig`](`STORAGE_ENGINE` / `STORAGE_DATA_DIR`,落盘 `data_dir/<engine>/`),入口 [`open_from_env()`]。**`STORAGE_ENGINE` 写了但不认识时报错**,不静默退回默认值 —— "以为在跑 bitcask、其实跑的是 memory"不能靠默认值发生。入口 [`open_engine`] 的引擎名走 [`EngineName`] trait:枚举和字符串两种写法都收(`EngineKind::LsmTree` / `"lsm"` / `String` / `&String`),拿枚举不用自己 `.as_str()`。这是**自由函数**上的泛型,`KvEngine` trait 依然对象安全。
 
 对象安全的代价是:所有方法都用 `&[u8]` / `Vec<u8>`,不能用 `impl AsRef<[u8]>` 这类泛型参数。
 
@@ -610,8 +613,8 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:233 单元 + 4 集成 + 2 文档测试
-cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
+cargo test                    # 全部:236 单元 + 4 集成 + 3 文档测试
+cargo test --lib engine::     # 只跑门面层(20 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```
 

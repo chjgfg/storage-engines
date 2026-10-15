@@ -62,6 +62,20 @@
   `is_production_ok` —— 只有一个 false：`memory` 没有持久化）、`StorageConfig`
   （`STORAGE_ENGINE` / `STORAGE_DATA_DIR`、`engine_dir()`、`ensure_dirs()`、`open()`）与
   `open_from_env()`。`STORAGE_ENGINE` 不认识时**报错**而不是静默退回默认值。
+- **`open_engine` 的引擎名改为 [`EngineName`] trait**：枚举和字符串两种写法都收 ——
+  `open_engine(EngineKind::BPlusTree, Some(path))` 与 `open_engine("bplus_tree", Some(path))`
+  落到同一个引擎，拿着枚举不必再自己 `.as_str()`；`&str` / `String` / `&String` 三种所有权形态
+  一起实现（`src/main.rs:43` 那种 `open_engine(&name, …)` 的顺手写法，泛型位置不会自动解引用，
+  少了这个 impl 就是一堵类型错误墙）。不认识的名字仍然原样回显，不退回默认值。
+  泛型只加在**自由函数**上，`KvEngine` 的对象安全不受影响。
+  守卫三条：`open_engine_accepts_enum_and_string_in_every_ownership_shape`（`EngineKind::as_str`
+  与 `canonical_name` 两张表的唯一汇合点）、`enum_without_path_is_path_required`（枚举 + 漏路径
+  归「必须给路径」管，不能被名字解析那一步吃掉）、
+  `unknown_name_is_echoed_verbatim_whatever_the_shape`。
+- **crate 根补 re-export**：`EngineKind` / `EngineName` / `StorageConfig` / `open_from_env`，
+  外加门面方法返回的那几个类型 `MvccHealth` / `DurabilityProfile` / `VacuumRound` ——
+  之前 `db.health()` 的返回类型只能在 `storage_engines::common::` 下命名，下游被迫在根和
+  子模块之间来回 import。
 - **`KvTxn::incr_with_ttl`** 上门面（四引擎本来就有，之前只有各自的 kv_ops 能碰到）。
 
 - **`src/common/wal.rs`：三份 WAL 收成一份**（原先 `diff` 实测只差 14–16 行注释与 import，`WAL_MAGIC` 与帧头本来就相同 —— 同一个磁盘格式的三份复制）。崩溃恢复是最不该有三分之一实现的地方：M3b 那个「`checkpoint()` 把刚写的 Checkpoint 记录自己 truncate 抹掉」的 bug，形状就是「一份改了、另两份照旧」。合并时补了一条三份原本都没有的守卫 `test_corrupt_tail_is_discarded_but_good_frames_survive`（半帧损坏必须只丢坏尾，不牵连前面的完整记录）。
@@ -75,10 +89,6 @@
   **明确报错**而不是猜一个页大小（猜错 = 把数据写到错误偏移，看起来一切正常）。
   这条立刻在 dblwr 撕裂用例上抓到一处未声明的构造。引擎侧路径
   `crate::<引擎>::storage::DiskFile` 等通过 re-export 保持不变。
-
-  `HealthFold` 链长折叠、`VacuumScheduler` 自动回收的记账/取账/游标、`is_unfinished` 漏网事务判据）。
-  内部 API，不影响调用方；收敛的边界是"是否涉及存储布局"——遍历原语、早停方式、各引擎的量尺
-  仍然一家一份（README 的「哪些只剩一份,哪些必须四份」有表）。
 - **`KvEngine::durability_profile()` / `MVCC::durability_profile()`**：把四家崩溃安全的差异作为
   数据吐出来（`DurabilityProfile`：有无事务 WAL、commit 是否 fsync、数据记录/大 value 有无校验和、
   是否原地页写与双写缓冲、全库重写残骸能否认回），`Display` 只报缺口。
@@ -133,9 +143,13 @@
 
 ### 测试
 
-233 个单元测试 + 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆次数），不用计时：
+236 个单元测试 + 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆次数），不用计时：
 原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
 并且复杂度守卫都先验证过"它会红"（临时短路被测代码跑一遍）才算数。
+- **门面入口三条**：`open_engine_accepts_enum_and_string_in_every_ownership_shape`、
+  `enum_without_path_is_path_required`、`unknown_name_is_echoed_verbatim_whatever_the_shape`。
+  前一条同时是 `EngineKind::as_str` 与 `canonical_name` 两张表的汇合点 —— 枚举写法漏实现会
+  **编译失败**，两张表漂开会 panic，都不是"跑起来悄悄换了一家"。
 - **长跑基线守卫 `test_long_run_baseline`（`#[ignore]`，release 手动跑）**：把事故形状
   （热点 key 持续更新 2 万次 + 稳定点读）跑成"开 vs 关自动回收"的对照，实测数字写进 README。
   两条从实测里改出来的认知（原先是按推理写的）：
@@ -151,3 +165,6 @@
 2. 搬之后**先量基线再优化**：`health().max_chain` 连续采样，看它是否从"线性爬"变成"贴着 1~切片宽度"。
 3. 别急着给 `vacuum()` 加定时器：自动回收已经在跑，手动 `vacuum()` 保留给"要立刻收文件空间"的场景
    （它是唯一会触发 `merge()` / blob 重写的入口）。
+4. **本 crate 在 crates.io 上最新只到 0.3.0**（0.1.0 / 0.2.0 / 0.3.0），也就是说出事故的那版才是
+   下游 `storage-engines = "0.3"` 拿到的东西。要用依赖代替内嵌副本，得先把 0.4.0 发上去；
+   在发布之前只能走 `path`/`git` 依赖。

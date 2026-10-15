@@ -2,12 +2,15 @@
 //!
 //! 四个引擎的 `MVCC` / `Transaction` / `BulkLoader` 结构体互不相同（各自的
 //! 后端、WAL、blob 都是独立类型），但对外暴露的方法签名高度一致。本模块把
-//! 这份一致性提取成 trait，于是可以按**运行时字符串**选引擎：
+//! 这份一致性提取成 trait，于是可以按**枚举或运行时字符串**选引擎：
 //!
 //! ```no_run
-//! use storage_engines::engine::open_engine;
+//! use storage_engines::engine::{open_engine, EngineKind};
 //! use std::path::Path;
 //!
+//! // 编译期就知道自己用哪个引擎
+//! let db = open_engine(EngineKind::LsmTree, Some(Path::new("./data/lsm")))?;
+//! // 引擎名来自配置/环境变量时
 //! let db = open_engine("lsm", Some(Path::new("./data/lsm")))?;
 //! let tx = db.begin();
 //! tx.set(b"k", b"v".to_vec());
@@ -401,7 +404,7 @@ impl StorageConfig {
             EngineKind::BPlusTree => Some(self.engine_dir().join("bplus.db")),
             _ => Some(self.engine_dir()),
         };
-        open_engine_with(self.kind.as_str(), path.as_deref(), &self.engine)
+        open_engine_with(self.kind, path.as_deref(), &self.engine)
     }
 }
 
@@ -410,22 +413,69 @@ pub fn open_from_env() -> Result<Box<dyn KvEngine>> {
     StorageConfig::from_env()?.open()
 }
 
-/// 按名字打开引擎，用默认 [`EngineConfig`]。
+/// [`open_engine`] 的入参：枚举和字符串两种写法都收。
 ///
-/// `path` 对三个磁盘引擎必填；`"memory"` 忽略该参数。
-/// 名字大小写不敏感，且接受常见别名：`"bplus"` / `"btree"` / `"lsm"` / `"mem"`。
-pub fn open_engine(name: &str, path: Option<&Path>) -> Result<Box<dyn KvEngine>> {
+/// [`EngineKind`] 把"选哪个引擎"这件事类型化了，入口却只吃 `&str`，于是拿着枚举的调用方
+/// 还得自己 `.as_str()` —— 门面层自己没闭环。补这个 trait 后四种形态都免转换：
+/// `EngineKind` / `&str` / `String` / `&String`（最后一种是 `open_engine(&s, …)` 这种
+/// 顺手写法，泛型入参处不会自动解引用成 `&str`，不实现就会撞一堵类型错误墙）。
+pub trait EngineName {
+    /// 归一到规范名。不认识 ⇒ [`EngineError::UnknownEngine`]，且错误里**原样回显**写进来的
+    /// 那个名字 —— 不静默退回默认值（同 [`StorageConfig::from_env`]）。
+    fn engine_canon(self) -> Result<&'static str>;
+}
+
+impl EngineName for EngineKind {
+    fn engine_canon(self) -> Result<&'static str> {
+        // as_str() 给的已经是规范名，过一遍 canonical_name 只是把"两张表不许漂"钉在这里；
+        // 真漂了先由 engine_kind_selection_is_typed_and_honest 红。
+        canonical_name(self.as_str())
+            .ok_or_else(|| EngineError::UnknownEngine(self.as_str().to_string()))
+    }
+}
+
+impl EngineName for &str {
+    fn engine_canon(self) -> Result<&'static str> {
+        canonical_name(self).ok_or_else(|| EngineError::UnknownEngine(self.to_string()))
+    }
+}
+
+impl EngineName for String {
+    fn engine_canon(self) -> Result<&'static str> {
+        canonical_name(&self).ok_or_else(|| EngineError::UnknownEngine(self))
+    }
+}
+
+impl EngineName for &String {
+    fn engine_canon(self) -> Result<&'static str> {
+        canonical_name(self).ok_or_else(|| EngineError::UnknownEngine(self.clone()))
+    }
+}
+
+/// 打开引擎，用默认 [`EngineConfig`]。入参见 [`EngineName`]（枚举或字符串均可）。
+///
+/// `path` 对三个磁盘引擎必填；`memory` 忽略该参数。
+/// 字符串大小写不敏感，且接受常见别名：`"bplus"` / `"btree"` / `"lsm"` / `"mem"`。
+///
+/// ```no_run
+/// use storage_engines::engine::{open_engine, EngineKind};
+/// use std::path::Path;
+///
+/// let a = open_engine("bplus_tree", Some(Path::new("./data/bplus_tree/bplus.db")));
+/// let b = open_engine(EngineKind::BPlusTree, Some(Path::new("./data/bplus_tree/bplus.db")));
+/// # drop((a, b));
+/// ```
+pub fn open_engine<N: EngineName>(name: N, path: Option<&Path>) -> Result<Box<dyn KvEngine>> {
     open_engine_with(name, path, &EngineConfig::default())
 }
 
-/// 按名字打开引擎，显式给参数
-pub fn open_engine_with(
-    name: &str,
+/// 打开引擎，显式给参数
+pub fn open_engine_with<N: EngineName>(
+    name: N,
     path: Option<&Path>,
     config: &EngineConfig,
 ) -> Result<Box<dyn KvEngine>> {
-    let canon = canonical_name(name)
-        .ok_or_else(|| EngineError::UnknownEngine(name.to_string()))?;
+    let canon = name.engine_canon()?;
 
     // 三个磁盘引擎必须有路径
     let disk_path = |engine: &'static str| -> Result<PathBuf> {
@@ -883,6 +933,71 @@ mod tests {
                 matches!(err, EngineError::PathRequired(_)),
                 "{name} should require a path"
             );
+        }
+    }
+
+    /// 门面入口的几种写法必须落到同一个引擎。
+    ///
+    /// `EngineKind::as_str` 和 `canonical_name` 是两张表，字符串时代它们只在
+    /// `open_engine` 内部碰头；现在枚举能直接入参，这张用例就是那个汇合点。
+    #[test]
+    fn open_engine_accepts_enum_and_string_in_every_ownership_shape() {
+        let mut dirs = Vec::new();
+        let disk = [
+            (EngineKind::Bitcask, "bitcask"),
+            (EngineKind::BPlusTree, "bplus-tree"),
+            (EngineKind::LsmTree, "lsm"),
+        ];
+        for (kind, alias) in disk {
+            let dir = tmp_dir("name_kind");
+            let want = kind.as_str();
+            let owned = alias.to_string();
+            let by_kind = open_engine(kind, Some(&dir)).expect("枚举入参").name().to_string();
+            let by_str = open_engine(alias, Some(&dir)).expect("&str 入参").name().to_string();
+            let by_string = open_engine(owned.clone(), Some(&dir))
+                .expect("String 入参")
+                .name()
+                .to_string();
+            // 泛型位置不会把 &String 自动解引用成 &str —— 这条就是钉住那个 impl
+            let by_ref = open_engine(&owned, Some(&dir)).expect("&String 入参").name().to_string();
+            for (got, how) in [
+                (&by_kind, "enum"),
+                (&by_str, "&str"),
+                (&by_string, "String"),
+                (&by_ref, "&String"),
+            ] {
+                assert_eq!(got, want, "{alias} 走 {how} 这条路");
+            }
+            dirs.push(dir);
+        }
+        // memory 不吃路径
+        assert_eq!(open_engine(EngineKind::Memory, None).unwrap().name(), "memory");
+        assert_eq!(open_engine("mem", None).unwrap().name(), "memory");
+        cleanup(dirs.into_iter().map(Some).collect());
+    }
+
+    #[test]
+    fn unknown_name_is_echoed_verbatim_whatever_the_shape() {
+        let s = String::from("redis");
+        let errs = [
+            expect_err(open_engine("redis", None)),
+            expect_err(open_engine(s.clone(), None)),
+            expect_err(open_engine(&s, None)),
+        ];
+        for err in errs {
+            assert!(
+                matches!(err, EngineError::UnknownEngine(ref n) if n == "redis"),
+                "错误里要原样回显传进来的名字，实际: {err}"
+            );
+        }
+    }
+
+    /// 枚举 + 漏路径 = 归「必须给路径」管，不能被名字解析那一步吃掉
+    #[test]
+    fn enum_without_path_is_path_required() {
+        for kind in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree] {
+            let err = expect_err(open_engine(kind, None));
+            assert!(matches!(err, EngineError::PathRequired(_)), "{kind}: {err}");
         }
     }
 
