@@ -605,26 +605,11 @@ impl Transaction {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut kvengine = self.kv.lock().unwrap();
-        let mut blob = self.blob.lock().unwrap();
-        let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-
-        for (enc, row) in Self::scan_key_versions(&mut kvengine, key) {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            if vk.raw_key.as_slice() != key {
-                continue;
-            }
-            if self.is_visible(vk.version) {
-                let logical = match &row.0 {
-                    None => None,
-                    Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
-                };
-                best = Some((vk.version, logical));
-            }
-        }
-        best.and_then(|(_, v)| v.and_then(|raw| crate::bplus_tree::kv_ops::logical_to_user(raw)))
+        // 转发给 latest_visible_raw：以前这里复制过一份同样的循环，正是
+        // 「改了事务层却漏掉点读」的形状。与 bitcask 保持一致。
+        self.latest_visible_raw(key)
+            .and_then(|(_, v)| v)
+            .and_then(|raw| crate::bplus_tree::kv_ops::logical_to_user(raw))
     }
 
     /// 最新可见逻辑行（含 TTL 信封原始字节；tombstone 为 None）
@@ -635,23 +620,14 @@ impl Transaction {
     ) -> Option<(u64, Option<Vec<u8>>)> {
         let mut kvengine = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
-        let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-        for (enc, row) in Self::scan_key_versions(&mut kvengine, key) {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            if vk.raw_key.as_slice() != key {
-                continue;
-            }
-            if self.is_visible(vk.version) {
-                let logical = match &row.0 {
-                    None => None,
-                    Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
-                };
-                best = Some((vk.version, logical));
-            }
-        }
-        best
+        // 从链尾往回走，第一个可见版本就是答案；value 随叶子一起到手，不再二次读页
+        let (enc, row) = Self::find_version_back(&mut kvengine, key, |v| self.is_visible(v))?;
+        let version = decode_key(&enc)?.version;
+        let logical = match &row.0 {
+            None => None,
+            Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
+        };
+        Some((version, logical))
     }
 
     /// 全部最新可见逻辑行（key 有序）：(key, version, raw_logical_or_tombstone)
@@ -779,24 +755,28 @@ impl Transaction {
         version <= self.version
     }
 
-    fn scan_key_versions(kv: &mut BPlusTree, key: &[u8]) -> Vec<(Vec<u8>, RowId)> {
+    /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键与行。
+    ///
+    /// 游走本身在存储层 [`BPlusTree::find_back`] 里做（只有单向 `next_leaf`，跨叶要重新
+    /// 下降）。这里负责 MVCC 的两个判据：`raw_key` 必须精确等于 `key` —— 以 `key` 为前缀的
+    /// 更长 key 会落进同一个字节区间（版本号首字节 0x00 小于任何 ASCII 字节）；以及可见性。
+    fn find_version_back(
+        kv: &mut BPlusTree,
+        key: &[u8],
+        accept: impl Fn(u64) -> bool,
+    ) -> Option<(Vec<u8>, RowId)> {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        kv.range_scan(low, high)
-            .into_iter()
-            .filter(|(enc, _)| {
-                decode_key(enc)
-                    .map(|vk| vk.raw_key.as_slice() == key)
-                    .unwrap_or(false)
-            })
-            .collect()
+        kv.find_back(&low, &high, |enc| {
+            decode_key(enc)
+                .map(|vk| vk.raw_key.as_slice() == key && accept(vk.version))
+                .unwrap_or(false)
+        })
     }
 
     fn latest_version_of(kv: &mut BPlusTree, key: &[u8]) -> Option<u64> {
-        Self::scan_key_versions(kv, key)
-            .into_iter()
-            .filter_map(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
-            .max()
+        Self::find_version_back(kv, key, |_| true)
+            .and_then(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
     }
 }
 
@@ -820,6 +800,60 @@ mod tests {
         let _ = std::fs::remove_file(crate::bplus_tree::storage::freelist_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::lock_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::blob_path(path));
+    }
+
+    /// 探针：一次点读 / 一次点写访问了多少页。
+    ///
+    /// 版本键大端有序 ⇒ 最新版本必然在链尾 ⇒ 下降到高界再往回一步就该停。
+    /// 修复前是从 `low` 下降后沿 `next_leaf` 正向走完整个区间：N 行版本横跨
+    /// N/order 片叶子，每片都要 read_page + 整节点 bincode 反序列化。
+    #[test]
+    fn test_point_op_cost_independent_of_chain_length() {
+        fn probe(chain_len: u64) -> (u64, u64) {
+            let path = tmp_db(&format!("probe_{chain_len}"));
+            let (get_pages, set_pages);
+            {
+                let mvcc = MVCC::open(&path, 4, 16);
+                for i in 0..chain_len {
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(b"hot", format!("v{i}").into_bytes()), "第 {i} 次写入被拒");
+                    tx.commit();
+                }
+
+                let tx = mvcc.begin_transaction();
+                let before = crate::bplus_tree::page::page_reads();
+                assert_eq!(
+                    tx.get(b"hot"),
+                    Some(format!("v{}", chain_len - 1).into_bytes())
+                );
+                get_pages = crate::bplus_tree::page::page_reads() - before;
+
+                let before = crate::bplus_tree::page::page_reads();
+                assert!(tx.set(b"hot", b"newer".to_vec()));
+                set_pages = crate::bplus_tree::page::page_reads() - before;
+                tx.rollback();
+            }
+            cleanup(&path);
+            (get_pages, set_pages)
+        }
+
+        let (g_short, s_short) = probe(50);
+        let (g_long, s_long) = probe(2000);
+        eprintln!(
+            "点读访问页数：链长 50 → {g_short} 页，链长 2000 → {g_long} 页\n\
+             点写访问页数：链长 50 → {s_short} 页，链长 2000 → {s_long} 页"
+        );
+        // 判据是「只能随树高（log 规模）涨，不许随链长（线性）涨」：
+        // order=4 时链长 50 → 2000 会让树高多约 3 层，所以给 8 页容差；
+        // 而未修实现同样的两个点是 34 → 1015 页（涨 981 页），远大于任何对数级容差。
+        assert!(
+            g_long <= g_short + 8,
+            "点读的页数不应随版本链长度线性增长（短链 {g_short}，长链 {g_long}）"
+        );
+        assert!(
+            s_long <= s_short + 8,
+            "点写的页数不应随版本链长度线性增长（短链 {s_short}，长链 {s_long}）"
+        );
     }
 
     #[test]

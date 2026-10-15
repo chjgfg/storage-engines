@@ -95,6 +95,22 @@ pub struct PageManager {
     bulk_mode: bool,
 }
 
+// 测试专用：本线程的页访问次数（含页缓存命中）。
+//
+// B+ 树没有「读一行」这种细粒度 IO，代价的对应物是读了多少页 —— 用来把
+// 「点操作代价不随版本链长度增长」这条不变量钉成断言。做成 thread_local 是为了
+// 不和 `cargo test` 的并行用例互相计数。
+#[cfg(test)]
+thread_local! {
+    static PAGE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已发生的页访问次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn page_reads() -> u64 {
+    PAGE_READS.with(|c| c.get())
+}
+
 impl PageManager {
     /// 打开或创建数据文件（同时获取单写者锁、打开 dblwr，并做 torn-page 恢复）
     pub fn open(path: impl AsRef<Path>, max_cache_pages: usize) -> std::io::Result<Self> {
@@ -463,6 +479,9 @@ impl PageManager {
 
     /// 读页 payload
     pub fn read_page(&mut self, page_id: PageId) -> Option<Vec<u8>> {
+        // 测试专用：页访问次数（含页缓存命中）—— 用来断言点操作的代价不随版本链长度增长
+        #[cfg(test)]
+        PAGE_READS.with(|c| c.set(c.get() + 1));
         if !self.page_is_live(page_id) {
             return None;
         }

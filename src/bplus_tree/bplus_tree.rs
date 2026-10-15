@@ -911,6 +911,73 @@ impl BPlusTree {
     }
 
     /// 找到包含指定key的叶子节点ID
+    /// 在闭区间 `[low, high]` 内**从大到小**找第一个被 `accept` 接受的行。
+    ///
+    /// 版本键 `raw_key ‖ version.to_be_bytes()` 大端有序 ⇒ 同一逻辑 key 的最新版本排在
+    /// 区间末尾，所以「从高界往回走、第一个满足条件的就停」通常一次下降就命中，
+    /// 代价只和树高有关、和链长无关。
+    ///
+    /// 本树的叶子之间只有单向 `next_leaf`，没有 `prev_leaf`，所以「再往前一片」不是走链表
+    /// 而是**重新下降**：取本叶最小键 `m`，用它的真前缀 `m[..m.len()-1]`（一定小于 `m`，
+    /// enc 键至少 8 字节所以前缀必然存在）作新上界。但「小于 m」并不保证落到更左的叶子——
+    /// 已经走到最左叶子时会又回到同一片，所以额外用 `prev_leaf_min` 做**进度守卫**：
+    /// 下一跳的叶最小键若不严格小于上一跳的，就说明没有更左的叶子了，直接收尾。
+    /// 宁可少走，也不能原地打转。
+    ///
+    /// 扫描中一旦遇到 `k < low` 就返回 `None`：叶子按键升序，再往左全部落在区间之外。
+    pub fn find_back(
+        &mut self,
+        low: &[u8],
+        high: &[u8],
+        mut accept: impl FnMut(&[u8]) -> bool,
+    ) -> Option<(Key, RowId)> {
+        let mut bound = high.to_vec();
+        // 上一跳那片叶子的最小键。每跳都必须严格小于它，否则说明下降又回到了同一片叶子
+        // （典型情形：已经走到最左叶子，它下面没有叶子了）—— 此时区间内再无未考察的行。
+        let mut prev_leaf_min: Option<Key> = None;
+        loop {
+            let leaf_id = self.find_leaf_for_key(self.root, bound.clone())?;
+            let data = self.page_manager.read_page(leaf_id)?;
+            let Ok(BTreeNode::Leaf { entries, .. }) = bincode::deserialize::<BTreeNode>(&data)
+            else {
+                log::warn!("find_back: 期望叶子却拿到内部节点，停止反向游走");
+                return None;
+            };
+
+            let mut leaf_min: Option<Key> = None;
+            for (k, rid) in entries.iter().rev() {
+                leaf_min = Some(k.clone());
+                // 首跳那片叶子可能延伸到高界之外；那些行不属于本区间
+                if k.as_slice() > high {
+                    continue;
+                }
+                // 叶子按键升序：反向走到这里，再往左全部落在区间之外
+                if k.as_slice() < low {
+                    return None;
+                }
+                if accept(k.as_slice()) {
+                    return Some((k.clone(), rid.clone()));
+                }
+            }
+
+            // 本叶没有命中：以更小的上界重新下降到左边的叶子
+            let leaf_min = leaf_min?;
+            if let Some(prev) = &prev_leaf_min {
+                if leaf_min.as_slice() >= prev.as_slice() {
+                    // 没有左移 ⇒ 已在最左叶子，区间内的行全部考察过了
+                    return None;
+                }
+            }
+            prev_leaf_min = Some(leaf_min.clone());
+            if leaf_min.len() <= 1 {
+                return None;
+            }
+            let mut next_bound = leaf_min;
+            next_bound.truncate(next_bound.len() - 1);
+            bound = next_bound;
+        }
+    }
+
     fn find_leaf_for_key(&mut self, node_page_id: PageId, key: Key) -> Option<PageId> {
         let node_data = self.page_manager.read_page(node_page_id).unwrap();
         let node: BTreeNode = bincode::deserialize(&node_data).unwrap();
