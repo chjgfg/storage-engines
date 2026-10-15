@@ -313,18 +313,32 @@ impl MVCC {
     /// 版本回收（vacuum）。
     ///
     /// 规则：
-    /// - `xmin` = 活跃事务 id 最小值；无活跃事务时为 `next_version`
+    /// - **有任何活跃事务 ⇒ 整轮跳过**（`skipped_active_txn = true`），什么都不裁
+    /// - 无活跃事务时 `xmin = next_version`
     /// - 每个逻辑 key：只保留「最后一个 version < xmin」+ 全部 version >= xmin
     /// - 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除
     /// - 结束后 `merge()` 压缩日志；无 blob 引用时清空 blob 文件
+    ///
+    /// 为什么是「整轮跳过」而不是旧的 `xmin = min(活跃事务 id)`：那个水位线**会裁掉
+    /// 活跃事务快照仍需要的版本**。T 的可见判据是「v ≤ T.version 且 v ∉ T.active_xid」，
+    /// 若「最后一个 < xmin」那一版本身就属于 T 的并发快照，T 得往前再退一版 ——
+    /// 而那一版刚被裁掉 ⇒ T 静默读到更旧的值或 None。裁错版本是**静默数据错误**，
+    /// 比多等一轮 vacuum 危险得多（守卫见 `test_vacuum_keeps_versions_needed_by_active_txn`）。
+    ///
+    /// 活跃表这把锁**全程持有**：确认它为空之后不会有新事务抢先拿到快照。
+    /// 锁序 `active_txn → kv → blob` 与 [`Transaction::write`] 一致（那边是
+    /// active_txn → wal → blob → kv，都在真正动手前拿齐，不会与这里交叉等待）。
     pub fn vacuum(&self) -> std::io::Result<VacuumStats> {
-        let active = self.active_txn.lock().unwrap();
-        let xmin = if active.is_empty() {
-            self.next_version.load(Ordering::SeqCst)
-        } else {
-            *active.keys().min().unwrap()
-        };
-        drop(active);
+        let _active_guard = self.active_txn.lock().unwrap();
+        if !_active_guard.is_empty() {
+            return Ok(VacuumStats {
+                xmin: 0,
+                versions_removed: 0,
+                blob_rewritten: Some(false),
+                skipped_active_txn: true,
+            });
+        }
+        let xmin = self.next_version.load(Ordering::SeqCst);
 
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
@@ -422,6 +436,7 @@ impl MVCC {
             xmin,
             versions_removed: removed,
             blob_rewritten: Some(blob_rewritten),
+            skipped_active_txn: false,
         })
     }
 }
@@ -1159,6 +1174,70 @@ mod tests {
                 assert_eq!(tx.get(key.as_bytes()), Some(format!("v{i}").into_bytes()));
             }
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// 复现「旧水位线会裁掉活跃事务快照仍需要的版本」⇒ **静默读到错值**。
+    ///
+    /// 形状：`hot` 有 v1、v2 两版。B 提交 v2 **之前** T1 已经 begin ⇒ v2 落在 T1 的
+    /// 并发快照里、对 T1 永久不可见 ⇒ T1 只能回退到 v1。而此时
+    /// `xmin = min(活跃事务 id) = T1.id`，「最后一个 < xmin」的版本正好是 v2，
+    /// 于是按规则 v1 被裁掉 —— T1 再读就成了 None。
+    ///
+    /// 这就是 12e3696 想修、当天又被 f78edbb revert 回来的那个洞。revert 信息里
+    /// 承认「旧水位线的已知问题随之回来了」，但仓库里没有一条测试钉住它 ——
+    /// 缺的就是这条。
+    #[test]
+    fn test_vacuum_keeps_versions_needed_by_active_txn() {
+        let path = tmp_db("vacuum_active");
+        {
+            let mvcc = MVCC::open(&path);
+
+            let t0 = mvcc.begin_transaction();
+            assert!(t0.set(b"hot", b"v1".to_vec()));
+            t0.commit();
+
+            let b = mvcc.begin_transaction();
+            assert!(b.set(b"hot", b"v2".to_vec()));
+            let t1 = mvcc.begin_transaction(); // T1 的快照里有 b
+            b.commit(); // v2 提交了，但对 T1 永久不可见
+
+            assert_eq!(
+                t1.get(b"hot"),
+                Some(b"v1".to_vec()),
+                "读前提：T1 应当看到 v1（v2 在它的并发快照里）"
+            );
+
+            let stats = mvcc.vacuum().unwrap();
+            assert!(
+                stats.skipped_active_txn,
+                "有活跃事务时 vacuum 应整轮跳过，而不是按 min(活跃 id) 去裁版本"
+            );
+            assert_eq!(stats.versions_removed, 0, "跳过的那一轮不该裁任何东西");
+            assert_eq!(
+                t1.get(b"hot"),
+                Some(b"v1".to_vec()),
+                "vacuum 不得裁掉活跃事务快照仍需要的版本（裁错 = 静默读到旧值/None）；本次 xmin={}",
+                stats.xmin
+            );
+
+            t1.rollback();
+
+            // T1 结束之后再 vacuum：这次必须真的能裁（否则「整轮跳过」会变成永久不回收）
+            let stats = mvcc.vacuum().unwrap();
+            assert!(
+                !stats.skipped_active_txn,
+                "没有活跃事务时不该再跳过，否则版本链永远裁不掉"
+            );
+            assert!(
+                stats.versions_removed > 0,
+                "hot 的旧版本这次应被裁掉，实测 {} 次",
+                stats.versions_removed
+            );
+            let t2 = mvcc.begin_transaction();
+            assert_eq!(t2.get(b"hot"), Some(b"v2".to_vec()), "裁完应读到最新版本");
+            t2.rollback();
         }
         cleanup(&path);
     }

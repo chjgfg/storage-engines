@@ -13,7 +13,7 @@ pub struct ExportRecord {
 /// vacuum 结果统计
 #[derive(Debug, Clone)]
 pub struct VacuumStats {
-    /// 本次使用的回收水位
+    /// 本次使用的回收水位（因存在活跃事务而整轮跳过时为 0）
     pub xmin: u64,
     /// 删除的旧版本行数
     pub versions_removed: usize,
@@ -21,6 +21,12 @@ pub struct VacuumStats {
     ///
     /// `None` 表示该引擎没有外置 blob 存储（lsm_tree / memory）。
     pub blob_rewritten: Option<bool>,
+    /// 因存在活跃事务而**整轮跳过**，什么都没扫。
+    ///
+    /// 必须能和「扫了但没东西可裁」区分开：两者 `versions_removed` 都是 0，
+    /// 但前者说明回收**根本没工作**（时机不对，或有事务忘了 commit），
+    /// 后者说明版本链已经压到 1 —— 结论完全相反。
+    pub skipped_active_txn: bool,
 }
 
 /// 解析逻辑 value 信封
