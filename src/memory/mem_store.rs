@@ -28,6 +28,21 @@ pub(crate) fn rows_touched() -> u64 {
     ROWS_TOUCHED.with(|c| c.get())
 }
 
+// 测试专用：本线程「把带 value 的条目整个克隆出来」的次数。
+//
+// 内存引擎没有磁盘读也没有 WAL，所以 ② 那条通道在这里的代价单位就是 value 克隆：
+// 重量路径（`iter`）每行克隆一次，轻量路径（`iter_keys`）一次都不克隆。
+#[cfg(test)]
+thread_local! {
+    static VALUE_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已发生的 value 克隆次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn value_clones() -> u64 {
+    VALUE_CLONES.with(|c| c.get())
+}
+
 #[cfg(test)]
 fn count_rows(n: usize) {
     ROWS_TOUCHED.with(|c| c.set(c.get() + n as u64));
@@ -105,8 +120,15 @@ impl MemStore {
     }
 
     /// 全表有序迭代（克隆 value，教学清晰）
+    ///
+    /// 注意这是**重量路径**：每一行的 value 都被克隆一次。全库折叠请改用
+    /// [`Self::iter_keys`] + 只对胜出行取值，别用这个。
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + '_ {
-        self.data.iter().map(|(k, v)| (k.clone(), v.clone()))
+        self.data.iter().map(|(k, v)| {
+            #[cfg(test)]
+            VALUE_CLONES.with(|c| c.set(c.get() + 1));
+            (k.clone(), v.clone())
+        })
     }
 
     /// 行数（含 tombstone 与历史版本）

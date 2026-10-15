@@ -550,6 +550,43 @@ mod tests {
         assert_eq!(s_short, s_long, "点写访问的行数不应随版本链长度增长（它只需要版本号）");
     }
 
+    /// ② 全库折叠：不该再逐行克隆 value。
+    ///
+    /// 计数挂在重量路径 `MemStore::iter` 上（它每行克隆一次 value），所以将来谁把折叠
+    /// 改回 `iter()`，这条会当场红。内存引擎没有磁盘读也没有 WAL，② 在这里的
+    /// 代价单位就是 value 克隆 —— 别的引擎用读盘/页/块来量，这里只能用克隆来量。
+    #[test]
+    fn test_collect_latest_does_not_clone_values() {
+        const KEYS: u64 = 8;
+        const VERSIONS: u64 = 120;
+
+        let mvcc = MVCC::new();
+        for v in 0..VERSIONS {
+            for k in 0..KEYS {
+                let key = format!("k{k}");
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key.as_bytes(), format!("v{v}").into_bytes()));
+                tx.commit();
+            }
+        }
+
+        let tx = mvcc.begin_transaction();
+        let base = crate::memory::mem_store::value_clones();
+        let recs = tx.export_latest_visible(false);
+        let used = crate::memory::mem_store::value_clones() - base;
+        eprintln!(
+            "折叠期 value 克隆次数：{used}（存活 key {KEYS}，历史行数 {}）",
+            KEYS * VERSIONS
+        );
+        assert_eq!(recs.len() as u64, KEYS, "存活 key 数应等于 {KEYS}");
+        assert_eq!(
+            used, 0,
+            "折叠只该比键，不该逐行克隆 value：实际 {used} 次，历史行数 {}",
+            KEYS * VERSIONS
+        );
+        tx.rollback();
+    }
+
     #[test]
     fn test_snapshot_isolation() {
         let mvcc = MVCC::new();
