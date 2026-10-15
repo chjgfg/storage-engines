@@ -53,6 +53,17 @@
   `HealthFold` 链长折叠、`VacuumScheduler` 自动回收的记账/取账/游标、`is_unfinished` 漏网事务判据）。
   内部 API，不影响调用方；收敛的边界是"是否涉及存储布局"——遍历原语、早停方式、各引擎的量尺
   仍然一家一份（README 的「哪些只剩一份,哪些必须四份」有表）。
+- **门面 trait 加 `Send`/`Sync` 上界**：`KvEngine: Send + Sync`、`KvTxn: Send`、`KvBulk: Send`。
+  在此之前 `Box<dyn KvEngine>` 既进不了 `Arc` 也搬不过线程，交易进程那种"开库线程 +
+  心跳线程 checkpoint + 工作线程读写"根本写不出来 —— 这就是下游在应用里又包一层 trait 的
+  直接原因。`KvTxn` 刻意不要求 `Sync`（内部有 `Cell` 与写集；共享一个事务对象没有语义）。
+  由 `facade_is_usable_across_threads` 在编译期钉住：trait 上界被人改窄就编译失败。
+- **类型化选型 + 一份配置**：`EngineKind`（`parse` 兼容别名、`as_str`、`needs_disk`、
+  `is_production_ok` —— 只有一个 false：`memory` 没有持久化）、`StorageConfig`
+  （`STORAGE_ENGINE` / `STORAGE_DATA_DIR`、`engine_dir()`、`ensure_dirs()`、`open()`）与
+  `open_from_env()`。`STORAGE_ENGINE` 不认识时**报错**而不是静默退回默认值。
+- **`KvTxn::incr_with_ttl`** 上门面（四引擎本来就有，之前只有各自的 kv_ops 能碰到）。
+
 - **`src/common/wal.rs`：三份 WAL 收成一份**（原先 `diff` 实测只差 14–16 行注释与 import，`WAL_MAGIC` 与帧头本来就相同 —— 同一个磁盘格式的三份复制）。崩溃恢复是最不该有三分之一实现的地方：M3b 那个「`checkpoint()` 把刚写的 Checkpoint 记录自己 truncate 抹掉」的 bug，形状就是「一份改了、另两份照旧」。合并时补了一条三份原本都没有的守卫 `test_corrupt_tail_is_discarded_but_good_frames_survive`（半帧损坏必须只丢坏尾，不牵连前面的完整记录）。
 - **`src/common/disk.rs`：三份逐字重复的字节级文件工具收成一份** —— `DiskFile`、`FileLock`、
   `crc32`（`diff` 实测原先 bitcask 与 lsm 的 FileLock 差 **0 行**，crc32 差 0 行）。
@@ -122,7 +133,7 @@
 
 ### 测试
 
-231 个单元测试 + 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆次数），不用计时：
+233 个单元测试 + 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆次数），不用计时：
 原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
 并且复杂度守卫都先验证过"它会红"（临时短路被测代码跑一遍）才算数。
 - **长跑基线守卫 `test_long_run_baseline`（`#[ignore]`，release 手动跑）**：把事故形状

@@ -115,7 +115,12 @@ impl Default for EngineConfig {
 ///
 /// 方法语义与各引擎的 `Transaction` 完全一致：`set` / `delete` 返回 `false`
 /// 表示写冲突，此时应当 [`KvTxn::rollback`]。
-pub trait KvTxn {
+/// 一个只读/读写事务（快照隔离）。
+///
+/// `Send` 是**必须**的：句柄要能跟着任务跨线程走（交易进程里典型是"主线程开库、
+/// 工作线程读写"）。刻意**不要求 `Sync`** —— 事务内部有 `Cell`（WAL 是否已开）与
+/// 写集，跨线程共享一个事务对象本身就没有语义：单写者模型下"共享"只会变成竞态。
+pub trait KvTxn: Send {
     // ---- 基本读写 ----
 
     /// 本事务的版本号 / xid
@@ -152,6 +157,17 @@ pub trait KvTxn {
     fn incr(&self, key: &[u8], delta: i64) -> std::result::Result<i64, IncrError>;
 
     fn decr(&self, key: &[u8], delta: i64) -> std::result::Result<i64, IncrError>;
+
+    /// 自增并给这个 key 设 TTL（`ttl` 是**绝对过期时刻**之前的存活时长）
+    ///
+    /// 为什么单列一个方法而不是"先 incr 再 refresh_ttl"：那是两个事务，中间崩了
+    /// 会留下"计数加了、TTL 没设"的行；引擎内部是一次写集里做完的。
+    fn incr_with_ttl(
+        &self,
+        key: &[u8],
+        delta: i64,
+        ttl: Duration,
+    ) -> std::result::Result<i64, IncrError>;
 
     // ---- 扫描 / 搜索 ----
 
@@ -195,7 +211,7 @@ pub trait KvTxn {
 /// 批量导入会话：无冲突检测、无 WAL，**单写者**假定。
 ///
 /// 结束时必须 [`KvBulk::finish`]（`Drop` 也会兜底，但不保证 flush 顺序）。
-pub trait KvBulk {
+pub trait KvBulk: Send {
     fn put(&mut self, key: &[u8], value: Vec<u8>);
 
     fn put_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]);
@@ -212,7 +228,11 @@ pub trait KvBulk {
 }
 
 /// 存储引擎门面
-pub trait KvEngine {
+///
+/// `Send + Sync`：句柄要能放进 `Arc` 跨线程共享（交易进程里"启动线程开库、
+/// 心跳线程 checkpoint、工作线程读写"是常态）。少了这两个 supertrait，门面就只能
+/// 在单线程里用 —— 那正是下游宁可自己在应用里再包一层的起因。
+pub trait KvEngine: Send + Sync {
     /// 规范引擎名（`"bitcask"` / `"bplus_tree"` / `"lsm_tree"` / `"memory"`）
     fn name(&self) -> &'static str;
 
@@ -271,6 +291,123 @@ pub trait KvEngine {
             op: "merge",
         })
     }
+}
+
+/// 引擎种类：把"传哪个字符串"变成类型。
+///
+/// 之前只有 [`ENGINE_NAMES`] + 字符串解析，调用方十有八九会在应用里再封一层
+/// `enum`（还顺手把 `memory` 误用于实盘）。这里给出类型化的选择器 + 两个谓词，
+/// 让"选型"这件事在门面层就闭环。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    Bitcask,
+    BPlusTree,
+    LsmTree,
+    Memory,
+}
+
+impl EngineKind {
+    /// 规范名（与 [`open_engine`] 接受的名字一致）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineKind::Bitcask => "bitcask",
+            EngineKind::BPlusTree => "bplus_tree",
+            EngineKind::LsmTree => "lsm_tree",
+            EngineKind::Memory => "memory",
+        }
+    }
+
+    /// 解析名字，大小写不敏感且接受常见别名（`bplus` / `btree` / `lsm` / `mem`…）
+    pub fn parse(s: &str) -> Option<Self> {
+        match canonical_name(s)? {
+            "bitcask" => Some(EngineKind::Bitcask),
+            "bplus_tree" => Some(EngineKind::BPlusTree),
+            "lsm_tree" => Some(EngineKind::LsmTree),
+            "memory" => Some(EngineKind::Memory),
+            _ => None,
+        }
+    }
+
+    /// 是否需要磁盘路径（`memory` 不需要）
+    pub fn needs_disk(self) -> bool {
+        self != EngineKind::Memory
+    }
+
+    /// 能不能上生产。
+    ///
+    /// 返回 `false` 的只有一个：`memory` —— 它没有任何持久化（见
+    /// [`KvEngine::durability_profile`]：无事务 WAL、无校验和），进程一退数据就没。
+    /// 它是给教学/测试当对照用的，不是"更快的选项"。
+    pub fn is_production_ok(self) -> bool {
+        self != EngineKind::Memory
+    }
+}
+
+impl std::fmt::Display for EngineKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 「选哪个引擎 + 数据放哪 + 引擎参数」一份配置。
+///
+/// 环境变量约定与常见部署写法一致：`STORAGE_ENGINE`（默认 `bitcask`）、
+/// `STORAGE_DATA_DIR`（默认 `./data`）。落盘位置是 `data_dir/<engine>/`，
+/// 所以**换引擎不会自动带数据** —— 要过得走导出/导入（`export_kv` / `import_kv`）。
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub kind: EngineKind,
+    pub data_dir: PathBuf,
+    pub engine: EngineConfig,
+}
+
+impl StorageConfig {
+    /// 从环境变量读配置。
+    ///
+    /// `STORAGE_ENGINE` 写了但不认识 ⇒ **报错**，不静默退回默认值："以为在跑 bitcask、
+    /// 其实跑的是 memory"这种事故不能靠默认值发生。
+    pub fn from_env() -> Result<Self> {
+        let raw = std::env::var("STORAGE_ENGINE").unwrap_or_else(|_| "bitcask".to_string());
+        let kind = EngineKind::parse(&raw).ok_or_else(|| EngineError::UnknownEngine(raw.clone()))?;
+        let data_dir = std::env::var("STORAGE_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("./data"));
+        Ok(StorageConfig {
+            kind,
+            data_dir,
+            engine: EngineConfig::default(),
+        })
+    }
+
+    /// 本引擎的数据目录：`data_dir/<engine>`
+    pub fn engine_dir(&self) -> PathBuf {
+        self.data_dir.join(self.kind.as_str())
+    }
+
+    /// 建好数据目录（幂等；memory 什么都不做）
+    pub fn ensure_dirs(&self) -> Result<()> {
+        if self.kind.needs_disk() {
+            std::fs::create_dir_all(self.engine_dir())?;
+        }
+        Ok(())
+    }
+
+    /// 按本配置打开引擎（内部会先建目录）
+    pub fn open(&self) -> Result<Box<dyn KvEngine>> {
+        self.ensure_dirs()?;
+        // B+ 树的"库"是一个文件，另两家是一个目录
+        let path = match self.kind {
+            EngineKind::Memory => None,
+            EngineKind::BPlusTree => Some(self.engine_dir().join("bplus.db")),
+            _ => Some(self.engine_dir()),
+        };
+        open_engine_with(self.kind.as_str(), path.as_deref(), &self.engine)
+    }
+}
+
+/// 便捷入口：设好 `STORAGE_ENGINE` / `STORAGE_DATA_DIR` 就能起库。
+pub fn open_from_env() -> Result<Box<dyn KvEngine>> {
+    StorageConfig::from_env()?.open()
 }
 
 /// 按名字打开引擎，用默认 [`EngineConfig`]。
@@ -459,6 +596,15 @@ macro_rules! impl_engine {
 
             fn decr(&self, key: &[u8], delta: i64) -> std::result::Result<i64, IncrError> {
                 self.inner.decr(key, delta)
+            }
+
+            fn incr_with_ttl(
+                &self,
+                key: &[u8],
+                delta: i64,
+                ttl: Duration,
+            ) -> std::result::Result<i64, IncrError> {
+                self.inner.incr_with_ttl(key, delta, ttl)
             }
 
             fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<ExportRecord> {
@@ -914,6 +1060,116 @@ mod tests {
         }
         drop(engines);
         cleanup(dirs.into_iter().map(Some).collect());
+    }
+
+    /// 门面必须**能跨线程用**。
+    ///
+    /// 这不是锦上添花：`Box<dyn KvEngine>` 少了 `Send`/`Sync`，既进不了 `Arc` 也搬不到
+    /// 别的线程，而交易进程的常态就是"开库线程 + 心跳线程 checkpoint + 工作线程读写"。
+    /// 下游正是因为这个才在应用里又包了一层 trait —— 那条 wrapper 现在可以删了。
+    /// 这条断言在 trait 上界被人改掉时立刻编译失败。
+    #[test]
+    fn facade_is_usable_across_threads() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Box<dyn KvEngine>>();
+        assert_sync::<Box<dyn KvEngine>>();
+
+        // 1) 事务搬到别的线程去写（scoped：`Box<dyn KvTxn + '_>` 带着对引擎的借用，
+        //    普通 spawn 要求 'static，所以这里用 scope —— 要证的还是 Send）
+        let dir = tmp_dir("send_txn");
+        {
+            let db = open_engine("bitcask", Some(&dir)).unwrap();
+            std::thread::scope(|sc| {
+                let t = db.begin();
+                sc.spawn(move || {
+                    assert!(t.set(b"moved", b"txn".to_vec()));
+                    t.commit();
+                });
+            });
+            let t = db.begin();
+            assert_eq!(t.get(b"moved"), Some(b"txn".to_vec()));
+            t.commit();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 2) 句柄进 Arc，四个线程共用同一个库
+        let db = std::sync::Arc::new(open_engine("memory", None).unwrap());
+        let mut handles = Vec::new();
+        for i in 0..4u8 {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || {
+                let t = db.begin();
+                // 刻意不用 0x00/0x01 打头的值：那会踩到"值信封标签"的坑，
+                // 与本条要证的跨线程无关（那个坑单独记在 README 已知局限 + 待决策）
+                assert!(t.set(format!("k{i}").as_bytes(), vec![i.max(1) + 0x10; 8]));
+                t.commit();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let t = db.begin();
+        for i in 0..4u8 {
+            assert_eq!(
+                t.get(format!("k{i}").as_bytes()),
+                Some(vec![i.max(1) + 0x10; 8])
+            );
+        }
+        t.commit();
+        // 引擎层的维护动作也能从别的线程调
+        let db2 = db.clone();
+        std::thread::spawn(move || {
+            db2.flush().unwrap();
+            let h = db2.health();
+            assert_eq!(h.live_keys, 4);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// 类型化选型：别名解析、"要不要路径"、"能不能上生产"。
+    #[test]
+    fn engine_kind_selection_is_typed_and_honest() {
+        assert_eq!(EngineKind::parse("LSM"), Some(EngineKind::LsmTree));
+        assert_eq!(EngineKind::parse(" b-plus-tree "), Some(EngineKind::BPlusTree));
+        assert_eq!(EngineKind::parse("mem"), Some(EngineKind::Memory));
+        assert_eq!(EngineKind::parse("redis"), None);
+        for k in [
+            EngineKind::Bitcask,
+            EngineKind::BPlusTree,
+            EngineKind::LsmTree,
+            EngineKind::Memory,
+        ] {
+            assert_eq!(EngineKind::parse(k.as_str()), Some(k), "as_str/parse 必须互逆");
+            assert_eq!(k.to_string(), k.as_str());
+        }
+        // memory 是唯一"没有持久化"的那个，选型时就得能问到
+        assert!(!EngineKind::Memory.is_production_ok());
+        assert!(!EngineKind::Memory.needs_disk());
+        for k in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree] {
+            assert!(k.is_production_ok() && k.needs_disk());
+        }
+
+        // StorageConfig 自己建目录、按引擎决定"目录 or 库文件"
+        let base = tmp_dir("storage_cfg");
+        let cfg = StorageConfig {
+            kind: EngineKind::BPlusTree,
+            data_dir: base.clone(),
+            engine: EngineConfig {
+                order: 16,
+                max_cache_pages: 32,
+            },
+        };
+        let db = cfg.open().expect("按配置打开 B+ 树");
+        assert_eq!(db.name(), "bplus_tree");
+        assert!(cfg.engine_dir().exists());
+        let t = db.begin();
+        assert!(t.set(b"cfg", b"ok".to_vec()));
+        assert_eq!(t.incr_with_ttl(b"counter", 3, Duration::from_secs(60)).unwrap(), 3);
+        assert!(t.get_ttl(b"counter").is_some_and(|o| o.is_some()), "TTL 必须真的设上");
+        t.commit();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 门面必须让上层**不看引擎源码**就能问出「最长版本链有多长」。
