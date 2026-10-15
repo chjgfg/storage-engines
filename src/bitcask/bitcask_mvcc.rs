@@ -156,7 +156,59 @@ fn run_checkpoint(
     let _ = seal_wal_checkpoint(&mut wal, next_ver);
 }
 
+/// 全库健康度快照 —— 让库自己说得出「版本链到底有多长」。
+///
+/// 这次事故的量化核心（某个热点 key 堆了 23.8 万个版本）从头到尾是靠
+/// `grep data.log | uniq -c` 数出来的；一个当基座用的库不该靠这个诊断自己。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MvccHealth {
+    /// 物理行数（含历史版本与墓碑）
+    pub total_rows: u64,
+    /// 不同逻辑 key 的个数
+    pub live_keys: u64,
+    /// 单个逻辑 key 的最长版本链
+    pub max_chain: u64,
+    /// 超出「每 key 一行」的多余行数 = total_rows - live_keys。
+    ///
+    /// 这是「链没被裁过」的量级指标，**不等于** vacuum 能裁掉多少
+    /// （vacuum 还要留「最后一个 < xmin」那一版，墓碑另有规则）。
+    pub rows_above_one: u64,
+    /// 当前活跃事务数：> 0 时 vacuum 会整轮跳过
+    pub active_txns: u64,
+}
+
 impl MVCC {
+    /// 全库健康度快照。**只走 KeyDir 元数据**（`iter_meta`），不读 value、不碰 blob。
+    ///
+    /// 代价是 O(物理行数) 的内存遍历，属管理面调用：别放进热路径，长跑里按分钟级采样就够。
+    pub fn health(&self) -> MvccHealth {
+        let mut h = MvccHealth::default();
+        let mut prev_raw: Option<Vec<u8>> = None;
+        let mut cur_chain = 0u64;
+        {
+            let kv = self.kv.lock().unwrap();
+            // KeyDir 按 enc 升序 ⇒ 同一逻辑 key 的版本块相邻 ⇒ 顺序分组，一遍就够
+            for (enc, _loc) in kv.iter_meta() {
+                let Some(vk) = decode_key(enc) else {
+                    continue;
+                };
+                h.total_rows += 1;
+                if prev_raw.as_ref() == Some(&vk.raw_key) {
+                    cur_chain += 1;
+                } else {
+                    h.max_chain = h.max_chain.max(cur_chain);
+                    h.live_keys += 1;
+                    cur_chain = 1;
+                    prev_raw = Some(vk.raw_key);
+                }
+            }
+            h.active_txns = self.active_txn.lock().unwrap().len() as u64;
+        }
+        h.max_chain = h.max_chain.max(cur_chain);
+        h.rows_above_one = h.total_rows.saturating_sub(h.live_keys);
+        h
+    }
+
     /// 打开/创建磁盘上的 MVCC 引擎（含 WAL 恢复）。失败时 panic（兼容旧代码）。
     pub fn open(dir: impl AsRef<Path>) -> Self {
         Self::try_open(dir).map_err(|e| format!("MVCC::open 失败: {e}")).unwrap()
@@ -1238,6 +1290,48 @@ mod tests {
             let t2 = mvcc.begin_transaction();
             assert_eq!(t2.get(b"hot"), Some(b"v2".to_vec()), "裁完应读到最新版本");
             t2.rollback();
+        }
+        cleanup(&path);
+    }
+
+    /// 健康度快照必须如实报出「最长版本链」。
+    ///
+    /// 这次事故的核心数字（某把热点 key 堆了多少个版本）一直是靠
+    /// `grep data.log | uniq -c` 数出来的 —— 一个当基座用的库不该靠这个诊断自己。
+    /// 顺带验证 vacuum 之后能看得见「链被压平」，那正是将来自动回收要盯的指标。
+    #[test]
+    fn test_health_reports_chain_length() {
+        const CHAIN: u64 = 500;
+
+        let path = tmp_db("health");
+        {
+            let mvcc = MVCC::open(&path);
+            for i in 0..CHAIN {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+            for k in 0..3u64 {
+                let key = format!("other{k}");
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key.as_bytes(), b"x".to_vec()));
+                tx.commit();
+            }
+
+            let h = mvcc.health();
+            assert_eq!(h.live_keys, 4, "逻辑 key 数");
+            assert_eq!(h.total_rows, CHAIN + 3, "物理行数（含历史版本）");
+            assert_eq!(h.max_chain, CHAIN, "最长版本链应由库自己报出来");
+            assert_eq!(h.rows_above_one, CHAIN - 1);
+            assert_eq!(h.active_txns, 0);
+
+            let stats = mvcc.vacuum().unwrap();
+            assert!(!stats.skipped_active_txn, "无活跃事务时不该跳过");
+            let after = mvcc.health();
+            assert_eq!(after.max_chain, 1, "vacuum 后最长链应降到 1");
+            assert_eq!(after.total_rows, 4, "vacuum 后应只剩每 key 一行");
+            assert_eq!(after.live_keys, 4);
+            assert_eq!(after.rows_above_one, 0);
         }
         cleanup(&path);
     }
