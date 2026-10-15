@@ -183,6 +183,21 @@ fn discover_sealed_ids(active_path: &Path) -> Vec<u32> {
     ids
 }
 
+/// hint 里的每条记录是否都指向**还在**的文件（active 或某个密封分片）。
+///
+/// 崩在 `merge()` 中途会留下这种 hint：它记的是合并前的布局，而那批 `data.{id}.log`
+/// 已经被删掉了。增量扫只补 active 文件里新增的行，指向失踪分片的键**永远不会被补回来**
+/// ⇒ 悄悄少数据，比慢严重。所以这里当作 hint 失效处理，回退全量扫。
+fn hint_files_exist(kd: &KeyDir, active_id: u32, sealed_ids: &[u32]) -> bool {
+    kd.values().all(|loc| {
+        let fid = match loc {
+            KeyLoc::Live { file_id, .. } => *file_id,
+            KeyLoc::SoftTombstone { file_id } => *file_id,
+        };
+        fid == active_id || sealed_ids.contains(&fid)
+    })
+}
+
 /// 写出 hint v2（原子）
 pub fn write_hint_file(
     path: &Path,
@@ -659,6 +674,11 @@ impl Bitcask {
     /// 指定单个 active 分片软上限（字节）；写满后 rotate。
     pub fn with_max_file_bytes(path: PathBuf, max_file_bytes: u64) -> Result<Self> {
         let base_path = path;
+        // 先认回收崩在中间的 merge 产物，再谈别的：`discover_sealed_ids` 与后面的
+        // `Log::new(data.log)` 都会**创建**缺失的文件，一旦让它们在恢复之前跑，
+        // 「data.log 被删了、真数据还在 data.merge 里」这个现场就被永久抹平 ——
+        // 表现是打开一个空库，谁都不报错。
+        Self::recover_merge_artifact(&base_path)?;
         let sealed_ids = discover_sealed_ids(&base_path);
         let hint_path = hint_path_for(&base_path);
 
@@ -684,6 +704,12 @@ impl Bitcask {
                 log::warn!("hint 增量扫失败: {e}，回退全量扫");
                 drop(active);
                 Self::full_rebuild(&base_path, &sealed_ids)?
+            } else if !hint_files_exist(&kd, active_id, &sealed_ids) {
+                // hint 指的是向已经不在的分片 ⇒ 增量扫只补 active 里新增的行，那些行**永远不在**
+                // 这次扫描里，于是键悄悄变少 —— 比启动慢严重得多，所以退回全量扫重建。
+                log::warn!("hint 引用了已不存在的分片，回退全量扫（崩在 merge 中间会留这种 hint）");
+                drop(active);
+                Self::full_rebuild(&base_path, &sealed_ids)?
             } else {
                 (kd, active_id, active)
             }
@@ -699,6 +725,42 @@ impl Bitcask {
             max_file_bytes,
             sealed: std::collections::HashMap::new(),
         })
+    }
+
+    /// 认回 / 清理崩在中间的 merge 产物，让 `merge()` 里那几步删除变得可恢复。
+    ///
+    /// `merge()` 的收口是「删密封分片 → 删旧 `data.log` → 把 `data.merge` 改名成 `data.log`」。
+    /// 第三步之前崩掉，磁盘上就只剩 `data.merge` 装着全部存活记录，而 open 找的是 `data.log`
+    /// —— 原样打开会得到一个**空库**：文件都在，谁都不报错，数据却"没了"。
+    ///
+    /// 两种现场，两种处置：
+    /// - `data.log` 不在、`data.merge` 在 ⇒ 改名认正。merge 的产物本来就包含全部存活键，
+    ///   且 merge 期间是单写者（文件锁 + 同一个 `&mut self`）⇒ 不会有任何行只在 `data.log` 里。
+    /// - 两者都在 ⇒ 崩在删旧文件之前，两边都是完整快照；留下 `data.log`（原路径继续走），
+    ///   把 `data.merge` 删掉。⚠️ 必须删：下次 merge 会以同一个名字打开那个残骸**往后追加**，
+    ///   把两份不同的记录混成一个文件 —— 那才是真的救不回来。
+    fn recover_merge_artifact(base_path: &Path) -> Result<()> {
+        let mut merge_path = base_path.to_path_buf();
+        merge_path.set_extension(MERGE_FILE_EXT);
+        if !merge_path.exists() {
+            return Ok(());
+        }
+        if base_path.exists() {
+            log::warn!(
+                "发现未完成 merge 的残骸 {}（{} 仍在），删掉残骸按原日志打开",
+                merge_path.display(),
+                base_path.display()
+            );
+            std::fs::remove_file(&merge_path)?;
+        } else {
+            log::warn!(
+                "{} 缺失而 {} 存在 ⇒ 上次 merge 崩在改名之前，把 merge 产物认作数据日志",
+                base_path.display(),
+                merge_path.display()
+            );
+            std::fs::rename(&merge_path, base_path)?;
+        }
+        Ok(())
     }
 
     /// 全量重建：扫所有密封分片 + active
@@ -902,6 +964,11 @@ impl Bitcask {
         drop(old_active);
 
         // 删除密封分片
+        //
+        // ⚠️ 从这里到 `rename(new_path, &target)` 之间崩掉，磁盘上只剩 `data.merge`。
+        // 这不是"运气好没碰上"而是必然要碰的：单核机器上 merge 是全库重写，窗口够长。
+        // 兜底不在这里（顺序不能改：旧 active 句柄还挂着时 Windows 不让改名覆盖），
+        // 而在 open 那边的 [`Bitcask::recover_merge_artifact`]。
         for id in discover_sealed_ids(&target) {
             let p = segment_path(&target, id);
             let _ = std::fs::remove_file(&p);
@@ -1211,6 +1278,100 @@ mod tests {
         for id in discover_sealed_ids(path) {
             let _ = std::fs::remove_file(segment_path(path, id));
         }
+    }
+
+    /// 崩在 `merge()` 改名之前的现场，必须能在下次 open 时被认回来。
+    ///
+    /// 手工布置现场而不是真去崩进程：`data.log` 已经不存在、全部存活记录只在 `data.merge` 里。
+    /// 没有恢复的话 open 会**新建一个空 data.log**（`Log::new` 就是 create-if-missing），
+    /// 于是得到一个"打开成功、一条都没有"的空库 —— 这类失败不报错，只能靠断言钉。
+    #[test]
+    fn test_open_recovers_merge_left_behind_by_crashed_merge() {
+        let path = tmp_log("merge_crash");
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            for i in 0..20u8 {
+                eng.set(format!("k{i}").as_bytes(), vec![i; 32]).unwrap();
+            }
+            eng.flush().unwrap();
+            eng.dump_hint().unwrap();
+        }
+        // 布置现场：merge 产物写好、旧 data.log 已删、改名还没跑
+        let merge = path.with_extension("merge");
+        std::fs::rename(&path, &merge).unwrap();
+        assert!(!path.exists() && merge.exists());
+
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            for i in 0..20u8 {
+                assert_eq!(
+                    eng.get(format!("k{i}").as_bytes()).unwrap(),
+                    Some(vec![i; 32]),
+                    "k{i} 本该在 merge 产物里 —— open 把它当空库开了"
+                );
+            }
+        }
+        cleanup(&path);
+    }
+
+    /// 两边都在的现场：留下 `data.log`，把 merge 残骸删掉。
+    ///
+    /// 删残骸不是洁癖：下次 `merge()` 会以同一个名字打开那个残骸**往后追加**，
+    /// 两份不同布局的记录混进一个文件 —— 那才是真救不回来。
+    #[test]
+    fn test_open_discards_merge_debris_when_log_survives() {
+        let path = tmp_log("merge_debris");
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            eng.set(b"a", b"1".to_vec()).unwrap();
+            eng.flush().unwrap();
+        }
+        let merge = path.with_extension("merge");
+        std::fs::write(&merge, b"stale debris").unwrap();
+
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            assert_eq!(eng.get(b"a").unwrap(), Some(b"1".to_vec()));
+        }
+        assert!(!merge.exists(), "data.log 还在 ⇒ 残骸该被清掉，别留给下次 merge 追加");
+        cleanup(&path);
+    }
+
+    /// hint 指的是向已经不存在的分片 ⇒ 必须回退全量扫，不能悄悄少键。
+    ///
+    /// 增量扫只补 active 文件里 `active_size` 之后的新增行；键的位置要是被 hint 记成
+    /// 「在某个已删掉的分片上」，它就**永远不会**被这次扫描补回来。
+    /// 真实来源就是崩在 merge 中途：合并后的 data.log 是全的，hint 却还记着合并前的布局。
+    #[test]
+    fn test_hint_naming_missing_segment_falls_back_to_full_scan() {
+        let path = tmp_log("stale_hint");
+        {
+            // 小分片上限 ⇒ 会 rotate，active 里是最后几行
+            let mut eng = Bitcask::with_max_file_bytes(path.clone(), 64).unwrap();
+            for i in 0..12u8 {
+                eng.set(format!("k{i}").as_bytes(), vec![i; 40]).unwrap();
+            }
+            eng.flush().unwrap();
+            eng.dump_hint().unwrap();
+        }
+        let hint = hint_path_for(&path);
+        let (mut kd, active_id, active_size) = read_hint_file(&hint).unwrap();
+        // 把最后写入的那个键伪造成"在分片 999 上"：它的真实记录确实在 data.log 里
+        let last = format!("k{}", 11u8).into_bytes();
+        kd.insert(last, KeyLoc::Live { file_id: 999, pos: 0, len: 40 });
+        write_hint_file(&hint, &kd, active_id, active_size).unwrap();
+
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            for i in 0..12u8 {
+                assert_eq!(
+                    eng.get(format!("k{i}").as_bytes()).unwrap(),
+                    Some(vec![i; 40]),
+                    "k{i} 该由全量扫补回来（hint 里有一条指向失踪分片的位置）"
+                );
+            }
+        }
+        cleanup(&path);
     }
 
     #[test]
