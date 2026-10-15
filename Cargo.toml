@@ -1,6 +1,6 @@
 [package]
 name = "storage-engines"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "四个教学用 KV 存储引擎(LSM 树 / B+ 树 / Bitcask / 纯内存),共享同一套 MVCC 事务层与统一 trait 门面,可在运行时按名字切换引擎。Four educational key-value storage engines behind one MVCC transaction layer and a runtime-selectable trait facade."
 license = "MIT OR Apache-2.0"

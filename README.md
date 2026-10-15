@@ -6,7 +6,8 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 210 个单元测试 + 4 个集成测试
+- 214 个单元测试 + 4 个集成测试
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -547,7 +548,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:210 单元 + 4 集成 + 2 文档测试
+cargo test                    # 全部:214 单元 + 4 集成 + 2 文档测试
 cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```
