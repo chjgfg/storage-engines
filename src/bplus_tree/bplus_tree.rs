@@ -1002,6 +1002,53 @@ pub struct BPlusTreeIterator<'a> {
 }
 
 impl BPlusTree {
+    /// 全表流式遍历，**只把键交给回调**（不克隆 value、不解码、不碰 blob 文件）。
+    ///
+    /// B+ 树的 value 就住在叶子条目里，没有 Bitcask `KeyDir` 那种独立键索引，所以
+    /// 「折叠出每个逻辑 key 的胜出版本行」这一遍必然要过每一行、把整页反序列化出来 ——
+    /// **页读取次数省不掉**，这点和 Bitcask 不一样，别指望一样。
+    ///
+    /// 真正能省的是「对每一行都做 value 解码」：内联值是一次 Vec 分配，大 value 更是
+    /// 一次 blob 读盘。本方法让折叠的第一遍只比键，value 留给第二遍按胜出行去取。
+    pub fn scan_keys_with(&mut self, mut f: impl FnMut(&[u8])) {
+        // 先下降到最左叶子
+        let mut current = self.root;
+        loop {
+            let Some(data) = self.page_manager.read_page(current) else {
+                return;
+            };
+            match bincode::deserialize::<BTreeNode>(&data) {
+                Ok(BTreeNode::Internal { children, .. }) => {
+                    let Some(&first) = children.first() else {
+                        return;
+                    };
+                    current = first;
+                }
+                Ok(BTreeNode::Leaf { .. }) => break,
+                Err(_) => return,
+            }
+        }
+
+        // 再沿单向 next_leaf 链表一路向右。读页/反序列化失败就止步（与现有 iter 一致地宽容）
+        let mut leaf = Some(current);
+        while let Some(id) = leaf {
+            let Some(data) = self.page_manager.read_page(id) else {
+                break;
+            };
+            let Ok(node) = bincode::deserialize::<BTreeNode>(&data) else {
+                break;
+            };
+            if let BTreeNode::Leaf { entries, next_leaf } = node {
+                for (k, _rid) in &entries {
+                    f(k);
+                }
+                leaf = next_leaf;
+            } else {
+                break;
+            }
+        }
+    }
+
     pub fn iter(&mut self) -> BPlusTreeIterator<'_> {
         // 找到最左边的叶子节点
         let mut current = self.root;

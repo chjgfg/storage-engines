@@ -677,31 +677,45 @@ impl Transaction {
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        let mut latest: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
+        // ① 第一遍只折「键 + 版本号」。
+        //    B+ 树的 value 就住在叶子条目里，没有 Bitcask KeyDir 那样的独立键索引，
+        //    所以整表走一遍、把每页反序列化出来这件事省不掉（这点别 self-contradict 成
+        //    「降到 O(live keys)」）。真正省掉的是原先对**每一行**都做一次 value 解码：
+        //    内联值 = 一次 Vec 分配，大 value = 一次 blob 读盘。
+        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        {
+            let mut kvengine = self.kv.lock().unwrap();
+            kvengine.scan_keys_with(|enc| {
+                let Some(vk) = decode_key(enc) else {
+                    return;
+                };
+                if !self.is_visible(vk.version) {
+                    return;
+                }
+                // 全表按 enc 升序 ⇒ 同一 raw_key 的版本块连续，最后一次覆盖即最大可见版本
+                winners.insert(vk.raw_key.clone(), (vk.version, enc.to_vec()));
+            });
+        }
+
+        // ② 只给胜出行取值：每个存活 key 一次树下降 + 一次解码。
         let mut kvengine = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
-        for (enc, row) in kvengine.iter() {
-            let Some(vk) = decode_key(&enc) else {
+        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
+        for (key, (ver, enc)) in winners {
+            // 胜出行读不到就跳过（与旧实现「该行不存在则不参与」一致）
+            let Some(row) = kvengine.get(enc) else {
                 continue;
             };
-            if !self.is_visible(vk.version) {
-                continue;
-            }
             let logical = match &row.0 {
                 None => None,
                 Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
             };
-            latest.insert(vk.raw_key, (vk.version, logical));
+            if logical.is_none() && !include_deleted {
+                continue;
+            }
+            out.push((key, ver, logical));
         }
-        latest
-            .into_iter()
-            .filter_map(|(key, (ver, value))| {
-                if value.is_none() && !include_deleted {
-                    return None;
-                }
-                Some((key, ver, value))
-            })
-            .collect()
+        out
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, RowId> {
@@ -967,6 +981,47 @@ mod tests {
                 );
             }
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// ② 全库折叠：value 解码次数必须只与**存活 key 数**相关，不随历史行数增长。
+    ///
+    /// 诚实边界：B+ 树没有独立键索引，整表走一遍的**页读取**省不掉，这条不守页读取；
+    /// 它守的是「不再对每一行都做 value 解码」—— 内联值省一次 Vec 分配，
+    /// 大 value 省一次 blob 读盘（后者是真 IO）。
+    #[test]
+    fn test_collect_latest_decodes_only_live_keys() {
+        const KEYS: u64 = 8;
+        const VERSIONS: u64 = 120;
+
+        let path = tmp_db("collect_decode");
+        {
+            let mvcc = MVCC::open(&path, 4, 16);
+            for v in 0..VERSIONS {
+                for k in 0..KEYS {
+                    let key = format!("k{k}");
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(key.as_bytes(), format!("v{v}").into_bytes()));
+                    tx.commit();
+                }
+            }
+
+            let tx = mvcc.begin_transaction();
+            let base = crate::bplus_tree::storage::value_decodes();
+            let recs = tx.export_latest_visible(false);
+            let used = crate::bplus_tree::storage::value_decodes() - base;
+            eprintln!(
+                "折叠 value 解码次数：{used}（存活 key {KEYS}，历史行数 {}）",
+                KEYS * VERSIONS
+            );
+            assert_eq!(recs.len() as u64, KEYS, "存活 key 数应等于 {KEYS}");
+            assert!(
+                used <= KEYS + 4,
+                "只应给胜出行解码：实际 {used} 次，而历史行数是 {}",
+                KEYS * VERSIONS
+            );
+            tx.rollback();
         }
         cleanup(&path);
     }

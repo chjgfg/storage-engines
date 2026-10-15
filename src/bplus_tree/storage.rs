@@ -663,11 +663,29 @@ pub fn encode_stored_value(
     Ok(out)
 }
 
+// 测试专用：本线程的 value 解码次数。
+//
+// B+ 树没有独立键索引，全库折叠的**页读取**次数省不掉；能省的是「每行一次 value 解码」
+// —— 内联值是一次 Vec 分配，大 value 是一次 blob 读盘。所以 ② 这条通道用这个量来守。
+// 做成 thread_local 是为了不和 `cargo test` 的并行用例互相计数。
+#[cfg(test)]
+thread_local! {
+    static VALUE_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已发生的 value 解码次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn value_decodes() -> u64 {
+    VALUE_DECODES.with(|c| c.get())
+}
+
 /// 叶子存储形式 → 逻辑 value
 pub fn decode_stored_value(
     blob: &mut BlobStore,
     stored: &[u8],
 ) -> std::io::Result<Option<Vec<u8>>> {
+    #[cfg(test)]
+    VALUE_DECODES.with(|c| c.set(c.get() + 1));
     if stored.is_empty() {
         return Ok(None);
     }
