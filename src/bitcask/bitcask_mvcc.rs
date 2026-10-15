@@ -395,20 +395,24 @@ impl MVCC {
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
 
-        let all = kv.iter()?;
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, Option<Vec<u8>>)>> = BTreeMap::new();
-        for (enc, val) in all {
-            let Some(vk) = decode_key(&enc) else {
+        // ① 分组只走 KeyDir 元数据：判「留哪一版」只需要版本号 + 是不是软墓碑，不需要 value。
+        //    旧实现是两次 `kv.iter()`（每一行连 value 全部读出来），于是 vacuum 自己成了
+        //    全库最重的一条路径 —— 在单核机器上「开自动回收」反而会在回收那一刻制造新事故。
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
+        for (enc, loc) in kv.iter_meta() {
+            let Some(vk) = decode_key(enc) else {
                 continue;
             };
             by_key
-                .entry(vk.raw_key)
+                .entry(vk.raw_key.clone())
                 .or_default()
-                .push((vk.version, enc, val));
+                .push((vk.version, enc.clone(), loc.is_soft_tombstone()));
         }
 
         let mut removed = 0usize;
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        // 留下来的行：blob GC 只需要读这些，不再走一遍全库
+        let mut keep: Vec<Vec<u8>> = Vec::new();
 
         for (_raw, mut versions) in by_key {
             versions.sort_by_key(|(v, _, _)| *v);
@@ -418,16 +422,26 @@ impl MVCC {
                     last_old = Some(i);
                 }
             }
-            if let Some(keep_old) = last_old {
-                for i in 0..keep_old {
-                    to_delete.push(versions[i].1.clone());
-                    removed += 1;
-                }
-                let old_is_tomb = versions[keep_old].2.is_none();
-                let has_newer = versions.iter().any(|(v, _, _)| *v >= xmin);
-                if old_is_tomb && !has_newer {
-                    to_delete.push(versions[keep_old].1.clone());
-                    removed += 1;
+            match last_old {
+                // 整条链都在 xmin 之上：全部保留
+                None => keep.extend(versions.into_iter().map(|(_, enc, _)| enc)),
+                Some(keep_old) => {
+                    for i in 0..keep_old {
+                        to_delete.push(versions[i].1.clone());
+                        removed += 1;
+                    }
+                    let old_is_tomb = versions[keep_old].2;
+                    let has_newer = versions.iter().any(|(v, _, _)| *v >= xmin);
+                    if old_is_tomb && !has_newer {
+                        // 墓碑的最终回收：否则 tombstone 会永久累积
+                        to_delete.push(versions[keep_old].1.clone());
+                        removed += 1;
+                    } else {
+                        keep.push(versions[keep_old].1.clone());
+                    }
+                    for i in (keep_old + 1)..versions.len() {
+                        keep.push(versions[i].1.clone());
+                    }
                 }
             }
         }
@@ -439,18 +453,24 @@ impl MVCC {
         // Blob GC：
         // - 无任何 blob 引用 → clear
         // - 仍有引用 → rewrite_in_place 只保留存活大 value，并更新 KeyDir 中的指针
-        let survivors = kv.iter()?;
+        //
+        // 只读上面 `keep` 里的行（旧实现这里又走一遍全库 iter()）。
         let mut blob_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (enc_key, full_user_value)
-        for (enc, val) in &survivors {
-            if let Some(stored) = val {
-                if stored.first() == Some(&VAL_TAG_BLOB) {
-                    match decode_stored_value(&mut blob, stored) {
-                        Ok(Some(user)) => blob_keys.push((enc.clone(), user)),
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::warn!("blob decode 失败 key={:?}: {e}", enc);
-                        }
-                    }
+        for enc in &keep {
+            let Ok(Some(stored)) = kv.get_entry(enc) else {
+                continue;
+            };
+            let Some(stored) = stored else {
+                continue; // 软墓碑没有 value
+            };
+            if stored.first() != Some(&VAL_TAG_BLOB) {
+                continue;
+            }
+            match decode_stored_value(&mut blob, &stored) {
+                Ok(Some(user)) => blob_keys.push((enc.clone(), user)),
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("blob decode 失败 key={enc:?}: {e}");
                 }
             }
         }
@@ -1332,6 +1352,50 @@ mod tests {
             assert_eq!(after.total_rows, 4, "vacuum 后应只剩每 key 一行");
             assert_eq!(after.live_keys, 4);
             assert_eq!(after.rows_above_one, 0);
+        }
+        cleanup(&path);
+    }
+
+    /// vacuum 自己不该是全库最重的路径：读盘次数必须只与**留下来的行数**相关。
+    ///
+    /// 旧实现里 vacuum 有两次 `kv.iter()`（每一行连 value 全读出来）。也就是说在
+    /// 「链已经涨到几十万行」的库上跑 vacuum，那一刻本身就是一次事故 ——
+    /// 这正是「先让 vacuum 变轻，再谈自动触发」这个施工顺序的理由。
+    #[test]
+    fn test_vacuum_does_not_read_every_version() {
+        const CHAIN: u64 = 400;
+        const KEYS: u64 = 5;
+
+        let path = tmp_db("vacuum_cost");
+        {
+            let mvcc = MVCC::open(&path);
+            for i in 0..CHAIN {
+                for k in 0..KEYS {
+                    let key = format!("k{k}");
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(key.as_bytes(), format!("v{i}").into_bytes()));
+                    tx.commit();
+                }
+            }
+            assert_eq!(mvcc.health().total_rows, CHAIN * KEYS);
+
+            let before = crate::bitcask::bitcask::read_value_calls();
+            let stats = mvcc.vacuum().unwrap();
+            let used = crate::bitcask::bitcask::read_value_calls() - before;
+            eprintln!(
+                "vacuum 读盘次数：{used} 次（裁掉 {} 行，存活 key {KEYS} 个）",
+                stats.versions_removed
+            );
+            assert_eq!(stats.versions_removed, ((CHAIN as usize - 1) * (KEYS as usize)) as usize);
+            // 界取 2×存活行数：每个留下来的行最多被读两次 —— 一次查 blob 引用，
+            // 一次是 merge 重写日志时把它搬走（那是 merge 的本职，不是 vacuum 的浪费）。
+            // 关键是它只与**存活行数**相关；未修前这里是 2000 次（每行连 value 全读）。
+            assert!(
+                used <= 2 * KEYS + 4,
+                "vacuum 只该读留下来的那些行：实际读盘 {used} 次，而历史行数是 {}",
+                CHAIN * KEYS
+            );
+            assert_eq!(mvcc.health().max_chain, 1, "裁完最长链应降到 1");
         }
         cleanup(&path);
     }

@@ -23,6 +23,7 @@
 use fs4::FileExt;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::matches;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -78,6 +79,16 @@ pub enum KeyLoc {
     },
     /// 软删除：版本行仍存在，逻辑 value 为 None
     SoftTombstone { file_id: u32 },
+}
+
+impl KeyLoc {
+    /// 是不是软墓碑（版本行还在，逻辑 value 为 None）。
+    ///
+    /// 给只需要「这一行存不存在 value」的调用方用 —— 比如 vacuum 判「要不要连这行一起删」，
+    /// 它不需要 value 内容，不该为此读盘。
+    pub fn is_soft_tombstone(&self) -> bool {
+        matches!(self, KeyLoc::SoftTombstone { .. })
+    }
 }
 
 /// 内存索引：key → 最新位置
