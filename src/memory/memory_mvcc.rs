@@ -129,17 +129,19 @@ impl MVCC {
         let xmin = self.next_version.load(Ordering::SeqCst);
 
         let mut store = self.store.lock().unwrap();
-        let all: Vec<(Vec<u8>, Option<Vec<u8>>)> = store.iter().collect();
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, Option<Vec<u8>>)>> = BTreeMap::new();
-        for (enc, val) in all {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
+
+        // 分组按引用走全表：判「留哪一版」只需要版本号 + 是不是墓碑，
+        // 不需要把每行 value 克隆出来（旧实现是 `store.iter().collect()`）。
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
+        store.scan_entries_with(|enc, val| {
+            let Some(vk) = decode_key(enc) else {
+                return;
             };
             by_key
-                .entry(vk.raw_key)
+                .entry(vk.raw_key.clone())
                 .or_default()
-                .push((vk.version, enc, val));
-        }
+                .push((vk.version, enc.to_vec(), val.is_none()));
+        });
 
         let mut removed = 0usize;
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
@@ -157,7 +159,7 @@ impl MVCC {
                     to_delete.push(versions[i].1.clone());
                     removed += 1;
                 }
-                let old_is_tomb = versions[keep_old].2.is_none();
+                let old_is_tomb = versions[keep_old].2;
                 let has_newer = versions.iter().any(|(v, _, _)| *v >= xmin);
                 if old_is_tomb && !has_newer {
                     to_delete.push(versions[keep_old].1.clone());
@@ -595,6 +597,40 @@ mod tests {
             KEYS * VERSIONS
         );
         tx.rollback();
+    }
+
+    /// vacuum 期间不该发生任何 value 克隆：它只需要版本号 + 「是不是墓碑」这个标志位。
+    ///
+    /// 量尺与 bplus 同一理由 —— 内存引擎没有 IO，`iter()` 的代价就是每行一次 value 克隆。
+    #[test]
+    fn test_vacuum_does_not_clone_values() {
+        const CHAIN: u64 = 300;
+        const KEYS: u64 = 4;
+
+        let mvcc = MVCC::new();
+        for i in 0..CHAIN {
+            for k in 0..KEYS {
+                let key = format!("k{k}");
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key.as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+        }
+
+        let base = crate::memory::mem_store::value_clones();
+        let stats = mvcc.vacuum();
+        let used = crate::memory::mem_store::value_clones() - base;
+        eprintln!(
+            "vacuum 期间 value 克隆次数：{used}（裁掉 {} 行，历史行数 {}）",
+            stats.versions_removed,
+            CHAIN * KEYS
+        );
+        assert_eq!(
+            stats.versions_removed,
+            ((CHAIN - 1) * KEYS) as usize,
+            "每 key 留一版，其余都该裁掉"
+        );
+        assert_eq!(used, 0, "vacuum 只需版本号与墓碑标志，不该克隆任何 value");
     }
 
     #[test]

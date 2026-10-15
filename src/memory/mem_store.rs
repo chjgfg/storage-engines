@@ -111,6 +111,16 @@ impl MemStore {
         rows
     }
 
+    /// 全表有序遍历，按**引用**把 `(键, value)` 交给回调 —— 一个 value 都不克隆。
+    ///
+    /// 给「只需要版本号 + 是不是墓碑」的调用方用（vacuum 就是），
+    /// 它们不该为了判断 `is_none()` 而把每行 value 克隆一份。
+    pub fn scan_entries_with(&self, mut f: impl FnMut(&[u8], &Option<Vec<u8>>)) {
+        for (k, v) in &self.data {
+            f(k, v);
+        }
+    }
+
     /// 只遍历键（**不克隆 value**），供上层折叠「每个逻辑 key 的胜出行」用。
     ///
     /// `iter` 会把每一行的键与 value 都克隆出来；全库折叠只需要先比键、最后才取
