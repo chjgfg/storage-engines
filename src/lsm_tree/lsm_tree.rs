@@ -917,6 +917,109 @@ impl LSMTree {
             .collect()
     }
 
+    /// 在闭区间 `[low, high]` 内**从大到小**找第一个满足 `accept(key, value)` 的键。
+    ///
+    /// MVCC 用它取版本链的链尾：版本键 `raw_key ‖ version.to_be_bytes()` 大端有序 ⇒
+    /// 同一逻辑 key 的**最新版本排在区间末尾**，各源只需定位自己那一份、命中即停，
+    /// 不必像 [`Self::range_scan`] 那样把整段（连 value）物化出来再挑。
+    ///
+    /// **遮蔽语义必须与 `range_scan` 一致**（这点是被测试逼出来的，不是想当然）：
+    /// 一个 key 由「最新的含它的源 + 该源内最大可见 seq」定论；若定论成 `Drop`，该 key
+    /// 就整体不可见 —— **不能**回退到更旧源里同 key 的 `Put`。所以这里先取各源的最大键，
+    /// 再用现成的跨源点查 [`Self::get_raw`] 定论（它用的就是 `merge_range_at` 那套取胜规则）。
+    ///
+    /// 被拒的 key 进 `excluded` 后重找。常态一次命中；若拒绝数超过 `BACK_SCAN_FALLBACK`
+    /// （例如以 `key` 为前缀的更长 key 大量交错那种退化形状），直接回退到一次
+    /// `range_scan` —— 宁可慢，不能让「每次重找全源」比旧实现还差。
+    pub fn find_back(
+        &self,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        accept: impl Fn(&[u8], &Option<Vec<u8>>) -> bool,
+    ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        const BACK_SCAN_FALLBACK: usize = 4096;
+
+        let mut excluded: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        loop {
+            let mut cand: Option<Vec<u8>> = None;
+            let mut consider = |k: Option<Vec<u8>>| {
+                if let Some(k) = k {
+                    if cand.as_ref().map_or(true, |b| k.as_slice() > b.as_slice()) {
+                        cand = Some(k);
+                    }
+                }
+            };
+
+            consider(Self::mem_max_key(&self.mem, low, high, snap_seq, &excluded));
+            for imm in &self.immutables {
+                consider(Self::mem_max_key(imm, low, high, snap_seq, &excluded));
+            }
+            if let Some(l0) = self.levels.first() {
+                for sst in l0.iter() {
+                    consider(
+                        sst.find_back(low, high, snap_seq, |k, _| !excluded.contains(k))
+                            .map(|(k, _)| k),
+                    );
+                }
+            }
+            for level in self.levels.iter().skip(1) {
+                for sst in level {
+                    consider(
+                        sst.find_back(low, high, snap_seq, |k, _| !excluded.contains(k))
+                            .map(|(k, _)| k),
+                    );
+                }
+            }
+
+            let Some(key) = cand else { return None };
+            if excluded.len() >= BACK_SCAN_FALLBACK {
+                // 退化形状：回退成一次正向全扫再反向挑（代价与旧实现同阶）
+                return self
+                    .range_scan(low.to_vec(), high.to_vec())
+                    .into_iter()
+                    .rev()
+                    .find(|(k, v)| accept(k.as_slice(), v));
+            }
+            excluded.insert(key.clone());
+
+            // 跨源定论：Drop / 不存在 ⇒ 该 key 整体不可见，继续找下一个更小的键
+            let Some(val) = self.get_raw_key_at(&key, snap_seq) else {
+                continue;
+            };
+            if accept(&key, &val) {
+                return Some((key, val));
+            }
+        }
+    }
+
+    /// 某 memtable 在 `[low, high]` 内的最大键（跳过已定论的键）
+    fn mem_max_key(
+        map: &MemMap,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        excluded: &std::collections::HashSet<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        map.range(low.to_vec()..=high.to_vec())
+            .rev()
+            .filter(|(k, _)| !excluded.contains(k.as_slice()))
+            .find(|(_, vers)| vers.iter().rev().any(|(s, _)| *s <= snap_seq))
+            .map(|(k, _)| k.clone())
+    }
+
+    /// `get_raw` 的按 seq 版本：跨源取胜后给出该 key 的逻辑 value。
+    ///
+    /// 外层 `None` = `Drop` 或根本不存在（该 key 不可见）；
+    /// `Some(None)` = `Put(None)`，即「行存在但逻辑 value 为 None」—— 与 `range_scan` 的
+    /// `(k, None)` 表示一致，两者不能混。
+    fn get_raw_key_at(&self, key: &[u8], snap_seq: u64) -> Option<Option<Vec<u8>>> {
+        match self.get_entry_at(key, snap_seq)? {
+            StoredEntry { value: EntryValue::Put(v), .. } => Some(v),
+            StoredEntry { value: EntryValue::Drop, .. } => None,
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> {
         self.merge_all_at(u64::MAX)
             .into_iter()

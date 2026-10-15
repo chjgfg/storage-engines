@@ -437,15 +437,13 @@ impl BulkLoader {
         let kv = self.kv.lock().unwrap();
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        let mut best: Option<Vec<u8>> = None;
-        for (enc, val) in kv.range_scan(low, high) {
-            if let Some(vk) = decode_key(&enc) {
-                if vk.raw_key.as_slice() == key && vk.version <= self.version {
-                    best = val;
-                }
-            }
-        }
-        best
+        // bulk 的读口径是「不比自己新的最大版本」：同样只定位链尾，不物化整条版本链
+        kv.find_back(&low, &high, u64::MAX, |enc, _val| {
+            decode_key(enc)
+                .map(|vk| vk.raw_key.as_slice() == key && vk.version <= self.version)
+                .unwrap_or(false)
+        })
+        .and_then(|(_, v)| v)
     }
 
     /// 中途可手动 flush，降低峰值内存
@@ -617,19 +615,9 @@ impl Transaction {
         key: &[u8],
     ) -> Option<(u64, Option<Vec<u8>>)> {
         let kvengine = self.kv.lock().unwrap();
-        let mut best: Option<(u64, Option<Vec<u8>>)> = None;
-        for (enc, val) in Self::scan_key_versions(&kvengine, key) {
-            let Some(vk) = decode_key(&enc) else {
-                continue;
-            };
-            if vk.raw_key.as_slice() != key {
-                continue;
-            }
-            if self.is_visible(vk.version) {
-                best = Some((vk.version, val));
-            }
-        }
-        best
+        // 从链尾往回走，第一个可见版本就是答案（旧实现把整条链读出来再取最后一个）
+        let (enc, val) = Self::find_version_back(&kvengine, key, |v| self.is_visible(v))?;
+        Some((decode_key(&enc)?.version, val))
     }
 
     /// 全部最新可见逻辑行（key 有序）：(key, version, raw_or_tombstone)
@@ -752,24 +740,28 @@ impl Transaction {
         version <= self.version
     }
 
-    fn scan_key_versions(kv: &LSMTree, key: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键与逻辑 value。
+    ///
+    /// 定位交给 [`LSMTree::find_back`]：逐源（新→旧）命中即停，不再把整条版本链连 value
+    /// 一起物化出来再挑最后一个。前缀交错的坑照旧 —— 以 `key` 为前缀的更长 key 会落进
+    /// 同一个字节区间，所以必须逐条核对 `raw_key == key`。
+    fn find_version_back(
+        kv: &LSMTree,
+        key: &[u8],
+        accept: impl Fn(u64) -> bool,
+    ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        kv.range_scan(low, high)
-            .into_iter()
-            .filter(|(enc, _)| {
-                decode_key(enc)
-                    .map(|vk| vk.raw_key.as_slice() == key)
-                    .unwrap_or(false)
-            })
-            .collect()
+        kv.find_back(&low, &high, u64::MAX, |enc, _val| {
+            decode_key(enc)
+                .map(|vk| vk.raw_key.as_slice() == key && accept(vk.version))
+                .unwrap_or(false)
+        })
     }
 
     fn latest_version_of(kv: &LSMTree, key: &[u8]) -> Option<u64> {
-        Self::scan_key_versions(kv, key)
-            .into_iter()
-            .filter_map(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
-            .max()
+        Self::find_version_back(kv, key, |_| true)
+            .and_then(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
     }
 }
 
@@ -792,6 +784,78 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(wal_path(path));
         let _ = std::fs::remove_file(lock_path(path));
+    }
+
+    /// 探针：一次点读 / 一次点写访问了多少个 SST 数据块。
+    ///
+    /// 旧实现是 `range_scan(encode(key,0), encode(key,MAX))` 跨 memtable 与每个重叠 SST，
+    /// 而 `SstFile::range_at` 又是从文件**第 0 块**开始逐条 `continue` 到 low ——
+    /// 于是 LSM 的代价不是随链长涨，而是随**库总量**涨。这正是同一份数据在 LSM 上一天
+    /// 就顶不住、换到 Bitcask 能撑一个多月的差别来源。
+    #[test]
+    fn test_point_op_cost_independent_of_chain_length() {
+        fn probe(chain_len: u64) -> (u64, u64, u64) {
+            let path = tmp_db(&format!("probe_{chain_len}"));
+            let (get_blocks, set_blocks, scan_blocks);
+            {
+                let mvcc = MVCC::open(&path);
+                for i in 0..chain_len {
+                    let tx = mvcc.begin_transaction();
+                    assert!(tx.set(b"hot", format!("v{i}").into_bytes()), "第 {i} 次写入被拒");
+                    tx.commit();
+                }
+                // 必须落到 SST：否则读全在 memtable 里，量不到块访问
+                mvcc.flush();
+
+                let tx = mvcc.begin_transaction();
+                let before = crate::lsm_tree::sst::block_reads();
+                assert_eq!(
+                    tx.get(b"hot"),
+                    Some(format!("v{}", chain_len - 1).into_bytes())
+                );
+                get_blocks = crate::lsm_tree::sst::block_reads() - before;
+
+                let before = crate::lsm_tree::sst::block_reads();
+                assert!(tx.set(b"hot", b"newer".to_vec()));
+                set_blocks = crate::lsm_tree::sst::block_reads() - before;
+                tx.rollback();
+
+                // 参照量：旧实现走的就是 range_scan（整段物化 + 每源从第 0 块起扫），
+                // 它就摆在这里，所以「改前」是实测而不是推断。
+                let kvengine = mvcc.kv.lock().unwrap();
+                let before = crate::lsm_tree::sst::block_reads();
+                let rows = kvengine
+                    .range_scan(encode_key(b"hot", 0), encode_key(b"hot", u64::MAX))
+                    .len();
+                scan_blocks = crate::lsm_tree::sst::block_reads() - before;
+                assert_eq!(rows as u64, chain_len);
+            }
+            cleanup(&path);
+            (get_blocks, set_blocks, scan_blocks)
+        }
+
+        let (g_short, s_short, scan_short) = probe(50);
+        let (g_long, s_long, scan_long) = probe(2000);
+        eprintln!(
+            "点读块访问：链长 50 → {g_short} 块，链长 2000 → {g_long} 块\n\
+             点写块访问：链长 50 → {s_short} 块，链长 2000 → {s_long} 块\n\
+             旧路径 range_scan 参照：链长 50 → {scan_short} 块，链长 2000 → {scan_long} 块"
+        );
+        assert!(
+            g_long <= g_short + 8,
+            "点读的块访问不应随链长/库总量增长（短链 {g_short}，长链 {g_long}）"
+        );
+        assert!(
+            s_long <= s_short + 8,
+            "点写的块访问不应随链长/库总量增长（短链 {s_short}，长链 {s_long}）"
+        );
+        // 反向定位必须明显便宜于整段物化。注意分母是**已经享受了起点定位改造**的
+        // range_scan（本次同批修的：它原先是从文件第 0 块逐条 continue 到 low），
+        // 所以真实改造前的差距比这里显示的更大 —— 旧实现还要把每行的 value 读出来并克隆。
+        assert!(
+            g_long * 4 <= scan_long,
+            "find_back 应当明显便宜于整段 range_scan（实际 {g_long} 块 vs {scan_long} 块）"
+        );
     }
 
     #[test]

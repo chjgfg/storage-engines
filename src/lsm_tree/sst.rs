@@ -91,6 +91,21 @@ struct DataBlock {
     entries: Vec<(Vec<u8>, StoredEntry)>,
 }
 
+// 测试专用：本线程的块访问次数（含块缓存命中）。
+//
+// LSM 的代价对应物是「读了多少个数据块」—— 用来把「点操作代价不随版本链长度/库总量
+// 增长」这条不变量钉成断言。做成 thread_local 是为了不和 `cargo test` 的并行用例互相计数。
+#[cfg(test)]
+thread_local! {
+    static BLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程已发生的数据块访问次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn block_reads() -> u64 {
+    BLOCK_READS.with(|c| c.get())
+}
+
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct CacheKey {
     /// 区分不同 CF / 目录（避免共享 cache 时 sst_id 碰撞）
@@ -264,7 +279,7 @@ impl SstFile {
             }
         };
 
-        for (k, se) in self.iter_all() {
+        for (k, se) in self.iter_from_key(low) {
             if k.as_slice() < low {
                 continue;
             }
@@ -289,6 +304,102 @@ impl SstFile {
         }
         flush(&mut pending, &mut out);
         out
+    }
+
+    /// 从**可能包含 `low` 的数据块**开始流式迭代（升序），用来给区间扫描定位起点。
+    ///
+    /// 旧 `range_at` 从第 0 块开始逐条 `continue` 到 `low`，于是区间查询的代价与
+    /// **整个文件**成正比而不是与命中行数成正比 —— MVCC 点读放大因此变成随库总量增长。
+    /// 起点额外回退一块：块是按**固定条数**切分的，同一个 key 的多个 seq 可能跨块边界，
+    /// 少回退一块就可能漏掉该 key 更旧的 seq（`snap_seq` 截断较新 seq 时会取错）。
+    /// v1 文件整份在 `entries_cache` 里，没有索引，保持从头扫。
+    fn iter_from_key(&self, low: &[u8]) -> SstEntryIter<'_> {
+        let block_i = self
+            .find_block(low)
+            .map(|i| i.saturating_sub(1))
+            .unwrap_or(0);
+        SstEntryIter {
+            sst: self,
+            block_i,
+            entry_i: 0,
+            cur: None,
+            cache_i: 0,
+        }
+    }
+
+    /// 在闭区间 `[low, high]` 内**从大到小**找第一个被 `accept` 接受的 key。
+    ///
+    /// 用稀疏索引直接定位 `high` 所在块，块内反向扫，一块扫完退到前一块；一旦某块里
+    /// 出现 `k < low` 即可收尾 —— 块内与块间都按 key 升序，再往前全部落在区间之外。
+    ///
+    /// 与 [`Self::range_at`] 保持同一套「每个 key 只取最大可见 seq」的语义：反向遇到某
+    /// key 的第一条若 `seq > snap_seq` 不可见，会继续在该 key 的更旧条目里找次大可见 seq；
+    /// 一旦该 key 定论（拿到可见条目并交给 `accept`），同 key 更旧的 seq 不再回看。
+    ///
+    /// 已知边界：若同一个 key 的条目**跨块**、且较新的那条落在后一块而 `snap_seq` 把它截断，
+    /// 这里取到的是「本块内最大可见 seq」，与 `range_at` 扫全文件相比可能偏旧。MVCC 调用
+    /// 传 `snap_seq = u64::MAX`（全可见），不落入该边界。
+    pub fn find_back(
+        &self,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        mut accept: impl FnMut(&[u8], &StoredEntry) -> bool,
+    ) -> Option<(Vec<u8>, StoredEntry)> {
+        if !self.may_overlap(low, high) {
+            return None;
+        }
+
+        // v1：整份在内存里，反向线性扫即可
+        if let Some(all) = &self.entries_cache {
+            for (k, se) in all.iter().rev() {
+                let ks = k.as_slice();
+                if ks > high {
+                    continue;
+                }
+                if ks < low {
+                    return None;
+                }
+                if accept(ks, se) {
+                    return Some((k.clone(), se.clone()));
+                }
+            }
+            return None;
+        }
+
+        let mut block_i = self.find_block(high)?;
+        loop {
+            let block = self.load_block(block_i).ok()?;
+            // 已经定论的 key：同 key 更旧的 seq 不再考虑（对齐 range_at 的每 key 取胜）
+            let mut decided: Option<Vec<u8>> = None;
+            let mut idx = block.entries.len();
+            while idx > 0 {
+                idx -= 1;
+                let (k, se) = &block.entries[idx];
+                let ks = k.as_slice();
+                if ks > high {
+                    continue;
+                }
+                if ks < low {
+                    return None;
+                }
+                if decided.as_deref() == Some(ks) {
+                    continue;
+                }
+                if !se.visible_at(snap_seq) {
+                    continue;
+                }
+                decided = Some(k.clone());
+                if accept(ks, se) {
+                    return Some((k.clone(), se.clone()));
+                }
+            }
+
+            if block_i == 0 {
+                return None;
+            }
+            block_i -= 1;
+        }
     }
 
     /// 流式迭代全部 entry（按磁盘顺序）
@@ -332,6 +443,8 @@ impl SstFile {
     }
 
     fn load_block(&self, index_i: usize) -> std::io::Result<Arc<DataBlock>> {
+        #[cfg(test)]
+        BLOCK_READS.with(|c| c.set(c.get() + 1));
         let ie = &self.index[index_i];
         if let Some(cache) = &self.block_cache {
             let mut c = cache.lock().unwrap();
@@ -1105,6 +1218,114 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("sst_{tag}_{nanos}.sst"))
+    }
+
+    /// `range_at` 改成用稀疏索引定位起始块之后，命中结果必须与「扫全文件再筛」逐条一致，
+    /// 且不能再把整个文件读一遍。
+    ///
+    /// 这条对拍是改动自带的安全网：全仓原本**没有**任何针对 `range_at` 的正确性测试。
+    #[test]
+    fn test_range_at_window_equals_full_scan() {
+        let path = tmp("window");
+        let mut b = SstBuilder::with_options(1, &path, 3, true);
+        // 40 个 key × 2 个 seq，块容量 3 条 ⇒ 十幾块；同 key 多 seq 用来验「取最大可见 seq」
+        for i in 0..40u32 {
+            let k = format!("k{i:03}").into_bytes();
+            b.add(k.clone(), StoredEntry::put(i as u64 * 2, Some(b"v".to_vec())));
+            b.add(k.clone(), StoredEntry::put(i as u64 * 2 + 1, Some(b"w".to_vec())));
+        }
+        let sst = b.finish().unwrap();
+
+        // 全文件区间 = 暴力参照
+        let all = sst.range_at(b"", &[0xffu8; 8], u64::MAX);
+        assert_eq!(all.len(), 40, "每个 key 只应出一条（最大可见 seq）");
+        assert!(
+            all.iter().all(|(_, se)| se.value == EntryValue::Put(Some(b"w".to_vec()))),
+            "同 key 应取最大 seq 的那条"
+        );
+
+        let windows: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"k007".to_vec(), b"k013".to_vec()),
+            (b"k000".to_vec(), b"k000".to_vec()),
+            (b"k039".to_vec(), b"k039".to_vec()),
+            (b"k020".to_vec(), b"zzz".to_vec()),
+            (b"k000".to_vec(), b"k039".to_vec()),
+            (b"aaa".to_vec(), b"zzz".to_vec()),
+            (Vec::new(), Vec::new()), // 双端皆空 ⇒ high 小于一切，区间为空
+            (b"k015".to_vec(), b"k005".to_vec()), // 上下界颠倒 ⇒ 空
+        ];
+        for (low, high) in windows {
+            let want: Vec<(Vec<u8>, StoredEntry)> = all
+                .iter()
+                .filter(|(k, _)| {
+                    k.as_slice() >= low.as_slice() && k.as_slice() <= high.as_slice()
+                })
+                .cloned()
+                .collect();
+            let before = block_reads();
+            let got = sst.range_at(&low, &high, u64::MAX);
+            let used = block_reads() - before;
+            assert_eq!(
+                got, want,
+                "区间 [{low:?}, {high:?}] 的 range_at 与全扫筛出的不一致"
+            );
+            if want.is_empty() || got.len() <= 3 {
+                assert!(
+                    used <= 6,
+                    "窄区间不该读全文件（[{low:?}, {high:?}] 读了 {used} 块）"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `find_back` 必须给出 `range_at` 结果里的**最后一条**（区间内最大 key），
+    /// 谓词不满足时要继续往更小的 key 退，并且只碰区间末尾附近的块。
+    #[test]
+    fn test_find_back_matches_range_at_tail() {
+        let path = tmp("back");
+        let mut b = SstBuilder::with_options(1, &path, 3, true);
+        for i in 0..40u32 {
+            let k = format!("k{i:03}").into_bytes();
+            b.add(k.clone(), StoredEntry::put(i as u64, Some(b"w".to_vec())));
+        }
+        // 末尾再放一条 Drop，验证「每 key 定论后交给 accept，而不是跳过该 key 回看更旧 seq」
+        b.add(b"k040".to_vec(), StoredEntry::drop_at(99));
+        let sst = b.finish().unwrap();
+
+        let low = b"k010".to_vec();
+        let high = b"k025".to_vec();
+        let rows = sst.range_at(&low, &high, u64::MAX);
+        assert_eq!(rows.len(), 16);
+
+        let before = block_reads();
+        let hit = sst.find_back(&low, &high, u64::MAX, |_, _| true);
+        let used = block_reads() - before;
+        assert_eq!(
+            hit.map(|(k, _)| k),
+            rows.last().map(|(k, _)| k.clone()),
+            "find_back 应当命中区间内最大 key"
+        );
+        assert!(
+            used <= 3,
+            "反向定位只应碰区间末尾附近的块，实际读了 {used} 块（全文件 {} 块）",
+            14
+        );
+
+        // 谓词只接受 k014 ⇒ 应从 k025 一路退到 k014，返回对的 key
+        let hit2 = sst.find_back(&low, &high, u64::MAX, |k, _| k == b"k014");
+        assert_eq!(hit2.map(|(k, _)| k), Some(b"k014".to_vec()));
+
+        // 区间内全是 Drop ⇒ 谓词按 value 拒绝，必须一路走到区间下界外并返回 None
+        let none = sst.find_back(b"k040", b"k040", u64::MAX, |_, se| {
+            !matches!(se.value, EntryValue::Drop)
+        });
+        assert_eq!(none.map(|(k, _)| k), None, "区间内无可接受的条目时应返回 None");
+
+        // 空区间 / 越界区间
+        assert!(sst.find_back(&low, &b"k005".to_vec(), u64::MAX, |_, _| true).is_none());
+        assert!(sst.find_back(b"zzz", b"zzzz", u64::MAX, |_, _| true).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
