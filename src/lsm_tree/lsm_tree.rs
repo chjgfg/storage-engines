@@ -6,7 +6,7 @@
 //! 版本 GC 由上层 `MVCC::vacuum` 负责；compact 只做空间合并（丢弃 Drop）。
 
 use std::{
-    collections::BTreeMap, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{
+    collections::{BTreeMap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{
         Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering},
     }, thread::JoinHandle, time::Duration, vec,
 };
@@ -480,19 +480,11 @@ impl LSMTree {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let v = self.get_at_seq(key, u64::MAX)?;
-        if let Some(resolved) = Self::resolve_blob(&v, &self.dir) {
-            return Some(resolved);
-        }
-        Some(v)
+        self.deref_value(self.get_at_seq(key, u64::MAX))
     }
 
     pub fn get_at(&self, snap: &Snapshot, key: &[u8]) -> Option<Vec<u8>> {
-        let v = self.get_at_seq(key, snap.seq)?;
-        if let Some(resolved) = Self::resolve_blob(&v, &self.dir) {
-            return Some(resolved);
-        }
-        Some(v)
+        self.deref_value(self.get_at_seq(key, snap.seq))
     }
 
     fn get_at_seq(&self, key: &[u8], snap_seq: u64) -> Option<Vec<u8>> {
@@ -691,6 +683,54 @@ impl LSMTree {
         None
     }
 
+    /// blob 旁路的空间回收：删掉**没有任何存活行引用**的 `blobs/*.blob`，返回删掉的个数。
+    ///
+    /// `keep` 是存活行的键（vacuum 裁完之后的那一集）。为什么只能由 vacuum 来做、compact
+    /// 做不了：compact 只看得到它正在合并的那几个文件，没法判断"这个键在别的层里还有一份
+    /// 更新的版本正引用着同一个 blob"。
+    ///
+    /// 判据只认指针字节（`\x02 + seq_u64_le`，见 [`Self::write_blob`]），不解析 value。
+    /// 保守方向是「宁可留着也不删错」：删掉一个仍被引用的 blob 是**丢数据**，
+    /// 留着一个没人引用的 blob 只是占空间。
+    pub fn gc_blobs(&self, keep: &[Vec<u8>]) -> std::io::Result<usize> {
+        let mut referenced: HashSet<u64> = HashSet::new();
+        for enc in keep {
+            // 外层 None = 这行已经不在；内层 None = Drop 墓碑（墓碑不引用任何 blob）
+            // ⚠️ 这里刻意用**不解析**的 get_raw_key_at：GC 靠指针字节认引用，解析就认不出来了
+            let Some(Some(val)) = self.get_raw_key_at(enc, u64::MAX) else {
+                continue;
+            };
+            if let Some(seq) = Self::blob_ptr_seq(&val) {
+                referenced.insert(seq);
+            }
+        }
+
+        let blob_dir = self.dir.join("blobs");
+        let Ok(rd) = fs::read_dir(&blob_dir) else {
+            return Ok(0); // 从没写过大数据 ⇒ 没有旁路目录，正常
+        };
+        let mut removed = 0usize;
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            // 文件名是 `{seq:016}.blob`：十进制零填充
+            let Some(stem) = name.strip_suffix(".blob") else {
+                continue;
+            };
+            let Ok(seq) = stem.parse::<u64>() else {
+                continue;
+            };
+            if referenced.contains(&seq) {
+                continue;
+            }
+            match fs::remove_file(ent.path()) {
+                Ok(()) => removed += 1,
+                Err(e) => log::warn!("blob 回收跳过 {}：{e}", ent.path().display()),
+            }
+        }
+        Ok(removed)
+    }
+
     fn maybe_stall_on_l0(&mut self) {
         if self.bulk_mode {
             // bulk：只在极端 L0 堆积时做一次 compact，避免写路径被 leveled 拖死
@@ -853,7 +893,7 @@ impl LSMTree {
     ///
     /// 与 `iter()` 的差别就在**不克隆 value**：`iter()` 会把每个源的条目整个 `collect()`
     /// 进内存（连 value），所以一次全库扫描的峰值内存约等于整个库；这里的峰值只有键字节。
-    /// 需要 value 的调用方对少数胜出行再点查 [`Self::get_raw_key_at`]，语义与归并取胜一致。
+    /// 需要 value 的调用方对少数胜出行再点查 [`Self::get_value_at`]（会解析 blob 指针），语义与归并取胜一致。
     pub fn scan_latest_light(&self, snap_seq: u64) -> Vec<(Vec<u8>, LightEntry)> {
         let mut sources: Vec<Vec<(Vec<u8>, LightEntry)>> = Vec::new();
         if !self.mem.is_empty() {
@@ -1128,7 +1168,7 @@ impl LSMTree {
         self.merge_range_at(low, high, snap_seq)
             .into_iter()
             .filter_map(|(k, se)| match se.value {
-                EntryValue::Put(val) => Some((k, val)),
+                EntryValue::Put(val) => Some((k, self.deref_value(val))),
                 EntryValue::Drop => None,
             })
             .collect()
@@ -1201,7 +1241,7 @@ impl LSMTree {
             excluded.insert(key.clone());
 
             // 跨源定论：Drop / 不存在 ⇒ 该 key 整体不可见，继续找下一个更小的键
-            let Some(val) = self.get_raw_key_at(&key, snap_seq) else {
+            let Some(val) = self.get_value_at(&key, snap_seq) else {
                 continue;
             };
             if accept(&key, &val) {
@@ -1237,11 +1277,44 @@ impl LSMTree {
         }
     }
 
+    /// 把「引擎里存着的字节」解成调用方该看到的字节：大 value 的 blob 指针 → 读回真值。
+    ///
+    /// ⚠️ 这条是**唯一的解析口**：凡是把存储值交给调用方的路径都必须过这里，过一次就够。
+    /// 原来只有 `get`/`get_at` 解析，而 MVCC 的读走的是 `find_back` / `range_scan` / `iter`
+    /// 那一族 ⇒ ≥ `blob_threshold`（默认 4 KiB）的值以 9 字节指针回到上层，**不报错**，
+    /// 只是变成一个小乱码值（守卫：`test_big_value_roundtrips_through_every_read_path`）。
+    /// Bitcask / B+ 树没有这一类洞，因为它们的 blob 分层在 MVCC 之上（storage.rs 的
+    /// `decode_stored_value` 是所有读法的必经之路），而 LSM 的分层在引擎**里面**。
+    fn deref_value(&self, v: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let v = v?;
+        Some(Self::resolve_blob(&v, &self.dir).unwrap_or(v))
+    }
+
+    /// 用户可见取值：跨源取胜 → 解析 blob 指针。外层 `None` = 不可见。
+    ///
+    /// 与 [`Self::get_raw_key_at`] 的差别只有一个：这里解析指针。blob GC 必须用**不解析**
+    /// 的那一个 —— 它就是靠指针字节认"哪几个 blob 还有人引用"，解析过后反而会把
+    /// 幸存的 blob 误判成没人引用。
+    pub(crate) fn get_value_at(&self, key: &[u8], snap_seq: u64) -> Option<Option<Vec<u8>>> {
+        let stored = self.get_raw_key_at(key, snap_seq)?;
+        Some(self.deref_value(stored))
+    }
+
+    /// 按字节解引用；不是指针就原样返回（GC 用，见 [`Self::deref_value`] 的说明）
+    pub(crate) fn blob_ptr_seq(value: &[u8]) -> Option<u64> {
+        if value.len() == 9 && value[0] == 0x02 {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&value[1..9]);
+            return Some(u64::from_le_bytes(bytes));
+        }
+        None
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> {
         self.merge_all_at(u64::MAX)
             .into_iter()
-            .filter_map(|(k, se)| match se.value {
-                EntryValue::Put(val) => Some((k, val)),
+            .filter_map(move |(k, se)| match se.value {
+                EntryValue::Put(val) => Some((k, self.deref_value(val))),
                 EntryValue::Drop => None,
             })
     }
@@ -1250,7 +1323,7 @@ impl LSMTree {
         self.merge_all_at(snap.seq)
             .into_iter()
             .filter_map(|(k, se)| match se.value {
-                EntryValue::Put(val) => Some((k, val)),
+                EntryValue::Put(val) => Some((k, self.deref_value(val))),
                 EntryValue::Drop => None,
             })
             .collect()

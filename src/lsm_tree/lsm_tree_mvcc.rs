@@ -477,7 +477,7 @@ impl MVCC {
         };
 
         // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]
-        let (to_delete, _kept) = vacuum_plan(by_key, xmin);
+        let (to_delete, kept) = vacuum_plan(by_key, xmin);
         let removed = to_delete.len();
 
         for enc in &to_delete {
@@ -486,20 +486,26 @@ impl MVCC {
 
         // 有界轮次只把删除留在 memtable 里，交给正常的 memtable flush 阈值收口：
         // 每片都 flush 会在 L0 造出一堆只装墓碑的小 SST，压实代价比省下的那点持久性贵。
-        // 崩在中间也不会读到旧值 —— 复活的行都是 version < xmin 的，新事务的快照看不见它。
+        // 崩在中间也不会读到旧值 —— 复活的行都是 version < xmin 的，新事务快照看不见。
+        let mut blob_rewritten = None;
         if budget_rows == u64::MAX {
             kv.flush()?;
             // 后续 compact 丢弃 ver < xmin 的 tombstone 版本键。
             // 只在全库轮次下发：判据用 budget 而不是游标，一把 key 的小库任何一片都读到库尾，
             // 用游标判断会让自动回收每片都改动 compact 的过滤条件。
             kv.set_mvcc_xmin_filter(xmin);
+
+            // blob 旁路的空间回收：必须在删完旧行之后、且只有全库扫完才敢做 ——
+            // 「还有没有人在引用这个 blob」是个全库问题。
+            let keep_enc: Vec<Vec<u8>> = kept.into_iter().map(|(enc, _)| enc).collect();
+            blob_rewritten = Some(kv.gc_blobs(&keep_enc)? > 0);
         }
 
         Ok(VacuumRound {
             stats: VacuumStats {
                 xmin,
                 versions_removed: removed,
-                blob_rewritten: None,
+                blob_rewritten,
                 skipped_active_txn: false,
                 rows_scanned: scanned,
             },
@@ -862,7 +868,9 @@ impl Transaction {
         let kvengine = self.kv.lock().unwrap();
         let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
         for (key, (ver, enc)) in winners {
-            let Some(val) = kvengine.get_raw_key_at(&enc, u64::MAX) else {
+            // get_value_at 而不是 get_raw_key_at：大 value 存的是 blob 指针，
+            // 交给调用方之前必须解回真值（GC 那种"要看指针本身"的读法才用 raw 版）
+            let Some(val) = kvengine.get_value_at(&enc, u64::MAX) else {
                 continue;
             };
             if val.is_none() && !include_deleted {
@@ -1681,6 +1689,101 @@ mod tests {
                 tx.commit();
             }
             assert_eq!(mvcc.health().max_chain, CHAIN, "关闭后不该裁掉任何一版");
+        }
+        cleanup(&path);
+    }
+
+    /// 大 value（≥ blob_threshold 4 KiB）走 LSM 自己的 blob 旁路，SST/memtable 里存的是指针。
+    ///
+    /// 这条用例先只证明一件事：**没 vacuum、没 compact，纯 set→get 也必须拿回原值**。
+    /// 引擎里只有 `get`/`get_at` 会解析指针，而 MVCC 读走的是 `find_version_back`/
+    /// `collect_latest_raw`/`range_scan`/`iter` 那一族 ⇒ 全都在往外发 9 字节的指针。
+    /// Bitcask / B+ 树没这个洞，因为它们的 blob 分层在 MVCC 之上（storage.rs 里
+    /// `decode_stored_value`），而 LSM 的分层在引擎**里面** —— 任何不走 `get` 的读都漏。
+    #[test]
+    fn test_big_value_roundtrips_through_every_read_path() {
+        let path = tmp_db("blob_read");
+        {
+            let mvcc = MVCC::open(&path);
+            let big = vec![0x5Au8; 8 * 1024];
+            let tx = mvcc.begin_transaction();
+            assert!(tx.set(b"big", big.clone()));
+            assert!(tx.set(b"small", b"tiny".to_vec()));
+            tx.commit();
+
+            let tx = mvcc.begin_transaction();
+            assert_eq!(tx.get(b"big"), Some(big.clone()), "点读拿到的是指针而不是值");
+            assert_eq!(tx.get(b"small"), Some(b"tiny".to_vec()));
+            tx.commit();
+
+            // 折叠类读法（export / scan）同一条路，也要给回值
+            let exported = mvcc.export_latest_visible(false);
+            let got = exported
+                .iter()
+                .find(|r| r.key == b"big")
+                .and_then(|r| r.value.clone());
+            assert_eq!(got, Some(big.clone()), "export 拿到的是指针而不是值");
+
+            // 落一次 SST：指针解析不能只在 memtable 里成立
+            mvcc.flush();
+            let tx = mvcc.begin_transaction();
+            assert_eq!(tx.get(b"big"), Some(big));
+            tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// blob 旁路（`blobs/`，大 value 写外面）过去**从来没人回收**：compact 只看得到自己
+    /// 正在合并的那几个文件，判断不了"这个键在别的层里还有更新的版本正引用同一个 blob"。
+    ///
+    /// 现在由 vacuum 的全库轮次收：先裁掉旧版本行，再删没人引用的 blob 文件。
+    /// 断言的是**文件个数**，不是"跑完没报错"—— 这条通道原来的症状就是文件只增不减。
+    #[test]
+    fn test_vacuum_reclaims_unreferenced_blobs() {
+        fn blob_count(mvcc: &MVCC) -> usize {
+            let dir = mvcc.db_dir().join("blobs");
+            std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().count())
+                .unwrap_or(0)
+        }
+
+        const CHAIN: u64 = 20;
+        let path = tmp_db("blob_gc");
+        {
+            let mvcc = MVCC::open(&path);
+            // LSM 的 blob_threshold 默认 4 KiB ⇒ 8 KiB 的 value 一定走旁路
+            for i in 0..CHAIN {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"big", vec![i as u8; 8 * 1024]));
+                tx.commit();
+            }
+            assert_eq!(blob_count(&mvcc), CHAIN as usize, "每版都该是一个独立的 blob 文件");
+
+            // 有界轮次不动 blob 文件：全库收尾只属于 vacuum()
+            let slice = mvcc.vacuum_bounded(None, 4).unwrap();
+            assert!(slice.next_cursor.is_some() || slice.stats.versions_removed > 0);
+            assert_eq!(
+                blob_count(&mvcc),
+                CHAIN as usize,
+                "有界片不该去动 blob —— 引用关系只有全库才看得全"
+            );
+
+            let stats = mvcc.vacuum().unwrap();
+            // 上一片可能已经裁掉过几版，所以按两轮之和核总账
+            assert!(
+                slice.stats.versions_removed + stats.versions_removed >= CHAIN as usize - 1,
+                "版本行没被裁干净：{} + {}",
+                slice.stats.versions_removed,
+                stats.versions_removed
+            );
+            assert_eq!(stats.blob_rewritten, Some(true), "全库 vacuum 必须报它收了 blob");
+            assert_eq!(blob_count(&mvcc), 1, "只剩存活那一版引用的 blob");
+            assert_eq!(mvcc.health().total_rows, 1, "全库 vacuum 之后每把 key 只剩一行");
+
+            // 活着的 value 必须还读得出来（回收不能把可见版本的 blob 删了）
+            let tx = mvcc.begin_transaction();
+            assert_eq!(tx.get(b"big"), Some(vec![(CHAIN - 1) as u8; 8 * 1024]));
+            tx.commit();
         }
         cleanup(&path);
     }

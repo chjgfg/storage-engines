@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 214 个单元测试 + 4 个集成测试
+- 219 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -428,7 +428,7 @@ data.db.lock       单写者锁(内含 pid)
 **LSM**
 - `fix_level_overlaps` 发现层内 key range 重叠**只打印警告,不修复**
 - compact 时每个 key 只保留最新一条,`enable_snapshot_gc` 并未真正按 snapshot 水位保留旧版本(源码注释已自陈)
-- `blobs/` 目录**没有 GC**(Bitcask 侧的 blob 在 vacuum 里有回收)
+- `blobs/` 旁路的回收挂在 `vacuum()` 的全库轮次上(compact 判不了"别的层里还有更新的版本引用同一个 blob");**有界轮次不动 blob**,引用关系只有全库才看得全
 - `start_bg_compact` 只建控制块不起线程,真正的后台线程要显式调 `spawn_bg_compactor`
 
 **Bitcask**
@@ -548,7 +548,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:214 单元 + 4 集成 + 2 文档测试
+cargo test                    # 全部:219 单元 + 4 集成 + 2 文档测试
 cargo test --lib engine::     # 只跑门面层(14 个,四引擎全覆盖)
 cargo test --test test_lsm_tree
 ```
