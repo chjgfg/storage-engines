@@ -9,6 +9,7 @@ pub mod kernel;
 pub mod kv_snapshot;
 pub mod types;
 pub mod version;
+pub mod wal;
 
 pub use codec::{
     decode_value_meta, key_matches, logical_to_user, now_unix_secs, pack_plain, pack_ttl,
