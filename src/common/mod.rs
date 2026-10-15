@@ -6,6 +6,7 @@
 pub mod codec;
 pub mod kv_snapshot;
 pub mod types;
+pub mod version;
 
 pub use codec::{
     decode_value_meta, key_matches, logical_to_user, now_unix_secs, pack_plain, pack_ttl,
@@ -15,3 +16,4 @@ pub use types::{
     ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage, SearchQuery,
     VacuumRound, VacuumStats, ValueMeta,
 };
+pub use version::{decode_key, encode_key, vacuum_plan, VersionedKey};

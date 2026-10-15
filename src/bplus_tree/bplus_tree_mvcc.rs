@@ -10,7 +10,6 @@
 //! - 页换出跳过双写与频繁 fsync
 //! - 结束时 [`BulkLoader::finish`] → flush_all + checkpoint
 
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -26,6 +25,7 @@ use crate::bplus_tree::storage::{
 };
 use crate::bplus_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+use crate::common::vacuum_plan;
 
 /// MVCC 存储引擎
 pub struct MVCC {
@@ -70,34 +70,11 @@ pub struct BulkLoader {
     finished: bool,
 }
 
-/// 逻辑键 + 版本（调试用）
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VersionedKey {
-    pub raw_key: Vec<u8>,
-    pub version: u64,
-}
-
-/// 编码：`raw_key || version.to_be_bytes()`
-pub fn encode_key(raw_key: &[u8], version: u64) -> Vec<u8> {
-    let mut enc = Vec::with_capacity(raw_key.len() + 8);
-    enc.extend_from_slice(raw_key);
-    enc.extend_from_slice(&version.to_be_bytes());
-    enc
-}
-
-/// 解码
-pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
-    if enc.len() < 8 {
-        return None;
-    }
-    let split = enc.len() - 8;
-    let mut ver_bytes = [0u8; 8];
-    ver_bytes.copy_from_slice(&enc[split..]);
-    Some(VersionedKey {
-        raw_key: enc[..split].to_vec(),
-        version: u64::from_be_bytes(ver_bytes),
-    })
-}
+/// 逻辑键 + 版本（调试用）与版本键编解码
+///
+/// 定义在 [`crate::common::version`]（四引擎共用）；这里 re-export 是为了
+/// `crate::bplus_tree::encode_key` 这个既有路径不中断。
+pub use crate::common::{decode_key, encode_key, VersionedKey};
 
 /// 把 WAL 收口成「只剩一条 Checkpoint」。
 ///
@@ -448,40 +425,12 @@ impl MVCC {
         });
         let next_cursor = if truncated { cur_raw } else { None };
 
-        let mut removed = 0usize;
-        let mut to_delete: Vec<Vec<u8>> = Vec::new();
-        // Blob GC 的判据顺手在同一次遍历里凑齐（留下来的行有没有引用 blob）
-        let mut has_blob_ref = false;
-
-        for (_raw, mut versions) in by_key {
-            versions.sort_by_key(|(v, _, _, _)| *v);
-            let mut last_old: Option<usize> = None;
-            for (i, (ver, _, _, _)) in versions.iter().enumerate() {
-                if *ver < xmin {
-                    last_old = Some(i);
-                }
-            }
-            let mut keep_from = 0usize;
-            if let Some(keep_old) = last_old {
-                for i in 0..keep_old {
-                    to_delete.push(versions[i].1.clone());
-                    removed += 1;
-                }
-                let old_is_tomb = versions[keep_old].2;
-                let has_newer = versions.iter().any(|(v, _, _, _)| *v >= xmin);
-                if old_is_tomb && !has_newer {
-                    // 墓碑的最终回收：否则 tombstone 会永久累积
-                    to_delete.push(versions[keep_old].1.clone());
-                    removed += 1;
-                } else {
-                    has_blob_ref |= versions[keep_old].3;
-                }
-                keep_from = keep_old + 1;
-            }
-            for i in keep_from..versions.len() {
-                has_blob_ref |= versions[i].3;
-            }
-        }
+        // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]；
+        // 这里把「保留行是否引用 blob」当作附带信息 R 一起带出来 —— Blob GC 的判据
+        // 因此仍然在同一次遍历里凑齐，不用为它再走一遍全库。
+        let (to_delete, kept) = vacuum_plan(by_key, xmin);
+        let removed = to_delete.len();
+        let has_blob_ref = kept.iter().any(|(_, refs_blob)| *refs_blob);
 
         for enc in &to_delete {
             let _ = kv.delete(enc.clone());

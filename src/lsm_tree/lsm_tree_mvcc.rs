@@ -27,7 +27,6 @@
 //! - Checkpoint 的 `root_page_id` / `next_page_id` 固定写 0
 //! - 数据目录：`dir/CURRENT.snap` + `dir/lsm.wal` + `dir/lsm.lock`
 
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -41,6 +40,7 @@ use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
 use crate::lsm_tree::storage::{wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+use crate::common::vacuum_plan;
 
 /// MVCC 存储引擎（LSM 后端）
 pub struct MVCC {
@@ -85,34 +85,11 @@ pub struct BulkLoader {
     finished: bool,
 }
 
-/// 逻辑键 + 版本（调试用）
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VersionedKey {
-    pub raw_key: Vec<u8>,
-    pub version: u64,
-}
-
-/// 编码：`raw_key || version.to_be_bytes()`
-pub fn encode_key(raw_key: &[u8], version: u64) -> Vec<u8> {
-    let mut enc = Vec::with_capacity(raw_key.len() + 8);
-    enc.extend_from_slice(raw_key);
-    enc.extend_from_slice(&version.to_be_bytes());
-    enc
-}
-
-/// 解码
-pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
-    if enc.len() < 8 {
-        return None;
-    }
-    let split = enc.len() - 8;
-    let mut ver_bytes = [0u8; 8];
-    ver_bytes.copy_from_slice(&enc[split..]);
-    Some(VersionedKey {
-        raw_key: enc[..split].to_vec(),
-        version: u64::from_be_bytes(ver_bytes),
-    })
-}
+/// 逻辑键 + 版本（调试用）与版本键编解码
+///
+/// 定义在 [`crate::common::version`]（四引擎共用）；这里 re-export 是为了
+/// `crate::lsm_tree::encode_key` 这个既有路径不中断。
+pub use crate::common::{decode_key, encode_key, VersionedKey};
 
 /// 把 WAL 收口成「只剩一条 Checkpoint」。
 ///
@@ -438,7 +415,7 @@ impl MVCC {
             let (rows, boundary) =
                 kv.scan_latest_light_window(after, u64::MAX, cap, VERSION_SUFFIX);
 
-            let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
+            let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>> = BTreeMap::new();
             let mut scanned = 0u64;
             let mut cur_raw: Option<Vec<u8>> = None;
             let mut last_done_raw: Option<Vec<u8>> = None;
@@ -467,7 +444,7 @@ impl MVCC {
                 by_key
                     .entry(vk.raw_key.clone())
                     .or_default()
-                    .push((vk.version, enc.clone(), le.kind == 1));
+                    .push((vk.version, enc.clone(), le.kind == 1, ()));
             }
             // 窗口被定界 或 预算截断 ⇒ 后面还有没看完的行
             let truncated = boundary.is_some() || budget_cut;
@@ -499,30 +476,9 @@ impl MVCC {
             break (by_key, scanned, next_cursor);
         };
 
-        let mut removed = 0usize;
-        let mut to_delete: Vec<Vec<u8>> = Vec::new();
-
-        for (_raw, mut versions) in by_key {
-            versions.sort_by_key(|(v, _, _)| *v);
-            let mut last_old: Option<usize> = None;
-            for (i, (ver, _, _)) in versions.iter().enumerate() {
-                if *ver < xmin {
-                    last_old = Some(i);
-                }
-            }
-            if let Some(keep_old) = last_old {
-                for i in 0..keep_old {
-                    to_delete.push(versions[i].1.clone());
-                    removed += 1;
-                }
-                let old_is_tomb = versions[keep_old].2;
-                let has_newer = versions.iter().any(|(v, _, _)| *v >= xmin);
-                if old_is_tomb && !has_newer {
-                    to_delete.push(versions[keep_old].1.clone());
-                    removed += 1;
-                }
-            }
-        }
+        // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]
+        let (to_delete, _kept) = vacuum_plan(by_key, xmin);
+        let removed = to_delete.len();
 
         for enc in &to_delete {
             let _ = kv.remove(enc);

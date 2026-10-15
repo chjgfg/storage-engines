@@ -17,6 +17,7 @@ use std::{
 };
 
 pub use crate::common::{ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+use crate::common::vacuum_plan;
 use crate::memory::mem_store::MemStore;
 
 /// MVCC 引擎（单进程内存）
@@ -50,34 +51,11 @@ pub struct BulkLoader {
     finished: bool,
 }
 
-/// 逻辑键 + 版本（调试用）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionedKey {
-    pub raw_key: Vec<u8>,
-    pub version: u64,
-}
-
-/// 编码：`raw_key || version.to_be_bytes()`
-pub fn encode_key(raw_key: &[u8], version: u64) -> Vec<u8> {
-    let mut enc = Vec::with_capacity(raw_key.len() + 8);
-    enc.extend_from_slice(raw_key);
-    enc.extend_from_slice(&version.to_be_bytes());
-    enc
-}
-
-/// 解码
-pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
-    if enc.len() < 8 {
-        return None;
-    }
-    let split = enc.len() - 8;
-    let mut ver_bytes = [0u8; 8];
-    ver_bytes.copy_from_slice(&enc[split..]);
-    Some(VersionedKey {
-        raw_key: enc[..split].to_vec(),
-        version: u64::from_be_bytes(ver_bytes),
-    })
-}
+/// 逻辑键 + 版本（调试用）与版本键编解码
+///
+/// 定义在 [`crate::common::version`]（四引擎共用）；这里 re-export 是为了
+/// `crate::memory::encode_key` 这个既有路径不中断。
+pub use crate::common::{decode_key, encode_key, VersionedKey};
 
 impl MVCC {
     /// 新建空库
@@ -237,7 +215,7 @@ impl MVCC {
         // 分组按引用走表：判「留哪一版」只需要版本号 + 是不是墓碑，
         // 不需要把每行 value 克隆出来（旧实现是 `store.iter().collect()`）。
         let budget_rows = budget_rows.max(1);
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool)>> = BTreeMap::new();
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>> = BTreeMap::new();
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut truncated = false;
@@ -261,36 +239,15 @@ impl MVCC {
             by_key
                 .entry(vk.raw_key.clone())
                 .or_default()
-                .push((vk.version, enc.to_vec(), val.is_none()));
+                .push((vk.version, enc.to_vec(), val.is_none(), ()));
             false
         });
         let next_cursor = if truncated { cur_raw } else { None };
         drop(store);
 
-        let mut removed = 0usize;
-        let mut to_delete: Vec<Vec<u8>> = Vec::new();
-
-        for (_raw, mut versions) in by_key {
-            versions.sort_by_key(|(v, _, _)| *v);
-            let mut last_old: Option<usize> = None;
-            for (i, (ver, _, _)) in versions.iter().enumerate() {
-                if *ver < xmin {
-                    last_old = Some(i);
-                }
-            }
-            if let Some(keep_old) = last_old {
-                for i in 0..keep_old {
-                    to_delete.push(versions[i].1.clone());
-                    removed += 1;
-                }
-                let old_is_tomb = versions[keep_old].2;
-                let has_newer = versions.iter().any(|(v, _, _)| *v >= xmin);
-                if old_is_tomb && !has_newer {
-                    to_delete.push(versions[keep_old].1.clone());
-                    removed += 1;
-                }
-            }
-        }
+        // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]
+        let (to_delete, _kept) = vacuum_plan(by_key, xmin);
+        let removed = to_delete.len();
 
         let mut store = self.store.lock().unwrap();
         for enc in &to_delete {
