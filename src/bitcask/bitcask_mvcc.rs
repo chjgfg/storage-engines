@@ -858,14 +858,44 @@ impl Transaction {
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
+        self.collect_latest_raw_in(include_deleted, None, None)
+    }
+
+    /// `[start, end)` 内每个逻辑 key 的最新可见版本 —— 界**下推到迭代器**的那一版。
+    ///
+    /// 为什么必须有它：旧形状是折完全库、再由调用方逐条筛界，于是"200 行的窗口"和
+    /// "20000 行的全量"一样贵（大库基线实测：窗口 scan 376.6 µs/行，同库全量 scan 3.8 µs/行）。
+    /// 范围查询是下游最主要的读法，代价必须随窗口宽度缩。
+    ///
+    /// 边界判定用**原始 key**，但迭代走的是版本键 `raw ‖ version_be`，所以两边都要兜：
+    /// - 起点：`iter_meta_from(start)` 只保证 `enc ≥ start`；raw < start 却排进来的（前缀
+    ///   交错）用 `continue` 掉。
+    /// - 终点：只有按**迭代键本身** `enc ≥ encode(end, 0)` 才能 break —— 按 raw 判 break
+    ///   不安全，因为交错时后面还可能出现更小的 raw；raw ≥ end 的个别键单独 `continue`。
+    pub(crate) fn collect_latest_raw_in(
+        &self,
+        include_deleted: bool,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
+        let hi_enc = end.map(|e| encode_key(e, 0));
         // ① 元数据折叠：enc 升序 ⇒ 同一 raw_key 最后一次 insert 就是最大可见版本
         let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
         {
             let kvengine = self.kv.lock().unwrap();
-            for (enc, _loc) in kvengine.iter_meta() {
+            for (enc, _loc) in kvengine.iter_meta_from(start) {
+                if hi_enc.as_deref().is_some_and(|h| enc.as_slice() >= h) {
+                    break;
+                }
                 let Some(vk) = decode_key(enc) else {
                     continue;
                 };
+                if start.is_some_and(|s| vk.raw_key.as_slice() < s) {
+                    continue;
+                }
+                if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
+                    continue;
+                }
                 if !self.is_visible(vk.version) {
                     continue;
                 }
@@ -1329,6 +1359,71 @@ mod tests {
                 used * 10 <= old_style,
                 "折叠读盘应比全行物化便宜一个量级以上（{used} vs {old_style}）"
             );
+        }
+        cleanup(&path);
+    }
+
+    /// **窗口 scan 的代价必须随窗口宽度缩，不随全库缩。**
+    ///
+    /// 旧形状是 `collect_latest_raw()` 折完**全库**再由调用方逐条筛界 ⇒ 10 行的窗口和
+    /// 2000 行的全量读盘次数一样（大库基线实测：窗口 scan 376.6 µs/行 vs 全量 3.8 µs/行）。
+    /// 现在界下推进折叠，这条用例同时钉两件事：① 结果与"全量之后筛"逐条一致（界判得对），
+    /// ② 读盘次数随窗口缩（不是又对又慢，也不是快了但筛错）。
+    #[test]
+    fn test_windowed_scan_cost_scales_with_window_not_library() {
+        const KEYS: u64 = 2000;
+
+        let path = tmp_db("window_cost");
+        {
+            let mvcc = MVCC::open(&path);
+            for i in 0..KEYS {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+
+            let tx = mvcc.begin_transaction();
+            let before = crate::bitcask::bitcask::read_value_calls();
+            let all = tx.scan(None, None);
+            let full = crate::bitcask::bitcask::read_value_calls() - before;
+
+            let lo = b"k01000".to_vec();
+            let hi = b"k01010".to_vec();
+            let before = crate::bitcask::bitcask::read_value_calls();
+            let win = tx.scan(Some(&lo), Some(&hi));
+            let windowed = crate::bitcask::bitcask::read_value_calls() - before;
+
+            assert_eq!(all.len() as u64, KEYS, "全量应折出 {KEYS} 行");
+            assert_eq!(win.len(), 10, "[k01000, k01010) 应给 10 行");
+            // 界判对了才算数：与"全量之后筛"逐条一致
+            let want: Vec<Vec<u8>> = all
+                .iter()
+                .filter(|r| r.key.as_slice() >= lo.as_slice() && r.key.as_slice() < hi.as_slice())
+                .map(|r| r.key.clone())
+                .collect();
+            let got: Vec<Vec<u8>> = win.iter().map(|r| r.key.clone()).collect();
+            assert_eq!(got, want, "下推界之后窗口结果必须与全量筛一致");
+
+            // 代价：窗口只有全库的 0.5%
+            assert!(
+                windowed <= 20,
+                "10 行窗口的读盘次数应随窗口缩（实际 {windowed}，全量 {full}）"
+            );
+            assert!(
+                windowed * 10 <= full,
+                "窗口代价不该是全库量级（{windowed} vs 全量 {full}）"
+            );
+
+            // 前缀同理（twosync 那种"按路径前缀取一段"的读法）：k001xx ⇒ 100 个键
+            let before = crate::bitcask::bitcask::read_value_calls();
+            let pre = tx.prefix_scan(b"k001");
+            let prefixed = crate::bitcask::bitcask::read_value_calls() - before;
+            assert_eq!(pre.len(), 100, "前缀 k001 应命中 100 行");
+            assert!(
+                prefixed <= 120,
+                "前缀扫的读盘应随前缀命中等同宽度（实际 {prefixed}，全量 {full}）"
+            );
+            tx.rollback();
         }
         cleanup(&path);
     }

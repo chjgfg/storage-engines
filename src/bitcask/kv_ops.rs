@@ -182,7 +182,8 @@ impl Transaction {
         mut f: impl FnMut(ExportRecord) -> bool,
     ) {
         let now = now_unix_secs();
-        for (key, _ver, raw) in self.collect_latest_raw(false) {
+        // 界下推给折叠：窗口扫的代价必须随窗口宽度缩，不是随全库存活 key 数缩
+        for (key, _ver, raw) in self.collect_latest_raw_in(false, start, end) {
             if let Some(s) = start {
                 if key.as_slice() < s {
                     continue;
@@ -284,7 +285,16 @@ impl Transaction {
         pattern: Option<&[u8]>,
         mode: KeyMatchMode,
     ) -> Vec<ExportRecord> {
-        self.collect_latest_raw(true)
+        // 前缀匹配的键是有界的 ⇒ 界下推给折叠。Contains 要逐键比子串，全库是它的本质代价，
+        // 不在这条里"优化"掉。
+        let (lo, hi) = match mode {
+            KeyMatchMode::Prefix => (
+                if pattern.unwrap_or_default().is_empty() { None } else { pattern },
+                prefix_upper_bound(pattern.unwrap_or_default()),
+            ),
+            KeyMatchMode::Contains => (None, None),
+        };
+        self.collect_latest_raw_in(true, lo, hi.as_deref())
             .into_iter()
             .filter_map(|(key, _ver, raw)| {
                 if let Some(pat) = pattern {
