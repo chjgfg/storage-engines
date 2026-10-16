@@ -1929,6 +1929,12 @@ mod tests {
                 prefixed * 4 <= full,
                 "前缀扫的页数不该是全库量级（{prefixed} vs 全量 {full}）"
             );
+
+            // 边界形状：前缀是**所有键的真前缀**（比第一个键还短 ⇒ 下降到最左叶子）。
+            // lsm 曾把这种扫法做成空结果，四家都钉一遍。
+            let whole = tx.prefix_scan(b"k");
+            assert_eq!(whole.len() as u64, KEYS, "前缀 k 应命中全部 {KEYS} 行");
+            assert_eq!(tx.key_count(b"k") as u64, KEYS, "key_count 同一个形状");
             tx.rollback();
         }
         cleanup(&path);

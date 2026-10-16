@@ -1425,6 +1425,12 @@ mod tests {
                 "前缀扫的读盘应随前缀命中等同宽度（实际 {prefixed}，全量 {full}）"
             );
 
+            // 边界形状：前缀是**所有键的真前缀**（比第一个键还短 ⇒ seek 落不到任何"键 ≥ from"
+            // 的位置）。lsm 在复测表里把这种前缀扫成空结果，四家都钉一遍。
+            let whole = tx.prefix_scan(b"k");
+            assert_eq!(whole.len() as u64, KEYS, "前缀 k 应命中全部 {KEYS} 行");
+            assert_eq!(tx.key_count(b"k") as u64, KEYS, "key_count 同一个形状");
+
             // 上界哨兵的陷阱形状：`seek_prev` 造出来的界是 `key ‖ 0x00`，若哨兵取
             // `encode_key(end, 0)` 就会把 `key` 自己的版本行判成越界 —— 表现为
             // `seek_prev(k)` 返回比 k 小的那一版。内存引擎先撞到，四家现在共用一个哨兵函数。

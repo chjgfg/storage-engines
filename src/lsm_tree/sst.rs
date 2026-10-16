@@ -547,9 +547,12 @@ impl SstFile {
                 feed(k, se);
             }
         } else {
-            // 起点定位到含 `from` 的那个块；前面的块一块不读
+            // 起点定位到含 `from` 的那个块；前面的块一块不读。
+            // ⚠️ 找不到（`from` 比第 0 块的首键还小，比如 `prefix_scan("0")` 这种
+            // "前缀是所有键的真前缀"的形状）必须**从第 0 块开始**，不能跳过整篇 ——
+            // 我第一版写成 `unwrap_or(index.len())`，于是这类前缀扫直接返回空。
             let start_block = match from {
-                Some(f) => self.find_block(f).unwrap_or(self.index.len()),
+                Some(f) => self.find_block(f).unwrap_or(0),
                 None => 0,
             };
             'blocks: for i in start_block..self.index.len() {

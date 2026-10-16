@@ -2266,6 +2266,13 @@ mod tests {
                 prefixed * 4 <= full,
                 "前缀扫的块读不该是全库量级（{prefixed} vs 全量 {full}）"
             );
+
+            // 边界形状：前缀是**所有键的真前缀**（比第 0 块的首键还短 ⇒ 稀疏索引里没有
+            // "first_key ≤ from" 的块）。这一步一旦按"没找到就跳过整篇"处理，
+            // prefix_scan 会静默返回近乎空的结果 —— 复测表里 lsm 的 key_count 报 0 就是这么来的。
+            let whole = tx.prefix_scan(b"k");
+            assert_eq!(whole.len() as u64, KEYS, "前缀 k 应命中全部 {KEYS} 行");
+            assert_eq!(tx.key_count(b"k") as u64, KEYS, "key_count 同一个形状");
             tx.rollback();
         }
         cleanup(&path);

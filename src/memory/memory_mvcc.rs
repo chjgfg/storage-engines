@@ -1114,6 +1114,12 @@ mod tests {
             "前缀扫的代价不该是全库量级（{prefixed} vs {full}）"
         );
 
+        // 边界形状：前缀是**所有键的真前缀**（比第一个键还短）。lsm 曾把这种扫法做成空结果，
+        // 四家都钉一遍。
+        let whole = tx.prefix_scan(b"k");
+        assert_eq!(whole.len() as u64, KEYS, "前缀 k 应命中全部 {KEYS} 行");
+        assert_eq!(tx.key_count(b"k") as u64, KEYS, "key_count 同一个形状");
+
         // 上界哨兵的陷阱形状：`seek_prev` 的界是 `key ‖ 0x00`，用 `encode_key(end, 0)`
         // 当哨兵会把 `key` 自己的版本行判成越界（这条用例最初就是因为这个而红）。
         assert_eq!(tx.seek_prev(b"k01005").unwrap().key, b"k01005");

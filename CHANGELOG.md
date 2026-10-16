@@ -135,6 +135,14 @@
   `LSMTree::scan_latest_light_range` + `mem_view_light_range`（原来的 `scan_latest_light` 把每个
   SST **整篇块读完**再归并，所以窗口再窄也要付全库的块读代价）。四家各用自己的代价单位：
   读盘次数 / 折叠走的键数 / 页数 / SST 块读次数。
+- **⚠️ 界下推的第一次复测就抓到我自己引入的回归**（如实留档）：`SstFile::light_view_range`
+  起点写成 `find_block(from).unwrap_or(self.index.len())` —— 意思是"`from` 比第 0 块首键还小时
+  跳过整篇"。于是**前缀是所有键的真前缀**那一类形状（`prefix_scan("0")`、`key_count("00")`）
+  直接返回近乎空的结果：复测表里 lsm 的 `prefix_scan 2B前缀` 只命中 1 行、`key_count` 返回 0 键，
+  而同库另三家都是 20000。改成 `unwrap_or(0)`（找不到就把第 0 块当起点），并在**四家各自的**
+  窗口守卫里都补一条这个边界形状（`prefix_scan(b"k") == 全部键` + `key_count` 同形）。
+  为什么以前没暴露：这类"前缀比所有键都短"的形状在既有单用例里根本没出现过，
+  而台架是第一次拿真实宽度与前缀去跑四家。
 - **过程中我自己引入、又被既有测试当场抓住的一个 bug**（值得留档）：第一版把终点哨兵取成
   `encode_key(end, 0)`。而 `seek_prev` 造的上界是 `key ‖ 0x00` ⇒ `key` 自己的版本行排在哨兵
   **之后** ⇒ 被判越界丢掉 ⇒ `seek_prev(k)` 返回比 k 小的那一版。内存引擎的既有用例
