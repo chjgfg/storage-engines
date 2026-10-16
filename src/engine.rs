@@ -193,7 +193,20 @@ pub trait KvTxn: Send {
     fn version(&self) -> u64;
 
     /// 写入；`false` = 写冲突
+    ///
+    /// ⚠️ `value` 是**已打过信封**的逻辑值（历史约定，现有调用点按它写）。直接拿这个口子
+    /// 存裸字节会踩坑：`0x00` 打头读回来少 1 字节，`0x01` 打头会被当成 TTL 信封少 9 字节、
+    /// 甚至被判"已过期"读成 `None`。存二进制请用 [`KvTxn::set_raw`]。
     fn set(&self, key: &[u8], value: Vec<u8>) -> bool;
+
+    /// 原样存这串字节：信封由引擎打，[`KvTxn::get`] 一字不差地还回来（空值、`0x00`/`0x01`
+    /// 打头、走 blob 旁路的长值都一样）。`false` 同 `set` = 写冲突。
+    ///
+    /// 为什么只加写的一侧：`get` 本来就已经把信封剥掉，它就是 `set_raw` 的读侧对应物；
+    /// 再造一个 `get_raw` 只是给同一个行为起第二个名字，换来的是"该用哪个"的困惑。
+    /// 确实需要"不经剥壳的存储字节"时，那是另一个能力（看 TTL 信封本身），目前只有引擎内部门
+    /// （`latest_visible_raw`），没有对外承诺。
+    fn set_raw(&self, key: &[u8], value: Vec<u8>) -> bool;
 
     /// 带 TTL 写入；`false` = 写冲突
     fn set_with_ttl(&self, key: &[u8], value: Vec<u8>, ttl: Duration) -> bool;
@@ -719,6 +732,10 @@ macro_rules! impl_engine {
 
             fn set(&self, key: &[u8], value: Vec<u8>) -> bool {
                 self.inner.set(key, value)
+            }
+
+            fn set_raw(&self, key: &[u8], value: Vec<u8>) -> bool {
+                self.inner.set_raw(key, value)
             }
 
             fn set_with_ttl(&self, key: &[u8], value: Vec<u8>, ttl: Duration) -> bool {
@@ -1454,6 +1471,109 @@ mod tests {
         assert!(t.get_ttl(b"counter").is_some_and(|o| o.is_some()), "TTL 必须真的设上");
         t.commit();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 门面层：`set_raw` 必须**一字不差**地把任意字节存进去、取回来（四家各自 + 重开之后）。
+    ///
+    /// 盯的是四组最容易踩的形状：空值、`0x00` 打头（读回来会少 1 字节）、`0x01` 打头且后 8
+    /// 字节看着像"已过期的 TTL 信封"（读回来直接变 `None`）、超过 blob 阈值的长值（走旁路）。
+    /// 同一条里必须留一组**对照**：拿 `set` 存同样的字节确实会丢 —— 没有这组对照，
+    /// 就无法区分"`set_raw` 真在做事"和"它只是个换个名字的 `set`"。
+    #[test]
+    fn set_raw_round_trips_every_byte_pattern() {
+        // 一个"看着像已过期 TTL 信封"的裸值：0x01 + 8 字节很早的 LE 时间戳
+        let mut fake_expired_ttl = vec![0x01u8];
+        fake_expired_ttl.extend_from_slice(&1u64.to_le_bytes());
+        fake_expired_ttl.extend_from_slice(b"payload");
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("空值", Vec::new()),
+            ("单个 0x00", vec![0x00]),
+            ("0x00 打头", vec![0x00, b'A', b'B', b'C']),
+            ("像 TTL 信封的裸值", fake_expired_ttl.clone()),
+            ("0x02 打头", vec![0x02, 0x00, 0x01, 0xFF]),
+            ("超过 blob 阈值的长值", vec![0xAB; 5000]),
+            ("全字节表", (0u16..=255).map(|b| b as u8).collect()),
+        ];
+
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir.clone());
+            for (idx, (tag, bytes)) in cases.iter().enumerate() {
+                let key = format!("raw{idx}").into_bytes();
+                {
+                    let tx = db.begin();
+                    assert!(
+                        tx.set_raw(&key, bytes.clone()),
+                        "{name}: {tag} 写冲突？"
+                    );
+                    tx.commit();
+                }
+                {
+                    let tx = db.begin();
+                    assert_eq!(
+                        tx.get(&key).as_deref(),
+                        Some(bytes.as_slice()),
+                        "{name}: {tag} 用 set_raw 存却读不回来（一字不差是这条守卫唯一的目的）"
+                    );
+                    tx.commit();
+                }
+                // 读路径不止 `get`：scan / multi_get 走的是同一套剥壳，必须同样原样
+                let tx = db.begin();
+                let one_key = vec![key.clone()];
+                assert_eq!(
+                    tx.multi_get(&one_key)[0].as_deref(),
+                    Some(bytes.as_slice()),
+                    "{name}: {tag} 在 multi_get 里变了"
+                );
+                let scanned = tx.scan(Some(&key), Some(&[key[0], b'z' + 1][..]));
+                assert!(
+                    scanned.iter().any(|r| r.key == key && r.value.as_deref() == Some(bytes.as_slice())),
+                    "{name}: {tag} 在 scan 里丢了或变了"
+                );
+                tx.commit();
+
+                // 对照：同一批字节用 `set` 存会怎样（`0x00`/`0x01` 打头的两类必须丢，
+                // 其余恰好不丢 —— 这正说明"坑"是按字节值偶发出现的，靠人记规矩记不住）
+                if *tag == "0x00 打头" || *tag == "像 TTL 信封的裸值" {
+                    let bad = format!("bad{idx}").into_bytes();
+                    {
+                        let tx = db.begin();
+                        assert!(tx.set(&bad, bytes.clone()));
+                        tx.commit();
+                    }
+                    let tx = db.begin();
+                    assert_ne!(
+                        tx.get(&bad).as_deref(),
+                        Some(bytes.as_slice()),
+                        "{name}: `set` 存 {tag} 居然没丢？那这条守卫就白写了（信封约定改了？）"
+                    );
+                    tx.commit();
+                }
+            }
+
+            // 落盘引擎：重开之后仍然一字不差（信封是在存储编码里，不是只在内存里）
+            if dir.is_some() {
+                db.checkpoint().expect("checkpoint");
+                drop(db);
+                let reopened = open_engine(name, dir.as_deref()).expect("重开");
+                {
+                    let tx = reopened.begin();
+                    for (idx, (tag, bytes)) in cases.iter().enumerate() {
+                        assert_eq!(
+                            tx.get(&format!("raw{idx}").into_bytes()).as_deref(),
+                            Some(bytes.as_slice()),
+                            "{name}: 重开后 {tag} 变了"
+                        );
+                    }
+                    tx.commit();
+                }
+                // 路径已在循环开头登记过，这里只放句柄（文件锁要放开才能删目录）
+                drop(reopened);
+            }
+        }
+        cleanup(dirs);
     }
 
     /// 门面层：`without_total()` 在四家必须给出**同一页的同一份内容**，而 `total` 如实是 `None`。

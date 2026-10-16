@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 261 个单元测试 + 4 个集成测试
+- 262 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -215,7 +215,9 @@ tx.commit();                               // 落 WAL + fsync(只读事务两者
   "漏网活跃事务",`vacuum` 就会从此整轮跳过,垃圾永久累积。
 - **只读事务不写 WAL、`commit` 不 fsync**(实测 2265.8µs/次 → 15.8µs/次)。所以"每 tick 做一次
   快照读"这种用法不会把磁盘拖成瓶颈。
-- `value` 是打过信封的**逻辑值**:直接存裸字节要先 `pack_plain`(见第 7 条与「已知局限」)。
+- `value` 是打过信封的**逻辑值**:直接存裸字节会踩坑(`0x00` 打头少 1 字节、`0x01` 打头被当 TTL 信封)。
+  存二进制/序列化字节请用 **`tx.set_raw(key, value)`** —— 信封由引擎打,`get` 一字不差还回来;
+  要自己打也行(`use storage_engines::common::pack_plain;`),两条等价。`set_with_ttl` 内部已打信封。
 - **读一段区间就交给区间,别读全库再筛**。`scan(start,end)` / `prefix_scan(prefix)` 把界下推到
   引擎的有序结构(KeyDir seek / BTreeMap range / 下降到 containing 叶子 / SST 稀疏索引定位块),
   所以代价随**窗口宽度**走;release + 20k 行实测(每行 µs,窗口 = 1% 即 200 行):
@@ -379,7 +381,8 @@ println!("{profile}");                     // 只报缺口:少了 WAL / 校验�
   需要 CF 隔离的下游得直接用 `crate::lsm_tree::LsmDB`。
 - **值信封要业务侧自己守**:`set` 把 `value` 当**已打信封**的逻辑值存,`get` 一律剥标签,
   所以裸字节直接存会踩坑(`0x00` 打头少 1 字节,`0x01` 打头被当 TTL 信封)。约定是
-  `use storage_engines::common::pack_plain;` 先打再 `set`。⚠️ 这条靠人不靠编译器,修法待定
+  用 `tx.set_raw(key, value)`(或自己 `use storage_engines::common::pack_plain;` 先打再 `set`,两条等价)
+  —— 引擎打的信封不会错,`set` 那个口子保留是因为现有调用点按约定写。
   —— 见[已知局限](#已知局限)。
 
 ---
@@ -868,7 +871,12 @@ data.db.lock       单写者锁(内含 pid)
 **其他**
 - ⚠️ **值信封不对称**:`set(key, value)` 把 `value` 当**已经打过信封**的逻辑值存,而 `get` 一律走 `logical_to_user` 剥标签。
   于是**直接用门面存裸字节**时:值以 `0x00` 打头会少 1 字节,以 `0x01` 打头会被当成 TTL 信封少 9 字节、甚至被判定"已过期"而读成 `None`。
-  约定是"业务侧先 `pack_plain` 再 `set`"(TTL 类 API 内部已打),但这靠人守不靠编译器 —— 要么让 `set` 自己打信封(对现有按约定打过的调用点是破坏性变更),要么加 `set_raw`/`get_raw`。尚未定
+  **已开口子(M16)**:新增 `KvTxn::set_raw(key, value)` —— 信封由引擎打,任意字节(空、`0x00` 打头、
+  `0x01` 打头像过期 TTL、超过 blob 阈值的长值)都一字不差地存下并取回,守卫
+  `set_raw_round_trips_every_byte_pattern`(四家 + 重开之后,并对照断言"`set` 存同样的字节确实会丢")。
+  ⚠️ 刻意**没有**加 `get_raw`:`get` 本来就是它的读侧对应物,再造一个同名不同义的口只会让人问"该用哪个";
+  真要"不经剥壳的存储字节"那是另一个能力(目前只有引擎内部的 `latest_visible_raw`),未对外承诺。
+  仍留的坑:`set` 本身还是要求调用方自己打过信封(现有调用点按这个约定写,改它是破坏性变更)
 - ~~**门面还缺的三项**~~ → 已补两项(M13):`EngineConfig` 现在装着四家的旋钮(bitcask 分片上限、
   LSM 整份 `LSMTreeOptions`、WAL 收口阈值、自动回收切片),`vacuum_bounded` / WAL 阈值读写 /
   `tuning()` 也都上了 `KvEngine`。仍缺的一项是跨引擎 `migrate()` 的库 API(只有 CLI)。
@@ -982,7 +990,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:261 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:262 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

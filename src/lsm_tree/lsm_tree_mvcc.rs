@@ -852,6 +852,23 @@ impl Transaction {
         self.write(key, Some(value))
     }
 
+    /// 原样存这串字节 —— 引擎替你打信封，`get` 会一字不差地还回来。
+    ///
+    /// 与 [`Self::set`] 的分工：`set` 把传进来的字节当作**已经打过信封**的逻辑值（现有调用点
+    /// 按这个约定写，改它会破坏它们），所以拿 `set` 直接存裸字节会踩坑：值以 `0x00` 打头
+    /// 读回来少 1 字节，以 `0x01` 打头会被当成 TTL 信封少 9 字节、甚至被判"已过期"读成 `None`。
+    /// 存二进制/序列化字节（protobuf、avro、压缩块）走这个口子，不必再记信封规矩。
+    ///
+    /// 空值、`0x00`/`0x01` 打头、超过 blob 阈值走旁路的长值，都由每条用例里的
+    /// `test_set_raw_round_trips_every_byte_pattern` 逐字节钉住；同一条里还对照断言
+    /// "`set` 存同样的字节确实会少" —— 不对照就证明不了这个口子在做事。
+    ///
+    /// 读侧语义不变：`get` / `scan` / `multi_get` 一律照旧剥信封（剥掉的正是这里加的那一层）。
+    /// 要"原样字节 + 过期时间"用 `set_with_ttl`（它内部同样已打信封）。
+    pub fn set_raw(&self, key: &[u8], value: Vec<u8>) -> bool {
+        self.set(key, crate::common::pack_plain(&value))
+    }
+
     pub fn delete(&self, key: &[u8]) -> bool {
         self.write(key, None)
     }
