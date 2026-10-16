@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 262 个单元测试 + 4 个集成测试
+- 264 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -345,6 +345,25 @@ if win.has_next() { /* 还有下一页 */ }
   `test_search_window_costs_the_window_not_the_library`,门面另有一条
   `windowed_search_agrees_across_engines`(四家必须给同一页的同一份内容)。
 
+**游标式有界扫描 `scan_page(after, limit)`**(M17):`scan(start, None)` 的代价与内存都按
+"从 start 到库尾"算,而"下一页"只需要 `limit` 行 —— 翻页/迁移/导出请用这个:
+
+```rust
+let mut cursor = None;
+let mut pages = 0;
+loop {
+    let tx = db.begin();
+    let (rows, next) = tx.scan_page(cursor.as_deref(), 1000);   // after 是**不含**
+    tx.commit();
+    pages += 1;
+    match next { Some(c) => cursor = Some(c), None => break }
+}
+```
+
+实测(2000 键、页 50):一页只折 **52 把编码键**(全库 `scan` 要折 2000 把),40 页走完全库,
+且逐条顺序与一次 `scan` **完全一致**(`scan_page_costs_the_page_and_walks_the_whole_library_once`)。
+游标推进用的是折出来的行的键(**含刚过期不可见的那些**) —— 否则下一次又从同一批过期行撞起,走不动。
+
 ### 6. 选型:别只看速度
 
 ```rust
@@ -367,9 +386,12 @@ println!("{profile}");                     // 只报缺口:少了 WAL / 校验�
 
 ### 7. 目前还不能指望库做的事(接入前必看)
 
-- **换引擎不搬数据**:`open_engine` 只是换了一家,原来那家的数据不会跟过来。跨引擎搬运只有 CLI
-  ([`export_kv` → `import_kv`](#命令行工具数据搬运与压测));库 API 侧只有
-  `export_latest_visible()` + `begin_bulk()` 这两块积木,没有 `migrate()`。
+- **换引擎不自动搬数据**:`open_engine` 只是换了一家,原来那家的数据不会跟过来。要搬有两条路:
+  CLI([`export_kv` → `import_kv`](#命令行工具数据搬运与压测))或库 API
+  `storage_engines::migrate(&from, &to, page_rows)`(M17) —— 后者按页走
+  [`KvTxn::scan_page`](#5-观测与维护长跑进程要盯的两个数),**每页代价只看 `page_rows`**,
+  不像 `export_latest_visible()` 那样整库物化。带 TTL 的行按剩余时间续,值走 `set_raw`
+  (不会踩信封约定),历史版本与墓碑不带(目标是干净库)。
 - **旋钮分两档**:open 时设的(`order` / `max_cache_pages` / `bitcask_max_file_bytes` / LSM 整份
   options)改一次要重开库 —— 前两者动的是**已落盘数据的形状**,不是能热调的运行时参数。
   开着库能调的只有切片宽度与 WAL 阈值(在 `KvEngine` 上),LSM 其余旋钮另走具体类型
@@ -994,7 +1016,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:262 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:264 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

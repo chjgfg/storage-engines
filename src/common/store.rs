@@ -10,7 +10,9 @@
 //! 搬完之后新增一个引擎只要写这两个方法，折叠/窗口/分页/界下推不用重写 —— 那正是
 //! "基座"与"四份复制"的分界。
 
-use crate::common::codec::{key_matches, logical_to_user, prefix_upper_bound};
+use crate::common::codec::{
+    decode_value_meta, key_matches, logical_to_user, now_unix_secs, prefix_upper_bound,
+};
 use crate::common::fold_window;
 use crate::common::types::{ExportRecord, KeyMatchMode};
 use crate::common::WinCandidate;
@@ -143,4 +145,38 @@ pub fn search_window<S: VersionedStore>(
             },
         },
     )
+}
+
+/// 游标式有界扫描：`after`（**不含**）之后最多 `limit` 行可见记录，返回 `(行, 下一页游标)`；
+/// 游标 `None` = 已经到底，调用方该停了。
+///
+/// 存在的理由是 README 里那句"扫描返回物化 `Vec`"的解药：`scan(start, None)` 会把**从 start
+/// 到库尾**的行全折出来（代价按剩余库量算），而翻页的人只要下一页。有了它，"把一个大库
+/// 一页一页搬完"不必先把整库物化 —— 每页只折 `limit + 1` 组。
+///
+/// ⚠️ 游标取的是**折出来的行**的键（包括刚好过期、对用户不可见的那些）：过期行也必须推进游标，
+/// 否则下一次又从同一批过期行撞起、永远走不动。墓碑在 `include_deleted = false` 的折叠里
+/// 整行不参与，库尾若剩一串墓碑会由"折不满一页"如实判成到底。
+pub fn scan_page<S: VersionedStore>(
+    store: &S,
+    after: Option<&[u8]>,
+    limit: usize,
+) -> (Vec<ExportRecord>, Option<Vec<u8>>) {
+    let now = now_unix_secs();
+    let (rows, more) = collect_rows(store, false, None, None, after, Some(limit.max(1)));
+    let mut out = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    for (key, _ver, raw) in rows {
+        cursor = Some(key.clone());
+        let Some(bytes) = raw else { continue };
+        let m = decode_value_meta(&bytes);
+        if m.is_expired_at(now) {
+            continue;
+        }
+        out.push(ExportRecord {
+            key,
+            value: Some(m.user().to_vec()),
+        });
+    }
+    (out, if more { cursor } else { None })
 }

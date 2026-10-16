@@ -173,6 +173,12 @@ impl Transaction {
         out
     }
 
+    /// 游标式有界扫描（实现见 [`crate::common::scan_page`]）：`after` 之后最多 `limit` 行，
+    /// 返回 `(行, 下一页游标)`，游标 `None` = 到底。翻页/迁移用它，别用 `scan(start, None)`。
+    pub fn scan_page(&self, after: Option<&[u8]>, limit: usize) -> (Vec<ExportRecord>, Option<Vec<u8>>) {
+        crate::common::scan_page(self, after, limit)
+    }
+
     /// 流式扫描：对每条存活记录调用 `f`；`f` 返回 `false` 提前结束。
     /// 不收集全库到单一大 Vec（内部按有序 latest 迭代）。
     pub fn scan_foreach(
@@ -483,6 +489,67 @@ mod tests {
             tx.batch_delete(&[b"b".to_vec()]).unwrap();
             assert!(!tx.exists(b"b"));
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// `scan_page` 的代价必须只看 `limit`，不看库有多大（这条是 migrate 与"翻页不必物化全库"
+    /// 的地基；`scan(start, None)` 至今仍然是按剩余库量算的，两者别混用）。
+    ///
+    /// 尺子 = 本引擎折候选时看了多少把编码键。同时必须断言"一页一页走到的行，与一次
+    /// `scan` 拿到的行**逐条相同**" —— 只测便宜不测等价，就是拿错数据换性能。
+    #[test]
+    fn scan_page_costs_the_page_and_walks_the_whole_library_once() {
+        const N: usize = 2000;
+        const PAGE: usize = 50;
+        let path = tmp("scan_page");
+        {
+            let mvcc = MVCC::open(&path);
+            let tx = mvcc.begin_transaction();
+            for i in 0..N {
+                assert!(tx.set(format!("k{i:05}").as_bytes(), pack_plain(b"v")));
+            }
+            tx.commit();
+
+            let base = crate::bitcask::bitcask::keydir_visits();
+            let (first, cursor) = {
+                let tx = mvcc.begin_transaction();
+                let page = tx.scan_page(None, PAGE);
+                tx.commit();
+                page
+            };
+            let page_visits = crate::bitcask::bitcask::keydir_visits() - base;
+
+            let mut seen: Vec<Vec<u8>> = first.iter().map(|r| r.key.clone()).collect();
+            let mut cur = cursor.clone();
+            let mut pages = 1usize;
+            while let Some(c) = cur {
+                let tx = mvcc.begin_transaction();
+                let (rows, next) = tx.scan_page(Some(&c), PAGE);
+                tx.commit();
+                seen.extend(rows.iter().map(|r| r.key.clone()));
+                pages += 1;
+                cur = next;
+                assert!(pages <= N / PAGE + 2, "游标不前进？已 {pages} 页");
+            }
+
+            let tx = mvcc.begin_transaction();
+            let all = tx.scan(None, None);
+            tx.commit();
+            assert_eq!(seen.len(), N, "一页一页走必须刚好覆盖全库");
+            assert_eq!(
+                seen,
+                all.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+                "逐条顺序必须与一次全量 scan 完全一致"
+            );
+            assert!(cursor.is_some(), "{PAGE} < {N} 行，首页之后必须有游标");
+            eprintln!(
+                "[scan_page] 一页折 {page_visits} 把键（limit={PAGE}）；全库 {N} 行分了 {pages} 页走完"
+            );
+            assert!(
+                page_visits <= (PAGE as u64 * 2 + 64),
+                "一页付了 {page_visits} 把键，limit 才 {PAGE} ⇒ 又变成走全库了"
+            );
         }
         cleanup(&path);
     }

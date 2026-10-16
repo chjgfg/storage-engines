@@ -20,7 +20,9 @@ pub use types::{
     DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
     SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
-pub use store::{RowValue, VersionedStore, collect_rows, search_bounds, search_window};
+pub use store::{
+    RowValue, VersionedStore, collect_rows, scan_page, search_bounds, search_window,
+};
 pub use version::{decode_key, encode_key, vacuum_plan, version_key_upper_bound, VersionedKey};
 
 /// 测试专用的临时路径。**必须带进程内单调序号**，不能只靠时间戳。

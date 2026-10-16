@@ -31,6 +31,10 @@
   的唯一定义移到 `crate::common`，各引擎模块仍然 `pub use` 转发 ⇒
   `crate::bitcask::encode_key` 这类既有路径**不受影响**，只有直接 import `crate::common::*`
   的写法会遇到重名。
+- **`KvTxn` 新增必需方法 `scan_page(after, limit)`**、**`EngineError` 新增变体
+  `MigrateAborted{key, reason}`**（M17）。前者对"自己实现 `KvTxn` 的人"是破坏性的（用本仓库
+  四个引擎的不受影响）；后者对 `match EngineError { .. }` 全模式匹配是破坏性的。
+
 - **`EngineConfig` 新增四个字段**（M13）：`lsm: Option<LSMTreeOptions>`、
   `bitcask_max_file_bytes: Option<u64>`、`wal_checkpoint_bytes: Option<u64>`、
   `vacuum_auto_slice_rows: Option<u64>`。用**全字段字面量**构造它的代码要补
@@ -135,6 +139,17 @@
   （读该源第一块），所以窗口再小也躲不开"源数 × 一块"⇒ 首页代价从 O(全库行数) 变成
   **O(SST 文件数)**。计数尺证明窗口确实生效（22 把键 vs 2000）。源启动的固定开销与 M10 那条
   "点读代价 ∝ 版本散在几个 SST"同源，已单列进未修队列，不在这里冒充已解决。
+- **游标式有界扫描 `KvTxn::scan_page(after, limit)`（M17）**：返回 `(行, 下一页游标)`，
+  `after` 是**不含**，游标 `None` = 到底。实现是 `common::store::scan_page` 一份泛型（建在
+  M18a 的 `VersionedStore` 上），四家各一行转发。它治的是 README 里那条"扫描返回物化 `Vec`":
+  `scan(start, None)` 的代价与内存按"从 start 到库尾"算，而翻页的人只要 `limit` 行。
+  ⚠️ 游标取**折出来的行**的键，含刚过期、对用户不可见的那些 —— 不推进游标就会下一次又从
+  同一批过期行撞起，永远走不动（这是实现里唯一不显然的一处）。
+- **`storage_engines::migrate(&from, &to, page_rows)`（M17）**：跨引擎在线搬家，不必经 CLI 的
+  中间文件。读侧 `scan_page` 一页一页走、写侧一页一个事务（`commit` 每页一次，不是每行一次
+  fsync）；带 TTL 的行按**剩余时间**续，值用 `set_raw` 写（源侧读回来的是已剥信封的用户字节，
+  直接进目标侧的 `set` 会踩信封约定）；历史版本与墓碑不带（目标是干净库，`max_chain` 从 1 开始）。
+  目标侧写被拒 ⇒ 回滚当前页并返回 `EngineError::MigrateAborted`。
 - **`src/common/store.rs`：版本行折叠收成一份（M18a，"基座"那一刀的第一步）**。新增
   `VersionedStore` trait（**只有两个必需方法**：`scan_candidates` 我这家的键怎么折、
   `materialize` 一组的字节在哪儿）+ 泛型 `collect_rows` / `search_window` / `search_bounds`。
@@ -441,7 +456,7 @@
 
 ### 测试
 
-262 个单元测试（258 跑 + 4 个 `#[ignore]` 的大库基线/长跑基线）+ 4 个集成测试 + 5 个文档测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆/索引比较次数/超载写次数），不用计时：原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
+264 个单元测试（260 跑 + 4 个 `#[ignore]` 的大库基线/长跑基线）+ 4 个集成测试 + 5 个文档测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆/索引比较次数/超载写次数），不用计时：原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
 并且复杂度守卫都先验证过"它会红"（临时短路被测代码跑一遍）才算数。
 - **B+ 树重组四条（M14）**：
   - `test_reorg_packs_leaves_instead_of_leaving_them_half_empty`：**页数**是唯一对这件事敏感的尺子
@@ -460,6 +475,16 @@
     拿字节数当尺子会把这条合法的 Begin 算成罪状，我第一版就是这么误报的）。
     把守卫挪到 append 之后 ⇒ `left: 1 / right: 0` 当场红。同一条里还断言"探针数得到那条
     真实写入的 `Write`"，否则 `== 0` 是空转。
+- **`scan_page` 与 `migrate` 两条（M17）**：
+  - `scan_page_costs_the_page_and_walks_the_whole_library_once`（bitcask，尺子 = 折候选看了
+    多少把编码键）：一页 50 行只折 **52 把**（全库 `scan` 是 2000 把），40 页走完后
+    "逐条顺序与一次 `scan` 完全一致" —— 只测便宜不测等价，就是拿错数据换性能。
+  - `migrate_walks_a_ring_of_engines_byte_for_byte`：跨引擎**环**一圈
+    （bitcask→lsm→bplus→memory），四形状（普通 / `0x00` 打头 / `0x01` 打头像 TTL 信封 /
+    真带 TTL），每一跳断言"export 内容与源头逐条相同 + TTL 仍在 + 裸字节没被吃"。
+    **为什么必须绕一圈**：第一版把 `get_meta` 写在**目标**事务里（那时那把 key 还不存在，
+    TTL 一律读成"永久"），只跳一次源就是 bitcask 自己 ⇒ 看不出丢；让每一家既当源又当目标才暴露。
+    这条守卫第一次跑就红了。
 - **`set_raw` 字节形状守卫（M16）**：`set_raw_round_trips_every_byte_pattern` 在门面上过四家，
   形状取"最容易踩"的几组：空值、单个 `0x00`、`0x00` 打头、`0x01` + 8 字节看着像"已过期的 TTL
   信封"、`0x02` 打头、5000 字节（走 blob 旁路）、0..255 全字节表；每条都断言 `get`/`multi_get`/

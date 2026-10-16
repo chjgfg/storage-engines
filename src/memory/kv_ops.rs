@@ -159,6 +159,12 @@ impl Transaction {
     }
 
     /// 流式扫描：对每条存活记录调用 `f`；`f` 返回 `false` 提前结束。
+
+    /// 游标式有界扫描（实现见 [`crate::common::scan_page`]）：`after` 之后最多 `limit` 行，
+    /// 返回 `(行, 下一页游标)`，游标 `None` = 到底。翻页/迁移用它，别用 `scan(start, None)`。
+    pub fn scan_page(&self, after: Option<&[u8]>, limit: usize) -> (Vec<ExportRecord>, Option<Vec<u8>>) {
+        crate::common::scan_page(self, after, limit)
+    }
     pub fn scan_foreach(
         &self,
         start: Option<&[u8]>,

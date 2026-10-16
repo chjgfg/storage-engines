@@ -52,6 +52,11 @@ pub enum EngineError {
     },
     /// 这个引擎必须落盘，但调用方没给路径
     PathRequired(&'static str),
+    /// [`migrate`] 中止：目标侧拒收这一行（键/值装不进一页，或写冲突）
+    MigrateAborted {
+        key: Vec<u8>,
+        reason: &'static str,
+    },
     Io(std::io::Error),
 }
 
@@ -68,6 +73,9 @@ impl fmt::Display for EngineError {
             }
             EngineError::PathRequired(engine) => {
                 write!(f, "engine {engine} requires a database path")
+            }
+            EngineError::MigrateAborted { key, reason } => {
+                write!(f, "migrate aborted at key {key:?}: {reason}")
             }
             EngineError::Io(e) => write!(f, "io error: {e}"),
         }
@@ -260,6 +268,14 @@ pub trait KvTxn: Send {
     fn seek(&self, key: &[u8]) -> Option<ExportRecord>;
 
     fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord>;
+
+    /// 游标式有界扫描：`after`（**不含**）之后最多 `limit` 行，返回 `(行, 下一页游标)`。
+    /// 游标 `None` = 已经到底。
+    ///
+    /// 为什么要有它：[`KvTxn::scan`] 返回的是 `Vec`，`scan(start, None)` 的代价与内存占用都按
+    /// **"从 start 到库尾"** 算 —— 而"下一页"这个动作本来只需要 `limit` 行。翻页、迁移、
+    /// 导出这类场景请用它，别拿 `scan` 的全量返回值切片。
+    fn scan_page(&self, after: Option<&[u8]>, limit: usize) -> (Vec<ExportRecord>, Option<Vec<u8>>);
 
     fn search_keys(&self, query: &SearchQuery) -> SearchPage;
 
@@ -812,6 +828,14 @@ macro_rules! impl_engine {
 
             fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
                 self.inner.seek_prev(key)
+            }
+
+            fn scan_page(
+                &self,
+                after: Option<&[u8]>,
+                limit: usize,
+            ) -> (Vec<ExportRecord>, Option<Vec<u8>>) {
+                self.inner.scan_page(after, limit)
             }
 
             fn search_keys(&self, query: &SearchQuery) -> SearchPage {
@@ -1572,6 +1596,83 @@ mod tests {
                 // 路径已在循环开头登记过，这里只放句柄（文件锁要放开才能删目录）
                 drop(reopened);
             }
+        }
+        cleanup(dirs);
+    }
+
+    /// `migrate` 的验收：跨引擎**环**一圈（bitcask → lsm → bplus → memory → bitcask），
+    /// 每一跳之后"键与用户字节逐条相同、TTL 仍在、`0x00`/`0x01` 打头的裸字节没被吃掉"。
+    ///
+    /// 为什么绕一圈而不是只跳一次：只跳一次看不出"某一跳丢了 TTL 或改了字节"—— 源头是那家写的，
+    /// 只有让它再当一次源才暴露。环上每一家都既当源又当目标。
+    #[test]
+    fn migrate_walks_a_ring_of_engines_byte_for_byte() {
+        let ring = ["bitcask", "lsm_tree", "bplus_tree", "memory"];
+        let mut dirs: Vec<Option<PathBuf>> = Vec::new();
+
+        // 四种形状各一条：普通、`0x00` 打头、`0x01` 打头（看着像 TTL 信封）、带 TTL
+        let seed: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = vec![
+            (b"plain".to_vec(), b"hello".to_vec(), None),
+            (b"lead00".to_vec(), vec![0x00, 0x01, 0xFE, 0x7F], None),
+            (b"lead01".to_vec(), {
+                let mut v = vec![0x01u8];
+                v.extend_from_slice(&9_999u64.to_le_bytes());
+                v.extend_from_slice(b"not-a-ttl");
+                v
+            }, None),
+            (b"ttl".to_vec(), b"expires-later".to_vec(), Some(3600)),
+        ];
+
+        let mut base: Option<Vec<(Vec<u8>, Option<Vec<u8>>)>> = None;
+        let mut prev: Option<Box<dyn KvEngine>> = None;
+        for (idx, name) in ring.iter().enumerate() {
+            let dir = tmp_dir("migrate");
+            let path = if *name == "memory" {
+                None
+            } else if *name == "bplus_tree" {
+                let _ = std::fs::create_dir_all(&dir);
+                Some(dir.join("bplus.db"))
+            } else {
+                Some(dir.clone())
+            };
+            dirs.push(path.clone());
+            let db = open_engine(*name, path.as_deref()).expect("开目标引擎");
+            if let Some(src) = prev.take() {
+                let stats = migrate(&*src, &*db, 2).expect("migrate 失败");
+                assert_eq!(stats.rows, seed.len() as u64, "{name}: 搬过去的 key 数");
+                assert_eq!(stats.with_ttl, 1, "{name}: 带 TTL 的行数");
+                // page_rows = 2 < 4 行 ⇒ 必须分多页（一页走完说明游标没在用）
+                assert!(stats.pages >= 2, "{name}: 页数 {stats:?}");
+            } else {
+                let tx = db.begin();
+                for (k, v, ttl) in &seed {
+                    assert!(
+                        match ttl {
+                            Some(secs) => {
+                                tx.set_with_ttl(k, v.clone(), Duration::from_secs(*secs))
+                            }
+                            None => tx.set_raw(k, v.clone()),
+                        },
+                        "播种 {k:?} 失败"
+                    );
+                }
+                tx.commit();
+            }
+            let got: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
+                let tx = db.begin();
+                let rows = tx.export_latest_visible(false);
+                let with_ttl = tx.get_ttl(b"ttl").is_some_and(|o| o.is_some());
+                let lead = tx.get(b"lead00").unwrap();
+                tx.commit();
+                assert!(with_ttl, "{name}: TTL 必须跟着搬过来");
+                assert_eq!(lead, seed[1].1, "{name}: 0x00 打头的裸字节被改了");
+                rows.into_iter().map(|r| (r.key, r.value)).collect()
+            };
+            match &base {
+                Some(want) => assert_eq!(&got, want, "{name}: 第 {idx} 跳的内容与源头不一致"),
+                None => base = Some(got),
+            }
+            prev = Some(db);
         }
         cleanup(dirs);
     }
@@ -2407,4 +2508,92 @@ mod tests {
             eprintln!();
         }
     }
+}
+
+/// 一次搬运的账。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrateStats {
+    /// 搬过去的逻辑 key 数
+    pub rows: u64,
+    /// 用户 value 字节总数
+    pub bytes: u64,
+    /// 走了多少页（`page_rows` 那么大的一页）
+    pub pages: u64,
+    /// 带 TTL 的行数（这些用 `set_with_ttl` 写，按剩余时间换算）
+    pub with_ttl: u64,
+}
+
+/// 把 `from` 每个可见逻辑 key 搬到 `to`：跨引擎在线搬运，不必经 CLI 的中间文件。
+///
+/// 读侧是 [`KvTxn::scan_page`] 一页一页走 ⇒ **内存与每页代价都只看 `page_rows`**，
+/// 与库总量无关（用 `export_latest_visible()` 整库物化那种写法搬大库，单核 6 GB 会当场翻）。
+/// 写侧一页一个事务（`commit` 每页一次，不是每行一次 WAL fsync）。
+///
+/// 语义要说清（这三条都是刻意选择，不是没做完）：
+/// - **只带"当前可见的最新版"**：历史版本与墓碑不带 ⇒ 目标库的 `max_chain` 从 1 开始，
+///   这通常正是搬家的目的（顺手把版本链压平）。要连墓碑一起搬得走 `include_deleted` 的导出路径。
+/// - **TTL 按剩余时间续**：绝对过期时刻折成 `Duration` 交给 `set_with_ttl` ⇒ 迁移本身不
+///   改变"还剩多久过期"，但目标库的过期判定从此刻起按它自己的 `now` 算。
+/// - **值用 `set_raw` 写**（源侧读回来的是已剥信封的用户字节，直接进目标侧的 `set`
+///   会踩信封约定 —— 这正是 [`KvTxn::set_raw`] 存在的理由）。
+///
+/// 目标库已有同名 key 会被覆盖成新的版本行（不是冲突）；写不进去（如 B+ 树拒收超长键）
+/// 会中止并回滚当前页，返回 [`EngineError::MigrateAborted`]。
+pub fn migrate(
+    from: &dyn KvEngine,
+    to: &dyn KvEngine,
+    page_rows: usize,
+) -> Result<MigrateStats> {
+    let page_rows = page_rows.max(1);
+    let mut stats = MigrateStats::default();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        // 读侧一页：`scan_page` + 每行一次 `get_meta`。**TTL 必须在源侧读** ——
+        // 目标侧此刻还没有这把 key，拿目标事务问 meta 会一律得到"永久"，于是 TTL 静默丢
+        // （这条是 migrate_walks_a_ring_of_engines 第一版就抓出来的错）。
+        let (rows, next) = {
+            let tx = from.begin();
+            let (page, next) = tx.scan_page(cursor.as_deref(), page_rows);
+            let page: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = page
+                .into_iter()
+                .filter_map(|rec| {
+                    let value = rec.value?;
+                    let expire = tx.get_meta(&rec.key).and_then(|m| m.expire_unix_secs);
+                    Some((rec.key, value, expire))
+                })
+                .collect();
+            tx.commit();
+            (page, next)
+        };
+        if !rows.is_empty() {
+            let tx = to.begin();
+            for (key, value, ttl) in rows {
+                stats.rows += 1;
+                stats.bytes += value.len() as u64;
+                let ok = match ttl {
+                    Some(expire) => {
+                        stats.with_ttl += 1;
+                        let now = crate::common::now_unix_secs();
+                        let left = expire.saturating_sub(now).max(1);
+                        tx.set_with_ttl(&key, value, std::time::Duration::from_secs(left))
+                    }
+                    None => tx.set_raw(&key, value),
+                };
+                if !ok {
+                    tx.rollback();
+                    return Err(EngineError::MigrateAborted {
+                        key,
+                        reason: "目标侧写被拒（写冲突或键/值超出一页载荷）",
+                    });
+                }
+            }
+            tx.commit();
+        }
+        stats.pages += 1;
+        match next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    Ok(stats)
 }
