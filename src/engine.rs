@@ -1426,4 +1426,346 @@ mod tests {
         }
         cleanup(dirs);
     }
+
+    // ==================== 大库基线台架（四引擎 × 每种操作） ====================
+    //
+    // 前面所有守卫数的是「访问了多少块/页/盘」—— 那是**复杂度**的尺子。下游报的却是
+    // **墙钟与占用**（点查 0.86ms、CPU 打满、进程吃内存）。两把尺子可以同时成立：LSM 那条
+    // 就是活例子（每点读只有 4 次块访问，实测 0.86ms，因为未命中要重开文件）。
+    // 所以这里把每个引擎的每个操作都灌进大库跑一遍，三件事一起量：
+    //   µs/次、结束后仍活着的字节（常驻）、期间峰值字节（瞬时物化）。
+    //
+    // 跑法（默认 5 万行，想更大给环境变量）：
+    //   SCALE_ROWS=200000 cargo test --release --lib -- --ignored --nocapture \
+    //       --test-threads=1 scale_baseline_all_engines
+    // `--test-threads=1` 是必须的：内存计数是进程级的，并行会把别家用例的分配算进来。
+
+    /// 记账分配器：只统计申请/释放的字节数。`#[cfg(test)]` ⇒ 对 crate 使用者零成本。
+    mod mem_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+        static LIVE: AtomicU64 = AtomicU64::new(0);
+        static PEAK: AtomicU64 = AtomicU64::new(0);
+
+        pub struct Tracking;
+
+        unsafe impl GlobalAlloc for Tracking {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                // SAFETY: 委托给 System，契约由调用方（Rust 运行时）保证
+                let p = unsafe { System.alloc(l) };
+                if !p.is_null() {
+                    let now = LIVE.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
+                    PEAK.fetch_max(now, Relaxed);
+                }
+                p
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                LIVE.fetch_sub(l.size() as u64, Relaxed);
+                // SAFETY: 指针与布局由调用方按 GlobalAlloc 契约提供
+                unsafe { System.dealloc(p, l) };
+            }
+        }
+
+        #[global_allocator]
+        static ALLOC: Tracking = Tracking;
+
+        pub fn live() -> u64 {
+            LIVE.load(Relaxed)
+        }
+        pub fn peak() -> u64 {
+            PEAK.load(Relaxed)
+        }
+    }
+
+    /// 跑一次操作，返回 (墙钟, 常驻字节增量, 期间峰值字节增量, 操作返回值)
+    fn timed<T>(f: impl FnOnce() -> T) -> (std::time::Duration, i64, u64, T) {
+        let (l0, p0) = (mem_probe::live() as i64, mem_probe::peak());
+        let t = std::time::Instant::now();
+        let out = f();
+        let d = t.elapsed();
+        let (l1, p1) = (mem_probe::live() as i64, mem_probe::peak());
+        (d, l1 - l0, p1.saturating_sub(p0), out)
+    }
+
+    /// 目录（或文件）总字节
+    fn disk_bytes(path: &std::path::Path) -> u64 {
+        if !path.exists() {
+            return 0;
+        }
+        if path.is_file() {
+            return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        }
+        let mut total = 0u64;
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let Ok(meta) = e.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(e.path());
+                } else {
+                    total += meta.len();
+                }
+            }
+        }
+        total
+    }
+
+    fn shuffled(n: usize) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..n).collect();
+        let mut s = 0x853c_49e6_77b9_5b3eu64;
+        for i in (1..n).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (s >> 33) as usize % (i + 1);
+            v.swap(i, j);
+        }
+        v
+    }
+
+    fn line(engine: &str, op: &str, per: f64, unit: &str, live: i64, peak: u64, extra: &str) {
+        let live_mb = live as f64 / 1e6;
+        let peak_mb = peak as f64 / 1e6;
+        eprintln!(
+            "{engine:<10} {op:<24} {per:>11.1} {unit:<7} 常驻 {live_mb:>9.1} MB  峰值 +{peak_mb:>8.1} MB  {extra}"
+        );
+    }
+
+    #[test]
+    #[ignore = "大库基线，手动 release 单线程跑：SCALE_ROWS=50000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline"]
+    fn scale_baseline_all_engines() {
+        let rows: usize = std::env::var("SCALE_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50_000);
+        // 键 ≈ 35 字节、值 ≈ 60 字节：照下游真实形状（也都远小于任何 blob 阈值）
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+
+        eprintln!("=== 大库基线 rows={rows}（µs/次 + 常驻/峰值 MB）===");
+        for kind in [
+            EngineKind::Bitcask,
+            EngineKind::BPlusTree,
+            EngineKind::LsmTree,
+            EngineKind::Memory,
+        ] {
+            let label = kind.as_str();
+            let dir = tmp_dir(&format!("scale_{label}"));
+            // B+ 树的"库"是一个文件，另两家是目录，memory 不落盘
+            let arg = match kind {
+                EngineKind::Memory => None,
+                EngineKind::BPlusTree => Some(dir.join("bplus.db")),
+                _ => Some(dir.clone()),
+            };
+            let arg = arg.as_deref();
+
+            let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+            line(label, "open 空库", d.as_secs_f64() * 1e6, "µs", live, peak, "");
+
+            // ---- 写入：每 1000 行一个事务（commit 带 fsync） ----
+            let (d, live, peak, ()) = timed(|| {
+                for base in (0..rows).step_by(1000) {
+                    let end = (base + 1000).min(rows);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), val(i))).collect();
+                    let tx = db.begin();
+                    if let Err(bad) = tx.batch_set(&items) {
+                        panic!("{label}: batch_set 冲突 {}", String::from_utf8_lossy(&bad));
+                    }
+                    tx.commit();
+                }
+            });
+            line(label, &format!("灌 {rows} 行(事务)"), d.as_secs_f64() * 1e6 / rows as f64, "µs/行", live, peak, "");
+
+            let (d, live, peak, ()) = timed(|| {
+                db.flush().unwrap();
+                db.checkpoint().unwrap();
+            });
+            let disk = if kind == EngineKind::Memory { 0 } else { disk_bytes(arg.unwrap()) };
+            line(label, "flush+checkpoint", d.as_secs_f64() * 1e6, "µs", live, peak, &format!("磁盘 {:.1} MB", disk as f64 / 1e6));
+
+            // ---- 冷重开：恢复要多久、恢复完常驻多少 ----
+            // memory 不落盘 ⇒ 对它"重开"就是新建一个空库（这正是 `is_production_ok() == false`
+            // 的全部内容），量恢复时间没有意义，直接跳过并保持同一个句柄。
+            let db = if kind == EngineKind::Memory {
+                eprintln!("{label:<10} {:<24} {:>17}   （内存引擎不落盘：重开 = 空库）", "冷重开(恢复)", "");
+                db
+            } else {
+                drop(db);
+                let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+                line(
+                    label,
+                    "冷重开(恢复)",
+                    d.as_secs_f64() * 1e6,
+                    "µs",
+                    live,
+                    peak,
+                    &format!("常驻 {:.1} MB", live as f64 / 1e6),
+                );
+                db
+            };
+
+            let order = shuffled(rows);
+
+            // ---- 点读：乱序 / 有序 ----
+            let (d, live, peak, ()) = timed(|| {
+                let tx = db.begin();
+                let mut hits = 0;
+                for &i in &order {
+                    if tx.get(&key(i)).is_some() {
+                        hits += 1;
+                    }
+                }
+                assert_eq!(hits, rows, "{label}: 乱序点读有键没读到");
+            });
+            line(label, "点读×N 乱序", d.as_secs_f64() * 1e6 / rows as f64, "µs/次", live, peak, "");
+
+            let (d, live, peak, ()) = timed(|| {
+                let tx = db.begin();
+                for i in 0..rows {
+                    assert!(tx.get(&key(i)).is_some(), "{label}: 有序点读落空");
+                }
+            });
+            line(label, "点读×N 有序", d.as_secs_f64() * 1e6 / rows as f64, "µs/次", live, peak, "");
+
+            // ---- multi_get（门面是 map(get)：批量到底省不省钱，量了才知道） ----
+            let chunk: Vec<Vec<u8>> = order[..1000.min(rows)].iter().map(|&i| key(i)).collect();
+            let (d, live, peak, got) = timed(|| {
+                let tx = db.begin();
+                tx.multi_get(&chunk)
+            });
+            line(label, "multi_get×1000", d.as_secs_f64() * 1e6 / chunk.len() as f64, "µs/键", live, peak, &format!("读到 {} 条", got.len()));
+
+            // ---- 扫描：全量 / 1% 窗口 ----
+            let (d, live, peak, scanned) = timed(|| {
+                let tx = db.begin();
+                tx.scan(None, None)
+            });
+            line(label, "一次全量 scan", d.as_secs_f64() * 1e6 / rows as f64, "µs/行", live, peak, &format!("{} 行", scanned.len()));
+            drop(scanned);
+
+            let lo = key(rows / 2);
+            let hi = key(((rows / 2) + rows / 100).max(1));
+            let (d, live, peak, window) = timed(|| {
+                let tx = db.begin();
+                tx.scan(Some(&lo), Some(&hi))
+            });
+            let w = window.len().max(1);
+            line(label, "窗口 scan(1%)", d.as_secs_f64() * 1e6 / w as f64, "µs/行", live, peak, &format!("{w} 行"));
+            drop(window);
+
+            let (d, live, peak, pref) = timed(|| {
+                let tx = db.begin();
+                tx.prefix_scan(&key(0)[..2])
+            });
+            let p = pref.len().max(1);
+            line(label, "prefix_scan 2B前缀", d.as_secs_f64() * 1e6 / p as f64, "µs/行", live, peak, &format!("{p} 行"));
+            drop(pref);
+
+            // ---- 管理面：分页搜索（首页 vs 深页 —— 深翻是最常见的"一次调用打满 CPU"） ----
+            let page_size = 100usize;
+            let last_page = rows / page_size;
+            let (d, live, peak, one) = timed(|| {
+                let tx = db.begin();
+                tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, page_size))
+            });
+            line(label, "search 首页", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", one.total));
+            let (d, live, peak, deep) = timed(|| {
+                let tx = db.begin();
+                tx.search_keys(&crate::common::SearchQuery::contains(b"", last_page, page_size))
+            });
+            line(label, "search 末页(深翻)", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", deep.total));
+            let (d, live, peak, cnt) = timed(|| {
+                let tx = db.begin();
+                tx.key_count(&key(0)[..2])
+            });
+            line(label, "key_count 2B前缀", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("{cnt} 键"));
+
+            // ---- TTL / 计数器 ----
+            let (d, live, peak, ()) = timed(|| {
+                let tx = db.begin();
+                for _ in 0..1000 {
+                    let _ = tx.incr(b"counter:hits", 1);
+                }
+                tx.commit();
+            });
+            line(label, "incr×1000", d.as_secs_f64() * 1e6 / 1000.0, "µs/次", live, peak, "");
+
+            // ---- 更新 10% 的键（制造版本链，看点写是否被链拖住） ----
+            let updates: usize = (rows / 10).max(1);
+            let (d, live, peak, ()) = timed(|| {
+                for base in (0..updates).step_by(500) {
+                    let end = (base + 500).min(updates);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), val(i + rows))).collect();
+                    let tx = db.begin();
+                    if let Err(bad) = tx.batch_set(&items) {
+                        panic!("{label}: 更新冲突 {}", String::from_utf8_lossy(&bad));
+                    }
+                    tx.commit();
+                }
+            });
+            line(label, &format!("更新 {updates} 键"), d.as_secs_f64() * 1e6 / updates as f64, "µs/次", live, peak, "");
+
+            // ---- 观测与回收 ----
+            let (d, live, peak, h) = timed(|| db.health());
+            line(label, "health()", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("rows={} max_chain={}", h.total_rows, h.max_chain));
+
+            let (d, live, peak, v) = timed(|| db.vacuum().unwrap());
+            line(label, "vacuum() 全库", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("裁掉 {} 行", v.versions_removed));
+
+            let (d, live, peak, ()) = timed(|| {
+                db.flush().unwrap();
+                let _ = db.merge();
+            });
+            let disk2 = if kind == EngineKind::Memory { 0 } else { disk_bytes(arg.unwrap()) };
+            line(label, "flush+merge", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("磁盘 {:.1} MB", disk2 as f64 / 1e6));
+
+            // ---- bulk 导入（另一条写路径：无 WAL、无冲突检测） ----
+            let bulk_rows = (rows / 10).max(1);
+            let (d, live, peak, ()) = timed(|| {
+                let mut bulk = db.begin_bulk();
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    (0..bulk_rows).map(|i| (key(rows + i), val(i))).collect();
+                bulk.put_batch_owned(items);
+                bulk.finish();
+            });
+            line(label, &format!("bulk 灌 {bulk_rows} 行"), d.as_secs_f64() * 1e6 / bulk_rows as f64, "µs/行", live, peak, "");
+
+            // ---- 再冷重开一次：bulk 之后的恢复代价 ----
+            let db = if kind == EngineKind::Memory {
+                eprintln!("{label:<10} {:<24} {:>17}", "再冷重开", "（同上，跳过）");
+                db
+            } else {
+                drop(db);
+                let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+                line(
+                    label,
+                    "再冷重开",
+                    d.as_secs_f64() * 1e6,
+                    "µs",
+                    live,
+                    peak,
+                    &format!("常驻 {:.1} MB", live as f64 / 1e6),
+                );
+                db
+            };
+
+            // 收尾：确认 bulk 的数据读得回来
+            let tx = db.begin();
+            assert!(tx.get(&key(rows)).is_some(), "{label}: bulk 写的键读不回来");
+            drop(tx);
+            drop(db);
+
+            if kind != EngineKind::Memory {
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_file(&dir);
+            }
+            eprintln!();
+        }
+    }
 }
