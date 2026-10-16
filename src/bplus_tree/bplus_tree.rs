@@ -4,6 +4,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::bplus_tree::page::{MAX_PAYLOAD, PageId, PageManager};
 
+// 测试专用：本线程「把一页字节 bincode 解析成节点」的次数。
+//
+// 这是 B+ 树点读真正的 CPU 单位：归因量过 —— 冷 41.8 µs / 热 41.3 µs、命中率 95%、
+// 把页缓存从 1024 开到 65536 仍然 37.8 µs ⇒ 钱不是花在读盘，是花在**每次点读 4 个页、
+// 每个页都要拷 4 KB + 解析整个节点**。这条计数用来证明解析缓存确实省掉了那 4 次解析。
+#[cfg(test)]
+thread_local! {
+    static NODE_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn node_parses() -> u64 {
+    NODE_PARSES.with(|c| c.get())
+}
+
 /// 行ID：指向数据在磁盘/内存中的位置
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 // pub struct RowId(pub u64);
@@ -40,6 +55,14 @@ pub struct BPlusTree {
     root: PageId,
     /// 阶数
     order: usize,
+    /// **解析过**的节点：`PageId → (这页当时的写入次数, 节点)`。
+    ///
+    /// 只服务只读路径（点读下降、反向找链尾）。校验靠 `PageManager::write_count` ——
+    /// 写入按页计数，所以不需要在每个写点手工失效（漏一处就是读到脏节点）；页被回收再
+    /// 复用时 `allocate_page` 也会 bump，不会把旧内容当成新内容。
+    /// 上限跟着 `max_cache_pages` 走：装不下就整表清空（解析缓存的意义是让点读不重解析，
+    /// 而不是再维护一个无限增长的堆）。
+    node_cache: std::collections::HashMap<PageId, (u64, std::sync::Arc<BTreeNode>)>,
 }
 
 impl BPlusTree {
@@ -72,6 +95,7 @@ impl BPlusTree {
             page_manager,
             root,
             order,
+            node_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -154,6 +178,30 @@ impl BPlusTree {
 }
 
 impl BPlusTree {
+    /// 只读路径取节点：**优先用解析过的**，未命中才读页 + bincode 解析。
+    ///
+    /// 为什么必须有它：归因量过，B+ 树点读的 41 µs 里几乎全是 CPU —— 每次点读要走 4 个页，
+    /// 每个页都要 4 KB 拷贝 + 解析整节点（34~64 条 ⇒ 上百次堆分配）；缓存开大也没用。
+    /// 校验凭 `PageManager::write_count` 按页做，所以写点不需要手工失效。
+    fn node_of(&mut self, page_id: PageId) -> Option<std::sync::Arc<BTreeNode>> {
+        let seen = self.page_manager.write_count(page_id);
+        if let Some((at, node)) = self.node_cache.get(&page_id) {
+            if *at == seen {
+                return Some(node.clone());
+            }
+        }
+        let data = self.page_manager.read_page(page_id)?;
+        #[cfg(test)]
+        NODE_PARSES.with(|c| c.set(c.get() + 1));
+        let node = std::sync::Arc::new(bincode::deserialize::<BTreeNode>(&data).ok()?);
+        if self.node_cache.len() >= self.page_manager.cache_capacity() {
+            // 上限跟页缓存同源；超了就整表丢，宁可重解析也不无界长
+            self.node_cache.clear();
+        }
+        self.node_cache.insert(page_id, (seen, node.clone()));
+        Some(node)
+    }
+
     /// 节点序列化后能不能装进一页。
     ///
     /// **只能问序列化结果，不能问条数**：条目是变长的（键可达几十字节、RowId 带 flag 与
@@ -314,9 +362,9 @@ impl BPlusTree {
     }
 
     pub fn get_recursive(&mut self, node_page_id: PageId, key: Key) -> Option<RowId> {
-        let node_data = self.page_manager.read_page(node_page_id).unwrap();
-        let node: BTreeNode = bincode::deserialize(&node_data).unwrap();
-        match &node {
+        // 走解析缓存：点读的代价大头是"每层都重新解析整个节点"，不是读盘
+        let node = self.node_of(node_page_id)?;
+        match &*node {
             BTreeNode::Leaf { entries, .. } => entries
                 .binary_search_by(|(k, _)| k.cmp(&key))
                 .ok()
@@ -326,7 +374,8 @@ impl BPlusTree {
                     .iter()
                     .position(|k| key < k.clone())
                     .unwrap_or(keys.len());
-                self.get_recursive(children[child_idx], key)
+                let next = children[child_idx];
+                self.get_recursive(next, key)
             }
         }
     }
@@ -988,9 +1037,9 @@ impl BPlusTree {
         let mut prev_leaf_min: Option<Key> = None;
         loop {
             let leaf_id = self.find_leaf_for_key(self.root, bound.clone())?;
-            let data = self.page_manager.read_page(leaf_id)?;
-            let Ok(BTreeNode::Leaf { entries, .. }) = bincode::deserialize::<BTreeNode>(&data)
-            else {
+            // 这条也是**点读的热路径**（MVCC 取版本链尾就走它）⇒ 同样走解析缓存
+            let node = self.node_of(leaf_id)?;
+            let BTreeNode::Leaf { entries, .. } = node.as_ref() else {
                 log::warn!("find_back: 期望叶子却拿到内部节点，停止反向游走");
                 return None;
             };
@@ -1030,17 +1079,17 @@ impl BPlusTree {
     }
 
     fn find_leaf_for_key(&mut self, node_page_id: PageId, key: Key) -> Option<PageId> {
-        let node_data = self.page_manager.read_page(node_page_id).unwrap();
-        let node: BTreeNode = bincode::deserialize(&node_data).unwrap();
-
-        match node {
+        // 下降只用来定位，不改内容 ⇒ 走解析缓存（点读、反向找链尾、区间起点都靠它）
+        let node = self.node_of(node_page_id)?;
+        match &*node {
             BTreeNode::Leaf { .. } => Some(node_page_id),
             BTreeNode::Internal { keys, children } => {
                 let child_idx = keys
                     .iter()
                     .position(|k| key < k.clone())
                     .unwrap_or(keys.len());
-                self.find_leaf_for_key(children[child_idx], key)
+                let next = children[child_idx];
+                self.find_leaf_for_key(next, key)
             }
         }
     }
@@ -1353,5 +1402,45 @@ mod tests {
             alive,
             "叶子链表的行数必须等于存活键数（链表指向已释放页会在这里露出来）"
         );
+    }
+
+    /// 解析缓存**一次都不许服务旧内容**。
+    ///
+    /// 失效凭的是"按页写入计数"（`PageManager::write_count`），不是在每个写点手工清 ——
+    /// 所以这条真正盯的是**哪条路径改了页内容却没 bump 计数**：覆盖写、分裂写回两片页、
+    /// 合并后 free 再 allocate 复用同一个页号，都在这条里走一遍。
+    #[test]
+    fn test_node_cache_never_serves_stale_content() {
+        let mut tree = BPlusTree::new(4, 16);
+        // ① 边插边读：分裂会不断改写既有页
+        for n in 0..200u8 {
+            assert!(tree.insert(key(n), rid(n)), "插入 {n} 失败");
+            assert_eq!(
+                tree.get(key(n)).unwrap().0,
+                Some(vec![n]),
+                "写完立刻读第 {n} 个拿到了旧内容"
+            );
+        }
+        // ② 覆盖写：同一个 key 换 RowId
+        for n in 0..200u8 {
+            let new = n.wrapping_add(1);
+            assert!(tree.update(key(n), rid(new)), "update {n} 失败");
+            assert_eq!(
+                tree.get(key(n)).unwrap().0,
+                Some(vec![new]),
+                "覆盖写之后第 {n} 个仍是旧值 = 服务了旧节点"
+            );
+        }
+        // ③ 删掉再插回：页被 free 后会被 allocate 复用，计数必须 bump
+        for n in (0..200u8).step_by(3) {
+            assert!(tree.delete(key(n)), "删除 {n} 失败");
+            assert!(tree.get(key(n)).is_none(), "删掉 {n} 之后还读得到 = 旧节点还在被服务");
+            assert!(tree.insert(key(n), rid(n)), "复用位置插回 {n} 失败");
+            assert_eq!(
+                tree.get(key(n)).unwrap().0,
+                Some(vec![n]),
+                "复用页之后读回的是上一个占用者的内容"
+            );
+        }
     }
 }

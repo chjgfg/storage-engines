@@ -94,6 +94,24 @@ pub struct PageManager {
     freelist_dirty: bool,
     /// bulk 模式：换出/刷盘跳过双写与频繁 fsync，只在 flush_all 末尾 sync 一次
     bulk_mode: bool,
+    /// 每页被写入过几次（`write_page` / `allocate_page` 各算一次）。
+    ///
+    /// 上层用它验证"解析过的节点还新不新"：数字一变，那份 `BTreeNode` 就是陈旧的，必须重解析。
+    /// 做成**按页**计数而不是全局 epoch，否则一次写入就把整棵树的解析全部作废，
+    /// 写多的时候缓存等于没有。
+    page_writes: HashMap<PageId, u64>,
+}
+
+impl PageManager {
+    /// 某页已被写入多少次（上层解析缓存的校验凭据）
+    pub fn write_count(&self, page_id: PageId) -> u64 {
+        self.page_writes.get(&page_id).copied().unwrap_or(0)
+    }
+
+    /// 页缓存容量（上层用它给"解析缓存"定同样的上限）
+    pub fn cache_capacity(&self) -> usize {
+        self.max_cache_pages
+    }
 }
 
 // 测试专用：本线程的页访问次数（含页缓存命中）。
@@ -230,6 +248,7 @@ impl PageManager {
             meta_dirty: false,
             freelist_dirty: false,
             bulk_mode: false,
+            page_writes: HashMap::new(),
         };
 
         if file_len == 0 {
@@ -562,6 +581,8 @@ impl PageManager {
                 last_access: self.clock,
             },
         );
+        // 复用空闲页也算"内容换了"：上层那份按旧内容解析出来的节点必须作废
+        *self.page_writes.entry(page_id).or_insert(0) += 1;
         self.lru_queue.push_back(page_id);
         page_id
     }
@@ -705,6 +726,8 @@ impl PageManager {
         entry.data.resize(PAGE_PAYLOAD_SIZE, 0);
         entry.state = PageState::Dirty;
         entry.last_access = self.clock;
+        // 内容变了 ⇒ 上层那份解析过的节点作废（按页计数，见 `page_writes`）
+        *self.page_writes.entry(page_id).or_insert(0) += 1;
         self.update_lru(page_id);
         true
     }

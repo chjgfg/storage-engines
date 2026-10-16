@@ -2082,30 +2082,47 @@ mod tests {
                     crate::bplus_tree::page::cache_hits(),
                     crate::bplus_tree::page::cache_misses(),
                 );
+                let parse0 = crate::bplus_tree::bplus_tree::node_parses();
                 let t = Instant::now();
                 for &i in &order {
                     assert!(tx.get(&key(i)).is_some(), "第 {i} 个键读空");
                 }
                 let d = t.elapsed().as_secs_f64() * 1e6;
-                let (dp, dh, dm) = (
+                let (dp, dh, dm, dn) = (
                     crate::bplus_tree::page::page_reads() - p0,
                     crate::bplus_tree::page::cache_hits() - hit0,
                     crate::bplus_tree::page::cache_misses() - miss0,
+                    crate::bplus_tree::bplus_tree::node_parses() - parse0,
                 );
                 eprintln!(
-                    "{label:<16} {:>7.1} µs/次 | 页/次 {:>4.2} | 命中 {:>7} | 未命中 {:>6}",
+                    "{label:<16} {:>7.1} µs/次 | 页/次 {:>4.2} | 解析/次 {:>5.2} | 命中 {:>7} | 未命中 {:>6}",
                     d / N as f64,
                     dp as f64 / N as f64,
+                    dn as f64 / N as f64,
                     dh,
                     dm
                 );
-                dp
+                (dp, dn)
             };
 
             eprintln!("--- 点读：同一份数据连测两遍（第二遍缓存是热的）---");
-            let cold_pages = probe("第一遍(冷)", &mvcc);
-            let warm_pages = probe("第二遍(热)", &mvcc);
-            assert_eq!(cold_pages, warm_pages, "两遍的页访问次数必须一致，不一致说明形状变了");
+            let (_, cold_parses) = probe("第一遍(冷)", &mvcc);
+            let (warm_pages, warm_parses) = probe("第二遍(热)", &mvcc);
+            let _ = warm_pages; // 页访问随两遍的缓存清除时机浮动，只对绝对量做断言
+            assert!(
+                cold_parses > 0,
+                "解析计数没在数东西 —— 那下面那条断言就是空转（探针自己也要自证会红）"
+            );
+            // 合同按**绝对量**写，不跟"第一遍 vs 第二遍"比（两遍谁冷谁热取决于执行顺序，
+            // 相对断言会假红）。一次点读走 4 层 ⇒ 没有解析缓存时每层解析一次 ≈ 4N 次；
+            // 生效之后热态必须压到 ≤1.5N（实测 0.48/次 = 9.6k）。残余的那点是
+            // "这页本遍第一次见"的必付成本 —— 1257 页 > max_cache_pages 1024，
+            // 工作集本来就装不下，剩下要收得靠"容量可配"（#17）。
+            assert!(
+                warm_parses * 2 <= (N as u64) * 3,
+                "点读还在按层重解析：{N} 次读解析了 {warm_parses} 次（无缓存基线约 4N = {}）",
+                4 * N as u64
+            );
 
             // 五个计数一起快照：命中/未命中只说"有没有读盘"，换出与批量写盘才说得出
             // "走一遍全库被顺带 flush 了多少脏页"（脏页换出要写双写缓冲 + sync）。
