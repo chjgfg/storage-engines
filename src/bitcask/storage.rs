@@ -83,7 +83,7 @@ impl BlobStore {
             Ok(Self {
                 file,
                 end_pos: BLOB_MAGIC.len() as u64,
-                buf: Vec::with_capacity(BLOB_BUF_TARGET),
+                buf: Vec::new(), // 首次 append 才按目标大小分配（见 BlobStore::append）
             })
         } else {
             let mut magic = [0u8; 8];
@@ -97,7 +97,7 @@ impl BlobStore {
             Ok(Self {
                 file,
                 end_pos: len,
-                buf: Vec::with_capacity(BLOB_BUF_TARGET),
+                buf: Vec::new(), // 首次 append 才按目标大小分配（见 BlobStore::append）
             })
         }
     }
@@ -112,13 +112,21 @@ impl BlobStore {
         Ok(())
     }
 
+    /// 测试探针：写缓冲当前的预留容量（"懒分配"那条守卫要看的就是这个）
+    #[cfg(test)]
+    pub fn buf_capacity_for_test(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// 追加一条 blob，返回文件内 offset（记录起点）
     pub fn append(&mut self, data: &[u8]) -> std::io::Result<u64> {
         let offset = self.end_pos;
         let checksum = crc32(data);
         let rec_len = 8 + data.len();
         if self.buf.capacity() < self.buf.len() + rec_len {
-            self.buf.reserve(rec_len);
+            // 首次就一步涨到目标大小（此后 flush_buf 只 clear、容量保留）：
+            // 既不空留 4 MiB，也不让小步 realloc 抖动
+            self.buf.reserve(BLOB_BUF_TARGET.saturating_sub(self.buf.len()).max(rec_len));
         }
         self.buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(&checksum.to_le_bytes());

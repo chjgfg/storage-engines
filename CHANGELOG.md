@@ -111,6 +111,16 @@
   但**按 WAL 记录数做统计或调试的脚本要改**。持久化点没动：写过就必须有 `Commit` + fsync，
   这条由各引擎的 `test_read_only_transaction_touches_no_wal` 反向钉住。
 
+- **Bitcask 打开空库不再预留 8 MiB**：`Log::new` 与 `BlobStore::open` 各写了一次
+  `Vec::with_capacity(4 MiB)`，merge 出来的新 active 再来一次 ⇒ **一个键都没有也要先占 8 MiB**
+  （大库基线台架量到 `open 空库` 常驻 8.4 MB）。改成**首次写入时才一步涨到目标大小**：
+  攒够 4 MiB 才落盘的 syscall 优化一字未动（`flush_buf` 是 `clear`，容量保留，所以既没有小步
+  realloc 抖动，也没有多一次 syscall）。实测 `open 空库` 常驻 8.4 MB → **0.0 MB**，
+  5000 键冷重开常驻 **0.7 MB**（那就是 keydir 本身）。
+  守卫 `test_write_buffer_is_allocated_lazily`：打开时容量必须为 0，第一次写入后必须 ≥ 目标。
+  为什么这算缺陷而不是风格：下游那台机器是单核 6 GB、RSS 预算按几十 MB 计，
+  而且一个进程可能同时开好几个库 —— 固定 8 MiB/库 是白给的。
+
 - **LSM 点查再降一档：稀疏索引二分 + MVCC 块缓存 64→256**。二分治的是**随库总量变贵**的那条
   纯 CPU 通道：`find_block` 原先线性扫索引（遇大于 key 才 break），代价 O(块数) = O(行数/64)。
   实测（250 块的样本）每次定位的比较次数 **125 → 7**，由

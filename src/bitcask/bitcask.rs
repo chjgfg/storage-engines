@@ -31,7 +31,6 @@ const KEY_VAL_HEADER_LEN: u32 = 4;
 const MERGE_FILE_EXT: &str = "merge";
 /// 写缓冲目标大小：攒够再落盘，减少 syscall
 const WRITE_BUF_TARGET: usize = 4 * 1024 * 1024;
-
 // ─── Hint 文件格式 ───────────────────────────────────────────────────────────
 //
 // ```text
@@ -393,7 +392,9 @@ impl Log {
             path,
             file,
             end_pos,
-            buf: Vec::with_capacity(WRITE_BUF_TARGET),
+            // 缓冲**首次写入时**才按目标大小分配：只读/空库不该一打开就留 4 MiB
+            // （基线实测：两处各 4 MiB ⇒ `open 空库` 就"常驻 8.4 MB"）
+            buf: Vec::new(),
         })
     }
 
@@ -533,6 +534,11 @@ impl Log {
     ) -> Result<(u64, u32, i32)> {
         let base = self.end_pos;
         let before = self.buf.len();
+        // 攒够 WRITE_BUF_TARGET 才落盘的规矩不变，但缓冲改成**首次写入时**才一次到位：
+        // 既不让只读/空库白留 4 MiB，也不让大写入反复 realloc（flush_buf 是 clear，容量保留）
+        if self.buf.capacity() < WRITE_BUF_TARGET {
+            self.buf.reserve(WRITE_BUF_TARGET.saturating_sub(before));
+        }
         let (value_pos, value_len, flag) =
             Self::encode_entry_to(&mut self.buf, base, key, value, hard_delete);
         let written = (self.buf.len() - before) as u64;
@@ -988,7 +994,7 @@ impl Bitcask {
             path: target,
             file,
             end_pos: new_end,
-            buf: Vec::with_capacity(WRITE_BUF_TARGET),
+            buf: Vec::new(), // 同 `Log::open`：首次写入才分配
         };
         self.active_id = 0;
         self.key_dir = new_key_dir;
@@ -1530,5 +1536,42 @@ mod tests {
             assert_eq!(eng.get(b"k010").unwrap(), Some(b"value-padding-010-xxxxxxxx".to_vec()));
         }
         cleanup(&path);
+    }
+
+    /// 写缓冲必须是**懒分配**：打开一个空库不该先占 4 MiB。
+    ///
+    /// 大库基线台架量到 `open 空库` 就"常驻 8.4 MB"，来源正是数据日志缓冲与 blob 缓冲各
+    /// 一次 `Vec::with_capacity(4 MiB)` —— 库里一个键都没有也要先占 8 MiB（下游那台单核机器
+    /// 同时只跑得起几百 MB 预算）。改成"首次写入才一步到位"之后：
+    /// ① 打开时容量为 0；② 第一次写入就涨满，所以"攒够 4 MiB 才落盘"的 syscall 优化不变。
+    #[test]
+    fn test_write_buffer_is_allocated_lazily() {
+        let path = tmp_log("lazy_buf");
+        {
+            let mut log = Log::new(path.clone()).unwrap();
+            assert_eq!(log.buf.capacity(), 0, "打开空库不该预留写缓冲");
+            log.append_entry(b"k", Some(b"v"), false).unwrap();
+            assert!(
+                log.buf.capacity() >= WRITE_BUF_TARGET,
+                "首次写入后应一步涨到目标大小（实际 {}）",
+                log.buf.capacity()
+            );
+        }
+        cleanup(&path);
+
+        // blob 旁路同一个规矩（这里的 4 MiB 与 storage.rs 的 BLOB_BUF_TARGET 同值）
+        let dir = tmp_log("lazy_blob_dir");
+        {
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut blob = crate::bitcask::storage::BlobStore::open(&dir).unwrap();
+            assert_eq!(blob.buf_capacity_for_test(), 0, "打开空库不该预留 blob 缓冲");
+            blob.append(b"payload").unwrap();
+            assert!(
+                blob.buf_capacity_for_test() >= 4 * 1024 * 1024,
+                "首次写入后应一步涨到目标大小（实际 {}）",
+                blob.buf_capacity_for_test()
+            );
+        }
+        cleanup(&dir);
     }
 }
