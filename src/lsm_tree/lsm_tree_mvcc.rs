@@ -1950,4 +1950,181 @@ mod tests {
         }
         cleanup(&path);
     }
+
+    // ---- 下游报告的形状：点查墙钟时间基线（手动 release 跑） -------------------
+    //
+    // 下游把本 crate 嵌进去之后实测：**单次点查 0.86 ms**（5002 键 / 40B 键 / 60B 值 /
+    // 10005 行 / max_chain=3 / active_txns=0，全 release）。而 `health()` 与
+    // `test_point_op_cost_independent_of_chain_length` 那套守卫给的都是**块访问次数** ——
+    // 它把块缓存命中和未命中算成同一个数，所以"链没失控、块访问只有 4 次"和"每次点查快 1 毫秒"
+    // 这两件事**能同时成立**。这个基线就是补上漏掉的那一环。
+    //
+    // 本机（Windows / NTFS / release）复现到的分配：
+    //   改造前  乱序 289.0 µs/次（未命中 1.61/次）  vs  有序 45.6 µs/次（未命中 0.15/次）
+    //           ⇒ 差值 243 µs ÷ 1.46 次未命中 ≈ **一次 File::open ≈ 167 µs**
+    //             —— 旧 `read_slice` 每次未命中都重开一次文件，而这个 open 比读那几 KB 贵一个量级。
+    //   改造后 乱序 120.3 µs/次、有序 21.0 µs/次、multi_get 19.5、一次全量 scan 19.1 µs/行
+    //           ⇒ 未命中次数没变（1.61/0.15），墙钟少了一半多：省掉的正是那次重开文件。
+    //           剩下 乱序/有序 还差 5.7 倍，那部分不是 open，而是 **4 块/次**（定位一趟 +
+    //           定论一趟）× 未命中的解码，属于下一条里程碑（一次定论 + 索引二分 + 缓存容量）。
+    // 结论"用法也有份"的另一半：读全部键时一次 `scan` 是 19 µs/行，逐条 `get` 是它的 1~6 倍。
+    //
+    // 复现命令（本仓库）：
+    //   cargo test --release --lib -- --ignored --nocapture point_read_baseline
+    #[test]
+    #[ignore = "墙钟基线，手动 release 跑：cargo test --release --lib -- --ignored --nocapture point_read_baseline"]
+    fn test_lsm_point_read_baseline_5000_keys() {
+        use std::time::Instant;
+
+        const N: usize = 5002;
+
+        // 键形状照抄下游：1 字节标签 + 4 字节项目 id + 路径文本 ≈ 40 字节
+        fn make_key(i: usize) -> Vec<u8> {
+            let tag = b'1' + (i % 3) as u8;
+            let pid = 1000 + i % 7;
+            let mut k = Vec::new();
+            k.push(tag);
+            k.extend_from_slice(format!("#{pid:04}#worldquant/datafields/{i}/f.json").as_bytes());
+            while k.len() < 40 {
+                k.push(b'0');
+            }
+            k
+        }
+        // 值 ≈ 60 字节：必须远小于 blob 阈值 4 KiB，否则就不是同一条路径
+        fn make_val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<24}\",\"n\":97}}", i * 7)
+                .into_bytes()
+        }
+
+        let path = tmp_db("point_baseline_5k");
+        let keys: Vec<Vec<u8>> = (0..N).map(make_key).collect();
+        let vals: Vec<Vec<u8>> = (0..N).map(make_val).collect();
+        assert!(vals.iter().all(|v| v.len() < 4 * 1024), "值必须小到不进 blob 旁路");
+
+        // 写路径照抄下游：begin → batch_set(2000) → commit，两轮全量 + 一轮单键
+        // ⇒ total_rows = 5002×2+1 = 10005、live_keys = 5002、max_chain = 3
+        {
+            let mvcc = MVCC::open(&path);
+            for round in 0..3 {
+                let upto = if round == 2 { 1 } else { N };
+                for base in (0..upto).step_by(2000) {
+                    let end = (base + 2000).min(upto);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (keys[i].clone(), vals[i].clone())).collect();
+                    let tx = mvcc.begin_transaction();
+                    if let Err(bad) = tx.batch_set(&items) {
+                        panic!("batch_set 冲突: {}", String::from_utf8_lossy(&bad));
+                    }
+                    tx.commit();
+                }
+            }
+            // 让数据真的落到 SST（下游是重开进程后读的；flush 是同一条路的近似）
+            mvcc.flush();
+            let h = mvcc.health();
+            eprintln!(
+                "形状: rows={} live_keys={} max_chain={} active_txns={}",
+                h.total_rows, h.live_keys, h.max_chain, h.active_txns
+            );
+            assert_eq!(h.total_rows as usize, N * 2 + 1);
+            assert_eq!(h.live_keys as usize, N);
+            assert_eq!(h.max_chain, 3);
+        }
+
+        // 重新打开，模拟"进程启动后读"
+        let mvcc = MVCC::open(&path);
+        let stats = mvcc.kv.lock().unwrap().stats();
+        eprintln!(
+            "布局: levels={:?} total_sst={} l0={} mem_entries={}",
+            stats.level_files, stats.total_sst, stats.l0_files, stats.mem_entries
+        );
+
+        // 乱序（≈ 目录序 / NTFS 哈希序）与有序两种访问顺序，分开量：局部性影响块缓存命中率
+        let mut shuffled: Vec<usize> = (0..N).collect();
+        let mut s = 0x853c_49e6_77b9_5b3eu64;
+        for i in (1..N).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (s >> 33) as usize % (i + 1);
+            shuffled.swap(i, j);
+        }
+
+        let tx = mvcc.begin_transaction();
+
+        let report = |name: &str, dur: std::time::Duration, n: usize, blocks: u64, opens: u64| {
+            let us = dur.as_micros() as f64;
+            eprintln!(
+                "{name:<22} 合计 {:>9.1} ms | 单次 {:>8.1} µs | 块/次 {:>5.2} | 未命中/次 {:>5.2}",
+                us / 1000.0,
+                if n == 0 { 0.0 } else { us / n as f64 },
+                blocks as f64 / n.max(1) as f64,
+                opens as f64 / n.max(1) as f64
+            );
+        };
+
+        // (a) 同一个事务里连读 5002 次 —— 乱序
+        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let t = Instant::now();
+        for &i in &shuffled {
+            assert!(tx.get(&keys[i]).is_some(), "乱序读第 {i} 个键落空");
+        }
+        let (d, db, do_) = (
+            t.elapsed(),
+            crate::lsm_tree::sst::block_reads() - b0,
+            crate::lsm_tree::sst::block_misses() - o0,
+        );
+        report("点读×N 乱序", d, N, db, do_);
+
+        // (b) 同一个事务里连读 5002 次 —— 有序（键升序 = 块升序）
+        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let t = Instant::now();
+        for k in &keys {
+            assert!(tx.get(k).is_some(), "有序读落空");
+        }
+        let (d, db, do_) = (
+            t.elapsed(),
+            crate::lsm_tree::sst::block_reads() - b0,
+            crate::lsm_tree::sst::block_misses() - o0,
+        );
+        report("点读×N 有序", d, N, db, do_);
+
+        // (c) multi_get：门面把它实现成 `map(get)`，所以理论上和 (a) 同价 —— 量出来才算数
+        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let t = Instant::now();
+        let got = tx.multi_get(&keys);
+        let (d, db, do_) = (
+            t.elapsed(),
+            crate::lsm_tree::sst::block_reads() - b0,
+            crate::lsm_tree::sst::block_misses() - o0,
+        );
+        assert_eq!(got.len(), N);
+        report("multi_get×N", d, N, db, do_);
+
+        // (d) 一次全量 scan —— "干脆整段读回来"那条路
+        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let t = Instant::now();
+        let rows = tx.scan(None, None);
+        let (d, db, do_) = (
+            t.elapsed(),
+            crate::lsm_tree::sst::block_reads() - b0,
+            crate::lsm_tree::sst::block_misses() - o0,
+        );
+        eprintln!("全量 scan 命中 {} 行", rows.len());
+        report("一次全量 scan", d, rows.len().max(1), db, do_);
+
+        // (e) 只要 4 条（下游"进程启动 + 打开 + 扫 4 条"那一段）
+        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let t = Instant::now();
+        for k in &keys[..4] {
+            assert!(tx.get(k).is_some());
+        }
+        let (d, db, do_) = (
+            t.elapsed(),
+            crate::lsm_tree::sst::block_reads() - b0,
+            crate::lsm_tree::sst::block_misses() - o0,
+        );
+        report("点读×4", d, 4, db, do_);
+
+        drop(tx);
+        drop(mvcc);
+        cleanup(&path);
+    }
 }

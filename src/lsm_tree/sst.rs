@@ -106,6 +106,23 @@ pub(crate) fn block_reads() -> u64 {
     BLOCK_READS.with(|c| c.get())
 }
 
+// 测试专用：本线程「块缓存未命中、真的按 offset 去读文件」的次数。
+//
+// `block_reads` 把命中和未命中算成同一个数，所以它守的是「代价不随链长/库总量涨」，
+// 却**看不见墙钟时间的来源**。下游实测单次点查 0.86ms，而块访问只有个位数 —— 差额就在
+// 未命中这几步真读上：改造前每次未命中还要额外 `File::open`（本机实测一次 open ≈ 167µs，
+// 见 `test_lsm_point_read_baseline_5000_keys` 的"乱序 vs 有序"之差）。所以量这个，不量 open 数。
+#[cfg(test)]
+thread_local! {
+    static BLOCK_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程的 SST 块缓存未命中次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn block_misses() -> u64 {
+    BLOCK_MISSES.with(|c| c.get())
+}
+
 // 测试专用：本线程「把带 value 的条目整个物化出来」的次数。
 //
 // 这是全库折叠那条通道真正的代价单位：重量路径（`iter_all` / `mem_view_at`）每行都要
@@ -208,6 +225,14 @@ pub struct SstFile {
     has_seq: bool,
     block_cache: Option<Arc<Mutex<BlockCache>>>,
     mmap: Option<Mmap>,
+    /// 常驻的只读句柄，**懒开**：第一次真读时 `File::open` 一次，之后按 offset 读不再开文件。
+    ///
+    /// 为什么必须有它：SST 是不可变的、路径按 id 唯一，所以句柄可以一直用到对象销毁；而没有它，
+    /// 每次块缓存未命中都要重开一次文件 —— 本机实测一次 `File::open` ≈ 167µs，比读那 4KB 字节
+    /// 贵一个量级，于是"块访问次数只有个位数"的点查照样能慢到 0.86ms（下游现场就是这个数）。
+    /// Windows 下 std 打开文件带 `FILE_SHARE_DELETE`，所以 compact 之后删旧 SST 仍然成功，
+    /// 这个句柄不需要显式关闭。
+    handle: Mutex<Option<File>>,
     /// block cache 命名空间（CF 隔离）
     cache_ns: u64,
 }
@@ -637,7 +662,15 @@ impl SstFile {
             }
             return Ok(m[start..end].to_vec());
         }
-        let mut f = File::open(&self.path)?;
+        #[cfg(test)]
+        BLOCK_MISSES.with(|c| c.set(c.get() + 1));
+        // 常驻句柄：懒开一次，之后只 seek + read。这里省掉的正是那次与读字节同量级、
+        // 却贵一个数量级的 File::open。
+        let mut guard = self.handle.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(File::open(&self.path)?);
+        }
+        let f = guard.as_mut().unwrap();
         f.seek(SeekFrom::Start(offset))?;
         let mut raw: Vec<u8> = vec![0u8; len];
         f.read_exact(&mut raw)?;
@@ -770,6 +803,8 @@ fn open_v1(
         has_seq: false,
         block_cache: None,
         mmap: None,
+        // v1 整份在 entries_cache 里，永不按 offset 读，所以不需要句柄
+        handle: Mutex::new(None),
         cache_ns: 0,
     })
 }
@@ -860,6 +895,8 @@ fn open_v2_from_footer(id: u64, path: PathBuf, size_bytes: u64) -> std::io::Resu
         has_seq,
         block_cache: None,
         mmap: None,
+        // 打开页脚/索引/bloom 用的这个句柄直接留下：之后每次按 offset 读都省掉一次 File::open
+        handle: Mutex::new(Some(f)),
         cache_ns: 0,
     })
 }
