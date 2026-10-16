@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 250 个单元测试 + 4 个集成测试
+- 254 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -194,7 +194,7 @@ use std::time::Duration;
 
 let tx = db.begin();                       // Box<dyn KvTxn + '_>,借用 db
 if !tx.set(b"order:1", b"payload".to_vec()) {
-    tx.rollback();                         // false = 写冲突,不是"没写进去"
+    tx.rollback();                         // false = 这一行没进去(冲突,或引擎拒收)
 }
 let token = b"session-token".to_vec();
 tx.set_with_ttl(b"session:abc", token, Duration::from_secs(600));
@@ -204,8 +204,13 @@ tx.commit();                               // 落 WAL + fsync(只读事务两者
 
 四条必须知道的语义:
 
-- `set` / `delete` 返回 `false`、`batch_set` / `batch_delete` 返回 `Err(key)` 都只表示**写冲突**
-  (别的事务在你之后改了同一个 key),此时应该 `rollback()` 整个事务重试,而不是继续写。
+- `set` / `delete` 返回 `false`、`batch_set` / `batch_delete` 返回 `Err(key)` **都表示"这行没进去"**，
+  应该 `rollback()` 整个事务重试，而不是继续写。两种成因要分清：
+  ① **写冲突**（别的事务在你之后改了同一个 key）—— 四引擎都会给出；
+  ② **引擎拒收**（仅 B+ 树）：单个逻辑键 > **一页载荷 4080 B**（版本键还要 +8 B，所以实际上限
+  ≈ 4 KB）⇒ 这一行装不进任何一页。此时**一字未写**，`log::error!` 点名是哪把键，
+  WAL 里也不会留下这条 `Write`（判据是 `BPlusTree::row_fits`，在 append WAL **之前**问）。
+  值不受这条限制：超过 256 B 的 value 走 blob 旁路，树里只放指针。
 - **不用保证收尾**:事务对象丢弃而未 `commit` ⇒ 自动回滚。这条是刻意设计的 —— 一次疏忽若留下
   "漏网活跃事务",`vacuum` 就会从此整轮跳过,垃圾永久累积。
 - **只读事务不写 WAL、`commit` 不 fsync**(实测 2265.8µs/次 → 15.8µs/次)。所以"每 tick 做一次
@@ -782,8 +787,29 @@ data.db.lock       单写者锁(内含 pid)
   删分隔键 + `free_page(死页)` ⇒ 幸存页还是合并前的旧内容,那批行两份副本一起没 = 静默丢数据
   (40 B 键 + 60 B 值、`order=64` 时合并两个半页就是 7.5 KB)。守卫:
   `test_reorg_never_drops_oversized_pages`(把检查临时关掉,第 36 次删除就报"删除失败")。
-  ⚠️ 代价如实记在这里:放弃合并会让下溢的叶子保留得更多、填充率下降,delete 密集之后一次全库
-  走查更贵(实测 `vacuum()` 206 ms → 450 ms @ 20k 行)。正解是"合并后再分裂",还没做。
+- ~~放弃合并会让下溢的叶子越留越多、填充率一路掉,delete 密集之后一次全库走查更贵
+  (实测 `vacuum()` 206 ms → 450 ms @ 20k 行)。正解是"合并后再分裂",还没做。~~
+  **已做(M14)**:union 装不下一页时不再整次作废,而是**按字节把两页的条目重切成两个各装得下的
+  半页**(不释放页、只换父节点那把分隔键)。分界取"左页能装下的最大条数"而不是中点 —— 中点切法
+  两片都停在半满,页数降不下来;压满左页会把剩余挤成一小片,那片下一轮就能和自己的右兄弟合并成功
+  ⇒ 真的释放一页。**同一形状(4000 行插满、隔一个删一个)叶子 222 → 64 页**(关掉重切 = 111 页,
+  1.73×),每页字节容量当场量得 35 条 ⇒ 理想 58 页 —— 结论从这条**计数**拿,不从墙钟拿
+  (同一份构建连跑四次 `vacuum()` = 241/252/300/393 ms,本机 ±2× 噪声;改前那一次 466 ms,
+  方向一致但幅度不敢报成一个数)。守卫 `test_reorg_packs_leaves_instead_of_leaving_them_half_empty`
+  (页数 ≤ 理想页数 × 1.5,尺子直接量"一页装得下几条");把重切那一支临时关掉 ⇒ 111 页、当场红,
+  而"没丢数据"那条**全绿** —— 这条病只有页数看得见。字节的分档靠 bincode 逐条相加,
+  由 `test_reorg_size_formula_matches_bincode` 与真实序列化逐档对拍(公式偏了只会退回"什么都不动",
+  不红测试、静默不优化,所以必须对拍)。
+- **单个逻辑键必须短于一页载荷(4080 B;版本键另加 8 B)**:装不进任何一页的行会被**明确拒收**
+  —— `insert` 返回 `false`、`MVCC::set` 在 append WAL **之前**就返回 `false`(判据
+  `BPlusTree::row_fits`),树那边**一字未写**,所以已有数据不受影响。老写法是按条数对半切、
+  两半都不量就写盘 ⇒ 写不进的那一半变成没人引用的页 = 静默丢数据(与 M11f 同一个洞,方向相反)。
+  插入路径现在也是"下降一趟全在内存里算、到顶统一落盘"(`InsertStep::writes`),否则
+  "孩子已分裂写完、父亲放不下"这一格会重演同一个形状。守卫:
+  `test_oversized_row_is_refused_not_dropped_silently`(把分裂退回按条数对半切 ⇒ 当场红)与
+  `test_oversized_row_is_refused_before_the_wal`(把拒收挪到 WAL 之后 ⇒ WAL 里多出一条 `Write`,红)。
+  ⚠️ 剩下没做的:BulkLoader 的 `put` 与 WAL 重放**没有返回值通道**(`KvBulk::put` 是 `()`),
+  所以那两条路只能 `log::error!` 喊出来(`insert_or_shout`),不会静默、也传不上去。
 - ⚠️ **页数会超过页缓存上限**:`max_cache_pages` 默认 1024,而 20000 行(40B 键)的树就有 **1257 页**。
   只读走查现在不再回填溢出的部分(`read_page_for_walk`:装不下就不缓存),所以一次全库走查
   不再把点读的热页挤出去(`health()` 150 ms → 21.2 ms、换出 1600 → **0**)。
@@ -909,7 +935,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:250 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:254 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

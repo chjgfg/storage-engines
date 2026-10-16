@@ -14,6 +14,18 @@ thread_local! {
     static NODE_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// 测试专用：有多少次插入因为"这一条装不进任何一页"而**一行没写**。
+// 正常形状下必须为 0；它不是错误计数器，是"库允许多大的键"这条边界的读数。
+#[cfg(test)]
+thread_local! {
+    static SPLIT_DROPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn split_drops() -> u64 {
+    SPLIT_DROPS.with(|c| c.get())
+}
+
 #[cfg(test)]
 pub(crate) fn node_parses() -> u64 {
     NODE_PARSES.with(|c| c.get())
@@ -45,6 +57,47 @@ enum BTreeNode {
         /// 子节点页ID
         children: Vec<PageId>,
     },
+}
+
+/// 相邻一对节点重排的三种结局（`handle_underflow` 据此决定是否继续向上传下溢）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairReorg {
+    /// union 装得下一页 ⇒ 并成一页并**释放**另一页：父节点少一个子节点，可能连锁下溢
+    Merged,
+    /// union 装不下 ⇒ 按字节**重切**成两个各装得下的半页：不释放页，只换父节点那把分隔键
+    Resplit,
+    /// 一个字节都没动（找不到合法分界，或父子形状对不上）
+    Nothing,
+}
+
+/// 一趟下降插入的结果：`writes` 是**还没落盘**的一串（页号, 内容），`alloc` 是途中占下的页
+/// （整条路径作废时由 [`BPlusTree::insert`] 回收）。为什么要攒着一起写，见 `insert` 的注释。
+struct InsertStep {
+    landed: bool,
+    /// 需要给父节点上提的分隔键 + 新建的右半页
+    promote: Option<(Key, PageId)>,
+    writes: Vec<(PageId, BTreeNode)>,
+    alloc: Vec<PageId>,
+}
+
+impl InsertStep {
+    fn written(writes: Vec<(PageId, BTreeNode)>) -> Self {
+        Self {
+            landed: true,
+            promote: None,
+            writes,
+            alloc: Vec::new(),
+        }
+    }
+
+    fn dropped() -> Self {
+        Self {
+            landed: false,
+            promote: None,
+            writes: Vec::new(),
+            alloc: Vec::new(),
+        }
+    }
 }
 
 /// 带页管理的B+树
@@ -225,144 +278,306 @@ impl BPlusTree {
         }
     }
 
-    /// 一次序列化判定 + 写入（避免 node_fits 与 try_write 双重 bincode）
-    fn write_if_fits(&mut self, page_id: PageId, node: &BTreeNode) -> bool {
-        let count_ok = match node {
-            BTreeNode::Leaf { entries, .. } => entries.len() < self.order,
-            BTreeNode::Internal { keys, .. } => keys.len() < self.order,
-        };
-        if !count_ok {
-            return false;
-        }
-        let data = match bincode::serialize(node) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        if data.len() > MAX_PAYLOAD {
-            return false;
-        }
-        self.page_manager.write_page(page_id, &data)
+    /// 一条条目在序列化结果里占多少字节。
+    ///
+    /// bincode 把 `Vec<T>` 编成「长度 + 逐条」⇒「空 vec 的字节」减掉之后每条**可加**，
+    /// 所以「节点字节 = 空节点字节 + Σ 每条字节」是精确值而不是估算（由
+    /// `test_reorg_size_formula_matches_bincode` 逐档与真实序列化对拍钉住）。
+    /// 为什么不直接 `serialized_size(&候选节点)` 逐档试：那要克隆上百条 `(Vec<u8>, RowId)`，
+    /// 一次删除重探十几档 ⇒ 4000 次删除就是几百万次堆分配，**量尺自己变成瓶颈**。
+    /// 为什么不让手算常量代替：`RowId` 是 `Option<Vec<u8>>`，键与值都变长，常量错一次
+    /// 就是"按错的尺寸写坏一页"。
+    fn vec_item_bytes<T: serde::Serialize>(item: &T) -> usize {
+        let empty = bincode::serialized_size(&Vec::<T>::new()).unwrap_or(0) as i64;
+        let one = bincode::serialized_size(&[item][..]).unwrap_or(0) as i64;
+        (one - empty).max(0) as usize
     }
 
+    /// 只有 `next_leaf` 的叶子（条目为空）序列化后的字节数
+    fn leaf_base(next_leaf: Option<PageId>) -> i64 {
+        let probe = BTreeNode::Leaf {
+            entries: Vec::new(),
+            next_leaf,
+        };
+        bincode::serialized_size(&probe).unwrap_or(i64::MAX as u64) as i64
+    }
+
+    /// 空内部节点（无键无子）的字节数，与「一个子节点占的字节」——子节点是定宽 `PageId`，
+    /// 所以键数与子节点数可以分开加（同样由对拍测试钉住）
+    fn internal_base() -> i64 {
+        let probe = BTreeNode::Internal {
+            keys: Vec::new(),
+            children: Vec::new(),
+        };
+        bincode::serialized_size(&probe).unwrap_or(i64::MAX as u64) as i64
+    }
+
+    /// 两半**都装得下**的分界区间 `(lo, hi)`；`None` = 没有任何合法分界 ⇒ 调用方一字都不能写。
+    ///
+    /// 前缀随 k 变胖、后缀随 k 变瘦 ⇒ 可行档是一段连续区间，一次线性扫把两端都记住就行
+    /// （不必二分：`k` 的上界就是阶数，一趟 O(order)）。
+    /// 为什么不用 `serialized_size(&候选节点)` 逐档试：重组与分裂都在写路径上，一次十几档
+    /// 每档克隆上百条 ⇒ delete 密集时**量尺自己变成瓶颈**；而 bincode 的 `Vec` 就是
+    /// 「长度 + 逐条」，所以逐条字节相加是精确值（由 `test_reorg_size_formula_matches_bincode`
+    /// 与真实序列化逐档对拍钉住 —— 公式偏了只会退回"什么都不动"，不红测试、静默不优化）。
+    fn fitting_split(
+        k_from: usize,
+        k_to: usize,
+        cap: i64,
+        bytes: &dyn Fn(usize) -> (i64, i64),
+    ) -> Option<(usize, usize)> {
+        if k_from > k_to {
+            return None;
+        }
+        let mut lo = None;
+        let mut hi = None;
+        for k in k_from..=k_to {
+            let (left, right) = bytes(k);
+            if left > cap {
+                break; // 再往右只会更胖，后缀那边不用看了
+            }
+            if right <= cap {
+                if lo.is_none() {
+                    lo = Some(k);
+                }
+                hi = Some(k);
+            }
+        }
+        Some((lo?, hi?))
+    }
+
+    /// 一批叶子条目 + `next_leaf` 序列化后的**精确**字节数（可加性见 `fitting_split` 的注释）
+    fn leaf_total_bytes(entries: &[(Key, RowId)], next_leaf: Option<PageId>) -> i64 {
+        Self::leaf_base(next_leaf)
+            + entries
+                .iter()
+                .map(|e| Self::vec_item_bytes(e) as i64)
+                .sum::<i64>()
+    }
+
+    /// 内部节点的精确字节数：键是变长的、子节点是定宽 `PageId` ⇒ 两项分开加
+    fn internal_total_bytes(keys: &[Key], child_count: usize) -> i64 {
+        Self::internal_base()
+            + keys
+                .iter()
+                .map(|k| Self::vec_item_bytes(k) as i64)
+                .sum::<i64>()
+            + child_count as i64 * Self::internal_child_unit()
+    }
+
+    /// 前缀字节表：`pre[i]` = 前 i 条的字节和 ⇒ 任意半页的字节 O(1) 拿到
+    fn prefix_bytes(per: &[i64]) -> Vec<i64> {
+        let mut pre = Vec::with_capacity(per.len() + 1);
+        pre.push(0i64);
+        for b in per {
+            pre.push(pre.last().unwrap() + b);
+        }
+        pre
+    }
+
+    /// 叶子的分裂点（左半留几条）：**取可行区间的中点**。
+    ///
+    /// 分裂与重组的目标不同，所以分界取法也不同 —— 分裂是把一页变两页，两边都得留增长空间，
+    /// 取中点；重组是要把空位挤成一小片、好让它下一轮合并成功，取最满的一档
+    /// （见 `rebalance_leaf_pair`）。两处照抄都会静默地更差，所以各写各的。
+    fn leaf_split_point(
+        entries: &[(Key, RowId)],
+        next_leaf: Option<PageId>,
+        order: usize,
+    ) -> Option<usize> {
+        let n = entries.len();
+        let per: Vec<i64> = entries.iter().map(|e| Self::vec_item_bytes(e) as i64).collect();
+        let pre = Self::prefix_bytes(&per);
+        // 左半的下一叶是"某个 Some"，与具体页号无关（PageId 定宽）
+        let base_left = Self::leaf_base(Some(PageId(0)));
+        let base_right = Self::leaf_base(next_leaf);
+        // 两半条数都必须 < order：否则分裂完谁也插不进去，下一次写必然超载
+        let k_from = 1usize.max(n.saturating_sub(order - 1));
+        let k_to = (order - 1).min(n.saturating_sub(1));
+        let (lo, hi) = Self::fitting_split(k_from, k_to, MAX_PAYLOAD as i64, &|k| {
+            (base_left + pre[k], base_right + (pre[n] - pre[k]))
+        })?;
+        Some((lo + hi) / 2)
+    }
+
+    /// 内部节点的分裂点（上提键的下标 `k`：左半拿 `keys[..k]`，右半拿 `keys[k+1..]`）
+    fn internal_split_point(keys: &[Key], order: usize) -> Option<usize> {
+        let n = keys.len();
+        let per: Vec<i64> = keys.iter().map(|k| Self::vec_item_bytes(k) as i64).collect();
+        let pre = Self::prefix_bytes(&per);
+        let base = Self::internal_base();
+        let cu = Self::internal_child_unit();
+        // 左半 k 把键 + k+1 个子；右半 n-k-1 把键 + n-k 个子
+        let k_from = 1usize.max(n.saturating_sub(order));
+        let k_to = (order - 1).min(n.saturating_sub(1));
+        let (lo, hi) = Self::fitting_split(k_from, k_to, MAX_PAYLOAD as i64, &|k| {
+            (
+                base + pre[k] + (k as i64 + 1) * cu,
+                base + (pre[n] - pre[k + 1]) + (n as i64 - k as i64) * cu,
+            )
+        })?;
+        Some((lo + hi) / 2)
+    }
+
+    fn internal_child_unit() -> i64 {
+        let one = BTreeNode::Internal {
+            keys: Vec::new(),
+            children: vec![PageId(1)],
+        };
+        bincode::serialized_size(&one).unwrap_or(0) as i64 - Self::internal_base()
+    }
+
+    /// 这一行**住得住一页吗** —— 给上层在动 WAL 之前先问一句。
+    ///
+    /// 为什么要有这个谓词而不是等 `insert` 返回 `false`：事务层是「先 append WAL、再写树」，
+    /// 树拒收之后 WAL 里就留下一条"提交了但这行不存在"的记录，恢复时按它重放只会再拒一次，
+    /// 表现成"WAL 说有、树里查无此键"。所以拒绝必须发生在写 WAL **之前**。
+    /// 判据与分裂用的是同一套字节账（`leaf_total_bytes`），不留两边不一致。
+    pub fn row_fits(&self, key: &Key, row: &Option<Vec<u8>>) -> bool {
+        Self::leaf_total_bytes(&[(key.clone(), RowId(row.clone()))], None) <= MAX_PAYLOAD as i64
+    }
+
+    /// 插入一行。返回 `false` = **这一行没进去**，只有一种成因：这一条比一整页还大，
+    /// 分裂也切不出「两半都装得下」的分界。此时磁盘上一个字节都没动 ⇒ 已有的行不受影响。
+    ///
+    /// 写法是**下降一趟全在内存里算，到顶才统一落盘**（`InsertStep::writes`）。老写法边算边写，
+    /// 于是「孩子已经分裂写完、父亲却放不下」这一格会把刚分出去的那一半变成**没人引用的页** ——
+    /// 和 M11f 那个静默丢页是同一个形状：`write_page` 超载只打一行日志，返回的 `false` 被调用链丢掉。
     pub fn insert(&mut self, key: Key, row_id: RowId) -> bool {
-        let (split, new_key, new_node_page_id) = self.insert_recursive(self.root, key, row_id);
-        if split {
+        let step = self.insert_recursive(self.root, key, row_id);
+        if !step.landed {
+            // 一个字节都没写 ⇒ 途中占下的页谁也不引用，回收掉别留孤儿
+            for page in step.alloc {
+                self.page_manager.free_page(page);
+            }
+            #[cfg(test)]
+            SPLIT_DROPS.with(|c| c.set(c.get() + 1));
+            return false;
+        }
+        for (page_id, node) in &step.writes {
+            // 到这里的每个节点都逐档量过字节 ⇒ 写失败只剩「磁盘坏了」这一种解释
+            let data = bincode::serialize(node).expect("serialize node");
+            self.page_manager.write_page(*page_id, &data);
+        }
+        if let Some((promote_key, new_page)) = step.promote {
             let new_root_page_id = self.page_manager.allocate_page();
             let new_root = BTreeNode::Internal {
-                keys: vec![new_key],
-                children: vec![self.root, new_node_page_id],
+                keys: vec![promote_key],
+                children: vec![self.root, new_page],
             };
-            let root_data = bincode::serialize(&new_root).unwrap();
+            let root_data = bincode::serialize(&new_root).expect("serialize new root");
             self.page_manager.write_page(new_root_page_id, &root_data);
             self.set_root(new_root_page_id);
         }
         true
     }
 
-    fn insert_recursive(
-        &mut self,
-        node_page_id: PageId,
-        key: Key,
-        row_id: RowId,
-    ) -> (bool, Key, PageId) {
+    /// 一趟下降：返回「还没落盘的一串（页号, 内容）」与要不要往上升一层。
+    /// `landed = false` 时 `writes` 必为空，`alloc` 继续往上传，由 [`Self::insert`] 统一回收。
+    fn insert_recursive(&mut self, node_page_id: PageId, key: Key, row_id: RowId) -> InsertStep {
         let node_data = self.page_manager.read_page(node_page_id).unwrap();
-        let mut node: BTreeNode = bincode::deserialize(&node_data).unwrap();
+        let node: BTreeNode = bincode::deserialize(&node_data).unwrap();
+        let order = self.order;
+        let cap = MAX_PAYLOAD as i64;
 
-        match &mut node {
+        match node {
             BTreeNode::Leaf {
-                entries,
-                next_leaf: _,
-            } => match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
-                Ok(idx) => {
-                    entries[idx].1 = row_id;
-                    if self.write_if_fits(node_page_id, &node) {
-                        (false, vec![0], PageId(0))
-                    } else {
-                        self.split_leaf(node_page_id, node)
-                    }
+                mut entries,
+                next_leaf,
+            } => {
+                match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
+                    Ok(idx) => entries[idx].1 = row_id,
+                    Err(idx) => entries.insert(idx, (key, row_id)),
                 }
-                Err(idx) => {
-                    entries.insert(idx, (key, row_id));
-                    if self.write_if_fits(node_page_id, &node) {
-                        (false, vec![0], PageId(0))
-                    } else {
-                        self.split_leaf(node_page_id, node)
-                    }
+                if entries.len() < order && Self::leaf_total_bytes(&entries, next_leaf) <= cap {
+                    return InsertStep::written(vec![(
+                        node_page_id,
+                        BTreeNode::Leaf {
+                            entries,
+                            next_leaf,
+                        },
+                    )]);
                 }
-            },
-            BTreeNode::Internal { keys, children } => {
-                let child_idx = keys
-                    .iter()
-                    .position(|k| key < k.clone())
-                    .unwrap_or(keys.len());
+                let Some(i) = Self::leaf_split_point(&entries, next_leaf, order) else {
+                    return InsertStep::dropped();
+                };
+                let promote_key = entries[i].0.clone();
+                let right_entries = entries.split_off(i);
+                let new_page = self.page_manager.allocate_page();
+                let left = BTreeNode::Leaf {
+                    entries,
+                    next_leaf: Some(new_page),
+                };
+                let right = BTreeNode::Leaf {
+                    entries: right_entries,
+                    next_leaf,
+                };
+                InsertStep {
+                    landed: true,
+                    promote: Some((promote_key, new_page)),
+                    writes: vec![(node_page_id, left), (new_page, right)],
+                    alloc: vec![new_page],
+                }
+            }
+            BTreeNode::Internal {
+                mut keys,
+                mut children,
+            } => {
+                let child_idx = keys.iter().position(|k| key < *k).unwrap_or(keys.len());
                 let child_page_id = children[child_idx];
-                let (split, split_key, new_child_page_id) =
-                    self.insert_recursive(child_page_id, key, row_id);
-                if !split {
-                    return (false, vec![0], PageId(0));
+                let child = self.insert_recursive(child_page_id, key, row_id);
+                if !child.landed {
+                    return child; // 孩子的 writes 本来就空；alloc 继续往上传
                 }
-                keys.insert(child_idx, split_key);
-                children.insert(child_idx + 1, new_child_page_id);
-                if self.write_if_fits(node_page_id, &node) {
-                    (false, vec![0], PageId(0))
-                } else {
-                    self.split_internal(node_page_id, node)
+                let Some((promote_key, new_page)) = child.promote else {
+                    return child; // 下面没分裂 ⇒ 孩子那条写入原样上交
+                };
+                keys.insert(child_idx, promote_key);
+                children.insert(child_idx + 1, new_page);
+                if keys.len() < order && Self::internal_total_bytes(&keys, children.len()) <= cap {
+                    let mut writes = child.writes;
+                    writes.push((node_page_id, BTreeNode::Internal { keys, children }));
+                    return InsertStep {
+                        landed: true,
+                        promote: None,
+                        writes,
+                        alloc: child.alloc,
+                    };
+                }
+                let Some(k) = Self::internal_split_point(&keys, order) else {
+                    // 塞不下又切不开 ⇒ **整条路径作废**：孩子的写入也丢掉。它们从没落过盘，
+                    // 所以盘上还是各自原来的内容 —— 这比"写了一半才发现不行"强得多。
+                    return InsertStep {
+                        landed: false,
+                        promote: None,
+                        writes: Vec::new(),
+                        alloc: child.alloc,
+                    };
+                };
+                let up_key = keys[k].clone();
+                let right_children = children.split_off(k + 1);
+                // keys[k] 就是上提那把：先切走 [k+1..]，再把 keys[k] 从剩下的尾巴上摘掉
+                let right_keys = keys.split_off(k + 1);
+                keys.pop();
+                let new_page = self.page_manager.allocate_page();
+                let left = BTreeNode::Internal { keys, children };
+                let right = BTreeNode::Internal {
+                    keys: right_keys,
+                    children: right_children,
+                };
+                let mut writes = child.writes;
+                writes.push((node_page_id, left));
+                writes.push((new_page, right));
+                let mut alloc = child.alloc;
+                alloc.push(new_page);
+                InsertStep {
+                    landed: true,
+                    promote: Some((up_key, new_page)),
+                    writes,
+                    alloc,
                 }
             }
         }
-    }
-
-    /// 分裂叶子：返回 (true, 右节点最小键, 右页 id)
-    fn split_leaf(&mut self, node_page_id: PageId, mut node: BTreeNode) -> (bool, Key, PageId) {
-        let BTreeNode::Leaf {
-            ref mut entries,
-            ref mut next_leaf,
-        } = node
-        else {
-            return (false, vec![0], PageId(0));
-        };
-        let mid = entries.len() / 2;
-        let right_entries = entries.split_off(mid);
-        let split_key = right_entries[0].0.clone();
-        let new_leaf_page_id = self.page_manager.allocate_page();
-        let right_node = BTreeNode::Leaf {
-            entries: right_entries,
-            next_leaf: *next_leaf,
-        };
-        *next_leaf = Some(new_leaf_page_id);
-        // 若半页仍超载（单条超大），尽力写入；真正的大 value 需要外置存储
-        let left_data = bincode::serialize(&node).unwrap();
-        self.page_manager.write_page(node_page_id, &left_data);
-        let right_data = bincode::serialize(&right_node).unwrap();
-        self.page_manager.write_page(new_leaf_page_id, &right_data);
-        (true, split_key, new_leaf_page_id)
-    }
-
-    /// 分裂内部节点
-    fn split_internal(&mut self, node_page_id: PageId, mut node: BTreeNode) -> (bool, Key, PageId) {
-        let BTreeNode::Internal {
-            ref mut keys,
-            ref mut children,
-        } = node
-        else {
-            return (false, vec![0], PageId(0));
-        };
-        let mid = keys.len() / 2;
-        let promote_key = keys[mid].clone();
-        let right_keys = keys.split_off(mid + 1);
-        let right_children = children.split_off(mid + 1);
-        keys.pop(); // 移除上提的键
-        let new_internal_page_id = self.page_manager.allocate_page();
-        let right_node = BTreeNode::Internal {
-            keys: right_keys,
-            children: right_children,
-        };
-        let left_data = bincode::serialize(&node).unwrap();
-        self.page_manager.write_page(node_page_id, &left_data);
-        let right_data = bincode::serialize(&right_node).unwrap();
-        self.page_manager
-            .write_page(new_internal_page_id, &right_data);
-        (true, promote_key, new_internal_page_id)
     }
 }
 
@@ -543,7 +758,7 @@ impl BPlusTree {
         is_left_sibling: bool,
         parent_page_id: PageId,
         child_idx: usize,
-    ) {
+    )  -> bool {
         let mut node = self.read_node(node_page_id);
         let mut sibling = self.read_node(sibling_page_id);
         let mut parent = self.read_node(parent_page_id);
@@ -576,93 +791,149 @@ impl BPlusTree {
                     }
                 }
             }
-            _ => return,
+            _ => return false,
         }
 
-        // 借完之后三个节点都必须还装得下一页，否则**整个重组作废**（locals 丢弃、盘不动）。
-        // 下溢本身不是错误，只是填充率低一点；写失败的静默丢页才是。
+        // 借完之后三个节点都必须还装得下一页，否则**这一步作废**（locals 丢弃、盘不动），
+        // 由调用方退到整对重排。下溢本身不是错误，只是填充率低一点；写失败的静默丢页才是。
         if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
-            return;
+            return false;
         }
         self.write_node(node_page_id, &node);
         self.write_node(sibling_page_id, &sibling);
         self.write_node(parent_page_id, &parent);
+        true
     }
 
-    /// 叶子：与兄弟合并
-    /// - 左兄弟：内容并入左兄弟，删 parent.keys[child_idx-1] 与 children[child_idx]
-    /// - 右兄弟：右兄弟并入当前，删 parent.keys[child_idx] 与 children[child_idx+1]
-    fn leaf_merge(
+    /// 相邻两叶重排：union 装得下一页就合并，装不下就按字节**重切成两个各装得下的半页**。
+    ///
+    /// 为什么必须有"重切"这一支：`order=64` 在 40B 键 + 60B 值下两个半页的 union 就是
+    /// 7.5 KB > 4080 B ⇒ 原先只有「合并」与「装不下就整次作废」两种结局，于是 delete 密集之后
+    /// 下溢的叶子永远留着、填充率一路掉（实测 `vacuum()` 206 → 466 ms）。重切不释放页、
+    /// 不动父子结构，只把父节点那把分隔键换成新右半页的最小键 ⇒ 行数一个不少，填充率回到 ~50%。
+    ///
+    /// 落盘前一律用 `node_fits`（真实序列化）复核：字节公式只用来**选分界**，
+    /// 公式与真实不符时宁可留下溢，也不写一个装不下的页。
+    fn rebalance_leaf_pair(
         &mut self,
-        node_page_id: PageId,
-        sibling_page_id: PageId,
-        is_left_sibling: bool,
+        left_page: PageId,
+        right_page: PageId,
         parent_page_id: PageId,
-        child_idx: usize,
-    ) {
-        let mut node = self.read_node(node_page_id);
-        let mut sibling = self.read_node(sibling_page_id);
-        let mut parent = self.read_node(parent_page_id);
-
-        let (survivor_id, dead_id, parent_key_idx, delete_child_idx) = if is_left_sibling {
-            // left=sibling, right=node → 并入 left
-            match (&mut sibling, &mut node) {
+        sep_idx: usize,
+    ) -> PairReorg {
+        let (left_entries, left_next, right_entries, right_next) =
+            match (self.read_node(left_page), self.read_node(right_page)) {
                 (
                     BTreeNode::Leaf {
-                        entries: left_entries,
-                        next_leaf: left_next,
+                        entries: a,
+                        next_leaf: l,
                     },
                     BTreeNode::Leaf {
-                        entries: right_entries,
-                        next_leaf: right_next,
+                        entries: b,
+                        next_leaf: r,
                     },
-                ) => {
-                    left_entries.append(right_entries);
-                    *left_next = *right_next;
-                }
-                _ => return,
-            }
-            (sibling_page_id, node_page_id, child_idx - 1, child_idx)
-        } else {
-            // left=node, right=sibling → 并入 left(node)
-            match (&mut node, &mut sibling) {
-                (
-                    BTreeNode::Leaf {
-                        entries: left_entries,
-                        next_leaf: left_next,
-                    },
-                    BTreeNode::Leaf {
-                        entries: right_entries,
-                        next_leaf: right_next,
-                    },
-                ) => {
-                    left_entries.append(right_entries);
-                    *left_next = *right_next;
-                }
-                _ => return,
-            }
-            (node_page_id, sibling_page_id, child_idx, child_idx + 1)
+                ) => (a, l, b, r),
+                _ => return PairReorg::Nothing,
+            };
+        let (mut parent_keys, parent_children) = match self.read_node(parent_page_id) {
+            BTreeNode::Internal { keys, children } => (keys, children),
+            _ => return PairReorg::Nothing,
         };
-
-        if let BTreeNode::Internal { keys, children } = &mut parent {
-            keys.remove(parent_key_idx);
-            children.remove(delete_child_idx);
+        // 形状核对：这对页必须是父里相邻的两个子节点，**且叶子链也这么认为**。
+        // 三样里任何一样对不上就什么都不动 —— 照着错结构改盘，比留下溢严重得多。
+        if left_next != Some(right_page)
+            || parent_children.len() != parent_keys.len() + 1
+            || parent_children.get(sep_idx) != Some(&left_page)
+            || parent_children.get(sep_idx + 1) != Some(&right_page)
+        {
+            return PairReorg::Nothing;
         }
 
-        // 合并的结果必须还装得下一页，而且这个判断**必须在 free_page 之前**：
-        // 原先的顺序是"写幸存页（可能失败）→ 删父节点分隔键 → free 死页"，
-        // 一旦幸存页因为超载没写进去，那批行就同时失去了两份副本 = 静默丢数据。
-        if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
-            return;
+        let tail = right_next;
+        let mut union = left_entries;
+        union.extend(right_entries);
+        // 逐条问 bincode：`RowId` 是 `Option<Vec<u8>>`（变长），手算常量错一次就是写坏页
+        let per: Vec<i64> = union.iter().map(|e| Self::vec_item_bytes(e) as i64).collect();
+        let cap = MAX_PAYLOAD as i64;
+        // 左半页的下一叶就是右半页，右半页接原本右页的下一叶 ⇒ 两个 base 分开算
+        let base_left = Self::leaf_base(Some(right_page));
+        let base_right = Self::leaf_base(tail);
+        // 前缀和：`prefix[i]` = 前 i 条的字节和 ⇒ 任意半页的字节都是 O(1) 拿到
+        let mut prefix = Vec::with_capacity(union.len() + 1);
+        prefix.push(0i64);
+        for b in &per {
+            prefix.push(prefix.last().unwrap() + b);
         }
-        let survivor = if survivor_id == node_page_id {
-            &node
-        } else {
-            &sibling
+        let left_bytes = |i: usize| -> i64 { base_left + prefix[i] };
+        let right_bytes = |i: usize| -> i64 { base_right + (prefix[union.len()] - prefix[i]) };
+
+        // ① union 整个装得下一页 ⇒ 真合并（释放右页）。合并后的 next_leaf 就是 tail ⇒
+        //    用 base_right 算，别用 base_left（差一个 Option 就是差一个字节档）
+        if union.len() < self.order && base_right + prefix[union.len()] <= cap {
+            let merged = BTreeNode::Leaf {
+                entries: union,
+                next_leaf: tail,
+            };
+            let mut children = parent_children;
+            parent_keys.remove(sep_idx);
+            children.remove(sep_idx + 1);
+            let parent = BTreeNode::Internal {
+                keys: parent_keys,
+                children,
+            };
+            if !Self::node_fits(&merged) || !Self::node_fits(&parent) {
+                return PairReorg::Nothing;
+            }
+            self.write_node(left_page, &merged);
+            self.write_node(parent_page_id, &parent);
+            self.page_manager.free_page(right_page);
+            return PairReorg::Merged;
+        }
+
+        // ② 装不下 ⇒ 找"两半都装得下"的分界。前缀随 i 变胖、后缀随 i 变瘦 ⇒ 可行档位是
+        //    一段**连续区间**，一路扫过去记住"最后一个后缀也装得下的档"就是它的最优端。
+        let n = union.len();
+        // 两半的条数都必须 < order：那是"以后还分裂得掉"的前提，不只是经典 B+ 树规矩
+        // （`write_node` 只看字节，条数超了之后任何一次插入都分裂不开 ⇒ 必然超载写页）。
+        let k_from = 1usize.max(n.saturating_sub(self.order - 1));
+        let k_to = (self.order - 1).min(n - 1);
+        let (_lo, hi) = match Self::fitting_split(k_from, k_to, cap, &|k| {
+            (left_bytes(k), right_bytes(k))
+        }) {
+            Some(range) => range,
+            None => return PairReorg::Nothing,
         };
-        self.write_node(survivor_id, survivor);
+        // 取**填得最满的那一档**（`hi`），不是中点：中点切法把两片都停在半满，
+        // 页数量永远降不下来（这正是 466 ms 那张单的来源）。把左页压到底，剩下的
+        // 挤成一小片 ⇒ 它下一次就能和**自己的**右兄弟合并成功 ⇒ 释放一页。
+        // 空位不会丢：一路往库尾排，最后合并掉的就是最右那几片。
+        let i = hi;
+        let right_side = union.split_off(i);
+        let sep_key = right_side[0].0.clone();
+        let left_node = BTreeNode::Leaf {
+            entries: union,
+            next_leaf: Some(right_page),
+        };
+        let right_node = BTreeNode::Leaf {
+            entries: right_side,
+            next_leaf: tail,
+        };
+        let children = parent_children;
+        parent_keys[sep_idx] = sep_key;
+        let parent = BTreeNode::Internal {
+            keys: parent_keys,
+            children,
+        };
+        if !Self::node_fits(&left_node)
+            || !Self::node_fits(&right_node)
+            || !Self::node_fits(&parent)
+        {
+            return PairReorg::Nothing;
+        }
+        self.write_node(left_page, &left_node);
+        self.write_node(right_page, &right_node);
         self.write_node(parent_page_id, &parent);
-        self.page_manager.free_page(dead_id);
+        PairReorg::Resplit
     }
 
     /// 内部节点：向兄弟借键（经典旋转）
@@ -673,7 +944,7 @@ impl BPlusTree {
         is_left_sibling: bool,
         parent_page_id: PageId,
         child_idx: usize,
-    ) {
+    )  -> bool {
         let mut node = self.read_node(node_page_id);
         let mut sibling = self.read_node(sibling_page_id);
         let mut parent = self.read_node(parent_page_id);
@@ -715,108 +986,147 @@ impl BPlusTree {
                     node_children.push(borrowed_child);
                 }
             }
-            _ => return,
+            _ => return false,
         }
 
-        // 借完之后三个节点都必须还装得下一页，否则**整个重组作废**（locals 丢弃、盘不动）。
-        // 下溢本身不是错误，只是填充率低一点；写失败的静默丢页才是。
+        // 借完之后三个节点都必须还装得下一页，否则**这一步作废**（locals 丢弃、盘不动），
+        // 由调用方退到整对重排。下溢本身不是错误，只是填充率低一点；写失败的静默丢页才是。
         if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
-            return;
+            return false;
         }
         self.write_node(node_page_id, &node);
         self.write_node(sibling_page_id, &sibling);
         self.write_node(parent_page_id, &parent);
+        true
     }
 
-    /// 内部节点合并
-    /// - 左兄弟：并入左兄弟，删 children[child_idx]（当前节点）
-    /// - 右兄弟：右兄弟并入当前，删 children[child_idx+1]
-    fn internal_merge(
+    /// 相邻两个内部节点重排：union 装得下一页就合并，装不下就按字节重切成两页。
+    ///
+    /// 与叶子的区别只在"分隔键是搬下来的、不是复制的"：内部节点的分隔键住在节点里，所以
+    /// union 要把父那把键**拉下来**一起排，重切时再把新边界那把键**提回**父 —— 全程系统的
+    /// 键数与子节点数都守恒（`k + 1 + m` 把键变 `i + 1 + (k+m-i)` 把）。
+    /// 两侧都要求**至少一把键**（`i ∈ [1, n-2]`）：留一个空键的内部节点会让 `shrink_root_if_needed`
+    /// 和下降逻辑多出没必要的分支。
+    fn rebalance_internal_pair(
         &mut self,
-        node_page_id: PageId,
-        sibling_page_id: PageId,
-        is_left_sibling: bool,
+        left_page: PageId,
+        right_page: PageId,
         parent_page_id: PageId,
-        child_idx: usize,
-    ) {
-        let mut node = self.read_node(node_page_id);
-        let mut sibling = self.read_node(sibling_page_id);
-        let mut parent = self.read_node(parent_page_id);
-
-        let parent_key_idx = if is_left_sibling {
-            child_idx - 1
-        } else {
-            child_idx
+        sep_idx: usize,
+    ) -> PairReorg {
+        let (left_keys, left_children) = match self.read_node(left_page) {
+            BTreeNode::Internal { keys, children } => (keys, children),
+            _ => return PairReorg::Nothing,
         };
-
-        let parent_key = match &mut parent {
-            BTreeNode::Internal { keys, .. } => keys.remove(parent_key_idx),
-            _ => return,
+        let (right_keys, right_children) = match self.read_node(right_page) {
+            BTreeNode::Internal { keys, children } => (keys, children),
+            _ => return PairReorg::Nothing,
         };
-
-        let (survivor_id, dead_id, delete_child_idx) = if is_left_sibling {
-            // 并入左兄弟(sibling)
-            match (&mut sibling, &mut node) {
-                (
-                    BTreeNode::Internal {
-                        keys: left_keys,
-                        children: left_children,
-                    },
-                    BTreeNode::Internal {
-                        keys: right_keys,
-                        children: right_children,
-                    },
-                ) => {
-                    left_keys.push(parent_key);
-                    left_keys.append(right_keys);
-                    left_children.append(right_children);
-                }
-                _ => return,
-            }
-            (sibling_page_id, node_page_id, child_idx)
-        } else {
-            // 右兄弟并入当前(node)
-            match (&mut node, &mut sibling) {
-                (
-                    BTreeNode::Internal {
-                        keys: left_keys,
-                        children: left_children,
-                    },
-                    BTreeNode::Internal {
-                        keys: right_keys,
-                        children: right_children,
-                    },
-                ) => {
-                    left_keys.push(parent_key);
-                    left_keys.append(right_keys);
-                    left_children.append(right_children);
-                }
-                _ => return,
-            }
-            (node_page_id, sibling_page_id, child_idx + 1)
+        let (mut parent_keys, parent_children) = match self.read_node(parent_page_id) {
+            BTreeNode::Internal { keys, children } => (keys, children),
+            _ => return PairReorg::Nothing,
         };
-
-        if let BTreeNode::Internal { children, .. } = &mut parent {
-            children.remove(delete_child_idx);
+        if parent_children.len() != parent_keys.len() + 1
+            || parent_children.get(sep_idx) != Some(&left_page)
+            || parent_children.get(sep_idx + 1) != Some(&right_page)
+        {
+            return PairReorg::Nothing;
         }
 
-        // 合并的结果必须还装得下一页，而且这个判断**必须在 free_page 之前**：
-        // 原先的顺序是"写幸存页（可能失败）→ 删父节点分隔键 → free 死页"，
-        // 一旦幸存页因为超载没写进去，那批行就同时失去了两份副本 = 静默丢数据。
-        if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
-            return;
-        }
-        let survivor = if survivor_id == node_page_id {
-            &node
-        } else {
-            &sibling
+        let sep = parent_keys[sep_idx].clone();
+        let mut union_keys = left_keys;
+        let mut union_children = left_children;
+        // 父那把键大于左半全部、小于右半全部 ⇒ 接在左半末尾，再拼上右半
+        union_keys.push(sep);
+        union_keys.extend(right_keys);
+        union_children.extend(right_children);
+
+        let base = Self::internal_base();
+        let cu = Self::internal_child_unit();
+        let cap = MAX_PAYLOAD as i64;
+        let per: Vec<i64> = union_keys
+            .iter()
+            .map(|k| Self::vec_item_bytes(k) as i64)
+            .collect();
+        let n = union_keys.len();
+        // 左半拿 keys[..i] + children[..i+1]，右半拿 keys[i+1..] + children[i+1..]
+        // （keys[i] 本身提回父当分隔键 ⇒ 不进任何一半）
+        let left_bytes = |i: usize| -> i64 { base + per[..i].iter().sum::<i64>() + (i as i64 + 1) * cu };
+        let right_bytes = |i: usize| -> i64 {
+            base + per[i + 1..].iter().sum::<i64>() + (n as i64 - i as i64) * cu
         };
-        self.write_node(survivor_id, survivor);
+
+        // ① union 整个装得下一页 ⇒ 真合并（父丢一把键与一个子节点，右页释放）
+        //    合并后的节点就是 n 把键 + n+1 个子，正好等于 `left_bytes(n)`
+        if n < self.order && left_bytes(n) <= cap {
+            let merged = BTreeNode::Internal {
+                keys: union_keys,
+                children: union_children,
+            };
+            let mut children = parent_children;
+            parent_keys.remove(sep_idx);
+            children.remove(sep_idx + 1);
+            let parent = BTreeNode::Internal {
+                keys: parent_keys,
+                children,
+            };
+            if !Self::node_fits(&merged) || !Self::node_fits(&parent) {
+                return PairReorg::Nothing;
+            }
+            self.write_node(left_page, &merged);
+            self.write_node(parent_page_id, &parent);
+            self.page_manager.free_page(right_page);
+            return PairReorg::Merged;
+        }
+
+        // ② 装不下 ⇒ 两半都装得下的 i 是一段连续区间（左随 i 变胖、右随 i 变瘦），取中点
+        if n < 3 {
+            // 至少要"左 1 把 + 提回父 1 把 + 右 1 把"才切得开
+            return PairReorg::Nothing;
+        }
+        // 两侧都至少留一把键 ⇒ k ∈ [1, n-2]；条数上限同叶子（分裂后插不进）
+        let k_from = 1usize.max(n.saturating_sub(self.order));
+        let k_to = (self.order - 1).min(n.saturating_sub(2));
+        let (_lo, hi) = match Self::fitting_split(k_from, k_to, cap, &|k| {
+            (left_bytes(k), right_bytes(k))
+        }) {
+            Some(range) => range,
+            None => return PairReorg::Nothing,
+        };
+        // 同叶子：取填得最满的那一档，把剩余挤成一小片好让后续合并成功
+        let i = hi;
+
+        let new_sep = union_keys[i].clone();
+        let right_children = union_children.split_off(i + 1);
+        let left_keys = union_keys[..i].to_vec();
+        let right_keys = union_keys[i + 1..].to_vec();
+        let left_node = BTreeNode::Internal {
+            keys: left_keys,
+            children: union_children,
+        };
+        let right_node = BTreeNode::Internal {
+            keys: right_keys,
+            children: right_children,
+        };
+        let children = parent_children;
+        parent_keys[sep_idx] = new_sep;
+        let parent = BTreeNode::Internal {
+            keys: parent_keys,
+            children,
+        };
+        if !Self::node_fits(&left_node)
+            || !Self::node_fits(&right_node)
+            || !Self::node_fits(&parent)
+        {
+            return PairReorg::Nothing;
+        }
+        self.write_node(left_page, &left_node);
+        self.write_node(right_page, &right_node);
         self.write_node(parent_page_id, &parent);
-        self.page_manager.free_page(dead_id);
+        PairReorg::Resplit
     }
 
-    /// 处理下溢：能借则借，否则合并；合并后递归处理父节点下溢
+    /// 处理下溢：能借则借，否则整对重排（合并或按字节重切）；只有释放了页才递归处理父节点下溢
     fn handle_underflow(&mut self, node_page_id: PageId, parent_page_id: PageId) {
         if node_page_id == self.root {
             return;
@@ -838,59 +1148,54 @@ impl BPlusTree {
         let sibling = self.read_node(sibling_page_id);
         let sibling_has_extra = Self::node_key_count(&sibling) > self.min_entries();
 
-        let merged = if sibling_has_extra {
-            match &node {
-                BTreeNode::Leaf { .. } => {
-                    self.leaf_borrow_key(
-                        node_page_id,
-                        sibling_page_id,
-                        is_left_sibling,
-                        parent_page_id,
-                        child_idx,
-                    );
-                }
-                BTreeNode::Internal { .. } => {
-                    self.internal_borrow_key(
-                        node_page_id,
-                        sibling_page_id,
-                        is_left_sibling,
-                        parent_page_id,
-                        child_idx,
-                    );
-                }
+        // 先试最便宜的一招：只动两页 + 一把分隔键。借不动（兄弟条数不够）或**借完装不下**，
+        // 都退到整对重排 —— 原先借完装不下就整次作废，等于"宁可一直下溢也不重排"。
+        let is_leaf = matches!(&node, BTreeNode::Leaf { .. });
+        if sibling_has_extra {
+            let borrowed = if is_leaf {
+                self.leaf_borrow_key(
+                    node_page_id,
+                    sibling_page_id,
+                    is_left_sibling,
+                    parent_page_id,
+                    child_idx,
+                )
+            } else {
+                self.internal_borrow_key(
+                    node_page_id,
+                    sibling_page_id,
+                    is_left_sibling,
+                    parent_page_id,
+                    child_idx,
+                )
+            };
+            // 借不释放页 ⇒ 父节点的子数不变 ⇒ 不会连锁下溢
+            if borrowed {
+                return;
             }
-            false
+        }
+
+        // 相邻两页按 key 顺序是「左在右之前」，重排只需要这一对页号 + 它们之间那把分隔键
+        let (left_page, right_page, sep_idx) = if is_left_sibling {
+            (sibling_page_id, node_page_id, child_idx - 1)
         } else {
-            match &node {
-                BTreeNode::Leaf { .. } => {
-                    self.leaf_merge(
-                        node_page_id,
-                        sibling_page_id,
-                        is_left_sibling,
-                        parent_page_id,
-                        child_idx,
-                    );
-                }
-                BTreeNode::Internal { .. } => {
-                    self.internal_merge(
-                        node_page_id,
-                        sibling_page_id,
-                        is_left_sibling,
-                        parent_page_id,
-                        child_idx,
-                    );
-                }
-            }
-            true
+            (node_page_id, sibling_page_id, child_idx)
+        };
+        let reorg = if is_leaf {
+            self.rebalance_leaf_pair(left_page, right_page, parent_page_id, sep_idx)
+        } else {
+            self.rebalance_internal_pair(left_page, right_page, parent_page_id, sep_idx)
         };
 
-        // 合并后父节点可能下溢：用 DFS 找祖父，正确向上传播
-        if merged && parent_page_id != self.root {
-            if let Some(grandparent) = self.find_parent_of(parent_page_id) {
-                self.handle_underflow(parent_page_id, grandparent);
+        // 只有真的**释放了一页**，父节点才可能因此下溢：用 DFS 找祖父，正确向上传播
+        if reorg == PairReorg::Merged {
+            if parent_page_id != self.root {
+                if let Some(grandparent) = self.find_parent_of(parent_page_id) {
+                    self.handle_underflow(parent_page_id, grandparent);
+                }
+            } else {
+                self.shrink_root_if_needed();
             }
-        } else if merged && parent_page_id == self.root {
-            self.shrink_root_if_needed();
         }
     }
 
@@ -1255,6 +1560,39 @@ impl<'a> Iterator for BPlusTreeIterator<'a> {
     }
 }
 
+/// 测试专用：叶子层形状画像。**重组有没有真的把空位收掉，只能按页数得出来** ——
+/// 行数在任何一种结局下都不变，所以"没丢数据"那类断言对这件事完全不敏感。
+#[cfg(test)]
+impl BPlusTree {
+    /// `(叶子片数, 行数, 单片最少条数, 单片最多条数)`；沿 `next_leaf` 走到底
+    pub(crate) fn leaf_profile(&mut self) -> (usize, usize, usize, usize) {
+        let mut cur = self.root;
+        let (mut leaves, mut rows, mut min, mut max) = (0usize, 0usize, usize::MAX, 0usize);
+        loop {
+            let next = match self.read_node(cur) {
+                BTreeNode::Internal { children, .. } => {
+                    cur = *children.first().expect("内部节点没有子节点");
+                    continue;
+                }
+                BTreeNode::Leaf {
+                    entries, next_leaf, ..
+                } => {
+                    leaves += 1;
+                    rows += entries.len();
+                    min = min.min(entries.len());
+                    max = max.max(entries.len());
+                    next_leaf
+                }
+            };
+            match next {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        (leaves, rows, if min == usize::MAX { 0 } else { min }, max)
+    }
+}
+
 // 为BTreeNode添加as_ref方法（方便获取叶子节点的next_leaf）
 impl AsRef<BTreeNode> for BTreeNode {
     fn as_ref(&self) -> &Self {
@@ -1411,6 +1749,153 @@ mod tests {
             tree.iter().count(),
             alive,
             "叶子链表的行数必须等于存活键数（链表指向已释放页会在这里露出来）"
+        );
+    }
+
+    /// 一条**比整页还大**的行：分裂切不出"两半都装得下"的分界 ⇒ 必须**一字不写并报告失败**，
+    /// 已有的行一条不少。老写法是"按条数对半切、两半都硬写"，写不进的那一半只留下一行日志，
+    /// 于是它变成**没人引用的页** = 静默丢数据（和 M11f 那个洞同一个形状，只是在插入这一侧）。
+    #[test]
+    fn test_oversized_row_is_refused_not_dropped_silently() {
+        const N: usize = 300;
+        fn k(i: usize) -> Key {
+            format!("k{i:06}").into_bytes()
+        }
+        let mut tree = BPlusTree::new(64, 512);
+        for i in 0..N {
+            assert!(tree.insert(k(i), RowId(Some(vec![b'v'; 60]))), "第 {i} 行没进去");
+        }
+        let before = tree.iter().count();
+        let drops_before = split_drops();
+        // 谓词与分裂必须用同一套字节账：否则上层按 `row_fits` 放行、树却按另一套判据拒收
+        assert!(
+            !tree.row_fits(&k(N), &Some(vec![b'H'; 8 * 1024])),
+            "8 KB 的行必须被 `row_fits` 判成装不下"
+        );
+        assert!(tree.row_fits(&k(N), &Some(vec![b'v'; 60])), "正常行不能被误判");
+
+        // 8 KB 比一页载荷(4080 B)还大 ⇒ 无论怎么切都有一侧装不下
+        assert!(
+            !tree.insert(k(N), RowId(Some(vec![b'H'; 8 * 1024]))),
+            "装不下的行必须报告失败，不能回一句「成功」"
+        );
+        assert_eq!(
+            split_drops() - drops_before,
+            1,
+            "要走的是「一行都没写」那条路，而不是别的失败"
+        );
+        assert_eq!(tree.iter().count(), before, "拒绝一行不许牵连已有的行");
+        for i in 0..before {
+            assert!(tree.get(k(i)).is_some(), "第 {i} 行在读的时候不见了");
+        }
+        assert_eq!(
+            crate::bplus_tree::page::oversized_writes(),
+            0,
+            "连一次超载写都不该尝试：分裂前就要量得出两半"
+        );
+    }
+
+    /// 重切的**分界**由字节公式选出，所以公式必须与真实序列化逐档相等。
+    ///
+    /// 为什么单开一条：公式偏了，落盘前的 `node_fits` 只会让它退回
+    /// "什么都不动" ⇒ 数据一条不丢、测试全绿，但优化**静默地没发生**。这种失败只有对拍抓得到。
+    #[test]
+    fn test_reorg_size_formula_matches_bincode() {
+        fn item(i: usize, pad: usize) -> (Key, RowId) {
+            (
+                format!("k{i:06}{}", "#".repeat(pad)).into_bytes(),
+                RowId(Some(vec![b'v'; 12 + pad])),
+            )
+        }
+        for pad in [0usize, 7, 40, 120, 300] {
+            let items: Vec<(Key, RowId)> = (0..50).map(|i| item(i, pad)).collect();
+            for next_leaf in [None, Some(PageId(7))] {
+                let node = BTreeNode::Leaf {
+                    entries: items.clone(),
+                    next_leaf,
+                };
+                let real = bincode::serialize(&node).unwrap().len() as i64;
+                let formula = BPlusTree::leaf_base(next_leaf)
+                    + items
+                        .iter()
+                        .map(|e| BPlusTree::vec_item_bytes(e) as i64)
+                        .sum::<i64>();
+                assert_eq!(formula, real, "叶子字节公式不等于真实序列化（pad={pad}）");
+            }
+
+            let keys: Vec<Key> = (0..40).map(|i| item(i, pad).0).collect();
+            let children: Vec<PageId> = (0..keys.len() + 1).map(|c| PageId(c as u64)).collect();
+            let node = BTreeNode::Internal {
+                keys: keys.clone(),
+                children,
+            };
+            let real = bincode::serialize(&node).unwrap().len() as i64;
+            let formula = BPlusTree::internal_base()
+                + keys.iter().map(|k| BPlusTree::vec_item_bytes(k) as i64).sum::<i64>()
+                + (keys.len() as i64 + 1) * BPlusTree::internal_child_unit();
+            assert_eq!(formula, real, "内部节点字节公式不等于真实序列化（pad={pad}）");
+        }
+    }
+
+    /// delete 密集之后**页数必须收回来到 rows/每页容量** —— 这条才是"合并后再分裂"的验收。
+    ///
+    /// 旧结局是"union 装不下 ⇒ 整次作废"：行数一条不少、一条测试都不红，但按页走的调用
+    /// 一直是双倍代价（实测 `vacuum()` 206 → 466 ms）。把重切那一支临时改成"什么都不动"，
+    /// 这条会红（页数停在删之前的量级）。
+    #[test]
+    fn test_reorg_packs_leaves_instead_of_leaving_them_half_empty() {
+        const N: usize = 4000;
+        fn big_key(i: usize) -> Key {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn big_rid() -> RowId {
+            RowId(Some(vec![b'x'; 60]))
+        }
+
+        let mut tree = BPlusTree::new(64, 4096);
+        for i in 0..N {
+            assert!(tree.insert(big_key(i), big_rid()), "插入第 {i} 个键失败");
+        }
+        let (leaves_full, rows_full, ..) = tree.leaf_profile();
+        assert_eq!(rows_full, N);
+
+        for i in (0..N).step_by(2) {
+            assert!(tree.delete(big_key(i)), "删除第 {i} 个键失败");
+        }
+        let (leaves, rows, min, max) = tree.leaf_profile();
+        let alive = (N + 1) / 2;
+        let item = |i: usize| (big_key(i), big_rid());
+        assert_eq!(rows, alive, "行数一条不许少");
+        // 删一半之后仍然可达 + 叶子链没断
+        for i in (1..N).step_by(2) {
+            assert!(tree.get(big_key(i)).is_some(), "第 {i} 个键在重组后读不回来了");
+        }
+        assert_eq!(
+            crate::bplus_tree::page::oversized_writes(),
+            0,
+            "重组前必须先量字节"
+        );
+
+        // 尺子必须问"一页**装得下**几条"，不能问插入时的观察值：插入路径按条数分裂，
+        // 每页只填到 ~22 条（`maxf`），而这批键的真实字节容量是 ~35 条 —— 拿 22 当上界
+        // 会把"重组其实更满"误判成异常。这里逐条加到装不下为止，直接量出容量。
+        let cap = (1usize..)
+            .take_while(|&k| {
+                let probe = BTreeNode::Leaf {
+                    entries: (0..k).map(item).collect(),
+                    next_leaf: Some(PageId(999)),
+                };
+                BPlusTree::node_fits(&probe)
+            })
+            .last()
+            .unwrap_or(1);
+        let ideal = alive.div_ceil(cap);
+        eprintln!(
+            "[reorg] 每页字节容量 {cap} 条；满树 {leaves_full} 叶 / {rows_full} 行 ⇒ 删一半              {leaves} 叶 / {rows} 行（单页 {min}~{max} 条），理想页数 {ideal}（= rows/{cap}）"
+        );
+        assert!(
+            leaves <= ideal + ideal / 2,
+            "页数 {leaves} 超出理想 {ideal} 的 1.5× ⇒ 空位没被收掉，按页走的调用              （health / vacuum / 全量 scan）一直在双倍代价（单页 {min}~{max} 条）"
         );
     }
 

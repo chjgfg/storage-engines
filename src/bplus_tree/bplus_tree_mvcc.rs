@@ -78,6 +78,18 @@ pub struct BulkLoader {
 /// `crate::bplus_tree::encode_key` 这个既有路径不中断。
 pub use crate::common::{decode_key, encode_key, VersionedKey};
 
+/// 落树但**不静默**：树对"单行比一页还大"这一条只能返回 false，而 bulk 的 `put` 与 WAL 重放
+/// 都没有返回值通道（`KvBulk::put` 是 `()`），所以这里把事实喊出来。
+/// 两种情况都不会写坏已有数据：树那边是**一字未写**。
+fn insert_or_shout(kv: &mut BPlusTree, enc: Vec<u8>, row: RowId, site: &str) {
+    if !kv.insert(enc.clone(), row) {
+        log::error!(
+            "{site}: 这一行装不进任何一页（编码后键 {} 字节），已拒收；数据未受影响",
+            enc.len()
+        );
+    }
+}
+
 /// 把 WAL 收口成「只剩一条 Checkpoint」。
 ///
 /// 顺序反直觉但必须这样：原先是 `append(Checkpoint) → sync → truncate()`，而 `truncate()`
@@ -142,7 +154,7 @@ impl MVCC {
 
         // REDO 已提交 / UNDO 未提交（仅当 WAL 非空有内容时）
         for (_xid, key, value) in &plan.committed_writes {
-            tree.insert(key.clone(), RowId(value.clone()));
+            insert_or_shout(&mut tree, key.clone(), RowId(value.clone()), "WAL REDO");
         }
         for (_xid, key) in &plan.uncommitted_writes {
             let _ = tree.delete(key.clone());
@@ -575,7 +587,7 @@ impl BulkLoader {
             encode_stored_value(&mut blob, value, false).expect("blob encode")
         };
         let mut kv = self.kv.lock().unwrap();
-        kv.insert(enc, RowId(Some(stored)));
+        insert_or_shout(&mut kv, enc, RowId(Some(stored)), "bulk put");
     }
 
     /// 批量 put：一次加锁插入多条，显著降低锁/调度开销
@@ -585,7 +597,7 @@ impl BulkLoader {
         for (key, value) in items {
             let enc = encode_key(key, self.version);
             let stored = encode_stored_value(&mut blob, value.clone(), false).expect("blob");
-            kv.insert(enc, RowId(Some(stored)));
+            insert_or_shout(&mut kv, enc, RowId(Some(stored)), "bulk put_batch");
         }
     }
 
@@ -596,14 +608,14 @@ impl BulkLoader {
         for (key, value) in items {
             let enc = encode_key(&key, self.version);
             let stored = encode_stored_value(&mut blob, value, false).expect("blob");
-            kv.insert(enc, RowId(Some(stored)));
+            insert_or_shout(&mut kv, enc, RowId(Some(stored)), "bulk put_batch_owned");
         }
     }
 
     pub fn delete(&mut self, key: &[u8]) {
         let enc = encode_key(key, self.version);
         let mut kv = self.kv.lock().unwrap();
-        kv.insert(enc, RowId(None));
+        insert_or_shout(&mut kv, enc, RowId(None), "bulk delete");
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -761,6 +773,18 @@ impl Transaction {
         if self.wal_policy.open_on_first_write() {
             let _ = wal.append(WalRecord::Begin { xid: self.version });
         }
+        // 先问树装不装得下，再动 WAL。树的"这一行比一页还大"必须在这里就变成 `false`：
+        // 否则 WAL 里会留下一条"提交了但树里没有"的记录，恢复时只会再拒一次。
+        if !kvengine.row_fits(&enc_key, &stored_opt) {
+            log::error!(
+                "bplus_tree 拒收一行：键 {} 字节 + 值 {} 字节，单行已超过一页载荷 {} 字节 ⇒ 键必须短于一页",
+                enc_key.len(),
+                stored_opt.as_ref().map_or(0, |v| v.len()),
+                crate::bplus_tree::page::MAX_PAYLOAD
+            );
+            return false;
+        }
+
         if let Err(e) = wal.append(WalRecord::Write {
             xid: self.version,
             key: enc_key.clone(),
@@ -1969,6 +1993,56 @@ mod tests {
     /// 这是那条两段式的账：B+ 树把 value 存在叶子条目里，折叠遍历时已经在手上；
     /// 旧实现却照抄 bitcask 的第二段「按胜出行再降一次树取值」，于是每个 key 多付
     /// 3~4 次页访问 —— 实测一次全量 scan **3.06 页/行**、36.2 µs/行；改成一趟之后是
+    /// 单行装不进一页时，事务层必须**在写 WAL 之前**就拒掉：`set` 返回 `false`、WAL 里
+    /// 不许留下这条 Write、重开之后也不许出现"WAL 说有、树里查无此键"。
+    ///
+    /// 为什么单独盯 WAL 这一半：`insert` 拒收只解决"别写坏已有数据"，而事务层是
+    /// 先 append WAL 再写树 —— 顺序错了就会留下一条永久无法重放的提交记录。
+    #[test]
+    fn test_oversized_row_is_refused_before_the_wal() {
+        let path = tmp_db("oversize");
+        let big_key = vec![b'K'; 5000]; // 5 KB 键 + 8 字节版本后缀 > 一页载荷 4080 B
+        {
+            let mvcc = MVCC::open(&path, 64, 512);
+            let tx = mvcc.begin_transaction();
+            assert!(tx.set(b"small", vec![b'v'; 60]), "正常行要写得进去");
+            tx.commit();
+
+            let tx = mvcc.begin_transaction();
+            assert!(
+                !tx.set(&big_key, vec![b'v'; 8]),
+                "装不下的行必须报 false（这里不是写冲突，是引擎拒收）"
+            );
+            assert!(tx.get(&big_key).is_none());
+            tx.commit();
+
+            // 判据要精确到**记录类型**：被拒的那行不许留下 `Write`。
+            // （`Begin` 会长出来：M8 之后第一次 `write()` 才补 Begin，这条副产品没有持久化含义，
+            //  拿 WAL 字节数当尺子会把它也算成罪状。）
+            let mut wal = Wal::open(wal_path(&path)).expect("打开 WAL 读记录");
+            let records = wal.read_all().expect("读 WAL");
+            let writes_for = |prefix: &[u8]| {
+                records
+                    .iter()
+                    .filter(|e| matches!(&e.record, WalRecord::Write { key, .. }
+                        if key.starts_with(prefix)))
+                    .count()
+            };
+            assert_eq!(writes_for(&big_key), 0, "拒收的一行不许在 WAL 里留下 Write 记录");
+            // 对照：同一把尺子量得到"真写进去的那行"，否则上面那条断言是空转
+            assert_eq!(writes_for(b"small"), 1, "探针必须能数到一条真实写入");
+            drop(mvcc);
+        }
+        // 重开：小行还在，大行不在，恢复流程也没被那条不存在的记录卡住
+        let mvcc = MVCC::open(&path, 64, 512);
+        let tx = mvcc.begin_transaction();
+        assert!(tx.get(b"small").is_some(), "拒收一行不许牵连已有的行");
+        assert!(tx.get(&big_key).is_none());
+        tx.commit();
+        drop(mvcc);
+        let _ = std::fs::remove_dir_all(&std::path::PathBuf::from(&path).parent().unwrap());
+    }
+
     /// 0.057 页/行、1.7 µs/行（同一份 20000 行的库）。
     /// 断言留了大余量（每 10 行不许超过 1 次页访问）：旧实现会红 30 倍以上。
     #[test]
