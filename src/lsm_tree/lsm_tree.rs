@@ -111,6 +111,11 @@ impl LSMTreeOptions {
             level_base_bytes: 16 * 1024 * 1024,
             max_compactions_per_flush: 4,
             blob_threshold: 4 * 1024,
+            // 块缓存从 64 提到 256：实测 5002 键 / 10005 行的小库就有 ~157 个块，64 槽装不下
+            // 工作集 ⇒ 乱序点读每次 1.61 个未命中（一次未命中实测 ≈ 40µs）。256 槽按块容量
+            // 64 条 × ~100B 估 ≈ 2MB 上限，对单核小机器是可控的；再大的库靠它也不可能全装下，
+            // 那时决定代价的是"同一把键散在几个 SST"（见 lsm_tree_mvcc 的基线用例）。
+            block_cache_blocks: 256,
             ..Self::default()
         }
     }

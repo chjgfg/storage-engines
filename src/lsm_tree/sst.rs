@@ -123,6 +123,22 @@ pub(crate) fn block_misses() -> u64 {
     BLOCK_MISSES.with(|c| c.get())
 }
 
+// 测试专用：本线程在稀疏索引上比了几次（= `find_block` 的循环次数）。
+//
+// 这是"点查随库总量变贵"的另一条通道：块访问数看不出一个块内部干了什么，而索引若是线性扫，
+// 每探一个块就要走上 ~块数 次比较 ⇒ O(行数/64)。二分成对数之后这个计数应当只跟 log2(块数)
+// 同阶，守卫就按这个断言，不看墙钟。
+#[cfg(test)]
+thread_local! {
+    static INDEX_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程在 SST 稀疏索引上做过的比较次数（测试探针用）
+#[cfg(test)]
+pub(crate) fn index_probes() -> u64 {
+    INDEX_PROBES.with(|c| c.get())
+}
+
 // 测试专用：本线程「把带 value 的条目整个物化出来」的次数。
 //
 // 这是全库折叠那条通道真正的代价单位：重量路径（`iter_all` / `mem_view_at`）每行都要
@@ -618,15 +634,25 @@ impl SstFile {
         if self.index.is_empty() {
             return None;
         }
-        let mut best = None;
-        for (i, ie) in self.index.iter().enumerate() {
-            if ie.first_key.as_slice() <= key {
-                best = Some(i);
+        // 索引按 `first_key` 升序 ⇒ 要找的是「最后一个 first_key <= key」。
+        // 手写二分而不是 `binary_search_by`：守卫要的是**比了几次索引**这个计数，闭包里数不干净。
+        // 原先这里是线性扫（`for (i, ie) in index.enumerate()` + 遇大于 key 才 break），
+        // 代价 O(块数) = O(库内行数 / 64) —— 点查路径上唯一一处随库总量变贵的纯 CPU。
+        let mut lo = 0usize;
+        let mut hi = self.index.len();
+        let mut found: Option<usize> = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            #[cfg(test)]
+            INDEX_PROBES.with(|c| c.set(c.get() + 1));
+            if self.index[mid].first_key.as_slice() <= key {
+                found = Some(mid);
+                lo = mid + 1;
             } else {
-                break;
+                hi = mid;
             }
         }
-        best
+        found
     }
 
     fn load_block(&self, index_i: usize) -> std::io::Result<Arc<DataBlock>> {
@@ -1676,6 +1702,71 @@ mod tests {
         }
         let sst = b.finish().unwrap();
         assert_eq!(sst.iter_all().count(), 20);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `find_block` 改成二分之后必须同时满足两件事：
+    /// ① 与线性扫**逐 key 给出同一个块**（块内/块边界/两块之间/文件内外都算）；
+    /// ② 定位代价只能是 log 阶 —— 原先线性扫平均要走 ~块数/2 次比较，那就是点查路径上
+    ///    唯一一处随**库内行数**变贵的纯 CPU（行数 20 万 ⇒ 每探一个块白走 ~1500 次）。
+    #[test]
+    fn test_find_block_is_binary_and_agrees_with_linear() {
+        let path = tmp("find_block");
+        let mut b = SstBuilder::with_options(1, &path, 8, true);
+        for i in 0..2000u32 {
+            b.add(
+                format!("k{i:05}").into_bytes(),
+                StoredEntry::put(i as u64, Some(b"v".to_vec())),
+            );
+        }
+        let sst = b.finish().unwrap();
+        let blocks = sst.index.len();
+        assert!(
+            blocks >= 200,
+            "样本要有足够多的块才分得出线性与二分（实际 {blocks}）"
+        );
+
+        let linear = |key: &[u8]| -> Option<usize> {
+            let mut best = None;
+            for (i, ie) in sst.index.iter().enumerate() {
+                if ie.first_key.as_slice() <= key {
+                    best = Some(i);
+                } else {
+                    break;
+                }
+            }
+            best
+        };
+
+        let mut probes: Vec<Vec<u8>> =
+            (0..2000u32).step_by(37).map(|i| format!("k{i:05}").into_bytes()).collect();
+        // 每个块的下界本身、以及块与块之间、文件外两侧
+        for i in (0..blocks).step_by(11) {
+            probes.push(sst.index[i].first_key.clone());
+        }
+        probes.push(b"k00000".to_vec());
+        probes.push(b"k01999".to_vec());
+        probes.push(b"aaa".to_vec());
+        probes.push(vec![0xffu8; 4]);
+        for k in &probes {
+            assert_eq!(sst.find_block(k), linear(k), "find_block 与线性扫不一致: {k:?}");
+        }
+
+        let log2 = usize::BITS - blocks.leading_zeros();
+        let before = index_probes();
+        const N: u64 = 200;
+        for _ in 0..N {
+            assert!(sst.find_block(b"k01999").is_some());
+        }
+        let per = (index_probes() - before) / N;
+        eprintln!(
+            "二分后每次定位比较 {per} 次（块数 {blocks}，线性参照 ≈ {} 次）",
+            blocks / 2
+        );
+        assert!(
+            per as u32 <= 2 + log2,
+            "定位代价应当只与 log2(块数) 同阶（块数 {blocks}，实测 {per} 次）"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

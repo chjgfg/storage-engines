@@ -2126,5 +2126,52 @@ mod tests {
         drop(tx);
         drop(mvcc);
         cleanup(&path);
+
+        // (f) 单次点查的代价 = **两趟**（定位 + 定论）× **含这个键的 SST 数** × 未命中。
+        //     所以真正该盯的量是"同一把键的版本散在几个文件里"：库里每多一层/每多一个覆盖
+        //     该键的 SST，点查就多探一次块。compact 的意义就是把这件事压回层数。
+        //     造法：每轮全量写一遍再 flush ⇒ 每个键在每个文件里都有一份。
+        eprintln!("--- 覆盖同一把键的 SST 数 → 单次点查代价 ---");
+        for files in [1usize, 2, 4, 7] {
+            let p2 = tmp_db(&format!("point_spread_{files}"));
+            {
+                let mv = MVCC::open(&p2);
+                // 关掉自动回收：7 轮全量写会把 pending 推过切片宽度，实验形状会被库自己改掉
+                mv.set_vacuum_auto_slice(0);
+                for _round in 0..files {
+                    for base in (0..N).step_by(2000) {
+                        let end = (base + 2000).min(N);
+                        let items: Vec<(Vec<u8>, Vec<u8>)> =
+                            (base..end).map(|i| (keys[i].clone(), vals[i].clone())).collect();
+                        let tx = mv.begin_transaction();
+                        if let Err(bad) = tx.batch_set(&items) {
+                            panic!("batch_set 冲突: {}", String::from_utf8_lossy(&bad));
+                        }
+                        tx.commit();
+                    }
+                    mv.flush();
+                }
+                let st = mv.kv.lock().unwrap().stats();
+                let h = mv.health();
+                let tx = mv.begin_transaction();
+                let b0 = crate::lsm_tree::sst::block_reads();
+                let m0 = crate::lsm_tree::sst::block_misses();
+                let t = Instant::now();
+                for &i in &shuffled {
+                    assert!(tx.get(&keys[i]).is_some());
+                }
+                let (d, db, dm) = (
+                    t.elapsed(),
+                    crate::lsm_tree::sst::block_reads() - b0,
+                    crate::lsm_tree::sst::block_misses() - m0,
+                );
+                report(&format!("乱序点读 (每键 {files} 份)"), d, N, db, dm);
+                eprintln!(
+                    "    ↳ total_sst={} levels={:?} rows={} max_chain={}",
+                    st.total_sst, st.level_files, h.total_rows, h.max_chain
+                );
+            }
+            cleanup(&p2);
+        }
     }
 }
