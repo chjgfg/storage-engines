@@ -7,35 +7,35 @@
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 250 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ 这个版本号只在本仓库,**crates.io 上最新仍是 0.3.0(出事故那版)**,要引修复版得走 path/git 依赖 —— 见[引入方式](#引入方式)
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
 
 ## 引入方式
 
-⚠️ **先看这条**:crates.io 上目前最新只到 **0.3.0**,而 0.3.0 正是"版本链随 uptime 爬升"那次事故
-所在的版本 —— 点读仍沿版本链全扫(O(链长))、没有自动回收、没有有界 vacuum、`KvEngine` 不是
-`Send + Sync`、WAL 不会自己收口、LSM 的大 value 读回裸指针、bitcask merge 崩了认不回残骸。
-所以**要拿修复版,现在只能用 path / git 依赖**,`"0.3"` 拿到的是旧行为。
-0.4.0 发布之后本段会改写(发布到 crates.io 不可逆,只能 yank ⇒ 由作者手动执行)。
+⚠️ **先看这条(2026-10-17 用 crates.io API 实测,不是凭印象)**:架上最新是 **0.4.0**
+(发布于 2026-10-15,未 yank)。**这一版已经包含**七条"随 uptime 恶化"通道的修复与 M9 的门面
+改造(`KvEngine: Send + Sync`、类型化选型、`EngineName`)⇒ 版本号依赖就能拿到。
+
+但 0.4.0 那个发布件**不含 10-16 之后的 M10–M13**:LSM 点查的常驻文件句柄与稀疏索引二分
+(下游实测单次点查 0.86 ms 那条就是它)、四引擎窗口/前缀 scan 的界下推、bitcask 懒分配写缓冲、
+B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`。
+磁盘格式这五批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 0.4.0 的全部修复
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M13
 storage-engines = { path = "../storage-engines" }
 
 # (b) 走远端:git 依赖(gitee 与 github 内容一致)
 storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branch = "master" }
 
-# (c) crates.io —— 只有 0.3.0,缺以上修复
-storage-engines = "0.3"
+# (c) crates.io —— 0.4.0:事故修复齐全,但没有 10-16 之后的读路径/配置改动
+storage-engines = "0.4"
 ```
 
-命令行工具也可以单独装(注意装到的仍是已发布的版本):
-
-```bash
-cargo install storage-engines
-```
+`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M13 又想要版本号依赖,
+只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
 MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
 
