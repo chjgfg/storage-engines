@@ -121,7 +121,8 @@
   为什么这算缺陷而不是风格：下游那台机器是单核 6 GB、RSS 预算按几十 MB 计，
   而且一个进程可能同时开好几个库 —— 固定 8 MiB/库 是白给的。
 
-- **窗口 scan / 前缀 scan 的代价开始随窗口宽度缩（bitcask + memory 先行，另两家在下一里程碑）**。
+- **窗口 scan / 前缀 scan 的代价开始随窗口宽度缩（bitcask + memory + bplus_tree 已接，
+  lsm_tree 在下一里程碑 —— 它的归并原语还缺一个终点界）**。
   根因不在遍历原语，在 MVCC 层的**用法**：`scan_foreach` 调的是 `collect_latest_raw()` ——
   折完**全库**每个 key 的胜出行，再由调用方逐条筛 `start/end`。于是 200 行的窗口和 20000 行的
   全量一样贵（大库基线实测：窗口 scan bitcask **376.6 µs/行**、memory **106.3 µs/行**，

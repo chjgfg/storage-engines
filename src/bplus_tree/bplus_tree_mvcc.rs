@@ -27,6 +27,7 @@ use crate::bplus_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats};
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
+use crate::common::version_key_upper_bound;
 
 /// MVCC 存储引擎
 pub struct MVCC {
@@ -778,28 +779,53 @@ impl Transaction {
         Some((version, logical))
     }
 
-    /// 全部最新可见逻辑行（key 有序）：(key, version, raw_logical_or_tombstone)
+    /// 全部最新可见逻辑行（key 有序）= 无界版的 [`Self::collect_latest_raw_in`]。
     pub(crate) fn collect_latest_raw(
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
+        self.collect_latest_raw_in(include_deleted, None, None)
+    }
+
+    /// `[start, end)` 内每个逻辑 key 的最新可见版本 —— 界**下推到树的下降与叶子链表**上。
+    ///
+    /// 旧形状是折完全库再由调用方逐条筛界 ⇒ 10 行的窗口也要从最左叶子走到最右叶子。
+    /// 现在起点直接下降到 containing 叶子（前面的叶子一篇都不读），终点靠回调喊停
+    /// （有序 ⇒ 越过上界就是尾巴）。
+    ///
+    /// B+ 树的 value 就住在叶子条目里，没有 Bitcask KeyDir 那样的独立键索引，所以
+    /// 「把窗口覆盖的那些页反序列化出来」这一步省不掉 —— 省掉的是**页数**，不是每页的解析。
+    pub(crate) fn collect_latest_raw_in(
+        &self,
+        include_deleted: bool,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
         // ① 第一遍只折「键 + 版本号」。
-        //    B+ 树的 value 就住在叶子条目里，没有 Bitcask KeyDir 那样的独立键索引，
-        //    所以整表走一遍、把每页反序列化出来这件事省不掉（这点别 self-contradict 成
-        //    「降到 O(live keys)」）。真正省掉的是原先对**每一行**都做一次 value 解码：
-        //    内联值 = 一次 Vec 分配，大 value = 一次 blob 读盘。
+        let hi_enc = end.map(version_key_upper_bound);
         let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
         {
             let mut kvengine = self.kv.lock().unwrap();
-            kvengine.scan_keys_with(|enc| {
+            kvengine.scan_entries_break_from(start, |enc, _row| {
+                if hi_enc.as_deref().is_some_and(|h| enc >= h) {
+                    return true; // 按 enc 定界 ⇒ 有序迭代后面只会更大，可以真停
+                }
                 let Some(vk) = decode_key(enc) else {
-                    return;
+                    return false;
                 };
+                // 前缀交错的边角：界判在原始 key 上，逐条兜
+                if start.is_some_and(|s| vk.raw_key.as_slice() < s) {
+                    return false;
+                }
+                if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
+                    return false;
+                }
                 if !self.is_visible(vk.version) {
-                    return;
+                    return false;
                 }
                 // 全表按 enc 升序 ⇒ 同一 raw_key 的版本块连续，最后一次覆盖即最大可见版本
                 winners.insert(vk.raw_key.clone(), (vk.version, enc.to_vec()));
+                false
             });
         }
 
@@ -1839,6 +1865,71 @@ mod tests {
             assert_eq!(after.total_rows, 4, "vacuum 后应只剩每 key 一行");
             assert_eq!(after.live_keys, 4);
             assert_eq!(after.rows_above_one, 0);
+        }
+        cleanup(&path);
+    }
+
+    /// 窗口 scan 的代价必须随**窗口宽度**缩 —— B+ 树的尺子是「读了多少页」。
+    ///
+    /// 旧形状：`collect_latest_raw()` 从最左叶子一路走完**全表**，调用方再逐条筛界
+    /// ⇒ 10 行的窗口和 3000 行的全量读一样多的页（大库基线实测：窗口 scan 3290 µs/行，
+    /// 而同库一次全量 scan 是 32.9 µs/行）。现在起点下降到 containing 叶子（前面的叶子
+    /// 一篇都不读）、终点靠回调喊停。
+    ///
+    /// B+ 树没有 Bitcask KeyDir 那样的独立键索引，"窗口覆盖到的那几页要反序列化"省不掉 ——
+    /// 这条省的是**页数**，不是每页的解析成本。断言两半：① 窗口结果与"全量之后筛"逐条一致
+    /// （界判得对，不是筛错换来快）；② 页数随窗口缩。
+    #[test]
+    fn test_windowed_scan_cost_scales_with_window_not_library() {
+        const KEYS: u64 = 3000;
+        let path = tmp_db("window_cost");
+        {
+            let mvcc = MVCC::open(&path, 64, 256);
+            for i in 0..KEYS {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+
+            let tx = mvcc.begin_transaction();
+            let before = crate::bplus_tree::page::page_reads();
+            let all = tx.scan(None, None);
+            let full = crate::bplus_tree::page::page_reads() - before;
+
+            let lo = b"k01000".to_vec();
+            let hi = b"k01010".to_vec();
+            let before = crate::bplus_tree::page::page_reads();
+            let win = tx.scan(Some(&lo), Some(&hi));
+            let windowed = crate::bplus_tree::page::page_reads() - before;
+
+            assert_eq!(all.len() as u64, KEYS, "全量应折出 {KEYS} 行");
+            assert_eq!(win.len(), 10, "[k01000, k01010) 应给 10 行");
+            let want: Vec<Vec<u8>> = all
+                .iter()
+                .filter(|r| r.key.as_slice() >= lo.as_slice() && r.key.as_slice() < hi.as_slice())
+                .map(|r| r.key.clone())
+                .collect();
+            let got: Vec<Vec<u8>> = win.iter().map(|r| r.key.clone()).collect();
+            assert_eq!(got, want, "下推界之后窗口结果必须与全量筛一致");
+            assert!(
+                windowed * 10 <= full,
+                "10 行窗口的页数不该是全库量级（{windowed} vs 全量 {full}）"
+            );
+
+            // 上界哨兵的陷阱形状（`seek_prev` 造的界是 `key ‖ 0x00`）：这条在内存引擎先红过
+            assert_eq!(tx.seek_prev(b"k01005").unwrap().key, b"k01005");
+            assert_eq!(tx.seek(b"k01000").unwrap().key, b"k01000");
+
+            // 前缀同理：k001xx ⇒ 100 个键
+            let before = crate::bplus_tree::page::page_reads();
+            let pre = tx.prefix_scan(b"k001");
+            let prefixed = crate::bplus_tree::page::page_reads() - before;
+            assert_eq!(pre.len(), 100, "前缀 k001 应命中 100 行");
+            assert!(
+                prefixed * 4 <= full,
+                "前缀扫的页数不该是全库量级（{prefixed} vs 全量 {full}）"
+            );
+            tx.rollback();
         }
         cleanup(&path);
     }
