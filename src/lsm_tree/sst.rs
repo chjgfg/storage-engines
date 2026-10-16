@@ -507,6 +507,72 @@ impl SstFile {
         out
     }
 
+    /// `[from, to)` 内的轻量视图：**起点靠稀疏索引定位，键一旦越过上界就收手**，
+    /// 后面的块一篇都不读。
+    ///
+    /// 存在的理由和 [`Self::light_view_break_from`] 同源但目的不同：那个按「行数预算」
+    /// 切给有界回收用，这个按**键的区间**切给窗口/前缀查询用。`light_view` 是把整个文件
+    /// 读完再筛，于是 10 行的窗口要付整文件的块读代价（大库基线实测：LSM 窗口 scan
+    /// 405 µs/行 vs 全量 scan 4.0 µs/行）。折叠规则与 `light_view` 完全一致。
+    pub fn light_view_range(
+        &self,
+        from: Option<&[u8]>,
+        to: Option<&[u8]>,
+        snap_seq: u64,
+    ) -> Vec<(Vec<u8>, LightEntry)> {
+        let mut out: Vec<(Vec<u8>, LightEntry)> = Vec::new();
+        let mut feed = |k: &[u8], se: &StoredEntry| {
+            if !se.visible_at(snap_seq) {
+                return;
+            }
+            let le = LightEntry::of(se);
+            match out.last_mut() {
+                Some((pk, p)) if pk.as_slice() == k => {
+                    if le.seq >= p.seq {
+                        *p = le;
+                    }
+                }
+                _ => out.push((k.to_vec(), le)),
+            }
+        };
+
+        if let Some(all) = &self.entries_cache {
+            for (k, se) in all {
+                if to.is_some_and(|t| k.as_slice() >= t) {
+                    break;
+                }
+                if from.is_some_and(|f| k.as_slice() < f) {
+                    continue;
+                }
+                feed(k, se);
+            }
+        } else {
+            // 起点定位到含 `from` 的那个块；前面的块一块不读
+            let start_block = match from {
+                Some(f) => self.find_block(f).unwrap_or(self.index.len()),
+                None => 0,
+            };
+            'blocks: for i in start_block..self.index.len() {
+                match self.load_block(i) {
+                    Ok(b) => {
+                        for (k, se) in &b.entries {
+                            if to.is_some_and(|t| k.as_slice() >= t) {
+                                break 'blocks; // 磁盘顺序即 key 非降序 ⇒ 后面全在界外
+                            }
+                            if from.is_some_and(|f| k.as_slice() < f) {
+                                continue;
+                            }
+                            feed(k, se);
+                        }
+                    }
+                    // 与 iter_all / light_view 一致：坏块即止
+                    Err(_) => break,
+                }
+            }
+        }
+        out
+    }
+
     /// 从 `from`（**含**）起取轻量条目，**够 `max_rows` 行就准备收手，但一定把当前这一组读完
     /// 才停**；返回 `(条目, 是否被截断)`，`truncated = true` 表示本文件在后面还有行。
     ///

@@ -893,6 +893,37 @@ impl LSMTree {
         out
     }
 
+    /// memtable 的 `[from, to)` 轻量视图：界走 BTreeMap 的 `range`，界外的键根本不遍历。
+    fn mem_view_light_range(
+        map: &MemMap,
+        from: Option<&[u8]>,
+        to: Option<&[u8]>,
+        snap_seq: u64,
+    ) -> Vec<(Vec<u8>, LightEntry)> {
+        use std::ops::Bound;
+        let lo = match from {
+            Some(k) => Bound::Included(k),
+            None => Bound::Unbounded,
+        };
+        let hi = match to {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::new();
+        for (k, vers) in map.range::<[u8], _>((lo, hi)) {
+            if let Some((seq, ev)) = vers.iter().rev().find(|(s, _)| **s <= snap_seq) {
+                out.push((
+                    k.clone(),
+                    LightEntry {
+                        seq: *seq,
+                        kind: ev.kind_byte(),
+                    },
+                ));
+            }
+        }
+        out
+    }
+
     /// 全库「每个 enc key 的胜者」的**轻量**视图（跨源取胜规则与 [`Self::iter`] 一致：
     /// 源新→旧优先，同 src 取更大 seq）。
     ///
@@ -922,6 +953,59 @@ impl LSMTree {
         for level in self.levels.iter().skip(1) {
             for sst in level {
                 sources.push(sst.light_view(snap_seq));
+            }
+        }
+        let mut out = Vec::new();
+        merge_streaming(sources, |_, _| true, |k, le| out.push((k, le)));
+        out
+    }
+
+    /// `[from, to)` 的跨源轻量视图。取胜规则与 [`Self::scan_latest_light`] 一字不差，
+    /// 区别只有一个：**界下推到每一个源**。
+    ///
+    /// 为什么必须有它：`scan_latest_light` 把每个 memtable 整表遍历、每个 SST 整篇块读完
+    /// 再交给归并，于是"10 行的窗口"付的是"全库"的块读代价（大库基线实测：LSM 窗口 scan
+    /// 405 µs/行 vs 一次全量 scan 4.0 µs/行）。memtable 走 `range`，SST 从 `from` 所在块
+    /// 起读、键越过 `to` 立即收手，先用 min/max 挡掉整篇不相干的文件。
+    pub fn scan_latest_light_range(
+        &self,
+        from: Option<&[u8]>,
+        to: Option<&[u8]>,
+        snap_seq: u64,
+    ) -> Vec<(Vec<u8>, LightEntry)> {
+        let probe_low = from.unwrap_or(&[]);
+        let probe_high = to.unwrap_or(&[0xffu8; 8]);
+        let mut sources: Vec<Vec<(Vec<u8>, LightEntry)>> = Vec::new();
+        if !self.mem.is_empty() {
+            let part = Self::mem_view_light_range(&self.mem, from, to, snap_seq);
+            if !part.is_empty() {
+                sources.push(part);
+            }
+        }
+        for imm in &self.immutables {
+            let part = Self::mem_view_light_range(imm, from, to, snap_seq);
+            if !part.is_empty() {
+                sources.push(part);
+            }
+        }
+        // 源顺序必须与 merge_all_at / scan_latest_light 一致：levels[0] 旧→新，反转成新→旧
+        let mut push_sst = |sst: &SstFile, sources: &mut Vec<Vec<(Vec<u8>, LightEntry)>>| {
+            if !sst.may_overlap(probe_low, probe_high) {
+                return; // min/max 不相干 ⇒ 整篇不读
+            }
+            let part = sst.light_view_range(from, to, snap_seq);
+            if !part.is_empty() {
+                sources.push(part);
+            }
+        };
+        if let Some(l0) = self.levels.first() {
+            for sst in l0.iter().rev() {
+                push_sst(sst, &mut sources);
+            }
+        }
+        for level in self.levels.iter().skip(1) {
+            for sst in level {
+                push_sst(sst, &mut sources);
             }
         }
         let mut out = Vec::new();

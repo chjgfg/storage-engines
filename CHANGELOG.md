@@ -121,8 +121,7 @@
   为什么这算缺陷而不是风格：下游那台机器是单核 6 GB、RSS 预算按几十 MB 计，
   而且一个进程可能同时开好几个库 —— 固定 8 MiB/库 是白给的。
 
-- **窗口 scan / 前缀 scan 的代价开始随窗口宽度缩（bitcask + memory + bplus_tree 已接，
-  lsm_tree 在下一里程碑 —— 它的归并原语还缺一个终点界）**。
+- **窗口 scan / 前缀 scan 的代价现在随窗口宽度缩（四个引擎全部接上，各带自己的守卫）**。
   根因不在遍历原语，在 MVCC 层的**用法**：`scan_foreach` 调的是 `collect_latest_raw()` ——
   折完**全库**每个 key 的胜出行，再由调用方逐条筛 `start/end`。于是 200 行的窗口和 20000 行的
   全量一样贵（大库基线实测：窗口 scan bitcask **376.6 µs/行**、memory **106.3 µs/行**，
@@ -130,6 +129,12 @@
   起点直接 seek、终点早停；`collect_latest_raw` 退化成它的无界特例，**调用方一字未改**。
   `search_keys` 的 **Prefix** 模式同样接上界（Contains 要逐键比子串，全库是它的本质代价，
   这里不假装优化）；`key_count(prefix)` 经 `prefix_scan` 自动受益。
+  各家的接法按各自的存储布局不同：bitcask 用 `iter_meta_from` seek KeyDir、memory 用 BTreeMap
+  `range`、bplus_tree 用 `scan_entries_break_from` 下降到 containing 叶子（前面的叶子一篇不读）、
+  lsm_tree 要先把终点界穿进归并的每一个源 —— 新增 `SstFile::light_view_range` +
+  `LSMTree::scan_latest_light_range` + `mem_view_light_range`（原来的 `scan_latest_light` 把每个
+  SST **整篇块读完**再归并，所以窗口再窄也要付全库的块读代价）。四家各用自己的代价单位：
+  读盘次数 / 折叠走的键数 / 页数 / SST 块读次数。
 - **过程中我自己引入、又被既有测试当场抓住的一个 bug**（值得留档）：第一版把终点哨兵取成
   `encode_key(end, 0)`。而 `seek_prev` 造的上界是 `key ‖ 0x00` ⇒ `key` 自己的版本行排在哨兵
   **之后** ⇒ 被判越界丢掉 ⇒ `seek_prev(k)` 返回比 k 小的那一版。内存引擎的既有用例

@@ -44,6 +44,7 @@ pub use crate::common::{
 };
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
+use crate::common::version_key_upper_bound;
 
 /// MVCC 存储引擎（LSM 后端）
 pub struct MVCC {
@@ -834,26 +835,52 @@ impl Transaction {
         Some((decode_key(&enc)?.version, val))
     }
 
-    /// 全部最新可见逻辑行（key 有序）：(key, version, raw_or_tombstone)
+    /// 全部最新可见逻辑行（key 有序）= 无界版的 [`Self::collect_latest_raw_in`]。
     pub(crate) fn collect_latest_raw(
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        // ① 轻量全库视图：每个 enc key 只拿到「胜者的 seq + 种类」，**不克隆任何 value**。
+        self.collect_latest_raw_in(include_deleted, None, None)
+    }
+
+    /// `[start, end)` 内每个逻辑 key 的最新可见版本 —— 界**下推到每一个源**。
+    ///
+    /// 旧形状是 `scan_latest_light(u64::MAX)` 把每个 memtable 整表遍历、每个 SST 整篇读完
+    /// 再归并，调用方随后逐条筛界 ⇒ 10 行的窗口要付全库的块读代价（大库基线实测：
+    /// 窗口 scan 405 µs/行 vs 一次全量 scan 4.0 µs/行）。
+    ///
+    /// 界判在**版本键**上，所以前缀交错的边角仍要逐条兜：起点 `raw < start ⇒ continue`，
+    /// 终点先按 `enc ≥ 哨兵` 把每个源的 range 收到上界，落在界内但 `raw ≥ end` 的再 continue。
+    pub(crate) fn collect_latest_raw_in(
+        &self,
+        include_deleted: bool,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
+        // ① 轻量视图：每个 enc key 只拿到「胜者的 seq + 种类」，**不克隆任何 value**。
         //    旧实现走 `iter()`，而它会先把每个源（含每个 SST 的每行）连 value 一起
         //    `collect()` 进内存 ⇒ 一次全库折叠的峰值内存约等于整个库。
         //    kind==2 即 EntryValue::Drop：与 `iter()` 的 filter 一致，整行不可见
         //    （注意是「该 key 不可见」，不是「回退到更旧源里同 key 的 Put」）。
+        let hi_enc = end.map(version_key_upper_bound);
         let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
         {
             let kvengine = self.kv.lock().unwrap();
-            for (enc, le) in kvengine.scan_latest_light(u64::MAX) {
+            for (enc, le) in
+                kvengine.scan_latest_light_range(start, hi_enc.as_deref(), u64::MAX)
+            {
                 if le.kind == 2 {
                     continue;
                 }
                 let Some(vk) = decode_key(&enc) else {
                     continue;
                 };
+                if start.is_some_and(|s| vk.raw_key.as_slice() < s) {
+                    continue;
+                }
+                if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
+                    continue;
+                }
                 if !self.is_visible(vk.version) {
                     continue;
                 }
@@ -2173,5 +2200,74 @@ mod tests {
             }
             cleanup(&p2);
         }
+    }
+
+    /// 窗口 scan 的代价必须随**窗口宽度**缩 —— LSM 的尺子是「读了多少个 SST 数据块」。
+    ///
+    /// 旧形状：`collect_latest_raw` 走 `scan_latest_light(全库)`，把每个 memtable 整表遍历、
+    /// 每个 SST **整篇块读完**再交给归并，调用方随后逐条筛界 ⇒ 10 行的窗口要付全库的块读代价
+    /// （大库基线 release 实测：窗口 scan 405 µs/行 vs 一次全量 scan 4.0 µs/行）。
+    /// 现在界下推到每一个源：memtable 走 `range`，SST 从 `from` 所在块起读、键越过上界立即
+    /// 收手，并用 min/max 先挡掉整篇不相干的文件。
+    ///
+    /// 必须先 `flush()`：数据若还全在 memtable 里，块读次数为 0，那条比值断言就是空转。
+    #[test]
+    fn test_windowed_scan_cost_scales_with_window_not_library() {
+        const KEYS: u64 = 3000;
+        let path = tmp_db("window_cost");
+        {
+            let mvcc = MVCC::open(&path);
+            for i in 0..KEYS {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+            mvcc.flush();
+
+            let tx = mvcc.begin_transaction();
+            let b0 = crate::lsm_tree::sst::block_reads();
+            let all = tx.scan(None, None);
+            let full = crate::lsm_tree::sst::block_reads() - b0;
+            assert!(
+                full >= 30,
+                "样本要有足够多的块才分得出窗口与全库（全量只读了 {full} 块）"
+            );
+
+            let lo = b"k01000".to_vec();
+            let hi = b"k01010".to_vec();
+            let b0 = crate::lsm_tree::sst::block_reads();
+            let win = tx.scan(Some(&lo), Some(&hi));
+            let windowed = crate::lsm_tree::sst::block_reads() - b0;
+
+            assert_eq!(all.len() as u64, KEYS, "全量应折出 {KEYS} 行");
+            assert_eq!(win.len(), 10, "[k01000, k01010) 应给 10 行");
+            let want: Vec<Vec<u8>> = all
+                .iter()
+                .filter(|r| r.key.as_slice() >= lo.as_slice() && r.key.as_slice() < hi.as_slice())
+                .map(|r| r.key.clone())
+                .collect();
+            let got: Vec<Vec<u8>> = win.iter().map(|r| r.key.clone()).collect();
+            assert_eq!(got, want, "下推界之后窗口结果必须与全量筛一致");
+            assert!(
+                windowed * 10 <= full,
+                "10 行窗口的块读不该是全库量级（{windowed} vs 全量 {full}）"
+            );
+
+            // 上界哨兵的陷阱形状（`seek_prev` 的界是 `key ‖ 0x00`）
+            assert_eq!(tx.seek_prev(b"k01005").unwrap().key, b"k01005");
+            assert_eq!(tx.seek(b"k01000").unwrap().key, b"k01000");
+
+            // 前缀同理：k001xx ⇒ 100 个键
+            let b0 = crate::lsm_tree::sst::block_reads();
+            let pre = tx.prefix_scan(b"k001");
+            let prefixed = crate::lsm_tree::sst::block_reads() - b0;
+            assert_eq!(pre.len(), 100, "前缀 k001 应命中 100 行");
+            assert!(
+                prefixed * 4 <= full,
+                "前缀扫的块读不该是全库量级（{prefixed} vs 全量 {full}）"
+            );
+            tx.rollback();
+        }
+        cleanup(&path);
     }
 }
