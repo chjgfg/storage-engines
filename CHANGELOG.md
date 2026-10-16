@@ -121,6 +121,25 @@
   为什么这算缺陷而不是风格：下游那台机器是单核 6 GB、RSS 预算按几十 MB 计，
   而且一个进程可能同时开好几个库 —— 固定 8 MiB/库 是白给的。
 
+- **窗口 scan / 前缀 scan 的代价开始随窗口宽度缩（bitcask + memory 先行，另两家在下一里程碑）**。
+  根因不在遍历原语，在 MVCC 层的**用法**：`scan_foreach` 调的是 `collect_latest_raw()` ——
+  折完**全库**每个 key 的胜出行，再由调用方逐条筛 `start/end`。于是 200 行的窗口和 20000 行的
+  全量一样贵（大库基线实测：窗口 scan bitcask **376.6 µs/行**、memory **106.3 µs/行**，
+  而同库一次全量 scan 是 3.8 / 1.1 µs/行）。新增 `collect_latest_raw_in(include_deleted, start, end)`：
+  起点直接 seek、终点早停；`collect_latest_raw` 退化成它的无界特例，**调用方一字未改**。
+  `search_keys` 的 **Prefix** 模式同样接上界（Contains 要逐键比子串，全库是它的本质代价，
+  这里不假装优化）；`key_count(prefix)` 经 `prefix_scan` 自动受益。
+- **过程中我自己引入、又被既有测试当场抓住的一个 bug**（值得留档）：第一版把终点哨兵取成
+  `encode_key(end, 0)`。而 `seek_prev` 造的上界是 `key ‖ 0x00` ⇒ `key` 自己的版本行排在哨兵
+  **之后** ⇒ 被判越界丢掉 ⇒ `seek_prev(k)` 返回比 k 小的那一版。内存引擎的既有用例
+  `test_scan_prefix_seek` 直接跑红。修法：哨兵做成**一份共享实现**
+  `common::version_key_upper_bound(end) = end ‖ 0xFF×8`，并把两条账单写进文档 ——
+  ① 代价合同是「窗口宽度 + 至多一个同前缀组」（以 `end` 为前缀的键会被 range 带进来，
+  再由 `raw ≥ end ⇒ continue` 滤掉；宁可多走，不可误删）；② 前提 `version < 2^56`。
+  守卫三条：`upper_bound_keeps_trailing_zero_end`（钉哨兵形状本身），bitcask 与 memory 各有一条
+  `test_windowed_scan_cost_scales_with_window_not_library` —— 既断言窗口结果与"全量之后筛"
+  **逐条一致**，又断言计数随窗口缩（bitcask 用读盘次数，memory 用"折叠走了多少把键"，
+  两家的代价单位本来就不一样）。
 - **LSM 点查再降一档：稀疏索引二分 + MVCC 块缓存 64→256**。二分治的是**随库总量变贵**的那条
   纯 CPU 通道：`find_block` 原先线性扫索引（遇大于 key 才 break），代价 O(块数) = O(行数/64)。
   实测（250 块的样本）每次定位的比较次数 **125 → 7**，由

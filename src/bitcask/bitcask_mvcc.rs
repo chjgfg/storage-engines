@@ -34,6 +34,7 @@ use crate::bitcask::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats};
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
+use crate::common::version_key_upper_bound;
 
 /// MVCC 存储引擎（Bitcask 后端）
 pub struct MVCC {
@@ -878,7 +879,7 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        let hi_enc = end.map(|e| encode_key(e, 0));
+        let hi_enc = end.map(version_key_upper_bound);
         // ① 元数据折叠：enc 升序 ⇒ 同一 raw_key 最后一次 insert 就是最大可见版本
         let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
         {
@@ -1423,6 +1424,13 @@ mod tests {
                 prefixed <= 120,
                 "前缀扫的读盘应随前缀命中等同宽度（实际 {prefixed}，全量 {full}）"
             );
+
+            // 上界哨兵的陷阱形状：`seek_prev` 造出来的界是 `key ‖ 0x00`，若哨兵取
+            // `encode_key(end, 0)` 就会把 `key` 自己的版本行判成越界 —— 表现为
+            // `seek_prev(k)` 返回比 k 小的那一版。内存引擎先撞到，四家现在共用一个哨兵函数。
+            assert_eq!(tx.seek_prev(b"k01005").unwrap().key, b"k01005");
+            assert_eq!(tx.seek(b"k01000").unwrap().key, b"k01000");
+            assert_eq!(tx.seek_prev(b"k01000").unwrap().key, b"k01000");
             tx.rollback();
         }
         cleanup(&path);

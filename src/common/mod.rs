@@ -19,7 +19,7 @@ pub use types::{
     DurabilityProfile, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage,
     SearchQuery, VacuumRound, VacuumStats, ValueMeta,
 };
-pub use version::{decode_key, encode_key, vacuum_plan, VersionedKey};
+pub use version::{decode_key, encode_key, vacuum_plan, version_key_upper_bound, VersionedKey};
 pub use kernel::{
     is_unfinished, visible_at, HealthFold, VacuumScheduler, WalPolicy,
 };

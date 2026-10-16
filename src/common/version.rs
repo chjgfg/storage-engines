@@ -40,6 +40,31 @@ pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
     })
 }
 
+/// 版本键域上的** exclusive 上界哨兵**：给定逻辑上界 `end`，返回一个字节串，
+/// 保证「任何 `raw < end` 的键的版本键」都严格小于它。
+///
+/// 用途：把 `[start, end)` 的界下推给按版本键有序的那张表（BTreeMap range / 日志 seek），
+/// 让窗口扫只走窗口内的键。
+///
+/// 为什么尾部是 8 个 `0xFF` 而不是 `encode_key(end, 0)`：`end` 以 `0x00` 结尾时
+/// （`seek_prev` 正是这样造上界的：`key ‖ 0x00`），`encode_key(end, 0)` 会排在
+/// `raw ‖ version` **前面** —— 于是"raw 明明小于 end"的那一行被判成越界**丢掉**，
+/// 表现为 `seek_prev(k)` 返回比 k 小的键。实测踩到过一次，所以这个函数只有一份实现，
+/// 四个引擎都用它（`test_upper_bound_keeps_trailing_zero_end` 就是那次事故）。
+///
+/// 这个选择的账单，两条都要知道：
+/// - **可能多走一步**：以 `end` 为前缀的键（raw > end）其版本键仍可能小于哨兵，于是被
+///   迭代器带进来，再由调用方的 `raw ≥ end ⇒ continue` 滤掉。所以代价是
+///   「窗口宽度 + 至多一个同前缀组」而不是精确的窗口宽度 —— 宁可多走，不可误删。
+/// - **前提是 `version < 2^56`**（版本键首字节为 0）。事务号是 u64 计数器，现实中到不了；
+///   `u64::MAX` 只该用作 seek 的上界哨兵，不是真实版本号。
+pub fn version_key_upper_bound(end: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(end.len() + 8);
+    b.extend_from_slice(end);
+    b.extend_from_slice(&[0xffu8; 8]);
+    b
+}
+
 /// vacuum 的保留判定：给定「逻辑 key → 它的全部版本行」，算出该删哪些行、该留哪些行。
 ///
 /// 规则（四引擎必须一致，否则换引擎等于换语义）：
@@ -180,5 +205,38 @@ mod tests {
         let (delete, keep) = vacuum_plan(by_key, 5);
         assert!(delete.is_empty());
         assert_eq!(keep.len(), 2);
+    }
+
+    /// 上界哨兵必须扛住**末尾是 `0x00` 的 `end`**。
+    ///
+    /// `seek_prev` 造上界的形状是 `key ‖ 0x00`；若哨兵取 `encode_key(end, 0)`，那
+    /// `key` 自己的版本行 `key ‖ 0x00…0x01` 会排在哨兵**之后** ⇒ 被判越界丢掉，
+    /// 表现为 `seek_prev(k)` 返回比 k 小的那一版（这条就是这么被发现的）。
+    #[test]
+    fn upper_bound_keeps_trailing_zero_end() {
+        let key = b"a2";
+        let end = [b'a', b'2', 0u8];
+        let enc_key = encode_key(key, 1);
+        let old_sentinel = encode_key(&end, 0);
+        let sentinel = version_key_upper_bound(&end);
+
+        assert!(
+            enc_key > old_sentinel,
+            "旧哨兵会把 key 自己挤出界外 —— 这正是要复现的 bug"
+        );
+        assert!(
+            enc_key < sentinel,
+            "新哨兵必须把 key 的版本行留在界内（否则窗口少一行）"
+        );
+        // 越界方向的键仍然被挡在外面（raw ≥ end 的个别交错键由调用方逐条判）
+        assert!(encode_key(b"a3", 1) > sentinel);
+        // 前提：版本首字节为 0（version < 2^56）。事务号是 u64 计数器，
+        // 每秒 100 万笔也要跑 228 年才碰得到 ⇒ 这个前提是成立的；
+        // 越过它（比如拿 u64::MAX 当真实版本号）哨兵就不再是上界 —— 那种值只该用作 seek 的哨兵。
+        let max_contract_version = 0x00ff_ffff_ffff_ffffu64;
+        assert!(
+            encode_key(b"a2", max_contract_version) < sentinel,
+            "合同范围内的最大版本仍须在界内"
+        );
     }
 }

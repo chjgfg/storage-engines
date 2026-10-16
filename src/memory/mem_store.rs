@@ -152,6 +152,30 @@ impl MemStore {
         self.data.keys()
     }
 
+    /// `[from, to)` 内的键有序遍历（都不给 ⇒ 等价于 [`Self::iter_keys`]）。
+    ///
+    /// 界打在**版本键**的字节序上（`from` 含、`to` 不含），所以调用方要自己兜住
+    /// "raw_key 与界的边角"（版本键前缀交错）；提供它的理由是让「每个逻辑 key 的胜出行」
+    /// 那次折叠能只走窗口内的键 —— 全表折叠出来的话，10 行的窗口和 2000 行的全量一样贵。
+    pub fn iter_keys_in(
+        &self,
+        from: Option<&[u8]>,
+        to: Option<&[u8]>,
+    ) -> impl Iterator<Item = &Vec<u8>> + '_ {
+        use std::ops::Bound;
+        let lo = match from {
+            Some(k) => Bound::Included(k),
+            None => Bound::Unbounded,
+        };
+        let hi = match to {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Unbounded,
+        };
+        self.data
+            .range::<[u8], _>((lo, hi))
+            .map(|(k, _v)| k)
+    }
+
     /// 全表有序迭代（克隆 value，教学清晰）
     ///
     /// 注意这是**重量路径**：每一行的 value 都被克隆一次。全库折叠请改用

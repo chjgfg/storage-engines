@@ -21,7 +21,23 @@ pub use crate::common::{
 };
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
+use crate::common::version_key_upper_bound;
 use crate::memory::mem_store::MemStore;
+
+// 测试专用：本线程在「每个逻辑 key 的胜出行」那次折叠里**走了多少个版本键**。
+//
+// 内存引擎既没有磁盘读也没有 WAL，所以它的代价单位就是"比了多少把键"：
+// 窗口扫必须只走窗口内的键，而不是折完全表再由调用方筛界。
+#[cfg(test)]
+thread_local! {
+    static FOLD_KEYS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程折叠时检查过的版本键数（测试探针用）
+#[cfg(test)]
+pub(crate) fn fold_keys() -> u64 {
+    FOLD_KEYS.with(|c| c.get())
+}
 
 /// MVCC 引擎（单进程内存）
 pub struct MVCC {
@@ -435,19 +451,43 @@ impl Transaction {
         Some((version, store.get(&enc).cloned()?))
     }
 
-    /// 全部最新可见逻辑行（key 有序）
+    /// 全部最新可见逻辑行（key 有序）= 无界版的 [`Self::collect_latest_raw_in`]。
     pub(crate) fn collect_latest_raw(
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
+        self.collect_latest_raw_in(include_deleted, None, None)
+    }
+
+    /// `[start, end)` 内每个逻辑 key 的最新可见版本 —— 界**下推到 BTreeMap 的 range** 上。
+    ///
+    /// 旧形状是折完全库再由调用方逐条筛界 ⇒ 窗口再窄也要走完全表。界判在**版本键**上，
+    /// 所以 raw_key 与界之间的前缀交错的边角仍需逐条比：起点用 `continue`，终点先按
+    /// `enc ≥ encode(end,0)` 把 range 收到上界（有序迭代下后面只会更大，可以真停），
+    /// 落在界内但 raw ≥ end 的个别键再 `continue`。
+    pub(crate) fn collect_latest_raw_in(
+        &self,
+        include_deleted: bool,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
         // 两段式（同 bitcask）：先只比键折叠出每个 raw_key 的胜出版本行，
         // 再只为这批行取 value。旧实现用 `store.iter()` 把每一行的键与 value 都克隆一遍。
+        let hi_enc = end.map(version_key_upper_bound);
         let store = self.store.lock().unwrap();
         let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
-        for enc in store.iter_keys() {
+        for enc in store.iter_keys_in(start, hi_enc.as_deref()) {
+            #[cfg(test)]
+            FOLD_KEYS.with(|c| c.set(c.get() + 1));
             let Some(vk) = decode_key(enc) else {
                 continue;
             };
+            if start.is_some_and(|s| vk.raw_key.as_slice() < s) {
+                continue;
+            }
+            if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
+                continue;
+            }
             if !self.is_visible(vk.version) {
                 continue;
             }
@@ -1010,5 +1050,73 @@ mod tests {
         let clones = crate::memory::mem_store::value_clones() - before;
         assert_eq!(h.max_chain, CHAIN);
         assert_eq!(clones, 0, "health 期间 value 克隆次数：{clones}（历史行数 {CHAIN}）");
+    }
+
+    /// 窗口 scan 的代价必须随**窗口宽度**缩 —— 内存引擎的尺子是「折叠走了多少把键」。
+    ///
+    /// 旧形状：`collect_latest_raw()` 折完**全库**再由调用方逐条筛界 ⇒ 10 行的窗口也要走
+    /// 2000 把键（大库基线实测：窗口 scan 106.3 µs/行 vs 全量 1.1 µs/行）。
+    /// 这条同时钉正确性：窗口结果必须与"全量之后筛"逐条一致，不能是筛错了才快。
+    #[test]
+    fn test_windowed_scan_cost_scales_with_window_not_library() {
+        const KEYS: u64 = 2000;
+        let mvcc = MVCC::new();
+        for i in 0..KEYS {
+            let tx = mvcc.begin_transaction();
+            assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}").into_bytes()));
+            tx.commit();
+        }
+
+        let tx = mvcc.begin_transaction();
+        let before = fold_keys();
+        let all = tx.scan(None, None);
+        let full = fold_keys() - before;
+
+        let lo = b"k01000".to_vec();
+        let hi = b"k01010".to_vec();
+        let before = fold_keys();
+        let win = tx.scan(Some(&lo), Some(&hi));
+        let windowed = fold_keys() - before;
+
+        assert_eq!(all.len() as u64, KEYS, "全量应折出 {KEYS} 行");
+        assert_eq!(win.len(), 10, "[k01000, k01010) 应给 10 行");
+        let want: Vec<Vec<u8>> = all
+            .iter()
+            .filter(|r| r.key >= lo && r.key < hi)
+            .map(|r| r.key.clone())
+            .collect();
+        let got: Vec<Vec<u8>> = win.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(got, want, "下推界之后窗口结果必须与全量筛一致");
+        assert!(
+            windowed <= 20,
+            "窗口只该走窗口内的键（实际 {windowed}，全量 {full}）"
+        );
+        assert!(
+            windowed * 10 <= full,
+            "窗口折叠不该是全库量级（{windowed} vs {full}）"
+        );
+
+        // 前缀同理：k001xx ⇒ 100 个键
+        let before = fold_keys();
+        let pre = tx.prefix_scan(b"k001");
+        let prefixed = fold_keys() - before;
+        assert_eq!(pre.len(), 100, "前缀 k001 应命中 100 行");
+        // 实测 200 而不是 100：哨兵是 `end ‖ 0xFF×8`，于是"以 end 为前缀的那一组键"
+        // （这里是 k002xx，raw ≥ end）也会被 range 带进来，再由 `raw ≥ end ⇒ continue` 滤掉。
+        // 代价合同因此是「窗口宽度 + 至多一个同前缀组」——宁可多走，不可误删
+        // （`seek_prev` 的界是 `key ‖ 0x00`，收紧哨兵就会误删，见 version_key_upper_bound 的文档）。
+        assert!(
+            prefixed <= 250,
+            "前缀扫该只走前缀覆盖的键 + 至多一个同前缀组（实际 {prefixed}，全量 {full}）"
+        );
+        assert!(
+            prefixed * 4 <= full,
+            "前缀扫的代价不该是全库量级（{prefixed} vs {full}）"
+        );
+
+        // 上界哨兵的陷阱形状：`seek_prev` 的界是 `key ‖ 0x00`，用 `encode_key(end, 0)`
+        // 当哨兵会把 `key` 自己的版本行判成越界（这条用例最初就是因为这个而红）。
+        assert_eq!(tx.seek_prev(b"k01005").unwrap().key, b"k01005");
+        assert_eq!(tx.seek(b"k01000").unwrap().key, b"k01000");
     }
 }
