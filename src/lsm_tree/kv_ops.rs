@@ -544,13 +544,17 @@ mod tests {
             tx.commit();
             let _ = mvcc.flush();
 
-            let base = crate::lsm_tree::sst::light_visits();
+            let vb = crate::lsm_tree::sst::light_visits();
+            let bb = crate::lsm_tree::sst::block_reads();
             let w = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE).without_total());
-            let window_cost = crate::lsm_tree::sst::light_visits() - base;
+            let window_cost = crate::lsm_tree::sst::light_visits() - vb;
+            let window_blocks = crate::lsm_tree::sst::block_reads() - bb;
 
-            let base = crate::lsm_tree::sst::light_visits();
+            let vb = crate::lsm_tree::sst::light_visits();
+            let bb = crate::lsm_tree::sst::block_reads();
             let full = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE));
-            let full_cost = crate::lsm_tree::sst::light_visits() - base;
+            let full_cost = crate::lsm_tree::sst::light_visits() - vb;
+            let full_blocks = crate::lsm_tree::sst::block_reads() - bb;
 
             assert_eq!(full.total, Some(N), "要 total 时语义与改前完全一致");
             assert_eq!(w.total, None, "没数就不许报一个数出来");
@@ -558,10 +562,21 @@ mod tests {
             assert_eq!(w.items.len(), PAGE);
             assert_eq!(w.items, full.items, "窗口必须是同一页的全量结果：分页语义一个字节都不许变");
             assert!(w.has_next(), "后面还有 {} 条，必须报得出来", N - PAGE);
-            eprintln!("[search 窗口] 首页走了 {window_cost} 把键；要精确 total 走 {full_cost} 把（N={N}）");
+            eprintln!(
+                "[search 窗口] 首页 {window_cost} 把键 / {window_blocks} 块；全量 {full_cost} 把 / {full_blocks} 块（N={N}）"
+            );
+
             assert!(
                 full_cost > 0 && window_cost * 2 <= full_cost,
                 "首页付了 {window_cost} / 全量 {full_cost} ⇒ 还在走全库"
+            );
+            // 块读也要跟着窗口走。**这条才是 M15b 的守卫**：上一行只数"归并吐出多少键",
+            // 而旧的 `scan_latest_light_range` 先把每个源整篇物化 ⇒ 键数看着对了,块却读满全库
+            // （实测首页 53 块,而这库总共才 32 块）。判据取"每交付一把键最多两块"——
+            // 内含每个源启动一块的余量,改回 eager 就会红。
+            assert!(
+                window_blocks <= 2 * (window_cost + 1),
+                "首页交付 {window_cost} 把键却读了 {window_blocks} 个块 ⇒ 源被整篇物化了，                 不是惰性拉取（改回 `scan_latest_light_range` 正是这个形状）"
             );
 
             let last = N / PAGE - 1;

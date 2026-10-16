@@ -989,8 +989,8 @@ impl Transaction {
             let kvengine = self.kv.lock().unwrap();
             let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
             let mut pending: Option<Vec<u8>> = None;
-            for (enc, le) in kvengine.scan_latest_light_range(start, hi_enc.as_deref(), u64::MAX)
-            {
+            // 惰性归并：`budget` 收够就 break ⇒ 后面的键连块都不读（M15b）
+            for (enc, le) in kvengine.light_iter_range(start, hi_enc.as_deref(), u64::MAX) {
                 #[cfg(test)]
                 crate::lsm_tree::sst::note_light_visit();
                 if le.kind == 2 {

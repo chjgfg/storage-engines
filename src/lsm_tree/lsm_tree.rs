@@ -6,7 +6,7 @@
 //! 版本 GC 由上层 `MVCC::vacuum` 负责；compact 只做空间合并（丢弃 Drop）。
 
 use std::{
-    collections::{BTreeMap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{
+    collections::{BTreeMap, BinaryHeap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{
         Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering},
     }, thread::JoinHandle, time::Duration, vec,
 };
@@ -967,51 +967,72 @@ impl LSMTree {
     /// 再交给归并，于是"10 行的窗口"付的是"全库"的块读代价（大库基线实测：LSM 窗口 scan
     /// 405 µs/行 vs 一次全量 scan 4.0 µs/行）。memtable 走 `range`，SST 从 `from` 所在块
     /// 起读、键越过 `to` 立即收手，先用 min/max 挡掉整篇不相干的文件。
-    pub fn scan_latest_light_range(
-        &self,
-        from: Option<&[u8]>,
-        to: Option<&[u8]>,
+    /// 跨源归并的**惰性**版本（M15b）：一次只往前拉一个键，所以"只要前 N 把键"的调用
+    /// 不会把每个源整篇读完。
+    ///
+    /// 老的 `scan_latest_light_range` 先把每个源 `Vec` 化再归并 ⇒ 首页也要读满全库的块
+    /// （实测 2000 行的库首页 53 次块读，其中 ~32 次就是全库块数）。改成惰性之后
+    /// 首页只读"覆盖到那几把键"需要的块，`scan_page` / 窗口搜索 / 有界 vacuum 一起受益。
+    ///
+    /// 取胜规则与 `merge_streaming` 逐条一致：源序号小 = 更新（mem → immutables → L0 新→旧 →
+    /// 更高层），同一个键只输出一行、由更新的源定论；同键同行的旧 seq 不复活。
+    pub fn light_iter_range<'a>(
+        &'a self,
+        from: Option<&'a [u8]>,
+        to: Option<&'a [u8]>,
         snap_seq: u64,
-    ) -> Vec<(Vec<u8>, LightEntry)> {
+    ) -> LightMerge<'a> {
         let probe_low = from.unwrap_or(&[]);
         let probe_high = to.unwrap_or(&[0xffu8; 8]);
-        let mut sources: Vec<Vec<(Vec<u8>, LightEntry)>> = Vec::new();
+        let mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + '_>> = Vec::new();
         if !self.mem.is_empty() {
-            let part = Self::mem_view_light_range(&self.mem, from, to, snap_seq);
-            if !part.is_empty() {
-                sources.push(part);
-            }
+            sources.push(Box::new(Self::mem_light_iter(&self.mem, from, to, snap_seq)));
         }
         for imm in &self.immutables {
-            let part = Self::mem_view_light_range(imm, from, to, snap_seq);
-            if !part.is_empty() {
-                sources.push(part);
-            }
+            sources.push(Box::new(Self::mem_light_iter(imm, from, to, snap_seq)));
         }
-        // 源顺序必须与 merge_all_at / scan_latest_light 一致：levels[0] 旧→新，反转成新→旧
-        let push_sst = |sst: &SstFile, sources: &mut Vec<Vec<(Vec<u8>, LightEntry)>>| {
-            if !sst.may_overlap(probe_low, probe_high) {
-                return; // min/max 不相干 ⇒ 整篇不读
-            }
-            let part = sst.light_view_range(from, to, snap_seq);
-            if !part.is_empty() {
-                sources.push(part);
-            }
-        };
+        // 源顺序必须与 merge_all_at / scan_latest_light 一致：levels[0] 旧→新，反转成新→旧。
+        // 先把"有哪些 SST、按什么优先级"排成一个 Vec，再统一建迭代器 ——
+        // 用闭包 push 会把两个不同的生命周期搅在一起（编译器拒绝得有道理）。
+        let mut ssts: Vec<&SstFile> = Vec::new();
         if let Some(l0) = self.levels.first() {
-            for sst in l0.iter().rev() {
-                push_sst(sst, &mut sources);
-            }
+            ssts.extend(l0.iter().rev());
         }
         for level in self.levels.iter().skip(1) {
-            for sst in level {
-                push_sst(sst, &mut sources);
-            }
+            ssts.extend(level.iter());
         }
-        let mut out = Vec::new();
-        merge_streaming(sources, |_, _| true, |k, le| out.push((k, le)));
-        out
+        for sst in ssts {
+            if !sst.may_overlap(probe_low, probe_high) {
+                continue; // min/max 不相干 ⇒ 整篇不读
+            }
+            sources.push(Box::new(sst.light_iter(from, to, snap_seq)));
+        }
+        LightMerge::new(sources)
     }
+
+    /// mem / immutable 的轻量视图（惰性）：`MemMap` 每个 key 一条版本列表 ⇒ 范围内逐 key
+    /// 取"≤ snap 的最大 seq"那一版，与 `mem_view_light_range` 同一判据。
+    fn mem_light_iter<'a>(
+        map: &'a MemMap,
+        from: Option<&'a [u8]>,
+        to: Option<&'a [u8]>,
+        snap_seq: u64,
+    ) -> impl Iterator<Item = (Vec<u8>, LightEntry)> + 'a {
+        use std::ops::Bound;
+        let lo = match from {
+            Some(k) => Bound::Included(k),
+            None => Bound::Unbounded,
+        };
+        let hi = match to {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Unbounded,
+        };
+        map.range::<[u8], _>((lo, hi)).filter_map(move |(k, vers)| {
+            let (seq, ev) = vers.iter().rev().find(|(s, _)| **s <= snap_seq)?;
+            Some((k.clone(), LightEntry { seq: *seq, kind: ev.kind_byte() }))
+        })
+    }
+
 
     /// memtable 的轻量视图 + 「够 `max_rows` 行就准备收手，但把当前这一组读完才停」。
     ///
@@ -2575,5 +2596,103 @@ mod tests {
             assert_eq!(db.get(b"k0000"), Some(b"v".to_vec()));
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// [`LSMTree::light_iter_range`] 的状态机：k 路归并，每次 `next()` 只往前拉一条。
+///
+/// 堆里只放 `(键, 源序号)`，每个源至多一个候选在堆里；真正的值在 `head` 里等着。
+/// 输出**非降序** ⇒ 跨源的同键去重只需一个"待定键"的先行量：
+/// - 同一键由更新的源（序号小）定论 ⇒ 后到的同键丢掉
+/// - 同源同键的多个 seq（正常写入不会出现，防的是.compaction 产物里同键多版）⇒ 取最大 seq
+/// 没有这个先行量就会把"该键还有更新的源"的键提前吐出去。
+pub struct LightMerge<'a> {
+    sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>,
+    head: Vec<Option<(Vec<u8>, LightEntry)>>,
+    heap: BinaryHeap<MergeNode>,
+    pending: Option<(Vec<u8>, LightEntry)>,
+}
+
+struct MergeNode {
+    key: Vec<u8>,
+    src: usize,
+}
+
+/// 最小键优先；同键时源序号小的优先（新→旧）
+impl Ord for MergeNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match other.key.cmp(&self.key) {
+            std::cmp::Ordering::Equal => other.src.cmp(&self.src),
+            o => o,
+        }
+    }
+}
+
+impl PartialOrd for MergeNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MergeNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.src == other.src
+    }
+}
+
+impl Eq for MergeNode {}
+
+impl<'a> LightMerge<'a> {
+    fn new(mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>) -> Self {
+        let mut head = Vec::with_capacity(sources.len());
+        let mut heap = BinaryHeap::new();
+        for (src, it) in sources.iter_mut().enumerate() {
+            match it.next() {
+                Some((k, le)) => {
+                    heap.push(MergeNode { key: k.clone(), src });
+                    head.push(Some((k, le)));
+                }
+                None => head.push(None),
+            }
+        }
+        Self { sources, head, heap, pending: None }
+    }
+
+    /// 把源 `src` 的下一个候选放进堆（源 exhausted 就不放）
+    fn advance(&mut self, src: usize) {
+        if let Some((k, le)) = self.sources[src].next() {
+            self.heap.push(MergeNode { key: k.clone(), src });
+            self.head[src] = Some((k, le));
+        } else {
+            self.head[src] = None;
+        }
+    }
+}
+
+impl<'a> Iterator for LightMerge<'a> {
+    type Item = (Vec<u8>, LightEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(node) = self.heap.pop() {
+            let Some((key, le)) = self.head[node.src].take() else {
+                self.advance(node.src);
+                continue;
+            };
+            self.advance(node.src);
+            match self.pending.take() {
+                None => self.pending = Some((key, le)),
+                Some((pk, ple)) if pk == key => {
+                    // 同一个键：更新的源已经先出（堆的 tie-break 保证），这里只防
+                    // "同源同键多版"那种畸形产物 ⇒ 取更大的 seq，别让旧版赢
+                    self.pending = Some((pk, if ple.seq >= le.seq { ple } else { le }));
+                }
+                Some((pk, ple)) => {
+                    // 换键了 ⇒ 前一个键已经收齐，可以吐
+                    self.pending = Some((key, le));
+                    return Some((pk, ple));
+                }
+            }
+        }
+        self.pending.take()
     }
 }

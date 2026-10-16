@@ -533,6 +533,55 @@ impl SstFile {
     /// 切给有界回收用，这个按**键的区间**切给窗口/前缀查询用。`light_view` 是把整个文件
     /// 读完再筛，于是 10 行的窗口要付整文件的块读代价（大库基线实测：LSM 窗口 scan
     /// 405 µs/行 vs 全量 scan 4.0 µs/行）。折叠规则与 `light_view` 完全一致。
+    /// **惰性**的轻量视图：一次只往前拉一条，块是一块一块读的。
+    ///
+    /// 为什么要有它（M15b）：[`Self::light_view_range`] 先把整篇范围 `Vec` 化才交给归并，
+    /// 于是"只要前 20 把键"的调用也得把**这个源的所有块**读完 —— 实测 2000 行的库
+    /// 首页付 53 次块读，其中 ~32 次就是全库的块数。跨源归并改成惰性之后，
+    /// 首页的块读只跟"覆盖到那 20 把键"有关（见 `LSMTree::light_iter_range`）。
+    ///
+    /// 语义与 `light_view_range` 逐条一致：只交 `visible_at(snap)` 的条目、`[from, to)` 定界、
+    /// 同一个 enc key 只可能出现在一个块里（键升序），所以不需要 lookahead 收口。
+    pub fn light_iter(
+        &self,
+        from: Option<&[u8]>,
+        to: Option<&[u8]>,
+        snap_seq: u64,
+    ) -> impl Iterator<Item = (Vec<u8>, LightEntry)> + '_ {
+        let filter = move |(k, se): &(Vec<u8>, StoredEntry)| -> Option<(Vec<u8>, LightEntry)> {
+            if !se.visible_at(snap_seq) {
+                return None;
+            }
+            Some((k.clone(), LightEntry::of(se)))
+        };
+        if let Some(all) = &self.entries_cache {
+            // v1 / 小文件：条目本来就在内存里，切片扫一遍即可（无块可读）
+            let (lo, hi) = (from.map(|k| k.to_vec()), to.map(|k| k.to_vec()));
+            return Box::new(
+                all.iter()
+                    .skip_while(move |(k, _)| lo.as_deref().is_some_and(|f| k.as_slice() < f))
+                    .take_while(move |(k, _)| hi.as_deref().is_none_or(|t| k.as_slice() < t))
+                    .filter_map(filter),
+            ) as Box<dyn Iterator<Item = _>>;
+        }
+        // 起点定位到含 `from` 的那个块：前面的块一块都不读。
+        // ⚠️ `from` 比第 0 块首键还小 ⇒ 从第 0 块开始（`unwrap_or(0)`，不是 `index.len()`，
+        // 那是 M11e 踩过的"真前缀扫直接返回空"）
+        let start_block = match from {
+            Some(f) => self.find_block(f).unwrap_or(0),
+            None => 0,
+        };
+        Box::new(SstLightIter {
+            sst: self,
+            block: start_block,
+            pos: 0,
+            cur: None,
+            from: from.map(|k| k.to_vec()),
+            to: to.map(|k| k.to_vec()),
+            snap_seq,
+        }) as Box<dyn Iterator<Item = _>>
+    }
+
     pub fn light_view_range(
         &self,
         from: Option<&[u8]>,
@@ -1854,3 +1903,55 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// [`SstFile::light_iter`] 的状态机：一块一块读、一条一条吐。
+///
+/// ⚠️ 只前进不回退：块内条目按 key 升序 ⇒ 越过 `to` 就 `None` 收尾，后面的块不再读。
+struct SstLightIter<'a> {
+    sst: &'a SstFile,
+    block: usize,
+    pos: usize,
+    cur: Option<Arc<DataBlock>>,
+    from: Option<Vec<u8>>,
+    to: Option<Vec<u8>>,
+    snap_seq: u64,
+}
+
+impl<'a> Iterator for SstLightIter<'a> {
+    type Item = (Vec<u8>, LightEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.block >= self.sst.index.len() {
+                return None;
+            }
+            if self.cur.is_none() {
+                self.cur = self.sst.load_block(self.block).ok();
+                self.pos = 0;
+                if self.cur.is_none() {
+                    // 坏块：跳过这一块而不是整篇放弃（与 eager 版 `match load_block(i)` 同口径）
+                    self.block += 1;
+                    continue;
+                }
+            }
+            let block = self.cur.as_ref().expect("上面保证有块");
+            while self.pos < block.entries.len() {
+                let (k, se) = &block.entries[self.pos];
+                self.pos += 1;
+                if self.to.as_deref().is_some_and(|t| k.as_slice() >= t) {
+                    return None; // 越界：后面的块只会更大
+                }
+                if self.from.as_deref().is_some_and(|f| k.as_slice() < f) {
+                    continue;
+                }
+                if !se.visible_at(self.snap_seq) {
+                    continue;
+                }
+                return Some((k.clone(), LightEntry::of(se)));
+            }
+            self.cur = None;
+            self.block += 1;
+        }
+    }
+}
+
