@@ -498,11 +498,16 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        crate::common::fold_window(
-            None,
-            |after, budget| self.scan_candidates(start, end, None, after, budget),
-            |c| (c.row.is_some() || include_deleted).then(|| (c.key, c.version, c.row)),
-        )
+        crate::common::collect_rows(self, include_deleted, start, end, None, None).0
+    }
+
+    /// 取一组的值：折叠时已经把行从 map 里带出来了（内存引擎没有"另一处"），
+    /// 所以凭据本身就是值，`None` 即墓碑。
+    fn read_row(row: Option<Vec<u8>>) -> crate::common::RowValue {
+        match row {
+            Some(bytes) => crate::common::RowValue::Value(bytes),
+            None => crate::common::RowValue::Tombstone,
+        }
     }
 
     /// 折出**候选组**（一把逻辑 key 一组，值已在手里）：按 enc 升序，组内最后一次覆盖
@@ -1206,5 +1211,26 @@ mod tests {
         // 当哨兵会把 `key` 自己的版本行判成越界（这条用例最初就是因为这个而红）。
         assert_eq!(tx.seek_prev(b"k01005").unwrap().key, b"k01005");
         assert_eq!(tx.seek(b"k01000").unwrap().key, b"k01000");
+    }
+}
+
+impl crate::common::VersionedStore for Transaction {
+    /// 
+    type Row = Option<Vec<u8>>;
+
+    fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
+        // 走本类型上的同名 inherent 方法（inherent 优先于 trait ⇒ 不会自我递归）
+        self.scan_candidates(start, end, accept, after, budget)
+    }
+
+    fn materialize(&self, row: Option<Vec<u8>>) -> crate::common::RowValue {
+        Self::read_row(row)
     }
 }

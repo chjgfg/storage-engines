@@ -920,29 +920,34 @@ impl Transaction {
     ///   交错）用 `continue` 掉。
     /// - 终点：只有按**迭代键本身** `enc ≥ encode(end, 0)` 才能 break —— 按 raw 判 break
     ///   不安全，因为交错时后面还可能出现更小的 raw；raw ≥ end 的个别键单独 `continue`。
+    /// 界内折叠：折法在 [`crate::common::collect_rows`]（四家一份），这一家只供
+    /// "候选怎么折"与"一组的值怎么取"两件事。
     pub(crate) fn collect_latest_raw_in(
         &self,
         include_deleted: bool,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        crate::common::fold_window(
-            None,
-            |after, budget| self.scan_candidates(start, end, None, after, budget),
-            |c| {
-                let logical = {
-                    let mut kvengine = self.kv.lock().unwrap();
-                    let mut blob = self.blob.lock().unwrap();
-                    match kvengine.get_entry(&c.row) {
-                        Ok(None) => None,
-                        Ok(Some(None)) => None,
-                        Ok(Some(Some(s))) => decode_stored_value(&mut blob, &s).ok().flatten(),
-                        Err(_) => None,
-                    }
-                };
-                (logical.is_some() || include_deleted).then(|| (c.key, c.version, logical))
-            },
-        )
+        crate::common::collect_rows(self, include_deleted, start, end, None, None).0
+    }
+
+    /// 取一组的值：KeyDir 里只有元数据 ⇒ 凭据是编码键，值要按位置回日志读
+    /// （大 value 还要过 blob 旁路）。这正是"布局相关的那一半"，各家不同。
+    fn read_row(&self, enc: &[u8]) -> crate::common::RowValue {
+        use crate::common::RowValue;
+        let mut kvengine = self.kv.lock().unwrap();
+        let mut blob = self.blob.lock().unwrap();
+        match kvengine.get_entry(enc) {
+            // 索引里查无此键 / IO 出错：与"墓碑"不是一回事，整行不参与结果
+            Ok(None) | Err(_) => RowValue::Missing,
+            Ok(Some(None)) => RowValue::Tombstone,
+            Ok(Some(Some(stored))) => {
+                match decode_stored_value(&mut blob, &stored).ok().flatten() {
+                    Some(bytes) => RowValue::Value(bytes),
+                    None => RowValue::Tombstone,
+                }
+            }
+        }
     }
 
     /// 折出**候选组**（一把逻辑 key 一组，值还没读）。
@@ -2342,5 +2347,26 @@ mod tests {
         let m2 = MVCC::try_open(&path).unwrap();
         drop(m2);
         cleanup(&path);
+    }
+}
+
+impl crate::common::VersionedStore for Transaction {
+    /// KeyDir 只有元数据 ⇒ 凭据是编码键，值在日志里另一处。
+    type Row = Vec<u8>;
+
+    fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Vec<u8>>>, bool) {
+        // 走的是本类型上的同名 inherent 方法（inherent 优先于 trait ⇒ 不会自我递归）
+        self.scan_candidates(start, end, accept, after, budget)
+    }
+
+    fn materialize(&self, row: Vec<u8>) -> crate::common::RowValue {
+        self.read_row(&row)
     }
 }

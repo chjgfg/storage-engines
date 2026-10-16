@@ -947,24 +947,21 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        crate::common::fold_window(
-            None,
-            |after, budget| self.scan_candidates(start, end, None, after, budget),
-            |c| {
-                let val = {
-                    let kvengine = self.kv.lock().unwrap();
-                    // get_value_at 而不是 get_raw_key_at：大 value 存的是 blob 指针，
-                    // 交给调用方之前必须解回真值（GC 那种"要看指针本身"的读法才用 raw 版）
-                    kvengine.get_value_at(&c.row, u64::MAX)
-                };
-                // 双层 Option：外层 `None` = 这一行已经不在视图里（跳过，与旧实现一致），
-                // 内层 `None` = 墓碑（只有 include_deleted 才留）
-                match val {
-                    Some(v) => (v.is_some() || include_deleted).then(|| (c.key, c.version, v)),
-                    None => None,
-                }
-            },
-        )
+        crate::common::collect_rows(self, include_deleted, start, end, None, None).0
+    }
+
+    /// 取一组的值：跨源点查（`get_value_at` 而不是 `get_raw_key_at` —— 大 value 存的是 blob
+    /// 指针，交给调用方之前必须解回真值；GC 那种"要看指针本身"的读法才用 raw 版）。
+    /// 外层 `None` = 这一行已经不在值存储里 ⇒ `Missing`（整行不参与，与改动前一致）；
+    /// 内层 `None` = 墓碑。这两种情况在折叠侧必须分开，所以 `RowValue` 是三态。
+    fn read_row(&self, enc: &[u8]) -> crate::common::RowValue {
+        use crate::common::RowValue;
+        let kvengine = self.kv.lock().unwrap();
+        match kvengine.get_value_at(enc, u64::MAX) {
+            None => RowValue::Missing,
+            Some(None) => RowValue::Tombstone,
+            Some(Some(bytes)) => RowValue::Value(bytes),
+        }
     }
 
     /// 折出**候选组**（一把逻辑 key 一组，值还没取）。
@@ -2418,5 +2415,26 @@ mod tests {
             tx.rollback();
         }
         cleanup(&path);
+    }
+}
+
+impl crate::common::VersionedStore for Transaction {
+    /// 
+    type Row = Vec<u8>;
+
+    fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Vec<u8>>>, bool) {
+        // 走本类型上的同名 inherent 方法（inherent 优先于 trait ⇒ 不会自我递归）
+        self.scan_candidates(start, end, accept, after, budget)
+    }
+
+    fn materialize(&self, row: Vec<u8>) -> crate::common::RowValue {
+        self.read_row(&row)
     }
 }

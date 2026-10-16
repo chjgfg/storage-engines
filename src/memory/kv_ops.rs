@@ -242,6 +242,8 @@ impl Transaction {
         );
         crate::common::search_page_from(matched, query)
     }
+    /// 窗口化的模式搜索：界下推、键级过滤、取值、剥壳全在
+    /// [`crate::common::search_window`]（四家一份），这一家只供折叠与取值。
     fn collect_for_search(
         &self,
         include_deleted: bool,
@@ -249,48 +251,7 @@ impl Transaction {
         mode: KeyMatchMode,
         limit: Option<usize>,
     ) -> Vec<ExportRecord> {
-        // 前缀匹配的键是有界的 ⇒ 界下推给折叠。Contains 要逐键比子串，全库是它的本质代价，
-        // 但**只要窗口那么宽的结果**就不必走到底 —— 于是 `limit` 与 `accept` 都交给驱动。
-        let (lo, hi) = match mode {
-            KeyMatchMode::Prefix => (
-                if pattern.unwrap_or_default().is_empty() {
-                    None
-                } else {
-                    pattern
-                },
-                prefix_upper_bound(pattern.unwrap_or_default()),
-            ),
-            KeyMatchMode::Contains => (None, None),
-        };
-        let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
-        crate::common::fold_window(
-            limit,
-            |after, budget| self.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
-            |cand| match cand.row {
-                // 墓碑：只在 include_deleted 时出现（与旧实现同口径）
-                None => {
-                    if include_deleted {
-                        Some(ExportRecord { key: cand.key, value: None })
-                    } else {
-                        None
-                    }
-                }
-                Some(bytes) => match logical_to_user(bytes) {
-                    Some(user) => Some(ExportRecord {
-                        key: cand.key,
-                        value: Some(user),
-                    }),
-                    // 过期与墓碑同待：算"取不到值"，不静默当成有效行
-                    None => {
-                        if include_deleted {
-                            Some(ExportRecord { key: cand.key, value: None })
-                        } else {
-                            None
-                        }
-                    }
-                },
-            },
-        )
+        crate::common::search_window(self, include_deleted, pattern, mode, limit)
     }
     // ── 元数据 ──
 

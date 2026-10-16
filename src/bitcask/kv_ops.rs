@@ -28,7 +28,6 @@
 use std::time::Duration;
 
 use crate::bitcask::bitcask_mvcc::{encode_key, MVCC, Transaction};
-use crate::bitcask::storage::decode_stored_value;
 use crate::common::codec::parse_i64_user;
 
 /// 公共类型与编解码工具现由 [`crate::common`] 统一定义。
@@ -268,6 +267,8 @@ impl Transaction {
         crate::common::search_page_from(matched, query)
     }
 
+    /// 窗口化的模式搜索：界下推、键级过滤、取值、剥壳全在
+    /// [`crate::common::search_window`]（四家一份），这一家只供折叠与取值。
     fn collect_for_search(
         &self,
         include_deleted: bool,
@@ -275,59 +276,7 @@ impl Transaction {
         mode: KeyMatchMode,
         limit: Option<usize>,
     ) -> Vec<ExportRecord> {
-        // 前缀匹配的键是有界的 ⇒ 界下推给折叠。Contains 要逐键比子串，全库是它的本质代价，
-        // 但只要窗口那么宽的结果就不必走到底 ⇒ `limit` 与 `accept` 都交给驱动。
-        let (lo, hi) = match mode {
-            KeyMatchMode::Prefix => (
-                if pattern.unwrap_or_default().is_empty() {
-                    None
-                } else {
-                    pattern
-                },
-                prefix_upper_bound(pattern.unwrap_or_default()),
-            ),
-            KeyMatchMode::Contains => (None, None),
-        };
-        let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
-        crate::common::fold_window(
-            limit,
-            |after, budget| self.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
-            |cand| {
-                // 命中几条读几条：值留到这里才取
-                let logical = {
-                    let mut kvengine = self.kv.lock().unwrap();
-                    let mut blob = self.blob.lock().unwrap();
-                    match kvengine.get_entry(&cand.row) {
-                        Ok(Some(Some(stored))) => {
-                            decode_stored_value(&mut blob, &stored).ok().flatten()
-                        }
-                        _ => None,
-                    }
-                };
-                match logical {
-                    None => {
-                        if include_deleted {
-                            Some(ExportRecord { key: cand.key, value: None })
-                        } else {
-                            None
-                        }
-                    }
-                    Some(bytes) => match logical_to_user(bytes) {
-                        Some(user) => Some(ExportRecord {
-                            key: cand.key,
-                            value: Some(user),
-                        }),
-                        None => {
-                            if include_deleted {
-                                Some(ExportRecord { key: cand.key, value: None })
-                            } else {
-                                None
-                            }
-                        }
-                    },
-                }
-            },
-        )
+        crate::common::search_window(self, include_deleted, pattern, mode, limit)
     }
 
     // ── 元数据 ──

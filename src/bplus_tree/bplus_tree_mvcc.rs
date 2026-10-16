@@ -868,20 +868,23 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        crate::common::fold_window(
-            None,
-            |after, budget| self.scan_candidates(start, end, None, after, budget),
-            |c| {
-                let logical = match &c.row {
-                    None => None,
-                    Some(stored) => {
-                        let mut blob = self.blob.lock().unwrap();
-                        decode_stored_value(&mut blob, stored).ok().flatten()
-                    }
-                };
-                (logical.is_some() || include_deleted).then(|| (c.key, c.version, logical))
-            },
-        )
+        crate::common::collect_rows(self, include_deleted, start, end, None, None).0
+    }
+
+    /// 取一组的值：叶子条目里带出来的就是存储字节，只有超过 blob 阈值的那部分要再解一次
+    /// （内联行的"无 tag"与解码失败都按墓碑算，与改动前同口径）。
+    fn read_row(&self, row: &Option<Vec<u8>>) -> crate::common::RowValue {
+        use crate::common::RowValue;
+        match row {
+            None => RowValue::Tombstone,
+            Some(stored) => {
+                let mut blob = self.blob.lock().unwrap();
+                match decode_stored_value(&mut blob, stored).ok().flatten() {
+                    Some(bytes) => RowValue::Value(bytes),
+                    None => RowValue::Tombstone,
+                }
+            }
+        }
     }
 
     /// 折出**候选组**（一把逻辑 key 一组，页里的原始字节顺手带走）。
@@ -2382,5 +2385,26 @@ mod tests {
             drop(mvcc);
         }
         cleanup(&path);
+    }
+}
+
+impl crate::common::VersionedStore for Transaction {
+    /// 
+    type Row = Option<Vec<u8>>;
+
+    fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
+        // 走本类型上的同名 inherent 方法（inherent 优先于 trait ⇒ 不会自我递归）
+        self.scan_candidates(start, end, accept, after, budget)
+    }
+
+    fn materialize(&self, row: Option<Vec<u8>>) -> crate::common::RowValue {
+        self.read_row(&row)
     }
 }
