@@ -112,6 +112,22 @@ pub(crate) fn page_reads() -> u64 {
     PAGE_READS.with(|c| c.get())
 }
 
+// 本线程「试图写一个装不下的页」的次数。
+//
+// 这个计数存在的理由是**正确性**而不只是噪音：`write_page` 超限只打印并返回 false，
+// 而 delete 的借键/合并这条链原先没人检查那个 bool —— 于是页保持**上一次**的内容，
+// 父节点却已经删掉分隔键、`free_page` 了死页 ⇒ 那批行不可达（静默丢数据）。
+// 真实形状（40B 键 + 60B 值、order=64）下合并两个半页就是 7.5 KB > 4080，必然踩到。
+// 现在四家重组前都先量字节，这条应当恒为 0（守卫：`test_reorg_never_drops_oversized_pages`）。
+thread_local! {
+    static OVERSIZED_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 本线程发生的超载写次数（诊断与守卫用）
+pub fn oversized_writes() -> u64 {
+    OVERSIZED_WRITES.with(|c| c.get())
+}
+
 // 测试专用：本线程「把某行的 value 克隆出来」的次数。
 //
 // B+ 树没有独立键索引，全库走一遍的**页读取**省不掉；能省的是把每一行的 value
@@ -542,11 +558,18 @@ impl PageManager {
     /// 写页 payload（标记 Dirty，真正落盘在 flush / 换出时）
     pub fn write_page(&mut self, page_id: PageId, data: &[u8]) -> bool {
         if data.len() > PAGE_PAYLOAD_SIZE {
-            eprintln!(
-                "数据超过页载荷限制 {} > {}",
-                data.len(),
-                PAGE_PAYLOAD_SIZE
-            );
+            // 超载写必须**很少见到**：调用方（借键/合并/插入分裂）都要先量过字节再动盘。
+            // 这里保留计数 + 首次告警：以前每条都 eprintln，真实形状（40B 键 + 60B 值）下
+            // 一次 vacuum 能刷出几万行，把被测的耗时整个污染掉（台架复测时 bplus 的
+            // `search 首页` 911ms 里就有它）。
+            OVERSIZED_WRITES.with(|c| c.set(c.get() + 1));
+            if OVERSIZED_WRITES.with(|c| c.get()) <= 3 {
+                eprintln!(
+                    "数据超过页载荷限制 {} > {}（同类告警只报前 3 条，其余计数）",
+                    data.len(),
+                    PAGE_PAYLOAD_SIZE
+                );
+            }
             return false;
         }
         if !self.page_is_live(page_id) {

@@ -145,6 +145,19 @@ impl BPlusTree {
 }
 
 impl BPlusTree {
+    /// 节点序列化后能不能装进一页。
+    ///
+    /// **只能问序列化结果，不能问条数**：条目是变长的（键可达几十字节、RowId 带 flag 与
+    /// offset），`order=64` 在 40B 键 + 60B 值的真实形状下是 7.5 KB，而一页载荷只有 4080 B。
+    /// 原先只有插入路径问过字节，delete 的借键/合并完全按条数走 ⇒ 见
+    /// `test_reorg_never_drops_oversized_pages`。
+    fn node_fits(node: &BTreeNode) -> bool {
+        match bincode::serialize(node) {
+            Ok(d) => d.len() <= MAX_PAYLOAD,
+            Err(_) => false,
+        }
+    }
+
     /// 一次序列化判定 + 写入（避免 node_fits 与 try_write 双重 bincode）
     fn write_if_fits(&mut self, page_id: PageId, node: &BTreeNode) -> bool {
         let count_ok = match node {
@@ -325,10 +338,9 @@ impl BPlusTree {
                 if let Ok(idx) = entries.binary_search_by(|(k, _)| k.cmp(&key)) {
                     // 更新RowId
                     entries[idx].1 = new_row_id;
-                    // 写回页
-                    let data = bincode::serialize(&node).unwrap();
-                    self.page_manager.write_page(node_page_id, &data);
-                    return true;
+                    // 写回页：RowId 变长可能让整页超载 ⇒ 必须量过字节，装不下就报失败，
+                    // 不能再走"write_page 打印一句、返回值丢掉"那条静默路径
+                    return self.write_node(node_page_id, &node);
                 }
                 return false;
             }
@@ -368,9 +380,17 @@ impl BPlusTree {
         bincode::deserialize(&data).expect("deserialize node")
     }
 
-    fn write_node(&mut self, page_id: PageId, node: &BTreeNode) {
+    /// 写回节点。**装不下就一个字节都不动**，并把失败告诉调用方。
+    ///
+    /// 为什么必须检查：`PageManager::write_page` 遇到超长 payload 只是打印 + 返回 false，
+    /// 而这条链原先把那个 bool 丢了 ⇒ 页保持合并前的旧内容，父节点却已经删掉分隔键、
+    /// `free_page` 掉死页 ⇒ 那批行不可达（静默丢数据），而且叶子的 `next_leaf` 还指向已释放页。
+    fn write_node(&mut self, page_id: PageId, node: &BTreeNode) -> bool {
+        if !Self::node_fits(node) {
+            return false;
+        }
         let data = bincode::serialize(node).expect("serialize node");
-        self.page_manager.write_page(page_id, &data);
+        self.page_manager.write_page(page_id, &data)
     }
 
     fn node_key_count(node: &BTreeNode) -> usize {
@@ -491,6 +511,11 @@ impl BPlusTree {
             _ => return,
         }
 
+        // 借完之后三个节点都必须还装得下一页，否则**整个重组作废**（locals 丢弃、盘不动）。
+        // 下溢本身不是错误，只是填充率低一点；写失败的静默丢页才是。
+        if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
+            return;
+        }
         self.write_node(node_page_id, &node);
         self.write_node(sibling_page_id, &sibling);
         self.write_node(parent_page_id, &parent);
@@ -556,6 +581,12 @@ impl BPlusTree {
             children.remove(delete_child_idx);
         }
 
+        // 合并的结果必须还装得下一页，而且这个判断**必须在 free_page 之前**：
+        // 原先的顺序是"写幸存页（可能失败）→ 删父节点分隔键 → free 死页"，
+        // 一旦幸存页因为超载没写进去，那批行就同时失去了两份副本 = 静默丢数据。
+        if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
+            return;
+        }
         let survivor = if survivor_id == node_page_id {
             &node
         } else {
@@ -619,6 +650,11 @@ impl BPlusTree {
             _ => return,
         }
 
+        // 借完之后三个节点都必须还装得下一页，否则**整个重组作废**（locals 丢弃、盘不动）。
+        // 下溢本身不是错误，只是填充率低一点；写失败的静默丢页才是。
+        if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
+            return;
+        }
         self.write_node(node_page_id, &node);
         self.write_node(sibling_page_id, &sibling);
         self.write_node(parent_page_id, &parent);
@@ -696,6 +732,12 @@ impl BPlusTree {
             children.remove(delete_child_idx);
         }
 
+        // 合并的结果必须还装得下一页，而且这个判断**必须在 free_page 之前**：
+        // 原先的顺序是"写幸存页（可能失败）→ 删父节点分隔键 → free 死页"，
+        // 一旦幸存页因为超载没写进去，那批行就同时失去了两份副本 = 静默丢数据。
+        if !Self::node_fits(&node) || !Self::node_fits(&sibling) || !Self::node_fits(&parent) {
+            return;
+        }
         let survivor = if survivor_id == node_page_id {
             &node
         } else {
@@ -1254,5 +1296,50 @@ mod tests {
         tree.insert(key(1), rid(2));
         assert_eq!(tree.get(key(1)).unwrap().0, Some(vec![2]));
         assert_eq!(collect_all(&mut tree).len(), 1);
+    }
+
+    /// 真实条目大小下的 delete：借键/合并不许动一页装不下的写，也不许丢行。
+    ///
+    /// 旧实现**按条数**判断（`order/2` 对半、`min_entries` 比较），从不量序列化字节：
+    /// 40B 键 + 60B 值时两个半页合并 = 7.5 KB > 4080 ⇒ `write_page` 打印一句"数据超过页载荷
+    /// 限制"并返回 false，而调用链把那个 bool 丢了 ⇒ 幸存页保持**合并前**的内容，父节点却
+    /// 已经删掉分隔键并 `free_page(死页)` ⇒ 那批行同时失去两份副本 = 静默不可达。
+    /// 大库基线台架跑 bplus 时刷出的几万行那条消息，走的就是这里
+    /// （而且 eprintln 本身把被测耗时污染了 —— `search 首页` 911ms 里有它一份）。
+    #[test]
+    fn test_reorg_never_drops_oversized_pages() {
+        const N: usize = 4000;
+        // 台架同款形状：键 ≈ 35 B、值 60 B ⇒ order=64 的一页装不下 64 条
+        fn big_key(i: usize) -> Key {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn big_rid() -> RowId {
+            RowId(Some(vec![b'x'; 60]))
+        }
+
+        let mut tree = BPlusTree::new(64, 256);
+        for i in 0..N {
+            assert!(tree.insert(big_key(i), big_rid()), "插入第 {i} 个键失败");
+        }
+        // 隔一个删一个 ⇒ 大量下溢，逼着走借键与合并
+        for i in (0..N).step_by(2) {
+            assert!(tree.delete(big_key(i)), "删除第 {i} 个键失败");
+        }
+
+        let oversized = crate::bplus_tree::page::oversized_writes();
+        assert_eq!(oversized, 0, "一次超载写都不该尝试：重组前必须先量字节");
+
+        // 剩下的键必须一个不少、全部读得回来（丢页的表现就是键突然不可达）
+        let mut alive = 0usize;
+        for i in (1..N).step_by(2) {
+            assert!(tree.get(big_key(i)).is_some(), "第 {i} 个键在重组后读不回来了");
+            alive += 1;
+        }
+        assert_eq!(alive, (N + 1) / 2);
+        assert_eq!(
+            tree.iter().count(),
+            alive,
+            "叶子链表的行数必须等于存活键数（链表指向已释放页会在这里露出来）"
+        );
     }
 }
