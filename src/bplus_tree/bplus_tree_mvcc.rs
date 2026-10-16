@@ -1971,6 +1971,59 @@ mod tests {
         cleanup(&path);
     }
 
+    /// 只读走查**不许把点读的工作集挤出去**。
+    ///
+    /// 归因实测：20000 行的库有 1257 页，而页缓存上限 1024 —— 一次 `health()` 走查
+    /// 换出 1600 页、顺带 flush 765 个脏页，150 ms；紧接着的第二遍命中数只有 1。
+    /// 走查对每片叶子只碰一次，回填它不会有下一次命中，却会把真正在用的热页逐出。
+    /// 现在走查走 `read_page_for_walk`：满了就不回填 ⇒ 换出次数必须是 0（与库大小无关）。
+    #[test]
+    fn test_full_walk_does_not_evict_the_working_set() {
+        const KEYS: u64 = 400;
+        const CACHE_PAGES: usize = 8; // 故意远小于页数：让"回填就会换出"成立
+        let path = tmp_db("walk_no_evict");
+        {
+            let mvcc = MVCC::open(&path, 16, CACHE_PAGES);
+            for i in 0..KEYS {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+            mvcc.flush();
+
+            // 预热：点读一遍，把能装的页装进缓存（此后缓存是满的）
+            {
+                let tx = mvcc.begin_transaction();
+                for i in 0..KEYS {
+                    assert!(tx.get(&format!("k{i:05}").into_bytes()).is_some());
+                }
+            }
+            let evict0 = crate::bplus_tree::page::page_evictions();
+            let read0 = crate::bplus_tree::page::page_reads();
+
+            {
+                let tx = mvcc.begin_transaction();
+                let rows = tx.scan(None, None);
+                assert_eq!(rows.len() as u64, KEYS, "全量 scan 应折出全部键");
+            }
+            let evicted = crate::bplus_tree::page::page_evictions() - evict0;
+            let walked = crate::bplus_tree::page::page_reads() - read0;
+            eprintln!("走查 {walked} 次页访问，换出 {evicted} 页（缓存上限 {CACHE_PAGES} 页）");
+            // 合同是"与树高同阶"，不是"绝对 0"：起点下降到那片叶子要读 root/内部页，
+            // 那几个导航页未命中时会回填（实测 2 次），这是常数级、与库大小无关。
+            // 真正的病灶是"每走一片叶子换出一批"——旧实现 53 次页访问换出 50 页。
+            assert!(
+                evicted * 8 <= walked,
+                "换出 {evicted} 页对 {walked} 次页访问太多：走查在逐页挤掉工作集"
+            );
+            assert!(
+                evicted as usize <= CACHE_PAGES,
+                "换出必须停在树高量级（实测 {evicted}，缓存上限 {CACHE_PAGES}）"
+            );
+        }
+        cleanup(&path);
+    }
+
     // ---- B+ 树读路径的墙钟归因（手动 release 跑）----
     //
     // 大库基线里 bplus 点读 33.6 µs/次（bitcask 4.3）、`search 首页` 518 ms、`health()` 110 ms。
@@ -2054,39 +2107,82 @@ mod tests {
             let warm_pages = probe("第二遍(热)", &mvcc);
             assert_eq!(cold_pages, warm_pages, "两遍的页访问次数必须一致，不一致说明形状变了");
 
+            // 五个计数一起快照：命中/未命中只说"有没有读盘"，换出与批量写盘才说得出
+            // "走一遍全库被顺带 flush 了多少脏页"（脏页换出要写双写缓冲 + sync）。
+            type Snap = (u64, u64, u64, u64, u64, u64);
+            let snap = || -> Snap {
+                (
+                    crate::bplus_tree::page::page_reads(),
+                    crate::bplus_tree::page::cache_hits(),
+                    crate::bplus_tree::page::cache_misses(),
+                    crate::bplus_tree::page::page_evictions(),
+                    crate::bplus_tree::page::batch_flushed_pages(),
+                    crate::bplus_tree::page::lru_compactions(),
+                )
+            };
+            let report = |label: &str, per: f64, unit: &str, a: Snap, b: Snap| {
+                eprintln!(
+                    "{label:<16} {per:>9.1} {unit:<7} | 页 {:>6} 命中 {:>6} 未命中 {:>5} 换出 {:>5} 批量写盘 {:>5} LRU压缩 {:>4}",
+                    b.0 - a.0,
+                    b.1 - a.1,
+                    b.2 - a.2,
+                    b.3 - a.3,
+                    b.4 - a.4,
+                    b.5 - a.5
+                );
+            };
+
             // 一次全量 scan
             let tx = mvcc.begin_transaction();
-            let (p0, hit0, miss0) = (
-                crate::bplus_tree::page::page_reads(),
-                crate::bplus_tree::page::cache_hits(),
-                crate::bplus_tree::page::cache_misses(),
-            );
+            let a = snap();
             let t = Instant::now();
             let rows = tx.scan(None, None);
             let d = t.elapsed().as_secs_f64() * 1e6;
-            eprintln!(
-                "{:<16} {:>7.1} µs/行 | 页 {:>6} | 命中 {:>6} | 未命中 {:>5} | {} 行",
-                "一次全量 scan",
-                d / rows.len().max(1) as f64,
-                crate::bplus_tree::page::page_reads() - p0,
-                crate::bplus_tree::page::cache_hits() - hit0,
-                crate::bplus_tree::page::cache_misses() - miss0,
-                rows.len()
-            );
+            report("一次全量 scan", d / rows.len().max(1) as f64, "µs/行", a, snap());
             drop(tx);
             drop(rows);
 
-            // health() 与 search 首页：管理面的两个数
+            // ⚠️ 复现台架的顺序：health() 之前有一轮"更新 2000 键"，那会把页弄脏。
+            //    复测表里 health() 从 110 ms 涨到 251 ms，这一组就是去分"每页更贵"还是"页更多"。
+            let a = snap();
+            let t = Instant::now();
+            for i in 0..2000usize {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(&key(i), val(i + N)), "更新第 {i} 个键失败");
+                tx.commit();
+            }
+            report(
+                "更新 2000 键",
+                t.elapsed().as_secs_f64() * 1e6 / 2000.0,
+                "µs/次",
+                a,
+                snap(),
+            );
+
+            let a = snap();
             let t = Instant::now();
             let _ = mvcc.health();
-            eprintln!("{:<16} {:>7.1} µs/次", "health()", t.elapsed().as_secs_f64() * 1e6);
+            report("health() 紧跟", t.elapsed().as_secs_f64() * 1e6, "µs/次", a, snap());
+
+            // 再量一遍：此时脏页已经flush过，若这一遍明显快 ⇒ 上一遍付的是flush脏页/换出的钱
+            let a = snap();
+            let t = Instant::now();
+            let _ = mvcc.health();
+            report("health() 第二遍", t.elapsed().as_secs_f64() * 1e6, "µs/次", a, snap());
 
             let q = crate::common::SearchQuery::contains(b"", 0, 100);
             let tx = mvcc.begin_transaction();
+            let a = snap();
             let t = Instant::now();
             let _ = tx.search_keys(&q);
-            eprintln!("{:<16} {:>7.1} µs/次", "search 首页", t.elapsed().as_secs_f64() * 1e6);
+            report("search 首页", t.elapsed().as_secs_f64() * 1e6, "µs/次", a, snap());
             drop(tx);
+
+            // 决定性的一条：走查之后点读的工作集还在不在。
+            // 修复前 —— 上面那几趟全库走查已经把缓存换出几千页，这一遍几乎全未命中；
+            // 修复后 —— 走查不回填，点读留下的热页应该原封不动。
+            eprintln!("--- 走查之后的点读（工作集是否被毁）---");
+            probe("点读(走查后)", &mvcc);
 
             // 页缓存开大到能装下全库，看未命中是否归零（这决定"贵"是 IO 还是 CPU）
             drop(mvcc);

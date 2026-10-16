@@ -1079,9 +1079,11 @@ impl BPlusTree {
         }
 
         // 再沿单向 next_leaf 链表一路向右。读页/反序列化失败就止步（与现有 iter 一致地宽容）
+        // 走查用 `read_page_for_walk`：每片叶子只碰一次，回填它不会有下一次命中，
+        // 却会把点读焐热的页挤出去（实测一次全库走查换出 1600 页、顺带 flush 765 页脏页）。
         let mut leaf = Some(current);
         while let Some(id) = leaf {
-            let Some(data) = self.page_manager.read_page(id) else {
+            let Some(data) = self.page_manager.read_page_for_walk(id) else {
                 break;
             };
             let Ok(node) = bincode::deserialize::<BTreeNode>(&data) else {
@@ -1120,7 +1122,8 @@ impl BPlusTree {
         // 空键 ≤ 一切 ⇒ 没有起点时下降到的就是最左叶子
         let mut leaf = self.find_leaf_for_key(self.root, from.unwrap_or(&[]).to_vec());
         while let Some(id) = leaf {
-            let Some(data) = self.page_manager.read_page(id) else {
+            // 同上：一次性走查不回填、不换出，见 `scan_entries_with`
+            let Some(data) = self.page_manager.read_page_for_walk(id) else {
                 break;
             };
             let Ok(node) = bincode::deserialize::<BTreeNode>(&data) else {
@@ -1169,8 +1172,8 @@ impl<'a> Iterator for BPlusTreeIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let page_id = self.current_page_id?;
 
-        // 读取当前节点
-        let node_data = self.tree.page_manager.read_page(page_id)?;
+        // 读取当前节点（叶子链上的走查 ⇒ 不回填、不把点读的热页挤出去）
+        let node_data = self.tree.page_manager.read_page_for_walk(page_id)?;
         let node: BTreeNode = bincode::deserialize(&node_data).ok()?;
 
         if let BTreeNode::Leaf { entries, next_leaf } = node {

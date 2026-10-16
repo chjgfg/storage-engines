@@ -694,6 +694,11 @@ data.db.lock       单写者锁(内含 pid)
   `test_reorg_never_drops_oversized_pages`(把检查临时关掉,第 36 次删除就报"删除失败")。
   ⚠️ 代价如实记在这里:放弃合并会让下溢的叶子保留得更多、填充率下降,delete 密集之后一次全库
   走查更贵(实测 `vacuum()` 206 ms → 450 ms @ 20k 行)。正解是"合并后再分裂",还没做。
+- ⚠️ **页数会超过页缓存上限**:`max_cache_pages` 默认 1024,而 20000 行(40B 键)的树就有 **1257 页**。
+  只读走查现在不再回填溢出的部分(`read_page_for_walk`:装不下就不缓存),所以一次全库走查
+  不再把点读的热页挤出去(`health()` 150 ms → 21.2 ms、换出 1600 → **0**);
+  但**容量本身没法按库大小调** —— `EngineConfig` 只把 `order` / `max_cache_pages` 透给
+  `open_engine_with`,而 `open_engine(name, path)` 用默认值。这条在「门面还缺的三项」里。
 - blob GC 是简化版:只在完全无引用时清空,有引用则暂不重写(append-only 空间残留)
 - `page_id` 在页头里被截断成 u32
 

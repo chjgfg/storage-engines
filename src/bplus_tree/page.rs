@@ -149,6 +149,34 @@ pub(crate) fn cache_misses() -> u64 {
     CACHE_MISSES.with(|c| c.get())
 }
 
+// 测试专用：换出、LRU 压缩、批量写盘各发生了多少。
+//
+// 归因 bplus `health()` 时必需的第三把尺子：命中/未命中只说明"有没有读盘"，说明不了
+// **走一遍全库时被顺带flush了多少脏页**（换出脏页要写双写缓冲 + sync，一次的成本和一次
+// 读盘不是一个量级）。台架复测里 `health()` 从 110 ms 涨到 251 ms，而它走的就是
+// `scan_keys_with` 一条链 —— 到底是"每页更贵"还是"页更多"，得靠这三个计数分开。
+#[cfg(test)]
+thread_local! {
+    static PAGE_EVICTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LRU_COMPACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BATCH_FLUSHED_PAGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn page_evictions() -> u64 {
+    PAGE_EVICTIONS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn lru_compactions() -> u64 {
+    LRU_COMPACTIONS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn batch_flushed_pages() -> u64 {
+    BATCH_FLUSHED_PAGES.with(|c| c.get())
+}
+
 // 测试专用：本线程「把某行的 value 克隆出来」的次数。
 //
 // B+ 树没有独立键索引，全库走一遍的**页读取**省不掉；能省的是把每一行的 value
@@ -580,6 +608,57 @@ impl PageManager {
         Some(payload)
     }
 
+    /// 只为**一次性走查**准备的读页：命中缓存就用，未命中时**只有在还装得下时才回填**。
+    ///
+    /// 为什么不能直接用 [`Self::read_page`]：全库走查（scan / prefix_scan / health /
+    /// search / vacuum 的键折叠）会把每一页都摸一次。当页数超过 `max_cache_pages`
+    /// （实测 20000 行 ≈ 1257 页 > 默认 1024），这趟走查就变成"逐页换出"——
+    /// 刚被点读焐热的叶子全被挤掉，还可能顺带把脏页 flush 出去
+    /// （实测一次 `health()` 换出 1600 页、写盘 765 页，150 ms；第二遍命中数只有 1）。
+    /// 走查对每一页只碰一次，回填它并不会有下一次命中，所以这里选择**装得下才缓存**：
+    /// 小库依然全部命中，大库不再毁掉 OLTP 的工作集。
+    pub fn read_page_for_walk(&mut self, page_id: PageId) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        PAGE_READS.with(|c| c.set(c.get() + 1));
+        if !self.page_is_live(page_id) {
+            return None;
+        }
+        self.clock += 1;
+
+        if self.cache.contains_key(&page_id) {
+            #[cfg(test)]
+            CACHE_HITS.with(|c| c.set(c.get() + 1));
+            self.update_lru(page_id);
+            let entry = self.cache.get_mut(&page_id).unwrap();
+            entry.last_access = self.clock;
+            return Some(entry.data.clone());
+        }
+
+        #[cfg(test)]
+        CACHE_MISSES.with(|c| c.set(c.get() + 1));
+        let payload = match self.read_disk_payload(page_id) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("读盘失败 page={}: {}", page_id.0, e);
+                return None;
+            }
+        };
+        // 关键区别：满了就不回填，宁可不缓存也不把热页挤出去
+        if self.cache.len() < self.max_cache_pages {
+            self.cache.insert(
+                page_id,
+                CacheEntry {
+                    page_id,
+                    data: payload.clone(),
+                    state: PageState::Clean,
+                    last_access: self.clock,
+                },
+            );
+            self.lru_queue.push_back(page_id);
+        }
+        Some(payload)
+    }
+
     /// 写页 payload（标记 Dirty，真正落盘在 flush / 换出时）
     pub fn write_page(&mut self, page_id: PageId, data: &[u8]) -> bool {
         if data.len() > PAGE_PAYLOAD_SIZE {
@@ -736,8 +815,12 @@ impl PageManager {
         if !dirty_victims.is_empty() {
             // bulk：只 write 不 sync；正常：批量双写 + 一次 sync
             let sync = !self.bulk_mode;
+            #[cfg(test)]
+            BATCH_FLUSHED_PAGES.with(|c| c.set(c.get() + dirty_victims.len() as u64));
             let _ = self.flush_pages_batch(&dirty_victims, sync);
         }
+        #[cfg(test)]
+        PAGE_EVICTIONS.with(|c| c.set(c.get() + victims.len() as u64));
         for pid in victims {
             self.cache.remove(&pid);
         }
@@ -763,6 +846,8 @@ impl PageManager {
     }
 
     fn compact_lru(&mut self) {
+        #[cfg(test)]
+        LRU_COMPACTIONS.with(|c| c.set(c.get() + 1));
         let mut seen = HashMap::with_capacity(self.cache.len());
         let mut new_q = VecDeque::with_capacity(self.cache.len());
         // 从队尾往队首扫，保留每个 page 最后一次出现（最近）
