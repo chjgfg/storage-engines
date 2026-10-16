@@ -27,5 +27,5 @@ pub use kv_ops::{IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery};
 pub use lsm_tree::{
     spawn_bg_compactor, CompactionFilter, LSMTree, LSMTreeOptions, LsmStats, Snapshot,
 };
-pub use lsm_tree_mvcc::{ExportRecord, VacuumStats, MVCC};
+pub use lsm_tree_mvcc::{EngineTuning, ExportRecord, VacuumStats, MVCC};
 pub use sst::StoredEntry;

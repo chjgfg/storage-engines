@@ -31,6 +31,17 @@
   的唯一定义移到 `crate::common`，各引擎模块仍然 `pub use` 转发 ⇒
   `crate::bitcask::encode_key` 这类既有路径**不受影响**，只有直接 import `crate::common::*`
   的写法会遇到重名。
+- **`EngineConfig` 新增四个字段**（M13）：`lsm: Option<LSMTreeOptions>`、
+  `bitcask_max_file_bytes: Option<u64>`、`wal_checkpoint_bytes: Option<u64>`、
+  `vacuum_auto_slice_rows: Option<u64>`。用**全字段字面量**构造它的代码要补
+  `..Default::default()`（读/写单个字段的代码不用改）。
+- **`KvEngine` trait 再加四个必需方法**（M13）：`vacuum_bounded(after, budget_rows)`、
+  `set_wal_checkpoint_limit(bytes)`、`wal_checkpoint_limit()`、`tuning()`。自己实现过这个
+  trait 的（不是用本仓库四个引擎）要补实现。其中 WAL 阈值那两个**返回 `Result`**：
+  `memory` 没有 WAL，给它设阈值返回 `Unsupported{engine:"memory", op:"wal checkpoint limit"}`
+  而不是"设置成功" —— 门面上以前没有这条转发，下游只能绕开门面直接摸 `crate::lsm_tree::MVCC`，
+  而那正是 wrapper 复制的起点。`open_engine_with` 里若给 `memory` 传了 `wal_checkpoint_bytes`
+  也**当场失败**（不静默忽略）。
 
 ### 新增
 
@@ -97,6 +108,31 @@
   所以补了 CRC 却忘了改文档这种事会当场红。
   如实记录的三条缺口：bitcask 主日志记录无校验和（补它要改磁盘格式，本仓库不采纳）、
   LSM 的 `blobs/*.blob` 是裸文件、LSM 的 MVCC 路径关掉了 mem.wal（持久化只靠事务 WAL）。
+- **`EngineConfig` 装齐四家的旋钮 + 参数能读回**（M13）。在此之前门面只有 B+ 树的
+  `order` / `max_cache_pages`，bitcask 的分片上限、LSM 的 `LSMTreeOptions`（memtable 阈值、
+  块缓存容量、mmap、L0 三档触发、blob 阈值、SST 目标大小）、WAL 收口阈值全留在各引擎的
+  `MVCC` 里，下游要调就得绕开门面自己构造 —— 基座该被依赖而不是被复制，缺一个入口就多一层复制。
+  现在：`EngineConfig { order, max_cache_pages, lsm, bitcask_max_file_bytes,
+  wal_checkpoint_bytes, vacuum_auto_slice_rows }`，`open_engine_with` 一路接通到
+  `MVCC::try_open_with`（bitcask 收 `Option<u64>`，lsm 收整份 `Option<LSMTreeOptions>`，
+  没给的字段留在 `for_mvcc()` 档上 —— 常规写法是 struct-update 从 `for_mvcc()` 抄基线）。
+  `LSMTreeOptions` 与 `DEFAULT_MAX_FILE_BYTES` 提到 crate 根 / `crate::bitcask` 可见。
+- **`KvEngine::tuning()`：写进去的旋钮要读得回来**（M13）。返回 `EngineTuning`
+  （`Vec<{key, value:String}>` + `get(key)`，定义在 `src/common/types.rs`，与 `MvccHealth` 同层），
+  各引擎的 `MVCC::tuning()` 自己列自己有的键 ⇒ 它同时是"这家能调什么"的清单，而不是门面里
+  为每家开一个参数 enum（那等于把引擎差异灌回适配层）。跨引擎共用的两条键名由
+  `EngineTuning::push_shared()` 给一次，不在四处各拼一遍字符串。
+  存在的理由：`EngineConfig` 只能"给"，以前给错了（字段记错、引擎根本不吃这条）是**静默**的。
+- **`vacuum_bounded` / WAL 阈值读写上门面**（M13）：`KvEngine::vacuum_bounded(after, budget_rows)`
+  与 `set_wal_checkpoint_limit` / `wal_checkpoint_limit`，`impl_engine!` 新增 `wal: yes|no` 开关
+  （`vacuum_bounded` 复用 `vacuum` 那个 io/plain 开关，形状一致）。长跑进程要的就是有界那一档：
+  一轮的代价只看 `budget_rows`，`vacuum()` 的代价看整库。
+- **`crate::lsm_tree::MVCC::set_options(patch)`（热更新，打开之后不用重开库）+ `options()` 读回**，
+  以及 bplus 的 `MVCC::{order, max_cache_pages}`、bitcask 的 `MVCC::{max_file_bytes}` 读回。
+  两条钉死项在 `pin_mvcc_invariants`：`enable_mem_wal` / `enable_bg_compact` 传 `true` 也恒为
+  `false`。前者是"事务 WAL 是唯一持久化点"的定义；后者不是洁癖 —— 后台线程只在 open 时按当时的
+  option 创建，若允许热改成 `true`，写路径会以为"有人替我 compact"而**自己不再 compact**，
+  而线程根本不存在 ⇒ L0 无限涨。
 
 ### 性能与正确性（无 API 变更）
 - **只读事务不再进 WAL**（实测 2265.8µs/次 → **15.8µs/次**，落盘字节 56 → **0**）。
@@ -277,6 +313,13 @@
   才退化到全库扫 KeyDir。以前"重启止血"这个动作本身一次比一次慢。
 - **vacuum 自己不再是全库最重的路径**：分组只走元数据/键视图，不物化 value；blob GC 只读
   保留下来的行。旧实现有两次全库 `iter()`，等于「一开自动回收，就在回收那一刻制造新事故」。
+- **M13 接线之后复跑 release / 20k 行的四引擎全表，没有回退**（耗时列按 ±2× 噪声读，
+  结论只来自计数）：bplus 点读乱序 16.0 / 有序 6.6 µs、全量 scan 1.6 µs/行、窗口 scan
+  1.9 µs/行、`health()` 25.3 ms、`vacuum()` 466 ms（这条仍是"合并后再分裂"未还的账）；
+  lsm 点读 15.2 µs、全量 scan 4.4 µs/行、窗口 2.6 µs/行；bitcask 窗口 6.8 µs/行（上次 3.0，
+  同一份代码 + 计数未变 ⇒ 记为计时噪声，不当结论）；memory 全部在 1~3 µs 量级。
+  接线本身零成本可解释：`try_open_with(dir, None)` 走的就是原先那条分支，只是多了一个
+  `Option` 的判断；`tuning()` 不在热路径上（管理面调用）。
 
 ### 修复
 
@@ -307,11 +350,34 @@
   merge 残骸认不回）⇒ 要拿修复版只能走 `path` / `git` 依赖。原先这里写的是 `storage-engines = "0.1"`。
 - **「已知局限」里「事务不是 `Send`/`Sync` 友好的多线程设计」按 M9 划掉改写** —— 那条已经反了：
   `KvEngine: Send + Sync`、`KvTxn: Send`；同时补上门面还缺的三项，指向使用说明第 7 条。
+- **M13 之后 README 的三处同步改写**：使用说明第 1 条加「旋钮：`EngineConfig` 一个结构体装齐四家」
+  的字段表（谁吃哪条、默认值、能不能热改）+ `tuning()` 读回示例；第 5 条补门面上的
+  `vacuum_bounded` 游标循环与实测的"160 行/预算 25 ⇒ 3 轮、单轮最多 40 行"；第 7 条把
+  「调参只开了 B+ 树」「有界回收不在门面上」两条**删掉**，换上此刻真实的边界（open 档 vs 热档、
+  `tuning()` 只列代价相关的旋钮、门面不暴露列族、仍无 `migrate()` 库 API）。「门面层设计」的
+  trait 方法与 `impl_engine!` 开关清单同步（新增 `wal: yes|no`）。
 
 ### 测试
 
-247 个单元测试（244 跑 + 3 个 `#[ignore]` 的大库基线/长跑基线）+ 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆/索引比较次数/超载写次数），不用计时：原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
+250 个单元测试（246 跑 + 4 个 `#[ignore]` 的大库基线/长跑基线）+ 4 个集成测试 + 5 个文档测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆/索引比较次数/超载写次数），不用计时：原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
 并且复杂度守卫都先验证过"它会红"（临时短路被测代码跑一遍）才算数。
+- **配置旋钮三条（M13）**：
+  - `engine_config_knobs_reach_the_engine_and_are_readable_back`：`EngineConfig` 的每个字段都要
+    在**那个引擎**里读得回（B+ 树 `order`/`max_cache_pages`、bitcask `max_file_bytes`、LSM
+    `block_cache_blocks`/`mem_threshold_bytes`/未动的字段仍留在 `for_mvcc()` 档、`wal_checkpoint_bytes`、
+    `vacuum_auto_slice`），并配**同一入口默认档的对照**（`64/1024`、`64 MiB`、`256/32 MiB`、
+    `16 Ki`）—— 没有对照，键名漂了或引擎没接这条时用例照样绿。给 `memory` 设 WAL 阈值必须
+    `Err(Unsupported{engine:"memory",...})`，且它的 `tuning()` 里**没有** `wal_checkpoint_bytes` 这个键。
+    把 `try_open_with` 临时改成"忽略补丁"，这条立刻红（`left: 256 / right: 999`）。
+  - `lsm_mvcc_pins_the_two_fields_that_would_break_crash_safety`：`enable_mem_wal` /
+    `enable_bg_compact` 传 `true` 也必须是 `false`，open 与 `set_options` 两条路都要钉；
+    同时断言 `block_cache_blocks` 这类**该生效的要生效**（钉两条不等于连坐）。临时把
+    `pin_mvcc_invariants` 掏空，它红在第一句"事务 WAL 是唯一的持久化点"。
+  - `vacuum_bounded_is_bounded_and_ends_where_vacuum_does`：160 行 / 预算 25 ⇒ 四家都是
+    **3 轮、单轮最多 40 行**（余量 = 一条链，因为截断只在逻辑 key 边界），游标严格前进，
+    接力扫完的终态与 `vacuum()` 一致（每 key 剩一行）；另一半断言 `budget_rows = u64::MAX`
+    的**一轮**读满 160 行、`next_cursor == None` —— 证明"两个入口一套规则"不是说法。
+    把预算临时放大到 1000（> 全库），断言"一轮扫完说明根本没限流"立刻红。
 - **窗口/前缀扫随窗口宽度缩**：`test_windowed_scan_cost_scales_with_window_not_library` 四家各一条
   （尺子分别是读盘次数 / 折叠走的键数 / 页数 / SST 块读次数），每条都同时断言"结果与全量之后筛
   逐条一致"和"计数随窗口缩"，外加一条 `prefix_scan(所有键的真前缀)` 的边界形状。
@@ -344,3 +410,7 @@
 4. **本 crate 在 crates.io 上最新只到 0.3.0**（0.1.0 / 0.2.0 / 0.3.0），也就是说出事故的那版才是
    下游 `storage-engines = "0.3"` 拿到的东西。要用依赖代替内嵌副本，得先把 0.4.0 发上去；
    在发布之前只能走 `path`/`git` 依赖。
+5. M13 之后，下游 wrapper 里**调参那一层也可以删了**：原先要绕过门面自己构造
+   `crate::lsm_tree::MVCC` 才能设的块缓存/分片上限/WAL 阈值，现在都在 `EngineConfig` 里，
+   并且 `db.tuning()` 能在启动日志里把"到底生效了没有"打出来（长跑进程调参没生效是查不出来的
+   那类问题）。回收也从"只有全库一档"变成 `db.vacuum_bounded(cursor, 预算)` 可接力。

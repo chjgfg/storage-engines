@@ -17,7 +17,7 @@ use std::{
 };
 
 pub use crate::common::{
-    DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
+    DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
@@ -119,6 +119,16 @@ impl MVCC {
 
     pub fn vacuum_auto_slice(&self) -> u64 {
         self.vac.slice()
+    }
+
+    /// 本引擎能被调的东西 —— 清单在这里，不在门面。
+    ///
+    /// 只有一条：`wal_checkpoint_bytes` 对内存引擎没有意义（连字段都不存在，见
+    /// [`MVCC::durability_profile`] 的"没有任何持久化"），所以共用清单里它对的那一半不列。
+    pub fn tuning(&self) -> EngineTuning {
+        let mut t = EngineTuning::default();
+        t.push_shared(self.vacuum_auto_slice(), None);
+        t
     }
 
     /// 默认切片宽度 = 16 Ki 行（四引擎同一个默认值，方便跨引擎对比观测）。

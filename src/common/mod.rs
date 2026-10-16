@@ -16,8 +16,8 @@ pub use codec::{
     prefix_upper_bound,
 };
 pub use types::{
-    DurabilityProfile, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage,
-    SearchQuery, VacuumRound, VacuumStats, ValueMeta,
+    DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
+    SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use version::{decode_key, encode_key, vacuum_plan, version_key_upper_bound, VersionedKey};
 

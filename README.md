@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 247 个单元测试 + 4 个集成测试
+- 250 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ 这个版本号只在本仓库,**crates.io 上最新仍是 0.3.0(出事故那版)**,要引修复版得走 path/git 依赖 —— 见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -113,7 +113,7 @@ let db = open_engine("bplus", Some(Path::new("data/bplus_tree/bplus.db")))?;
 let db = StorageConfig {
     kind: EngineKind::BPlusTree,
     data_dir: PathBuf::from("data"),
-    engine: EngineConfig::default(), // order=64 / max_cache_pages=1024,只有 B+ 树用得到
+    engine: EngineConfig::default(), // 四家的旋钮都在这一份里,取值见下面的旋钮表
 }
 .open()?;
 
@@ -123,6 +123,52 @@ let db = open_from_env()?;
 
 四种写法返回的都是 `Box<dyn KvEngine>`。第一个参数的类型是 `EngineName` trait:`EngineKind` /
 `&str` / `String` / `&String` 都能直接传,拿着枚举不必自己 `.as_str()`。
+
+#### 旋钮:`EngineConfig` 一个结构体装齐四家
+
+| 字段 | 默认 | 生效于 | 说明 |
+|---|---|---|---|
+| `order` | 64 | 只有 `bplus_tree` | B+ 树阶数,**只能打开时设**(改了等于让新旧页用两套节点形状) |
+| `max_cache_pages` | 1024 | 只有 `bplus_tree` | 页缓存容量(页数)。20k 行 ≈ 1257 页 > 1024,库大了就按页数往上调 |
+| `lsm` | `None`(= `LSMTreeOptions::for_mvcc()`) | 只有 `lsm_tree` | 整份 options;改单个字段用 struct-update 从 `for_mvcc()` 抄基线 |
+| `bitcask_max_file_bytes` | `None`(= 64 MiB) | 只有 `bitcask` | active 分片软上限,决定 rotate 与 `merge()` 的粒度 |
+| `wal_checkpoint_bytes` | `None`(= 16 MiB) | 三个磁盘引擎 | 涨过就在下一次提交后自动 checkpoint;`Some(0)` = 关闭 |
+| `vacuum_auto_slice_rows` | `None`(= 16 Ki 行) | 四引擎 | 自动回收切片宽度;`Some(0)` = 关闭 |
+
+```rust
+use storage_engines::{open_engine_with, EngineConfig, LSMTreeOptions};
+
+// 只改要改的那个字段,其余留在引擎自己的 MVCC 档上
+let db = open_engine_with(
+    "lsm_tree",
+    Some(Path::new("data/lsm_tree")),
+    &EngineConfig {
+        lsm: Some(LSMTreeOptions { block_cache_blocks: 1024, ..LSMTreeOptions::for_mvcc() }),
+        ..Default::default()
+    },
+)?;
+```
+
+**写进去要能读回来**:`db.tuning()` 返回这个引擎当前生效的参数快照(键名与上表对齐),
+各引擎只列自己有的键 —— 它同时是"这家能调什么"的清单。
+
+```rust
+let t = db.tuning();
+assert_eq!(t.get("block_cache_blocks"), Some("1024"));
+assert_eq!(t.get("wal_checkpoint_bytes"), Some("16777216")); // memory 上这条是 None
+```
+
+三条边界,都由守卫钉住(`engine_config_knobs_reach_the_engine_and_are_readable_back`、
+`lsm_mvcc_pins_the_two_fields_that_would_break_crash_safety`):
+
+- 每个引擎只读自己那几个字段,其余**忽略**;忽略不等于假装成功 —— 给 `memory` 设
+  `wal_checkpoint_bytes` 会直接 `Err(Unsupported{engine:"memory", op:"wal checkpoint limit"})`,
+  因为"以为设了阈值、其实那家根本没有 WAL"正是不能靠默认值发生的那类事故。
+- LSM 的 `enable_mem_wal` / `enable_bg_compact` **传了也不算**,恒被钉回 `false`:事务 WAL 是唯一
+  的持久化点,再开 mem.wal 就有两个互不知情的提交日志;而 `set_options` 热开后台 compact 不会
+  真的起线程(线程只在 open 时创建),只会让写路径以为有人替它 compact ⇒ L0 无限涨。
+- 打开之后还能热改的只有 `vacuum_auto_slice` 与 WAL 阈值(都在 `KvEngine` 上);LSM 其余旋钮的
+  热改走具体类型 `crate::lsm_tree::MVCC::set_options`。
 
 各家"一个库"的形状不同 —— `StorageConfig::open()` 替你抹平了这条差异,手写路径时得自己对上:
 
@@ -137,8 +183,9 @@ let db = open_from_env()?;
 ("以为在跑 bitcask、其实跑的是 memory"不能靠默认值发生)。磁盘引擎漏给路径 ⇒ `PathRequired`。
 
 错误只有一个类型:`EngineError { UnknownEngine(String), Unsupported{engine,op}, PathRequired(&str), Io(io::Error) }`,
-`Display` 直接可读。`Unsupported` 目前只有一个来源:`merge()` 仅 bitcask 支持(其余三家调它返回这个错,
-不是 panic)。内存引擎的 `flush()` / `checkpoint()` 是 **no-op**,不会报错 —— 别把它当"落盘成功"。
+`Display` 直接可读。`Unsupported` 有两个来源:`merge()` 仅 bitcask 支持;WAL 阈值读写
+(`set_wal_checkpoint_limit` / `wal_checkpoint_limit`)仅三个磁盘引擎有 —— 都返回错误而不是 panic。
+内存引擎的 `flush()` / `checkpoint()` 是 **no-op**,不会报错 —— 别把它当"落盘成功"。
 
 ### 2. 读写:事务是唯一入口
 
@@ -212,7 +259,9 @@ if h.max_chain > 64 {
 }
 db.set_vacuum_auto_slice(8 * 1024);        // 调切片宽度;**设 0 才是关闭**(默认 16 Ki 行,四引擎同值)
 let _ = db.vacuum()?;                      // 全库轮次:唯一会顺手做 merge() / blob 重写的入口
-db.checkpoint()?;                          // WAL 涨过阈值其实会自动做(默认 16 MiB)
+db.set_wal_checkpoint_limit(4 << 20)?;     // WAL 收口阈值(默认 16 MiB;0 = 关闭自动触发)
+println!("现在生效的: {}", db.tuning());   // 引擎自报的参数快照,写进去的要读得回来
+db.checkpoint()?;                          // 手动收口(不等到阈值)
 println!("{}", db.durability_profile());   // Display 只报缺口
 ```
 
@@ -222,7 +271,25 @@ println!("{}", db.durability_profile());   // Display 只报缺口
   `active_txns` —— 有活跃事务时 `vacuum()` **整轮跳过**(返回 `skipped_active_txn = true`,
   和"扫了但没得裁"是两种结论完全不同的 0)。
 - 自动回收默认开着,提交时记账、`begin()` 时取账,触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率
-  1:1。手动 `vacuum()` 留给"要立刻收文件空间"的场景。
+  1:1。
+
+**有界回收 `vacuum_bounded(after, budget_rows)` 也在门上了** —— 长跑进程要的是它,不是 `vacuum()`:
+
+```rust
+let mut cursor = None;
+loop {
+    let round = db.vacuum_bounded(cursor.as_deref(), 4 * 1024)?;   // 一轮最多读这么多行版本
+    cursor = round.next_cursor;          // None ⇒ 已扫完全库
+    if cursor.is_none() { break; }
+}
+```
+
+- 一轮的代价只看 `budget_rows`,不看库有多大;`next_cursor` 原样传回就接着扫。
+  截断只发生在**逻辑 key 边界**(半条链不能收:判"留哪一版"要求整组版本都在手上),所以
+  `rows_scanned` 的预算余量 = 一条链的长度。实测 160 行 / 预算 25 ⇒ 四家都是 3 轮、
+  单轮最多 40 行;扫完的终态与 `vacuum()` 一致(每 key 剩一行)。
+- `budget_rows = u64::MAX` 的那一轮**等价于** `vacuum()`(同一份保留规则,不是两套),
+  也只有这一轮做 blob 回收与日志压缩 —— 两者都是全库代价,放进中间轮等于每轮重写一遍库。
 
 ### 6. 选型:别只看速度
 
@@ -249,11 +316,15 @@ println!("{profile}");                     // 只报缺口:少了 WAL / 校验�
 - **换引擎不搬数据**:`open_engine` 只是换了一家,原来那家的数据不会跟过来。跨引擎搬运只有 CLI
   ([`export_kv` → `import_kv`](#命令行工具数据搬运与压测));库 API 侧只有
   `export_latest_visible()` + `begin_bulk()` 这两块积木,没有 `migrate()`。
-- **调参只开了 B+ 树**:`EngineConfig` 目前只有 `order` / `max_cache_pages`。bitcask 的分片上限、
-  LSM 的 memtable/blob 阈值、WAL 收口阈值都还在各引擎的 `MVCC` 上
-  (如 `crate::lsm_tree::MVCC::set_wal_checkpoint_limit`),门面没转发。
-- **有界回收不在门面上**:`vacuum_bounded(after, budget_rows)` 只在各引擎的 `MVCC` 上
-  (`crate::bitcask::MVCC::vacuum_bounded`),`KvEngine::vacuum()` 是全库那一轮。
+- **旋钮分两档**:open 时设的(`order` / `max_cache_pages` / `bitcask_max_file_bytes` / LSM 整份
+  options)改一次要重开库 —— 前两者动的是**已落盘数据的形状**,不是能热调的运行时参数。
+  开着库能调的只有切片宽度与 WAL 阈值(在 `KvEngine` 上),LSM 其余旋钮另走具体类型
+  `crate::lsm_tree::MVCC::set_options`。
+- **`tuning()` 列的是代价相关的旋钮,不是全部字段**:LSM 的 `LSMTreeOptions` 有 21 个字段,
+  快照只列其中影响读写代价的 9 个;`enable_mem_wal` / `enable_bg_compact` **有意不列**
+  (列了会被读成"能调",而它们恒为 `false`)。要看全量读 `crate::lsm_tree::MVCC::options()`。
+- **门面不暴露列族**:多列族 `LsmDB` 与 `CF` 只在各引擎模块里,`KvEngine` 一层没有。
+  需要 CF 隔离的下游得直接用 `crate::lsm_tree::LsmDB`。
 - **值信封要业务侧自己守**:`set` 把 `value` 当**已打信封**的逻辑值存,`get` 一律剥标签,
   所以裸字节直接存会踩坑(`0x00` 打头少 1 字节,`0x01` 打头被当 TTL 信封)。约定是
   `use storage_engines::common::pack_plain;` 先打再 `set`。⚠️ 这条靠人不靠编译器,修法待定
@@ -389,6 +460,9 @@ fn is_visible(&self, version: u64) -> bool {
 
 ### 有界回收 `vacuum_bounded(after, budget_rows)`
 
+四个引擎的 `MVCC` 与门面 `KvEngine` **同名同参数**(`db.vacuum_bounded(...)` 返回
+`Result<VacuumRound>`),所以"按小片推"这件事不需要知道底下是哪一家:
+
 ```rust
 let mut cursor = None;
 loop {
@@ -398,7 +472,10 @@ loop {
 }
 ```
 
-`vacuum()` 就是 `budget_rows = u64::MAX` 的一轮,两者共用同一份保留规则。截断只发生在**逻辑 key 边界**:半条链不能收,因为「留哪一版」的判据要求整组版本都在手上 —— 所以一片实际读的行数可能超出预算,超出量 = 那一条链的长度。这是本设计明确接受的代价(也是游标前进的下界:每轮至少前进一组)。
+`vacuum()` 就是 `budget_rows = u64::MAX` 的一轮,两者共用同一份保留规则 —— 这条"一套规则、
+两个入口"由门面上的 `vacuum_bounded_is_bounded_and_ends_where_vacuum_does` 钉住:160 行 /
+预算 25 时四家都是 3 轮、单轮最多 40 行,接力扫完之后的终态(每 key 剩一行)与 `vacuum()` 一致。
+截断只发生在**逻辑 key 边界**:半条链不能收,因为「留哪一版」的判据要求整组版本都在手上 —— 所以一片实际读的行数可能超出预算,超出量 = 那一条链的长度。这是本设计明确接受的代价(也是游标前进的下界:每轮至少前进一组)。
 
 ### health 观测
 
@@ -596,7 +673,7 @@ blob:   [0x01] offset(u64 LE) len(u32 LE)   —— 共 13 字节
 
 | trait | 用途 |
 |---|---|
-| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `health` / `set_vacuum_auto_slice` / `durability_profile` / `flush` / `checkpoint` / `merge` |
+| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `vacuum_bounded` / `health` / `set_vacuum_auto_slice` / `set_wal_checkpoint_limit` / `wal_checkpoint_limit` / `tuning` / `durability_profile` / `flush` / `checkpoint` / `merge` |
 | `KvTxn` | 读写 / 批量 / 扫描 / 搜索分页 / TTL / `commit` / `rollback` |
 | `KvBulk` | 批量导入,无冲突检测、不写 WAL |
 
@@ -610,11 +687,18 @@ blob:   [0x01] offset(u64 LE) len(u32 LE)   —— 共 13 字节
 四个引擎的 MVCC 层方法名本来就一致,所以用一个 `impl_engine!` 宏生成全部适配代码,**引擎差异做成开关参数**而不是写四遍:
 
 ```
-vacuum:  io | plain     // memory 的 vacuum 不返回 io::Result
+vacuum:  io | plain     // memory 的 vacuum 不返回 io::Result(同形状的还有 vacuum_bounded)
 durable: yes | no       // memory 没有 flush / checkpoint
+wal:     yes | no       // memory 没有 WAL ⇒ 阈值读写返回 Unsupported
 path:    db_dir | db_path | none
 merge:   yes | no       // 只有 bitcask 有
 ```
+
+`tuning()` 不在这些开关里,宏只有一行转发 —— **清单归各引擎的 `MVCC` 自己写**:门面若为每家
+开一个参数 enum,就等于把"引擎差异"重新灌回适配层,正是这套宏要消除的东西。返回值
+`EngineTuning` 是 `Vec<{key, value: String}>` + `get(key)`,四家共用同一份类型(定义在
+`src/common/types.rs`,与 `MvccHealth` / `DurabilityProfile` 同层),键名由
+`push_shared()` 统一给(`vacuum_auto_slice` / `wal_checkpoint_bytes`),各引擎只补自己独有的那几个。
 
 不支持的操作返回 `EngineError::Unsupported` 而不是 panic —— 这是门面层在如实告知能力边界,调用方按需处理:
 
@@ -648,6 +732,12 @@ match db.merge() {
 | 大 value 阈值 | 256 B / 256 B / 4096 B | B+树 / Bitcask / LSM |
 | 默认 order / 页缓存 | 64 / 1024 页 | B+ Tree |
 | WAL 单帧 body 上限 | 16 MB | 全部 |
+| **MVCC 档**（`LSMTreeOptions::for_mvcc`，与上面裸 LSM 默认值**不同**）| mem 32 MB / 262144 条、L0 8/12/32、目标 SST 2 MB、块缓存 256、`enable_mem_wal=false`、`enable_bg_compact=false` | LSM |
+| 自动回收切片 | 16 Ki 行(四引擎同值;`0` = 关闭) | 全部 |
+| WAL 自动收口阈值 | 16 MiB(`0` = 关闭;`memory` 没有 WAL) | 三个磁盘引擎 |
+
+上面这几行都是**默认值**，不是常量 —— 从 M13 起它们都在 `EngineConfig` 里可配，
+`KvEngine::tuning()` 读得回来(见「下游接入使用说明」第 1 条)。
 
 **磁盘文件族**(以 B+ 树为例):
 
@@ -696,9 +786,9 @@ data.db.lock       单写者锁(内含 pid)
   走查更贵(实测 `vacuum()` 206 ms → 450 ms @ 20k 行)。正解是"合并后再分裂",还没做。
 - ⚠️ **页数会超过页缓存上限**:`max_cache_pages` 默认 1024,而 20000 行(40B 键)的树就有 **1257 页**。
   只读走查现在不再回填溢出的部分(`read_page_for_walk`:装不下就不缓存),所以一次全库走查
-  不再把点读的热页挤出去(`health()` 150 ms → 21.2 ms、换出 1600 → **0**);
-  但**容量本身没法按库大小调** —— `EngineConfig` 只把 `order` / `max_cache_pages` 透给
-  `open_engine_with`,而 `open_engine(name, path)` 用默认值。这条在「门面还缺的三项」里。
+  不再把点读的热页挤出去(`health()` 150 ms → 21.2 ms、换出 1600 → **0**)。
+  容量**能**按库大小调了(就在 `EngineConfig`,见「下游接入使用说明」第 1 条的旋钮表),剩下的
+  缺口是**没有自动档**:库涨到多少页要人自己盯 `health()`/页数来调,引擎不会自己按页数定容量。
 - blob GC 是简化版:只在完全无引用时清空,有引用则暂不重写(append-only 空间残留)
 - `page_id` 在页头里被截断成 u32
 
@@ -706,9 +796,10 @@ data.db.lock       单写者锁(内含 pid)
 - ⚠️ **值信封不对称**:`set(key, value)` 把 `value` 当**已经打过信封**的逻辑值存,而 `get` 一律走 `logical_to_user` 剥标签。
   于是**直接用门面存裸字节**时:值以 `0x00` 打头会少 1 字节,以 `0x01` 打头会被当成 TTL 信封少 9 字节、甚至被判定"已过期"而读成 `None`。
   约定是"业务侧先 `pack_plain` 再 `set`"(TTL 类 API 内部已打),但这靠人守不靠编译器 —— 要么让 `set` 自己打信封(对现有按约定打过的调用点是破坏性变更),要么加 `set_raw`/`get_raw`。尚未定
-- **门面还缺的三项**(全部列在「下游接入使用说明」第 7 条,接入前先看那里):跨引擎 `migrate()` 没有库
-  API(只有 CLI)、`EngineConfig` 只暴露 B+ 树的两个旋钮、`vacuum_bounded` 不在 `KvEngine` 上。
-  这三项都是**下游 wrapper 里真在干活**的部分,缺一项就多一层该被删掉的复制
+- ~~**门面还缺的三项**~~ → 已补两项(M13):`EngineConfig` 现在装着四家的旋钮(bitcask 分片上限、
+  LSM 整份 `LSMTreeOptions`、WAL 收口阈值、自动回收切片),`vacuum_bounded` / WAL 阈值读写 /
+  `tuning()` 也都上了 `KvEngine`。仍缺的一项是跨引擎 `migrate()` 的库 API(只有 CLI)。
+  这三项原先都是**下游 wrapper 里真在干活**的部分,缺一项就多一层该被删掉的复制
 - ~~只读事务也要付一次 WAL fsync~~ → 已改:`Begin` 推迟到第一次 `write()` 才补,只读事务的 `commit` 不写 `Commit`、不 fsync(实测 2265.8µs/次 → **15.8µs/次**,WAL 落字节 56 → **0**)。策略只有一份实现:[`crate::common::WalPolicy`]
 - ~~`FileLock` 在三个引擎里各有一份近乎逐字重复的实现~~ → 已收成 `src/common/disk.rs` 一份(`DiskFile` / `FileLock` / `crc32` 三样都是崩溃语义的载体,`diff` 实测原先 bitcask 与 lsm 的 FileLock 差 0 行)。各引擎只保留自己的**锁文件路径规则**(dir/bitcask.lock、`<stem>.lock`、dir/lsm.lock)
 - ~~三份 `wal.rs` 仍是各自一份~~ → 已收成 `src/common/wal.rs` 一份(原先 `diff` 只差 14–16 行注释与 import,`WAL_MAGIC` 与帧头本来就更相同:同一格式的三份复制)。各引擎的 `wal.rs` 现在只是 re-export + 自己的 WAL 路径规则
@@ -818,7 +909,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:247 单元 + 4 集成 + 3 文档测试
+cargo test                    # 全部:250 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

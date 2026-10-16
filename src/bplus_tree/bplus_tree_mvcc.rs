@@ -24,7 +24,9 @@ use crate::bplus_tree::storage::{
     decode_stored_value, encode_stored_value, wal_path, BlobStore,
 };
 use crate::bplus_tree::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+pub use crate::common::{
+    DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
+};
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
 use crate::common::version_key_upper_bound;
@@ -265,6 +267,30 @@ impl MVCC {
 
     pub fn wal_checkpoint_limit(&self) -> u64 {
         self.wal_limit.load(Ordering::SeqCst)
+    }
+
+    /// 生效的 B+ 树阶数（每个节点的子节点上限）。
+    ///
+    /// 只在**打开时**可设：阶数决定已落盘节点的形状，开着库改它等于让新旧页用两套规则。
+    pub fn order(&self) -> usize {
+        self.kv.lock().unwrap().order()
+    }
+
+    /// 生效的页缓存容量（页数）。
+    ///
+    /// 这是全库走查（scan / health / search / vacuum）与工作集能否焐热之间的那颗旋钮：
+    /// 页数超过容量时走查只"装得下才缓存"（`read_page_for_walk`），不再挤掉 OLTP 的热页。
+    pub fn max_cache_pages(&self) -> usize {
+        self.kv.lock().unwrap().max_cache_pages()
+    }
+
+    /// 本引擎能被调的东西 —— 清单在这里，不在门面。
+    pub fn tuning(&self) -> EngineTuning {
+        let mut t = EngineTuning::default();
+        t.push_shared(self.vacuum_auto_slice(), Some(self.wal_checkpoint_limit()));
+        t.push("order", self.order());
+        t.push("max_cache_pages", self.max_cache_pages());
+        t
     }
 
     pub fn checkpoint(&self) {

@@ -24,4 +24,4 @@ pub mod memory_mvcc;
 
 pub use kv_ops::{IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery};
 pub use mem_store::MemStore;
-pub use memory_mvcc::{ExportRecord, MVCC, VacuumStats};
+pub use memory_mvcc::{EngineTuning, ExportRecord, MVCC, VacuumStats};

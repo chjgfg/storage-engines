@@ -40,7 +40,7 @@ use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
 use crate::lsm_tree::storage::{lock_path, wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{
-    DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
+    DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
@@ -122,6 +122,22 @@ fn run_checkpoint(kv: &Mutex<LSMTree>, wal: &Mutex<Wal>, next_version: &AtomicU6
     persist_mvcc_next(db_dir, next_ver);
 }
 
+/// MVCC 档里**不容下游改动**的两个字段：钉回 `false`，无论传进来的是什么。
+///
+/// - `enable_mem_wal`：持久化点是这层的事务 WAL（commit 时 fsync WAL 记录）。再开 mem.wal
+///   就变成同一份数据有两个提交日志，崩溃后"谁重放谁、谁覆盖谁"没有定义 ——
+///   而 [`MVCC::durability_profile`] 承诺的正是"只有一个"。
+/// - `enable_bg_compact`：后台线程会在 MVCC 外层锁**之外**动同一棵树的层，事务 WAL 的
+///   重放/截断不知道它在跑。更要命的是 [`LSMTree::set_options`] 并不会起线程（线程只在
+///   open 时按当时的 option 创建），若让它被热改成 `true`，写路径会以为"有人替我 compact"
+///   而**不再同步 compact** ⇒ L0 无限涨。所以这条路整个封掉。
+fn pin_mvcc_invariants(patch: LSMTreeOptions) -> LSMTreeOptions {
+    let mut o = patch;
+    o.enable_mem_wal = false;
+    o.enable_bg_compact = false;
+    o
+}
+
 impl MVCC {
     /// 打开/创建磁盘上的 MVCC 引擎（含 WAL 恢复）。失败时 panic（兼容旧代码）。
     pub fn open(dir: impl AsRef<Path>) -> Self {
@@ -130,13 +146,38 @@ impl MVCC {
 
     /// 打开/创建，错误以 `io::Result` 返回（锁冲突、坏文件、IO 等）。
     pub fn try_open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::try_open_with(dir, None)
+    }
+
+    /// 打开并覆盖 MVCC 档的旋钮；`None` = 全用 [`LSMTreeOptions::for_mvcc`]。
+    ///
+    /// 传进来的是**整份** options（不是差量），所以常规写法是用引擎自己的档当基线做
+    /// struct-update，改哪个字段写在哪个字段上：
+    ///
+    /// ```no_run
+    /// use storage_engines::lsm_tree::{MVCC, LSMTreeOptions};
+    /// # use std::path::Path;
+    /// let opts = LSMTreeOptions {
+    ///     block_cache_blocks: 1024,
+    ///     ..LSMTreeOptions::for_mvcc()
+    /// };
+    /// let db = MVCC::try_open_with(Path::new("./data/lsm_tree"), Some(opts)).unwrap();
+    /// ```
+    ///
+    /// 两个字段**传了也不算**，恒被钉回 `false`（见 [`MVCC::set_options`] 同处的理由）：
+    /// `enable_mem_wal`、`enable_bg_compact`。
+    pub fn try_open_with(
+        dir: impl AsRef<Path>,
+        overrides: Option<LSMTreeOptions>,
+    ) -> std::io::Result<Self> {
         let db_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&db_dir)?;
 
         // 锁文件路径规则是各引擎自己的（lsm: `dir/lsm.lock`），锁的**语义**在
         // [`crate::common::disk::FileLock`]（四引擎共用的一份实现）
         let lock = FileLock::try_acquire_at(&lock_path(&db_dir))?;
-        let mut tree = LSMTree::open_with_config(&db_dir, LSMTreeOptions::for_mvcc())?;
+        let opts = pin_mvcc_invariants(overrides.unwrap_or_else(LSMTreeOptions::for_mvcc));
+        let mut tree = LSMTree::open_with_config(&db_dir, opts)?;
         let mut wal = Wal::open(wal_path(&db_dir))?;
 
         let entries = wal.read_all()?;
@@ -275,6 +316,38 @@ impl MVCC {
 
     pub fn wal_checkpoint_limit(&self) -> u64 {
         self.wal_limit.load(Ordering::SeqCst)
+    }
+
+    /// 当前生效的引擎旋钮（读回用，与 [`LSMTree::options`] 同一份）。
+    pub fn options(&self) -> LSMTreeOptions {
+        self.kv.lock().unwrap().options().clone()
+    }
+
+    /// 热更新旋钮（打开之后也能改，不用重开库）。
+    ///
+    /// `enable_mem_wal` / `enable_bg_compact` 会被钉回 `false`，理由见
+    /// [`pin_mvcc_invariants`]。其余字段立刻生效：`block_cache_blocks` 会重建块缓存，
+    /// compact/l0 阈值影响下一次写路径。
+    pub fn set_options(&self, patch: LSMTreeOptions) {
+        let mut kv = self.kv.lock().unwrap();
+        kv.set_options(pin_mvcc_invariants(patch));
+    }
+
+    /// 本引擎能被调的东西 —— 清单在这里，不在门面。
+    pub fn tuning(&self) -> EngineTuning {
+        let mut t = EngineTuning::default();
+        t.push_shared(self.vacuum_auto_slice(), Some(self.wal_checkpoint_limit()));
+        let o = self.options();
+        t.push("mem_threshold_bytes", o.mem_threshold_bytes);
+        t.push("mem_threshold_entries", o.mem_threshold_entries);
+        t.push("block_cache_blocks", o.block_cache_blocks);
+        t.push("use_mmap", o.use_mmap);
+        t.push("l0_compact_threshold", o.l0_compact_threshold);
+        t.push("l0_slowdown_trigger", o.l0_slowdown_trigger);
+        t.push("l0_stop_trigger", o.l0_stop_trigger);
+        t.push("target_sst_bytes", o.target_sst_bytes);
+        t.push("blob_threshold", o.blob_threshold);
+        t
     }
 
     pub fn checkpoint(&self) {

@@ -27,10 +27,13 @@ pub mod lsm_tree;
 pub mod memory;
 
 pub use common::{
-    DurabilityProfile, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth, SearchPage,
-    SearchQuery, VacuumRound, VacuumStats, ValueMeta,
+    DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
+    SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use engine::{
     EngineConfig, EngineError, EngineKind, EngineName, KvBulk, KvEngine, KvTxn, StorageConfig,
     open_engine, open_engine_with, open_from_env,
 };
+/// LSM 的旋钮集：`EngineConfig::lsm` 收的就是这个类型，所以在根上直接给个名字，
+/// 免得下游为了配一个缓存容量还得写全 `lsm_tree::` 路径（那正是"绕开门面自己拼"的起点）。
+pub use lsm_tree::LSMTreeOptions;

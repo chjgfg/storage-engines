@@ -282,3 +282,71 @@ impl SearchPage {
         self.page > 0 && self.total > 0
     }
 }
+
+/// 引擎当前**生效**的一个可调参数（名字 → 值）。
+///
+/// 值统一用字符串：四家的旋钮类型本来就不同（`usize` / `bool` / `Option<u64>`），
+/// 门面要在 `dyn KvEngine` 上返回同一类型，类型化的读回只能变成"每引擎一个 enum"，
+/// 那等于把引擎差异又灌回门面 —— 正是适配层要消除的东西。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuningEntry {
+    pub key: &'static str,
+    pub value: String,
+}
+
+/// 引擎的可调参数快照 —— 写进去的旋钮要能读回来核对。
+///
+/// 存在的理由：`EngineConfig` 只能"给"，给错了（字段名拼错、类型对不上、引擎根本不吃
+/// 这个旋钮）以前是**静默**的。`tuning()` 让下游和守卫测试都能问一句"现在到底生效的是
+/// 什么"。各引擎只列自己有的键，所以它同时是一张"这个引擎能调什么"的清单。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineTuning {
+    pub entries: Vec<TuningEntry>,
+}
+
+impl EngineTuning {
+    /// 追加一条（由各引擎的 `tuning()` 逐条 push）
+    pub fn push(&mut self, key: &'static str, value: impl std::fmt::Display) -> &mut Self {
+        self.entries.push(TuningEntry {
+            key,
+            value: value.to_string(),
+        });
+        self
+    }
+
+    /// 读回某个旋钮的当前值；`None` = **这个引擎没有这个旋钮**（不是"值为空"）。
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.value.as_str())
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &'static str> {
+        self.entries.iter().map(|e| e.key)
+    }
+
+    /// 各引擎 `tuning()` 共用的那两条账。
+    ///
+    /// 四家都要列它们，所以列法只写一遍：键名一旦在四处各拼一次字符串，门面和下游核对
+    /// 时就会对不上（`wal_limit` / `wal_checkpoint_bytes` 各写一半这种事）。
+    /// `wal_checkpoint_bytes` 传 `None` = 该引擎没有 WAL（memory）。
+    pub fn push_shared(&mut self, vacuum_auto_slice: u64, wal_checkpoint_bytes: Option<u64>) {
+        self.push("vacuum_auto_slice", vacuum_auto_slice);
+        if let Some(bytes) = wal_checkpoint_bytes {
+            self.push("wal_checkpoint_bytes", bytes);
+        }
+    }
+}
+
+impl std::fmt::Display for EngineTuning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.entries.is_empty() {
+            return f.write_str("(无可调参数)");
+        }
+        for e in &self.entries {
+            writeln!(f, "{key}={value}", key = e.key, value = e.value)?;
+        }
+        Ok(())
+    }
+}

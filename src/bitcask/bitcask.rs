@@ -813,6 +813,11 @@ impl Bitcask {
         self.active_id
     }
 
+    /// 当前生效的单分片软上限（门面读回用：证明设进去的值真到了引擎里）
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_bytes
+    }
+
     /// 对应的 hint 文件路径
     pub fn hint_path(&self) -> PathBuf {
         hint_path_for(&self.base_path)

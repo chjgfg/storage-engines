@@ -178,6 +178,16 @@ impl BPlusTree {
 }
 
 impl BPlusTree {
+    /// 当前生效的阶数（门面读回用：证明"设进去的值真到了引擎里"）
+    pub fn order(&self) -> usize {
+        self.order
+    }
+
+    /// 页缓存容量（同上）
+    pub fn max_cache_pages(&self) -> usize {
+        self.page_manager.cache_capacity()
+    }
+
     /// 只读路径取节点：**优先用解析过的**，未命中才读页 + bincode 解析。
     ///
     /// 为什么必须有它：归因量过，B+ 树点读的 41 µs 里几乎全是 CPU —— 每次点读要走 4 个页，

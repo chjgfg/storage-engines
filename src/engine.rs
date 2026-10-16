@@ -36,8 +36,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::common::{
-    DurabilityProfile, ExportRecord, IncrError, KeyMeta, MvccHealth, SearchPage, SearchQuery,
-    VacuumStats,
+    DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMeta, MvccHealth, SearchPage,
+    SearchQuery, VacuumRound, VacuumStats,
 };
 
 /// 门面层错误
@@ -94,15 +94,74 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 /// 可用引擎名（[`open_engine`] 接受的规范名）
 pub const ENGINE_NAMES: &[&str] = &["bitcask", "bplus_tree", "lsm_tree", "memory"];
 
-/// 打开引擎的可调参数。
+/// 打开引擎的可调参数：四个引擎的旋钮都在这一份里。
 ///
-/// 只有 `bplus_tree` 会用到 `order` / `max_cache_pages`，其余引擎忽略。
+/// 每个引擎只读自己那几个字段，其余**忽略**（不是报错 —— 同一份配置换引擎是常态，
+/// 就像 `StorageConfig` 里的 `data_dir`）。哪些字段真的生效，用
+/// [`KvEngine::tuning`] 读回来核对：它列的就是"这个引擎现在生效的那些"。
+///
+/// | 字段 | 生效于 |
+/// |---|---|
+/// | `order` / `max_cache_pages` | 只有 `bplus_tree` |
+/// | `lsm` | 只有 `lsm_tree` |
+/// | `bitcask_max_file_bytes` | 只有 `bitcask` |
+/// | `wal_checkpoint_bytes` | 三个磁盘引擎；`memory` **没有 WAL ⇒ 传了会报错** |
+/// | `vacuum_auto_slice_rows` | 四引擎都有 |
+///
+/// ⚠️ 新增字段是**破坏性**的：按位置/全字段字面量构造 `EngineConfig { .. }` 的老代码要加
+/// `..Default::default()`。
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// B+ 树阶数
+    /// B+ 树阶数（默认 64）
     pub order: usize,
-    /// B+ 树页缓存上限（页数）
+    /// B+ 树页缓存上限（页数，默认 1024）
+    ///
+    /// 库的物理页超过它时，全库走查改成"装得下才缓存"，不再挤掉 OLTP 的热页；
+    /// 想让走查也全部命中，就把容量配到 ≥ 页数。
     pub max_cache_pages: usize,
+    /// LSM 引擎旋钮：`None` = 用引擎自己的 MVCC 档 [`LSMTreeOptions::for_mvcc`]。
+    ///
+    /// 传进来的是**整份** options，所以常规写法是拿基线做 struct-update，
+    /// 只改要改的那个字段：
+    ///
+    /// ```no_run
+    /// use storage_engines::engine::{open_engine_with, EngineConfig, EngineKind};
+    /// use storage_engines::LSMTreeOptions;
+    /// use std::path::Path;
+    ///
+    /// let cfg = EngineConfig {
+    ///     lsm: Some(LSMTreeOptions {
+    ///         block_cache_blocks: 1024,
+    ///         ..LSMTreeOptions::for_mvcc()
+    ///     }),
+    ///     ..Default::default()
+    /// };
+    /// let db = open_engine_with(
+    ///     EngineKind::LsmTree,
+    ///     Some(Path::new("./data/lsm_tree")),
+    ///     &cfg,
+    /// )?;
+    /// # Ok::<(), storage_engines::EngineError>(())
+    /// ```
+    ///
+    /// `enable_mem_wal` / `enable_bg_compact` 会被钉回 `false`（事务 WAL 是唯一的持久化点；
+    /// MVCC 档的 compact 必须同步做），传了也不算 —— 这条由守卫
+    /// `lsm_mvcc_pins_the_two_fields_that_would_break_crash_safety` 钉住。
+    pub lsm: Option<crate::lsm_tree::LSMTreeOptions>,
+    /// bitcask 单个 active 分片的软上限（字节）；`None` = 默认
+    /// [`DEFAULT_MAX_FILE_BYTES`](crate::bitcask::DEFAULT_MAX_FILE_BYTES)。
+    ///
+    /// 影响的是 rotate 节奏与 `merge()` 的粒度：调小 ⇒ 分片多、每次 merge  rewrite 的量小、
+    /// 但 open 时要发现的文件也多。
+    pub bitcask_max_file_bytes: Option<u64>,
+    /// WAL 长到这么多字节就在下一次提交后自动 checkpoint；`None` = 默认 16 MiB，`Some(0)` = 关闭。
+    ///
+    /// 崩溃恢复是**全量扫描** WAL，所以这条不设 = 启动一次比一次慢。
+    /// `memory` 没有 WAL：给它传 `Some(..)` 会直接返回 [`EngineError::Unsupported`]，
+    /// 不静默忽略（"以为设了阈值、其实跑的是没有 WAL 的引擎"不能靠默认值发生）。
+    pub wal_checkpoint_bytes: Option<u64>,
+    /// 自动回收的切片宽度（版本行数）；`None` = 默认 16 Ki 行，`Some(0)` = 关闭自动回收。
+    pub vacuum_auto_slice_rows: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -110,6 +169,10 @@ impl Default for EngineConfig {
         Self {
             order: 64,
             max_cache_pages: 1024,
+            lsm: None,
+            bitcask_max_file_bytes: None,
+            wal_checkpoint_bytes: None,
+            vacuum_auto_slice_rows: None,
         }
     }
 }
@@ -279,6 +342,32 @@ pub trait KvEngine: Send + Sync {
     /// 发现不了）、LSM 的大 value 旁路是裸文件、只有 B+ 树有原地页写 + 双写缓冲、memory
     /// 干脆不持久。选引擎之前先看它 —— 别再靠"换个引擎"当成修好了。
     fn durability_profile(&self) -> DurabilityProfile;
+
+    /// 本引擎**当前生效**的可调参数快照。
+    ///
+    /// 存在的理由：`EngineConfig` 只能"给"，给错了以前是静默的（字段名记错、引擎根本不吃
+    /// 这个旋钮）。这里给一条读回的路，各引擎只列自己有的键 ⇒ 它同时是"这个引擎能调什么"
+    /// 的清单。键名与 [`EngineConfig`] 的字段名对齐（`order` / `max_cache_pages` /
+    /// `block_cache_blocks` / `max_file_bytes` / `wal_checkpoint_bytes` / `vacuum_auto_slice`…）。
+    fn tuning(&self) -> EngineTuning;
+
+    /// 有界回收一小轮：从 `after` 这个逻辑 key 之后开始，最多读 `budget_rows` 行版本。
+    ///
+    /// 这是 [`KvEngine::vacuum`] 的"不锁全库版"：手动 `vacuum()` = 一次 `budget_rows =
+    /// u64::MAX` 的轮次，两者共用同一份保留规则。返回的 `next_cursor` 原样传回就接着扫，
+    /// `None` 表示已扫完全库（blob 回收/日志压缩只在这一轮才做）。
+    ///
+    /// 长跑进程要的是这个而不是 `vacuum()`：全库一轮的代价随库变大而变大，而切片一轮
+    /// 只和 `budget_rows` 有关。
+    fn vacuum_bounded(&self, after: Option<&[u8]>, budget_rows: u64) -> Result<VacuumRound>;
+
+    /// WAL 自动 checkpoint 的字节阈值（`0` = 关闭自动触发，只能手动 [`KvEngine::checkpoint`]）。
+    ///
+    /// `memory` 没有 WAL ⇒ [`EngineError::Unsupported`]。
+    fn set_wal_checkpoint_limit(&self, bytes: u64) -> Result<()>;
+
+    /// 读回 WAL 自动 checkpoint 阈值；`memory` 同理会返回 [`EngineError::Unsupported`]。
+    fn wal_checkpoint_limit(&self) -> Result<u64>;
 
     /// 落盘数据（内存引擎为 no-op）
     fn flush(&self) -> Result<()>;
@@ -469,7 +558,7 @@ pub fn open_engine<N: EngineName>(name: N, path: Option<&Path>) -> Result<Box<dy
     open_engine_with(name, path, &EngineConfig::default())
 }
 
-/// 打开引擎，显式给参数
+/// 打开引擎，显式给参数（哪些字段被哪个引擎读，见 [`EngineConfig`] 的对照表）。
 pub fn open_engine_with<N: EngineName>(
     name: N,
     path: Option<&Path>,
@@ -483,9 +572,12 @@ pub fn open_engine_with<N: EngineName>(
             .ok_or(EngineError::PathRequired(engine))
     };
 
-    Ok(match canon {
+    let db: Box<dyn KvEngine> = match canon {
         "bitcask" => Box::new(BitcaskEngine {
-            inner: crate::bitcask::MVCC::try_open(disk_path("bitcask")?)?,
+            inner: crate::bitcask::MVCC::try_open_with(
+                disk_path("bitcask")?,
+                config.bitcask_max_file_bytes,
+            )?,
         }),
         "bplus_tree" => Box::new(BPlusTreeEngine {
             inner: crate::bplus_tree::MVCC::try_open(
@@ -495,13 +587,27 @@ pub fn open_engine_with<N: EngineName>(
             )?,
         }),
         "lsm_tree" => Box::new(LsmTreeEngine {
-            inner: crate::lsm_tree::MVCC::try_open(disk_path("lsm_tree")?)?,
+            inner: crate::lsm_tree::MVCC::try_open_with(
+                disk_path("lsm_tree")?,
+                config.lsm.clone(),
+            )?,
         }),
         "memory" => Box::new(MemoryEngine {
             inner: crate::memory::MVCC::new(),
         }),
         _ => unreachable!("canonical_name 已校验"),
-    })
+    };
+
+    // 后两条是**跨引擎**的旋钮，不在任何一家的 open 签名里，所以先开库、再在把句柄交出去
+    // 之前立刻应用 —— 下游拿到的必须已经是"他配过的那份"，不能存在"打开成功、阈值还没生效"
+    // 的中间态。`?` 也是有意的：给 memory 设 WAL 阈值要当场失败，而不是静默通过。
+    if let Some(bytes) = config.wal_checkpoint_bytes {
+        db.set_wal_checkpoint_limit(bytes)?;
+    }
+    if let Some(rows) = config.vacuum_auto_slice_rows {
+        db.set_vacuum_auto_slice(rows);
+    }
+    Ok(db)
 }
 
 /// 把别名归一到规范名
@@ -519,7 +625,10 @@ fn canonical_name(name: &str) -> Option<&'static str> {
 ///
 /// 各引擎方法名一致，差异通过这几个开关吸收：
 /// - `vacuum: io` → 直接透传 `io::Result`；`vacuum: plain` → 包成 `Ok`
+///   （`vacuum_bounded` 用同一个开关：两处的形状一致）
 /// - `durable: yes` → 转发 `flush` / `checkpoint`；`no` → no-op
+/// - `wal: yes` → 转发 WAL 阈值读写；`no` → 返回 [`EngineError::Unsupported`]
+///   （memory 没有 WAL，"设了阈值"这件事对它没有意义，不能假装成功）
 /// - `path: $method` → 取库路径的方法名；`none` → 纯内存
 /// - `merge: yes` → 转发 `merge`；`no` → 用 trait 默认（`Unsupported`）
 macro_rules! impl_engine {
@@ -534,6 +643,7 @@ macro_rules! impl_engine {
         path: $path:tt,
         vacuum: $vacuum:tt,
         durable: $durable:tt,
+        wal: $wal:tt,
         merge: $merge:tt,
     ) => {
         struct $engine {
@@ -592,8 +702,14 @@ macro_rules! impl_engine {
             }
 
             impl_engine!(@vacuum $vacuum);
+            impl_engine!(@vacuum_bounded $vacuum);
             impl_engine!(@durable $durable);
+            impl_engine!(@wal $wal);
             impl_engine!(@merge $merge);
+
+            fn tuning(&self) -> EngineTuning {
+                self.inner.tuning()
+            }
         }
 
         impl<'a> KvTxn for $txn<'a> {
@@ -769,6 +885,26 @@ macro_rules! impl_engine {
         }
     };
 
+    // ---- 有界回收分支：形状与 vacuum 一致，所以复用同一个开关 ----
+    (@vacuum_bounded io) => {
+        fn vacuum_bounded(
+            &self,
+            after: Option<&[u8]>,
+            budget_rows: u64,
+        ) -> Result<VacuumRound> {
+            Ok(self.inner.vacuum_bounded(after, budget_rows)?)
+        }
+    };
+    (@vacuum_bounded plain) => {
+        fn vacuum_bounded(
+            &self,
+            after: Option<&[u8]>,
+            budget_rows: u64,
+        ) -> Result<VacuumRound> {
+            Ok(self.inner.vacuum_bounded(after, budget_rows))
+        }
+    };
+
     // ---- flush / checkpoint 分支 ----
     (@durable yes) => {
         fn flush(&self) -> Result<()> {
@@ -790,6 +926,34 @@ macro_rules! impl_engine {
         /// 纯内存引擎：无 WAL 可截断
         fn checkpoint(&self) -> Result<()> {
             Ok(())
+        }
+    };
+
+    // ---- WAL 阈值分支 ----
+    (@wal yes) => {
+        fn set_wal_checkpoint_limit(&self, bytes: u64) -> Result<()> {
+            self.inner.set_wal_checkpoint_limit(bytes);
+            Ok(())
+        }
+
+        fn wal_checkpoint_limit(&self) -> Result<u64> {
+            Ok(self.inner.wal_checkpoint_limit())
+        }
+    };
+    // 没有 WAL 的引擎：这条能力对它不存在 ⇒ 明确说 unsupported，不返回"设成功了"
+    (@wal no) => {
+        fn set_wal_checkpoint_limit(&self, _bytes: u64) -> Result<()> {
+            Err(EngineError::Unsupported {
+                engine: self.name(),
+                op: "wal checkpoint limit",
+            })
+        }
+
+        fn wal_checkpoint_limit(&self) -> Result<u64> {
+            Err(EngineError::Unsupported {
+                engine: self.name(),
+                op: "wal checkpoint limit",
+            })
         }
     };
 
@@ -815,6 +979,7 @@ impl_engine! {
     path: db_dir,
     vacuum: io,
     durable: yes,
+    wal: yes,
     merge: yes,
 }
 
@@ -829,6 +994,7 @@ impl_engine! {
     path: db_path,
     vacuum: io,
     durable: yes,
+    wal: yes,
     merge: no,
 }
 
@@ -843,6 +1009,7 @@ impl_engine! {
     path: db_dir,
     vacuum: io,
     durable: yes,
+    wal: yes,
     merge: no,
 }
 
@@ -857,6 +1024,7 @@ impl_engine! {
     path: none,
     vacuum: plain,
     durable: no,
+    wal: no,
     merge: no,
 }
 
@@ -1274,6 +1442,7 @@ mod tests {
             engine: EngineConfig {
                 order: 16,
                 max_cache_pages: 32,
+                ..Default::default()
             },
         };
         let db = cfg.open().expect("按配置打开 B+ 树");
@@ -1322,6 +1491,279 @@ mod tests {
             assert_eq!(after.max_chain, 1, "{name}: vacuum 后最长链应降到 1");
             assert_eq!(after.total_rows, 3, "{name}: vacuum 后应只剩每 key 一行");
 
+            drop(db);
+        }
+        cleanup(dirs);
+    }
+
+    /// #17 的守卫：**写进 [`EngineConfig`] 的旋钮必须在引擎里生效，而且要读得回来**。
+    ///
+    /// 每条断言都配一条"不设时是多少"的对照。没有对照，这个测试会在两种坏情况下照样绿：
+    /// ① `tuning()` 的键名和 `EngineConfig` 字段名漂了（`.get()` 一律返回 `None`，
+    /// 而我若只断言 `!= Some("64")` 就永远成立）；② 引擎根本没接这个旋钮、值是门面自己
+    /// 编的。对照必须来自**同一条代码路径的默认档**，所以这里既有 `open_engine_with`
+    /// 也有 `open_engine`。
+    #[test]
+    fn engine_config_knobs_reach_the_engine_and_are_readable_back() {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        // ---- bplus_tree：order / max_cache_pages（只有这一家吃）----
+        let dir = tmp_dir("knob_bplus");
+        dirs.push(dir.clone());
+        let db = open_engine_with(
+            "bplus_tree",
+            Some(&dir),
+            &EngineConfig {
+                order: 16,
+                max_cache_pages: 32,
+                ..Default::default()
+            },
+        )
+        .expect("按配置打开 B+ 树");
+        let t = db.tuning();
+        assert_eq!(t.get("order"), Some("16"), "{t}");
+        assert_eq!(t.get("max_cache_pages"), Some("32"), "{t}");
+
+        let ddir = tmp_dir("default_bplus");
+        dirs.push(ddir.clone());
+        let dflt = open_engine("bplus_tree", Some(&ddir)).expect("默认档 B+ 树");
+        let d = dflt.tuning();
+        assert_eq!(d.get("order"), Some("64"), "默认档必须是另一个数，上面的断言才不是空转");
+        assert_eq!(d.get("max_cache_pages"), Some("1024"));
+
+        // ---- bitcask：分片上限（open 时就定死了，之后 rotate 按它走）----
+        let dir = tmp_dir("knob_bitcask");
+        dirs.push(dir.clone());
+        let db = open_engine_with(
+            EngineKind::Bitcask,
+            Some(&dir),
+            &EngineConfig {
+                bitcask_max_file_bytes: Some(4096),
+                ..Default::default()
+            },
+        )
+        .expect("按配置打开 bitcask");
+        assert_eq!(db.tuning().get("max_file_bytes"), Some("4096"));
+        // 引擎自己的读回（`tuning()` 就是从这里取的）—— 证明值进的是 Bitcask 结构体，不是门面
+        assert_eq!(db.tuning().get("max_file_bytes"), Some("4096"));
+
+        let ddir = tmp_dir("default_bitcask");
+        dirs.push(ddir.clone());
+        let dflt = open_engine("bitcask", Some(&ddir)).expect("默认档 bitcask");
+        assert_eq!(
+            dflt.tuning().get("max_file_bytes"),
+            Some("67108864"),
+            "bitcask 默认分片上限应是 64 MiB"
+        );
+
+        // ---- lsm_tree：整份 LSMTreeOptions 补丁 ----
+        let dir = tmp_dir("knob_lsm");
+        dirs.push(dir.clone());
+        let db = open_engine_with(
+            EngineKind::LsmTree,
+            Some(&dir),
+            &EngineConfig {
+                lsm: Some(crate::lsm_tree::LSMTreeOptions {
+                    block_cache_blocks: 7,
+                    mem_threshold_bytes: 12345,
+                    ..crate::lsm_tree::LSMTreeOptions::for_mvcc()
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("按配置打开 lsm_tree");
+        let t = db.tuning();
+        assert_eq!(t.get("block_cache_blocks"), Some("7"), "{t}");
+        assert_eq!(t.get("mem_threshold_bytes"), Some("12345"), "{t}");
+        // 没动的字段留在 MVCC 档上：证明"补丁"不是"整份替换成裸 LSM 默认值"
+        assert_eq!(t.get("l0_compact_threshold"), Some("8"), "MVCC 档的 L0 阈值不该被顺手改回 4");
+
+        let ddir = tmp_dir("default_lsm");
+        dirs.push(ddir.clone());
+        let dflt = open_engine("lsm_tree", Some(&ddir)).expect("默认档 lsm_tree");
+        let d = dflt.tuning();
+        assert_eq!(d.get("block_cache_blocks"), Some("256"), "for_mvcc 的块缓存是 256");
+        assert_eq!(d.get("mem_threshold_bytes"), Some("33554432"));
+
+        // ---- 跨引擎两条：WAL 阈值 + 自动回收切片 ----
+        for name in ["bitcask", "bplus_tree", "lsm_tree"] {
+            let dir = tmp_dir("knob_wal");
+            dirs.push(dir.clone());
+            let db = open_engine_with(
+                name,
+                Some(&dir),
+                &EngineConfig {
+                    wal_checkpoint_bytes: Some(4096),
+                    vacuum_auto_slice_rows: Some(0),
+                    ..Default::default()
+                },
+            )
+            .expect("带 WAL 阈值打开磁盘引擎");
+            assert_eq!(db.wal_checkpoint_limit().unwrap(), 4096, "{name}: 阈值要真生效");
+            assert_eq!(db.tuning().get("wal_checkpoint_bytes"), Some("4096"));
+            assert_eq!(db.vacuum_auto_slice(), 0, "{name}: 切片设 0 = 关闭自动回收，要读得回 0");
+            assert_eq!(db.tuning().get("vacuum_auto_slice"), Some("0"));
+        }
+
+        // memory 没有 WAL：给它设阈值必须**当场失败**，不能静默通过（"以为设了、其实没 WAL"
+        // 是这次事故的形状之一）。切片它有的是真的。
+        let db = open_engine_with(
+            EngineKind::Memory,
+            None,
+            &EngineConfig {
+                vacuum_auto_slice_rows: Some(0),
+                ..Default::default()
+            },
+        )
+        .expect("内存引擎只需切片");
+        assert_eq!(db.vacuum_auto_slice(), 0);
+        assert!(db.tuning().get("wal_checkpoint_bytes").is_none(), "没有 WAL 就不该出现在清单里");
+        let e = db.set_wal_checkpoint_limit(4096).err().expect("memory 设 WAL 阈值要报错");
+        assert!(
+            matches!(e, EngineError::Unsupported { engine, op }
+                if engine == "memory" && op == "wal checkpoint limit"),
+            "错误要指到具体的引擎与操作：{e}"
+        );
+        let mem_default = open_engine("memory", None).expect("默认档 memory");
+        assert_eq!(mem_default.vacuum_auto_slice(), 16 * 1024, "四引擎默认切片同一个值");
+
+        cleanup(dirs.into_iter().map(Some).collect());
+    }
+
+    /// LSM 档里 `enable_mem_wal` / `enable_bg_compact` 传 `true` 也**必须**是 `false`。
+    ///
+    /// 这两条一旦被下游打开，崩溃恢复就有两个互不知情的提交日志（mem.wal 与事务 WAL），
+    /// 而 `set_options` 热开 bg compact 更阴：线程只在 open 时创建，热改成 `true` 只会让
+    /// 写路径以为"有人替我 compact"于是自己不再 compact ⇒ L0 无限涨。
+    ///
+    /// 走具体类型而不是门面：门面的 `tuning()` 有意**不列**这两条（列了会被读成"能调"）。
+    #[test]
+    fn lsm_mvcc_pins_the_two_fields_that_would_break_crash_safety() {
+        use crate::lsm_tree::LSMTreeOptions;
+
+        let dir = tmp_dir("lsm_pin");
+        let db = crate::lsm_tree::MVCC::try_open_with(
+            &dir,
+            Some(LSMTreeOptions {
+                enable_mem_wal: true,
+                enable_bg_compact: true,
+                block_cache_blocks: 999,
+                ..LSMTreeOptions::for_mvcc()
+            }),
+        )
+        .expect("带补丁打开 lsm_tree");
+
+        let got = db.options();
+        assert!(!got.enable_mem_wal, "事务 WAL 是唯一的持久化点：mem.wal 不能被下游打开");
+        assert!(!got.enable_bg_compact, "MVCC 档的 compact 必须同步做");
+        assert_eq!(got.block_cache_blocks, 999, "钉住两条不等于连坐：其余字段要真的生效");
+
+        // 热更新路径同样钉住
+        db.set_options(LSMTreeOptions {
+            enable_mem_wal: true,
+            enable_bg_compact: true,
+            ..got.clone()
+        });
+        let after = db.options();
+        assert!(!after.enable_mem_wal && !after.enable_bg_compact, "set_options 也要钉");
+        assert_eq!(after.block_cache_blocks, 999, "热更新不能把补丁读回原样");
+
+        drop(db);
+        cleanup(vec![Some(dir)]);
+    }
+
+    /// 门面层的有界回收：一轮的代价只和 `budget_rows` 有关、游标能接力，
+    /// **扫完全库后的终态与 `vacuum()` 一致**（同一份保留规则，不是两套）。
+    #[test]
+    fn vacuum_bounded_is_bounded_and_ends_where_vacuum_does() {
+        const KEYS: u64 = 4;
+        const CHAIN: u64 = 40;
+        const BUDGET: u64 = 25;
+        const TOTAL: u64 = KEYS * CHAIN;
+
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            // 关掉自动回收：本例要的是"我手动一轮一轮推"这个现场
+            db.set_vacuum_auto_slice(0);
+
+            for i in 0..CHAIN {
+                for k in 0..KEYS {
+                    let tx = db.begin();
+                    assert!(tx.set(format!("k{k}").as_bytes(), format!("v{i}").into_bytes()));
+                    tx.commit();
+                }
+            }
+            let before = db.health();
+            assert_eq!(before.total_rows, TOTAL, "{name}: 灌数后的物理行数");
+            assert_eq!(before.max_chain, CHAIN, "{name}: 每把链 {CHAIN} 版");
+
+            let mut cursor: Option<Vec<u8>> = None;
+            let mut rounds = 0usize;
+            let mut max_scanned = 0u64;
+            loop {
+                let round = db
+                    .vacuum_bounded(cursor.as_deref(), BUDGET)
+                    .unwrap_or_else(|e| panic!("{name}: vacuum_bounded 失败 {e}"));
+                assert!(!round.stats.skipped_active_txn, "{name}: 不该有活跃事务挡路");
+                // 预算的余量 = 一条链：截断只发生在逻辑 key 边界（半条链不能收，
+                // 判"留哪一版"要求整组版本都在手上）。
+                max_scanned = max_scanned.max(round.stats.rows_scanned);
+                assert!(
+                    round.stats.rows_scanned <= BUDGET + CHAIN,
+                    "{name}: 一轮扫了 {} 行，预算 {BUDGET} + 一条链 {CHAIN}",
+                    round.stats.rows_scanned
+                );
+                match round.next_cursor {
+                    None => break,
+                    Some(next) => {
+                        assert!(
+                            cursor.as_ref().is_none_or(|c| next.as_slice() > c.as_slice()),
+                            "{name}: 游标必须严格前进，否则每轮重读同一片"
+                        );
+                        cursor = Some(next);
+                    }
+                }
+                rounds += 1;
+                assert!(rounds < 64, "{name}: 游标不前进？已 {rounds} 轮");
+            }
+            assert!(
+                rounds > 1 && max_scanned < TOTAL,
+                "{name}: 预算 {BUDGET} ≪ 全库 {TOTAL} 行，一轮扫完说明根本没限流（轮数 {rounds}）"
+            );
+            eprintln!(
+                "[vacuum_bounded] {name}: 全库 {TOTAL} 行 / 预算 {BUDGET} ⇒ {rounds} 轮，\
+                 单轮最多扫 {max_scanned} 行"
+            );
+            let after = db.health();
+            assert_eq!(after.max_chain, 1, "{name}: 接力扫完应等价于 vacuum()");
+            assert_eq!(after.total_rows, KEYS, "{name}: 每个逻辑 key 只剩一行");
+
+            drop(db);
+        }
+        cleanup(dirs);
+
+        // 一次性大预算 = 手动 `vacuum()`：同一个入口，只是不分片
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            db.set_vacuum_auto_slice(0);
+            for i in 0..CHAIN {
+                for k in 0..KEYS {
+                    let tx = db.begin();
+                    assert!(tx.set(format!("k{k}").as_bytes(), format!("v{i}").into_bytes()));
+                    tx.commit();
+                }
+            }
+            let round = db
+                .vacuum_bounded(None, u64::MAX)
+                .unwrap_or_else(|e| panic!("{name}: 全库轮次失败 {e}"));
+            assert_eq!(round.next_cursor, None, "{name}: 全库轮次应一次到底");
+            assert_eq!(round.stats.rows_scanned, TOTAL, "{name}: 全库轮次要读满 {TOTAL} 行");
+            let after = db.health();
+            assert_eq!(after.total_rows, KEYS, "{name}: 与 vacuum() 同一份保留规则");
             drop(db);
         }
         cleanup(dirs);

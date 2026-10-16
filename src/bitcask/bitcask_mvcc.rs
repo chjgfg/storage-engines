@@ -31,7 +31,9 @@ use crate::bitcask::{Bitcask, storage::{lock_path,
     BlobStore, FileLock, VAL_TAG_BLOB, data_path, decode_stored_value, encode_stored_value, wal_path,
 }};
 use crate::bitcask::wal::{analyze_recovery, Wal, WalRecord};
-pub use crate::common::{DurabilityProfile, ExportRecord, MvccHealth, VacuumRound, VacuumStats};
+pub use crate::common::{
+    DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
+};
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
 use crate::common::version_key_upper_bound;
@@ -192,13 +194,28 @@ impl MVCC {
 
     /// 打开/创建，错误以 `io::Result` 返回（锁冲突、坏文件、IO 等）。
     pub fn try_open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::try_open_with(dir, None)
+    }
+
+    /// 打开并允许覆盖分片滚动阈值（`max_file_bytes = None` ⇒ 用引擎默认）。
+    ///
+    /// 门面层 `EngineConfig::bitcask` 走的就是这里 —— 目的是让下游**不必绕开门面自己构造
+    /// `Bitcask`**。基座被依赖而不是被复制，缺一个入口就多一层复制。
+    pub fn try_open_with(
+        dir: impl AsRef<Path>,
+        max_file_bytes: Option<u64>,
+    ) -> std::io::Result<Self> {
         let db_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&db_dir)?;
 
         // 锁文件路径规则是各引擎自己的（bitcask: `dir/bitcask.lock`），锁的**语义**在
         // [`crate::common::disk::FileLock`]（四引擎共用的一份实现）
         let lock = FileLock::try_acquire_at(&lock_path(&db_dir))?;
-        let mut tree = Bitcask::new(data_path(&db_dir))?;
+        let data_log = data_path(&db_dir);
+        let mut tree = match max_file_bytes {
+            Some(n) => Bitcask::with_max_file_bytes(data_log, n)?,
+            None => Bitcask::new(data_log)?,
+        };
         let blob = BlobStore::open(&db_dir)?;
         let mut wal = Wal::open(wal_path(&db_dir))?;
 
@@ -351,6 +368,19 @@ impl MVCC {
 
     pub fn wal_checkpoint_limit(&self) -> u64 {
         self.wal_limit.load(Ordering::SeqCst)
+    }
+
+    /// 当前生效的 active 分片软上限（字节），写满后 rotate 到下一个 `data.{id}.log`。
+    pub fn max_file_bytes(&self) -> u64 {
+        self.kv.lock().unwrap().max_file_bytes()
+    }
+
+    /// 本引擎能被调的东西 —— 清单在这里，不在门面。
+    pub fn tuning(&self) -> EngineTuning {
+        let mut t = EngineTuning::default();
+        t.push_shared(self.vacuum_auto_slice(), Some(self.wal_checkpoint_limit()));
+        t.push("max_file_bytes", self.max_file_bytes());
+        t
     }
 
     pub fn flush(&self) {

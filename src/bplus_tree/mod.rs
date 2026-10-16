@@ -7,4 +7,4 @@ pub mod wal;
 
 pub use bplus_tree::BPlusTree;
 pub use kv_ops::{IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery};
-pub use bplus_tree_mvcc::{ExportRecord, MVCC, VacuumStats};
+pub use bplus_tree_mvcc::{EngineTuning, ExportRecord, MVCC, VacuumStats};

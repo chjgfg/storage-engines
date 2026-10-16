@@ -12,7 +12,9 @@ pub mod bitcask_mvcc;
 pub mod storage;
 pub mod wal;
 
-pub use bitcask::{hint_path_for, Bitcask, KeyDir, KeyLoc, Log, Result as BitcaskResult};
+pub use bitcask::{
+    hint_path_for, Bitcask, KeyDir, KeyLoc, Log, Result as BitcaskResult, DEFAULT_MAX_FILE_BYTES,
+};
 pub use error::{Error, Result};
 pub use kv_ops::{IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery};
-pub use bitcask_mvcc::{ExportRecord, VacuumStats, MVCC};
+pub use bitcask_mvcc::{EngineTuning, ExportRecord, VacuumStats, MVCC};
