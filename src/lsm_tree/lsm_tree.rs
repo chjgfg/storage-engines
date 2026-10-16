@@ -989,7 +989,7 @@ impl LSMTree {
             }
         }
         // 源顺序必须与 merge_all_at / scan_latest_light 一致：levels[0] 旧→新，反转成新→旧
-        let mut push_sst = |sst: &SstFile, sources: &mut Vec<Vec<(Vec<u8>, LightEntry)>>| {
+        let push_sst = |sst: &SstFile, sources: &mut Vec<Vec<(Vec<u8>, LightEntry)>>| {
             if !sst.may_overlap(probe_low, probe_high) {
                 return; // min/max 不相干 ⇒ 整篇不读
             }
@@ -2236,11 +2236,7 @@ mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("lsm_{tag}_{nanos}"));
+        let p = crate::common::tmp_test_path("lsm", tag, "");
         let _ = fs::remove_dir_all(&p);
         p
     }

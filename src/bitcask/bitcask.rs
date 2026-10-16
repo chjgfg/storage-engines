@@ -1260,18 +1260,9 @@ impl Bitcask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_log(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "bitcask_hint_{tag}_{}_{}.log",
-            std::process::id(),
-            nanos
-        ))
+        crate::common::tmp_test_path("bitcask_hint", tag, ".log")
     }
 
     fn cleanup(path: &Path) {

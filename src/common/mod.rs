@@ -20,6 +20,27 @@ pub use types::{
     SearchQuery, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use version::{decode_key, encode_key, vacuum_plan, version_key_upper_bound, VersionedKey};
+
+/// 测试专用的临时路径。**必须带进程内单调序号**，不能只靠时间戳。
+///
+/// Windows 的 `SystemTime` 粒度约 15.6 ms，`cargo test` 并发跑时两个线程可以拿到**同一个
+/// nanos**，于是同名目录/文件 + 同一把 `.lock` ⇒ 后来者直接 `WouldBlock`，表现是随机偶发的
+/// "打开数据文件失败"。这个坑在 bplus / bitcask / lsm / 门面四层里各复制过一份，
+/// 现在收敛成一个函数（每份复制都要自己的守卫 —— 但守卫之外，路径规则不该复制）。
+#[cfg(test)]
+pub(crate) fn tmp_test_path(prefix: &str, tag: &str, suffix: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        "{prefix}_{}_{tag}_{nanos}_{n}{suffix}",
+        std::process::id()
+    ))
+}
 pub use kernel::{
     is_unfinished, visible_at, HealthFold, VacuumScheduler, WalPolicy,
 };

@@ -128,6 +128,27 @@ pub fn oversized_writes() -> u64 {
     OVERSIZED_WRITES.with(|c| c.get())
 }
 
+// 测试专用：页缓存的命中 / 未命中分开数。
+//
+// `PAGE_READS` 把两者算成同一个数，所以它只能守"代价不随链长涨"，量不出**为什么慢**：
+// 命中是一次 4 KB 拷贝 + 一次 bincode 反序列化，未命中还要多一次真读盘与 CRC。
+// bplus 在所有引擎里点读/管理面最贵，必须先分清这两者谁在花钱。
+#[cfg(test)]
+thread_local! {
+    static CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CACHE_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn cache_hits() -> u64 {
+    CACHE_HITS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn cache_misses() -> u64 {
+    CACHE_MISSES.with(|c| c.get())
+}
+
 // 测试专用：本线程「把某行的 value 克隆出来」的次数。
 //
 // B+ 树没有独立键索引，全库走一遍的**页读取**省不掉；能省的是把每一行的 value
@@ -528,12 +549,16 @@ impl PageManager {
         self.clock += 1;
 
         if self.cache.contains_key(&page_id) {
+            #[cfg(test)]
+            CACHE_HITS.with(|c| c.set(c.get() + 1));
             self.update_lru(page_id);
             let entry = self.cache.get_mut(&page_id).unwrap();
             entry.last_access = self.clock;
             return Some(entry.data.clone());
         }
 
+        #[cfg(test)]
+        CACHE_MISSES.with(|c| c.set(c.get() + 1));
         let payload = match self.read_disk_payload(page_id) {
             Ok(p) => p,
             Err(e) => {

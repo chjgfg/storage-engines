@@ -194,6 +194,27 @@
   灌数 156.8 → **93.3 µs/行**、一次全量 scan 33.3 → **24.7 µs/行**、`search 首页` 911 → **518 ms**、
   `key_count` 618 → **514 ms**。⚠️ 另一头也如实记：**`vacuum()` 206 → 450 ms** —— 放弃合并会留下
   更多下溢叶子、填充率下降，delete 密集之后的全库走查因此变贵；正解是"合并后再分裂"，尚未做。
+- **B+ 树的全库折叠从"每行再降一次树"改成一趟走完**（这条是 bplus 管理面贵的结构性原因）：
+  `collect_latest_raw_in` 原来照抄 bitcask 的两段式 —— ① 只折键 ② 按胜出行 `kvengine.get(enc)`
+  回树取值。对 bitcask 那是对的（KeyDir 只有元数据、值在日志另一处），对 B+ 树是错的：
+  **value 就住在叶子条目里，遍历的时候已经在手上**。代价是每个存活 key 多付 3~4 次页访问 ——
+  新加的归因基线实测：一次全量 scan **61146 次页访问 / 36.2 µs·行**；改成一趟之后
+  **1146 次 / 1.7 µs·行**（同一份 20000 行的库），`search 首页` 718 ms → **34.4 ms**、
+  `health()` 43.0 ms → **21.5 ms**。胜出行的 blob/TTL 解码仍然只在走完之后做一次
+  （`test_collect_latest_decodes_only_live_keys` 不变）。新守卫
+  `test_full_scan_pages_scale_with_leaves_not_with_keys_times_height`：2000 行只许 ≤200 次页访问
+  （实测 64 次），旧实现是 6000 次，会红 30 倍以上。
+- **bplus 读路径的钱到底花在哪**（新基线 `test_bplus_read_cost_attribution`，`#[ignore]`）：
+  同一份数据连测两遍 —— 冷 41.8 µs/次 vs 热 41.3 µs/次，命中率 95%，把页缓存从 1024 开到
+  65536 也还是 37.8 µs ⇒ **点读的 41 µs 是纯 CPU**（每次点读 4 个页访问，每个都要
+  4 KB 拷贝 + bincode 解析整节点），不是在读盘。这一条决定了下一步该做"解析过的节点缓存"，
+  而不是继续加大缓存。页缓存现在分开数 `cache_hits()` / `cache_misses()` ——
+  原先 `page_reads()` 把两者算成同一个数，所以它守得住"代价不随链长涨"，答不出为什么慢
+  （和 LSM 那次是同一个错误：代价单位选对了，冷热没分）。
+- **`BPlusTree::open` 在并发测试里随机 `WouldBlock`** —— 同一类 flake 的第三处：Windows 的
+  `SystemTime` 粒度约 15.6 ms，两个测试线程能拿到**同一个 nanos**，于是同名临时文件 + 同一把
+  `.lock`，后来者直接失败。这次不再逐个补丁：`common::tmp_test_path()` 一份实现（进程内
+  单调序号），把 bplus/bitcask/lsm 九个测试辅助函数全部接过去。
 - **LSM 点查慢两个数量级的根因不是复杂度，是"块缓存未命中就重开文件"**：下游把本 crate 嵌进去
   实测**单次点查 0.86 ms**（5002 键 / 40B 键 / 60B 值 / 10005 行 / `max_chain=3` / 全 release），
   本仓库同形状复现到 **289 µs**。`SstFile` 原来只存 `path`，`read_slice` 每有一次块缓存未命中就

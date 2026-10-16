@@ -801,12 +801,12 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        // ① 第一遍只折「键 + 版本号」。
+        // ① 一趟走完：折「键 + 版本号 + 那一行的原始字节」。
         let hi_enc = end.map(version_key_upper_bound);
-        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        let mut winners: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
         {
             let mut kvengine = self.kv.lock().unwrap();
-            kvengine.scan_entries_break_from(start, |enc, _row| {
+            kvengine.scan_entries_break_from(start, |enc, row| {
                 if hi_enc.as_deref().is_some_and(|h| enc >= h) {
                     return true; // 按 enc 定界 ⇒ 有序迭代后面只会更大，可以真停
                 }
@@ -823,24 +823,26 @@ impl Transaction {
                 if !self.is_visible(vk.version) {
                     return false;
                 }
-                // 全表按 enc 升序 ⇒ 同一 raw_key 的版本块连续，最后一次覆盖即最大可见版本
-                winners.insert(vk.raw_key.clone(), (vk.version, enc.to_vec()));
+                // 全表按 enc 升序 ⇒ 同一 raw_key 的版本块连续，最后一次覆盖即最大可见版本。
+                // 这里**顺手把页里那一行的原始字节带走**：B+ 树的 value 就住在叶子条目里，
+                // 遍历的时候已经在手上，不需要再降一次树去取。
+                // 原先抄的是 bitcask 的两段式（① 只折键 ② 按胜出行回树取值），那对 bitcask 对 ——
+                // 它的 KeyDir 只有元数据、值在日志里另一处；对 B+ 树就是**每个存活 key 多付
+                // 3~4 次页访问**：实测一次全量 scan 3.06 页/行、36.2 µs/行。
+                winners.insert(vk.raw_key.clone(), (vk.version, row.clone()));
                 false
             });
         }
 
-        // ② 只给胜出行取值：每个存活 key 一次树下降 + 一次解码。
-        let mut kvengine = self.kv.lock().unwrap();
+        // ② 只对**胜出行**做解码（blob 指针解引用 + 剥 TTL）。非胜者只多一次字节拷贝，
+        //     而 blob 读/值解码的次数仍然等于存活 key 数 —— 这条由
+        //     `test_collect_latest_decodes_only_live_keys` 守着。
         let mut blob = self.blob.lock().unwrap();
         let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
-        for (key, (ver, enc)) in winners {
-            // 胜出行读不到就跳过（与旧实现「该行不存在则不参与」一致）
-            let Some(row) = kvengine.get(enc) else {
-                continue;
-            };
-            let logical = match &row.0 {
+        for (key, (ver, stored)) in winners {
+            let logical = match &stored {
                 None => None,
-                Some(stored) => decode_stored_value(&mut blob, stored).ok().flatten(),
+                Some(s) => decode_stored_value(&mut blob, s).ok().flatten(),
             };
             if logical.is_none() && !include_deleted {
                 continue;
@@ -984,11 +986,7 @@ mod tests {
     use crate::bplus_tree::storage::{dblwr_path, wal_path};
 
     fn tmp_db(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("mvcc_{tag}_{nanos}.db"))
+        crate::common::tmp_test_path("mvcc", tag, ".db")
     }
 
     fn cleanup(path: &Path) {
@@ -1936,6 +1934,166 @@ mod tests {
             assert_eq!(whole.len() as u64, KEYS, "前缀 k 应命中全部 {KEYS} 行");
             assert_eq!(tx.key_count(b"k") as u64, KEYS, "key_count 同一个形状");
             tx.rollback();
+        }
+        cleanup(&path);
+    }
+
+    /// 一次全量 scan 的**页访问次数**必须与叶子页数同阶，而不是与「存活 key 数 × 树高」同阶。
+    ///
+    /// 这是那条两段式的账：B+ 树把 value 存在叶子条目里，折叠遍历时已经在手上；
+    /// 旧实现却照抄 bitcask 的第二段「按胜出行再降一次树取值」，于是每个 key 多付
+    /// 3~4 次页访问 —— 实测一次全量 scan **3.06 页/行**、36.2 µs/行；改成一趟之后是
+    /// 0.057 页/行、1.7 µs/行（同一份 20000 行的库）。
+    /// 断言留了大余量（每 10 行不许超过 1 次页访问）：旧实现会红 30 倍以上。
+    #[test]
+    fn test_full_scan_pages_scale_with_leaves_not_with_keys_times_height() {
+        const KEYS: u64 = 2000;
+        let path = tmp_db("scan_pages");
+        {
+            let mvcc = MVCC::open(&path, 64, 1024);
+            for i in 0..KEYS {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+
+            let tx = mvcc.begin_transaction();
+            let before = crate::bplus_tree::page::page_reads();
+            let rows = tx.scan(None, None);
+            let pages = crate::bplus_tree::page::page_reads() - before;
+            assert_eq!(rows.len() as u64, KEYS);
+            eprintln!("一次全量 scan：{KEYS} 行用了 {pages} 次页访问");
+            assert!(
+                pages * 10 <= KEYS,
+                "{pages} 次页访问对 {KEYS} 行来说太多：折叠不该按行再降一次树（旧实现 3 页/行）"
+            );
+        }
+        cleanup(&path);
+    }
+
+    // ---- B+ 树读路径的墙钟归因（手动 release 跑）----
+    //
+    // 大库基线里 bplus 点读 33.6 µs/次（bitcask 4.3）、`search 首页` 518 ms、`health()` 110 ms。
+    // `page_reads()` 把「缓存命中」和「未命中要读盘 + CRC」算成同一个数，所以它守得住
+    // "代价不随链长涨"，却答不出**钱花在哪**。这条基线分开数 hits/misses，并且**同一份数据
+    // 连测两遍**：第二遍缓存是热的 ⇒ 两遍之差就是真读盘那部分，剩下的才是每页重解析的成本。
+    //
+    // 跑法：
+    //   cargo test --release --lib -- --ignored --nocapture bplus_read_cost_attribution
+    #[test]
+    #[ignore = "墙钟归因，手动 release 跑：cargo test --release --lib -- --ignored --nocapture bplus_read_cost_attribution"]
+    fn test_bplus_read_cost_attribution() {
+        use std::time::Instant;
+
+        const N: usize = 20000;
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+
+        let mut order: Vec<usize> = (0..N).collect();
+        let mut s = 0x853c_49e6_77b9_5b3eu64;
+        for i in (1..N).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (s >> 33) as usize % (i + 1);
+            order.swap(i, j);
+        }
+
+        let path = tmp_db("attrib");
+        {
+            let mvcc = MVCC::open(&path, 64, 1024);
+            for base in (0..N).step_by(1000) {
+                let end = (base + 1000).min(N);
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    (base..end).map(|i| (key(i), val(i))).collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("batch_set 冲突: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            mvcc.flush();
+            let h = mvcc.health();
+            eprintln!("形状: rows={} live_keys={} max_chain={}", h.total_rows, h.live_keys, h.max_chain);
+
+            // 冷重开：缓存清空，模拟"进程启动后第一次读"
+            drop(mvcc);
+            let mvcc = MVCC::open(&path, 64, 1024);
+
+            let probe = |label: &str, mvcc: &MVCC| {
+                let tx = mvcc.begin_transaction();
+                let (p0, hit0, miss0) = (
+                    crate::bplus_tree::page::page_reads(),
+                    crate::bplus_tree::page::cache_hits(),
+                    crate::bplus_tree::page::cache_misses(),
+                );
+                let t = Instant::now();
+                for &i in &order {
+                    assert!(tx.get(&key(i)).is_some(), "第 {i} 个键读空");
+                }
+                let d = t.elapsed().as_secs_f64() * 1e6;
+                let (dp, dh, dm) = (
+                    crate::bplus_tree::page::page_reads() - p0,
+                    crate::bplus_tree::page::cache_hits() - hit0,
+                    crate::bplus_tree::page::cache_misses() - miss0,
+                );
+                eprintln!(
+                    "{label:<16} {:>7.1} µs/次 | 页/次 {:>4.2} | 命中 {:>7} | 未命中 {:>6}",
+                    d / N as f64,
+                    dp as f64 / N as f64,
+                    dh,
+                    dm
+                );
+                dp
+            };
+
+            eprintln!("--- 点读：同一份数据连测两遍（第二遍缓存是热的）---");
+            let cold_pages = probe("第一遍(冷)", &mvcc);
+            let warm_pages = probe("第二遍(热)", &mvcc);
+            assert_eq!(cold_pages, warm_pages, "两遍的页访问次数必须一致，不一致说明形状变了");
+
+            // 一次全量 scan
+            let tx = mvcc.begin_transaction();
+            let (p0, hit0, miss0) = (
+                crate::bplus_tree::page::page_reads(),
+                crate::bplus_tree::page::cache_hits(),
+                crate::bplus_tree::page::cache_misses(),
+            );
+            let t = Instant::now();
+            let rows = tx.scan(None, None);
+            let d = t.elapsed().as_secs_f64() * 1e6;
+            eprintln!(
+                "{:<16} {:>7.1} µs/行 | 页 {:>6} | 命中 {:>6} | 未命中 {:>5} | {} 行",
+                "一次全量 scan",
+                d / rows.len().max(1) as f64,
+                crate::bplus_tree::page::page_reads() - p0,
+                crate::bplus_tree::page::cache_hits() - hit0,
+                crate::bplus_tree::page::cache_misses() - miss0,
+                rows.len()
+            );
+            drop(tx);
+            drop(rows);
+
+            // health() 与 search 首页：管理面的两个数
+            let t = Instant::now();
+            let _ = mvcc.health();
+            eprintln!("{:<16} {:>7.1} µs/次", "health()", t.elapsed().as_secs_f64() * 1e6);
+
+            let q = crate::common::SearchQuery::contains(b"", 0, 100);
+            let tx = mvcc.begin_transaction();
+            let t = Instant::now();
+            let _ = tx.search_keys(&q);
+            eprintln!("{:<16} {:>7.1} µs/次", "search 首页", t.elapsed().as_secs_f64() * 1e6);
+            drop(tx);
+
+            // 页缓存开大到能装下全库，看未命中是否归零（这决定"贵"是 IO 还是 CPU）
+            drop(mvcc);
+            let mvcc = MVCC::open(&path, 64, 65536);
+            eprintln!("--- max_cache_pages=65536 ---");
+            probe("点读(大缓存)", &mvcc);
+            drop(mvcc);
         }
         cleanup(&path);
     }

@@ -1067,11 +1067,7 @@ mod tests {
     use crate::bitcask::storage::{blob_path, data_path, hint_path, lock_path};
 
     fn tmp_db(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("bitcask_mvcc_{tag}_{nanos}"))
+        crate::common::tmp_test_path("bitcask_mvcc", tag, "")
     }
 
     fn cleanup(path: &Path) {

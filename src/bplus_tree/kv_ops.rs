@@ -510,18 +510,9 @@ impl MVCC {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "kv_ops_{tag}_{}_{}.db",
-            std::process::id(),
-            nanos
-        ))
+        crate::common::tmp_test_path("kv_ops", tag, ".db")
     }
 
     fn cleanup(path: &Path) {

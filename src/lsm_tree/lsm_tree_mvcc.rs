@@ -1040,11 +1040,7 @@ mod tests {
     use crate::lsm_tree::storage::lock_path;
 
     fn tmp_db(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("lsm_mvcc_{tag}_{nanos}"))
+        crate::common::tmp_test_path("lsm_mvcc", tag, "")
     }
 
     fn cleanup(path: &Path) {

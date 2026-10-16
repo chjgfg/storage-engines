@@ -93,12 +93,21 @@ impl BPlusTree {
 
     /// 兼容旧接口：在系统临时目录创建匿名数据文件
     pub fn new(order: usize, max_cache_pages: usize) -> Self {
+        // ⚠️ 路径必须带**进程内单调序号**，不能只靠时间戳：Windows 的 SystemTime 粒度较粗，
+        // 并发测试里两个线程可以拿到同一个 nanos ⇒ 第二个会在 `.lock` 上吃到 WouldBlock，
+        // 表现为随机失败的"打开数据文件失败"。同一个坑在 engine.rs / 各家 tmp_db 上都出现过。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("bplus_anon_{}_{}.db", std::process::id(), nanos));
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "bplus_anon_{}_{}_{}.db",
+            std::process::id(),
+            nanos,
+            n
+        ));
         Self::open(path, order, max_cache_pages)
     }
 
