@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 236 个单元测试 + 4 个集成测试
+- 247 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ 这个版本号只在本仓库,**crates.io 上最新仍是 0.3.0(出事故那版)**,要引修复版得走 path/git 依赖 —— 见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -164,6 +164,19 @@ tx.commit();                               // 落 WAL + fsync(只读事务两者
 - **只读事务不写 WAL、`commit` 不 fsync**(实测 2265.8µs/次 → 15.8µs/次)。所以"每 tick 做一次
   快照读"这种用法不会把磁盘拖成瓶颈。
 - `value` 是打过信封的**逻辑值**:直接存裸字节要先 `pack_plain`(见第 7 条与「已知局限」)。
+- **读一段区间就交给区间,别读全库再筛**。`scan(start,end)` / `prefix_scan(prefix)` 把界下推到
+  引擎的有序结构(KeyDir seek / BTreeMap range / 下降到 containing 叶子 / SST 稀疏索引定位块),
+  所以代价随**窗口宽度**走;release + 20k 行实测(每行 µs,窗口 = 1% 即 200 行):
+
+  | 引擎 | 一次全量 scan | 1% 窗口 scan(改前) | 1% 窗口 scan(改后) |
+  |---|---|---|---|
+  | bitcask | 3.1 | 376.6 | **3.0** |
+  | bplus_tree | 24.7 | 3290.4 | **23.8** |
+  | lsm_tree | 5.7 | 405.0 | **4.2** |
+  | memory | 2.3 | 106.3 | **1.1** |
+
+  改前那一列不是"慢一点",是**窗口根本没参与决定代价** —— 折完全库再由调用方筛。
+  复现:`SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline`
 
 ### 3. 跨线程
 
@@ -674,6 +687,13 @@ data.db.lock       单写者锁(内含 pid)
 - 全量 key 常驻内存,key 数量受内存限制
 
 **B+ 树**
+- 大条目下的重组是**"装得下才动盘"**:借键/合并的结果若超过一页载荷(4080 B),整次重组作废
+  (盘上一字未动)。以前的写法是 `write_page` 打印一句、返回的 `false` 被调用链丢掉,而父节点照样
+  删分隔键 + `free_page(死页)` ⇒ 幸存页还是合并前的旧内容,那批行两份副本一起没 = 静默丢数据
+  (40 B 键 + 60 B 值、`order=64` 时合并两个半页就是 7.5 KB)。守卫:
+  `test_reorg_never_drops_oversized_pages`(把检查临时关掉,第 36 次删除就报"删除失败")。
+  ⚠️ 代价如实记在这里:放弃合并会让下溢的叶子保留得更多、填充率下降,delete 密集之后一次全库
+  走查更贵(实测 `vacuum()` 206 ms → 450 ms @ 20k 行)。正解是"合并后再分裂",还没做。
 - blob GC 是简化版:只在完全无引用时清空,有引用则暂不重写(append-only 空间残留)
 - `page_id` 在页头里被截断成 u32
 
@@ -793,8 +813,10 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:236 单元 + 4 集成 + 3 文档测试
-cargo test --lib engine::     # 只跑门面层(20 个,四引擎全覆盖)
+cargo test                    # 全部:247 单元 + 4 集成 + 3 文档测试
+cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
+SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
+                              # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)
 cargo test --test test_lsm_tree
 ```
 

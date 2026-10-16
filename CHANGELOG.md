@@ -189,7 +189,11 @@
   吞掉失败。合并路径的判断必须排在 `free_page` 前面，顺序反了就是两份副本一起没。
 - **`write_page` 的超载告警改为"前 3 条打印 + 全部计数"**（新探针 `page::oversized_writes()`）。
   原来每条都 `eprintln`，一次基线刷几万行到 stderr —— 那本身在花钱，而且**污染了被测耗时**
-  （bplus 的 `search 首页` 911 ms 里有它一份）。守卫就是断言这个计数为 0。
+  （bplus 的 `search 首页` 911 ms 里有它一份）。守卫就是断言 `oversized_writes()` 为 0。
+  复测（release + 20k 行，同一台机器）：载荷告警 **几万行 → 0 行**；bplus 点读 57.7 → **33.6 µs/次**、
+  灌数 156.8 → **93.3 µs/行**、一次全量 scan 33.3 → **24.7 µs/行**、`search 首页` 911 → **518 ms**、
+  `key_count` 618 → **514 ms**。⚠️ 另一头也如实记：**`vacuum()` 206 → 450 ms** —— 放弃合并会留下
+  更多下溢叶子、填充率下降，delete 密集之后的全库走查因此变贵；正解是"合并后再分裂"，尚未做。
 - **LSM 点查慢两个数量级的根因不是复杂度，是"块缓存未命中就重开文件"**：下游把本 crate 嵌进去
   实测**单次点查 0.86 ms**（5002 键 / 40B 键 / 60B 值 / 10005 行 / `max_chain=3` / 全 release），
   本仓库同形状复现到 **289 µs**。`SstFile` 原来只存 `path`，`read_slice` 每有一次块缓存未命中就
@@ -251,9 +255,18 @@
 
 ### 测试
 
-236 个单元测试 + 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆次数），不用计时：
-原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
+247 个单元测试（244 跑 + 3 个 `#[ignore]` 的大库基线/长跑基线）+ 4 个集成测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆/索引比较次数/超载写次数），不用计时：原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
 并且复杂度守卫都先验证过"它会红"（临时短路被测代码跑一遍）才算数。
+- **窗口/前缀扫随窗口宽度缩**：`test_windowed_scan_cost_scales_with_window_not_library` 四家各一条
+  （尺子分别是读盘次数 / 折叠走的键数 / 页数 / SST 块读次数），每条都同时断言"结果与全量之后筛
+  逐条一致"和"计数随窗口缩"，外加一条 `prefix_scan(所有键的真前缀)` 的边界形状。
+- **哨兵形状** `upper_bound_keeps_trailing_zero_end`：钉住 `seek_prev` 那种 `key ‖ 0x00` 的上界
+  为什么不能用 `encode_key(end, 0)`（这条是先把内存引擎的既有用例跑红才发现的）。
+- **B+ 树重组** `test_reorg_never_drops_oversized_pages`：4000 个 35B 键 + 60B 值、隔一个删一个，
+  断言超载写次数为 0 且剩下的键全部仍可读、叶子链表行数一致。把字节检查临时关掉，
+  它在**第 36 次删除**就报"删除失败"——这就是"静默丢数据"的直接证据。
+- **稀疏索引二分** `test_find_block_is_binary_and_agrees_with_linear`：与线性扫逐 key 对拍 + 比较次数只与 log2(块数) 同阶。
+- **懒分配缓冲** `test_write_buffer_is_allocated_lazily`：打开时容量必须为 0，首次写入后必须 ≥ 目标。
 - **门面入口三条**：`open_engine_accepts_enum_and_string_in_every_ownership_shape`、
   `enum_without_path_is_path_required`、`unknown_name_is_echoed_verbatim_whatever_the_shape`。
   前一条同时是 `EngineKind::as_str` 与 `canonical_name` 两张表的汇合点 —— 枚举写法漏实现会
