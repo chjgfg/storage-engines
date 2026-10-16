@@ -909,14 +909,54 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
+        crate::common::fold_window(
+            None,
+            |after, budget| self.scan_candidates(start, end, None, after, budget),
+            |c| {
+                let logical = {
+                    let mut kvengine = self.kv.lock().unwrap();
+                    let mut blob = self.blob.lock().unwrap();
+                    match kvengine.get_entry(&c.row) {
+                        Ok(None) => None,
+                        Ok(Some(None)) => None,
+                        Ok(Some(Some(s))) => decode_stored_value(&mut blob, &s).ok().flatten(),
+                        Err(_) => None,
+                    }
+                };
+                (logical.is_some() || include_deleted).then(|| (c.key, c.version, logical))
+            },
+        )
+    }
+
+    /// 折出**候选组**（一把逻辑 key 一组，值还没读）。
+    ///
+    /// 只折键、不碰日志：KeyDir 里就是元数据，`iter_meta_from` 按 enc 升序 ⇒ 同一
+    /// raw_key 的版本块连续，组内最后一次覆盖就是最大可见版本。值留到 `keep` 里读，
+    /// 于是"命中几条读几条"，而不是"全库折完再筛"。
+    ///
+    /// `after` 是续跑游标、`accept` 是键级过滤、`budget` 是组数上限；返回的 `bool` =
+    /// 已走到界尾（`false` = 被预算拦下，还能续）。⚠️ 交出一组只能在组边界。
+    pub(crate) fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Vec<u8>>>, bool) {
         let hi_enc = end.map(version_key_upper_bound);
-        // ① 元数据折叠：enc 升序 ⇒ 同一 raw_key 最后一次 insert 就是最大可见版本
-        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        let mut out: Vec<crate::common::WinCandidate<Vec<u8>>> = Vec::new();
+        // 键流走完了没：`for` 自然结束 = 走完；`break` 有两种 —— 越界(走完) 与 预算(没走完)
+        let mut walk_done = true;
         {
             let kvengine = self.kv.lock().unwrap();
-            for (enc, _loc) in kvengine.iter_meta_from(start) {
+            let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+            let mut pending: Option<Vec<u8>> = None;
+                for (enc, _loc) in kvengine.iter_meta_from(start) {
+                #[cfg(test)]
+                crate::bitcask::bitcask::note_keydir_visit();
                 if hi_enc.as_deref().is_some_and(|h| enc.as_slice() >= h) {
-                    break;
+                    break; // 越界：键流在本引擎里升序，后面全在界外
                 }
                 let Some(vk) = decode_key(enc) else {
                     continue;
@@ -927,32 +967,47 @@ impl Transaction {
                 if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
                     continue;
                 }
+                if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                    continue; // 上一轮已经交出去的那组
+                }
                 if !self.is_visible(vk.version) {
                     continue;
                 }
-                winners.insert(vk.raw_key, (vk.version, enc.clone()));
+                if pending.as_deref() != Some(vk.raw_key.as_slice()) {
+                    if let Some(key) = pending.take() {
+                        if let Some((ver, win_enc)) = winners.remove(&key) {
+                            if accept.is_none_or(|f| f(&key)) {
+                                out.push(crate::common::WinCandidate {
+                                    key,
+                                    version: ver,
+                                    row: win_enc,
+                                });
+                                if out.len() >= budget {
+                                    walk_done = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    pending = Some(vk.raw_key.clone());
+                }
+                winners.insert(vk.raw_key.clone(), (vk.version, enc.to_vec()));
+            }
+            if walk_done {
+                if let Some(key) = pending {
+                    if let Some((ver, win_enc)) = winners.remove(&key) {
+                        if accept.is_none_or(|f| f(&key)) {
+                            out.push(crate::common::WinCandidate {
+                                key,
+                                version: ver,
+                                row: win_enc,
+                            });
+                        }
+                    }
+                }
             }
         }
-
-        // ② 只给胜出行读盘。软墓碑 → logical None，与旧实现一致；
-        //    两阶段之间索引若已不含该行（单写者模型下不会发生）就跳过该行。
-        let mut kvengine = self.kv.lock().unwrap();
-        let mut blob = self.blob.lock().unwrap();
-        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
-        for (key, (ver, enc)) in winners {
-            let Ok(Some(stored)) = kvengine.get_entry(&enc) else {
-                continue;
-            };
-            let logical = match stored {
-                None => None,
-                Some(s) => decode_stored_value(&mut blob, &s).ok().flatten(),
-            };
-            if logical.is_none() && !include_deleted {
-                continue;
-            }
-            out.push((key, ver, logical));
-        }
-        out
+        (out, walk_done)
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {

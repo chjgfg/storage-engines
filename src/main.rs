@@ -139,8 +139,8 @@ fn batch_and_scan(db: &dyn KvEngine) {
     println!(
         "   搜索 \"user\" 第0页: {:?}  (共{}条 {}页, 有下一页={})",
         keys_of(&page.items),
-        page.total,
-        page.total_pages,
+        page.total.unwrap_or_default(),
+        page.total_pages.unwrap_or_default(),
         page.has_next()
     );
 

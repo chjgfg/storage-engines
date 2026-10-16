@@ -851,11 +851,53 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        // ① 一趟走完：折「键 + 版本号 + 那一行的原始字节」。
+        crate::common::fold_window(
+            None,
+            |after, budget| self.scan_candidates(start, end, None, after, budget),
+            |c| {
+                let logical = match &c.row {
+                    None => None,
+                    Some(stored) => {
+                        let mut blob = self.blob.lock().unwrap();
+                        decode_stored_value(&mut blob, stored).ok().flatten()
+                    }
+                };
+                (logical.is_some() || include_deleted).then(|| (c.key, c.version, logical))
+            },
+        )
+    }
+
+    /// 折出**候选组**（一把逻辑 key 一组，页里的原始字节顺手带走）。
+    ///
+    /// 为什么值要在这里就带上：B+ 树的 value 就住在叶子条目里，遍历的时候已经在手上。
+    /// 原先抄 bitcask 的两段式（① 只折键 ② 按胜出行回树取值）对 bitcask 对 ——
+    /// 它的 KeyDir 只有元数据、值在日志另一处；对 B+ 树就是**每个存活 key 多付
+    /// 3~4 次页访问**：实测一次全量 scan 3.06 页/行、36.2 µs/行。
+    ///
+    /// `after` 是续跑游标、`accept` 是键级过滤（不命中的键连字节都不带）、
+    /// `budget` 是组数上限；返回的 `bool` = 已走到界尾（`false` = 被预算拦下，还能续）。
+    /// ⚠️ 交出一组只能在组边界：全表按 enc 升序 ⇒ 同一 raw_key 的版本块连续，
+    /// 最后一次覆盖才是最大可见版本；在半截组上收手会把旧版本当新的交出去。
+    pub(crate) fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
         let hi_enc = end.map(version_key_upper_bound);
-        let mut winners: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
+        // 候选按组边界依次成型，两个 Vec 用索引配对（闭包不能把 `out` 同时借走，
+        // 见 memory 引擎同名方法里的说明）
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut rows: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut versions: Vec<u64> = Vec::new();
+        let mut stopped_by_budget = false;
         {
             let mut kvengine = self.kv.lock().unwrap();
+            let mut winners: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
+            let mut pending: Option<Vec<u8>> = None;
+            let accept: Option<&dyn Fn(&[u8]) -> bool> = accept;
             kvengine.scan_entries_break_from(start, |enc, row| {
                 if hi_enc.as_deref().is_some_and(|h| enc >= h) {
                     return true; // 按 enc 定界 ⇒ 有序迭代后面只会更大，可以真停
@@ -863,43 +905,57 @@ impl Transaction {
                 let Some(vk) = decode_key(enc) else {
                     return false;
                 };
-                // 前缀交错的边角：界判在原始 key 上，逐条兜
+                // 界判在原始 key 上，逐条兜（前缀交错的边角）
                 if start.is_some_and(|s| vk.raw_key.as_slice() < s) {
                     return false;
                 }
                 if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
                     return false;
                 }
+                if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                    return false; // 上一轮已经交出去的那组
+                }
                 if !self.is_visible(vk.version) {
                     return false;
                 }
-                // 全表按 enc 升序 ⇒ 同一 raw_key 的版本块连续，最后一次覆盖即最大可见版本。
-                // 这里**顺手把页里那一行的原始字节带走**：B+ 树的 value 就住在叶子条目里，
-                // 遍历的时候已经在手上，不需要再降一次树去取。
-                // 原先抄的是 bitcask 的两段式（① 只折键 ② 按胜出行回树取值），那对 bitcask 对 ——
-                // 它的 KeyDir 只有元数据、值在日志里另一处；对 B+ 树就是**每个存活 key 多付
-                // 3~4 次页访问**：实测一次全量 scan 3.06 页/行、36.2 µs/行。
+                if pending.as_deref() != Some(vk.raw_key.as_slice()) {
+                    if let Some(key) = pending.take() {
+                        if let Some((ver, stored)) = winners.remove(&key) {
+                            if accept.is_none_or(|f| f(&key)) {
+                                keys.push(key);
+                                versions.push(ver);
+                                rows.push(stored);
+                                if keys.len() >= budget {
+                                    stopped_by_budget = true;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    pending = Some(vk.raw_key.clone());
+                }
                 winners.insert(vk.raw_key.clone(), (vk.version, row.clone()));
                 false
             });
-        }
-
-        // ② 只对**胜出行**做解码（blob 指针解引用 + 剥 TTL）。非胜者只多一次字节拷贝，
-        //     而 blob 读/值解码的次数仍然等于存活 key 数 —— 这条由
-        //     `test_collect_latest_decodes_only_live_keys` 守着。
-        let mut blob = self.blob.lock().unwrap();
-        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
-        for (key, (ver, stored)) in winners {
-            let logical = match &stored {
-                None => None,
-                Some(s) => decode_stored_value(&mut blob, s).ok().flatten(),
-            };
-            if logical.is_none() && !include_deleted {
-                continue;
+            if !stopped_by_budget {
+                if let Some(key) = pending {
+                    if let Some((ver, stored)) = winners.remove(&key) {
+                        if accept.is_none_or(|f| f(&key)) {
+                            keys.push(key);
+                            versions.push(ver);
+                            rows.push(stored);
+                        }
+                    }
+                }
             }
-            out.push((key, ver, logical));
         }
-        out
+        let out = keys
+            .into_iter()
+            .zip(versions)
+            .zip(rows)
+            .map(|((key, version), row)| crate::common::WinCandidate { key, version, row })
+            .collect();
+        (out, !stopped_by_budget)
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, RowId> {

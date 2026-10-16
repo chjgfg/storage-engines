@@ -139,6 +139,25 @@ pub(crate) fn index_probes() -> u64 {
     INDEX_PROBES.with(|c| c.get())
 }
 
+// 测试专用：窗口折叠里**看了多少把编码键**（轻量视图的遍历量，不含取值）。
+// 与 bitcask 的 `keydir_visits` 同一角色：只数取值的尺子抓不到"键流照样走到底"，
+// 第一版守卫就是量 `block_reads()`，把预算整个忽略掉它照样绿。
+#[cfg(test)]
+thread_local! {
+    static LIGHT_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_light_visit() {
+    LIGHT_VISITS.with(|c| c.set(c.get() + 1));
+}
+
+/// 当前线程折候选时检查过的编码键数（测试探针用）
+#[cfg(test)]
+pub(crate) fn light_visits() -> u64 {
+    LIGHT_VISITS.with(|c| c.get())
+}
+
 // 测试专用：本线程「把带 value 的条目整个物化出来」的次数。
 //
 // 这是全库折叠那条通道真正的代价单位：重量路径（`iter_all` / `mem_view_at`）每行都要

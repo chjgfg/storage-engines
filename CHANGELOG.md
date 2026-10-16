@@ -42,6 +42,16 @@
   而不是"设置成功" —— 门面上以前没有这条转发，下游只能绕开门面直接摸 `crate::lsm_tree::MVCC`，
   而那正是 wrapper 复制的起点。`open_engine_with` 里若给 `memory` 传了 `wal_checkpoint_bytes`
   也**当场失败**（不静默忽略）。
+- **`SearchPage` 的 `total` / `total_pages` 变成 `Option<usize>`，并新增 `has_next: bool`**（M15）；
+  `SearchQuery` 新增字段 `need_total: bool`（构造函数默认 `true`，行为与旧版一致）。
+  ⇒ 读 `page.total` 的代码要改成 `page.total.unwrap()` / `unwrap_or_default()`；
+  构造 `SearchQuery { .. }` 全字段字面量的代码要补 `need_total`（用
+  `SearchQuery::contains(..)` / `::prefix(..)` 的不受影响）。
+  为什么值得动 API：`total` 以前**总是**数一遍全库，于是"翻页"这个动作的代价与库总量同阶
+  （20000 键时首页也要 100 ms 量级），而调用方真正要的只是"还有没有下一页"。
+  现在 `without_total()` 把这件事分开计价，`total = None` 如实表示"没数"，
+  `has_next` 由"多取一条"探出来（代价 = 一条记录）。
+
 
 ### 新增
 
@@ -117,6 +127,30 @@
   `MVCC::try_open_with`（bitcask 收 `Option<u64>`，lsm 收整份 `Option<LSMTreeOptions>`，
   没给的字段留在 `for_mvcc()` 档上 —— 常规写法是 struct-update 从 `for_mvcc()` 抄基线）。
   `LSMTreeOptions` 与 `DEFAULT_MAX_FILE_BYTES` 提到 crate 根 / `crate::bitcask` 可见。
+- **`search_keys` 的窗口分页不再为 `total` 走全库**（M15）。计数尺（本引擎"走了多少把键/页"，
+  2000 键 / 页宽 20）：bitcask 2000→**22**、lsm 2000→**22**、memory 2000→**22**、
+  bplus 62→**2** 页。release / 20000 行台架的墙钟（页宽 100，首页）：bitcask 48.1→**0.25 ms**、
+  bplus 25.6→**0.14 ms**、memory 24.3→**0.16 ms**、lsm 64.4→**18.2 ms**。
+  ⚠️ **LSM 那 18.2 ms 不是"没修好"，是撞到另一条通道**：归并要为每个 SST 源各初始化一次
+  （读该源第一块），所以窗口再小也躲不开"源数 × 一块"⇒ 首页代价从 O(全库行数) 变成
+  **O(SST 文件数)**。计数尺证明窗口确实生效（22 把键 vs 2000）。源启动的固定开销与 M10 那条
+  "点读代价 ∝ 版本散在几个 SST"同源，已单列进未修队列，不在这里冒充已解决。
+- **窗口折叠与分页核各收成一份（M15）**：`common::kernel.rs` 新增
+  `fold_window(wanted, round, keep)` 与 `search_page_from(matched, query)` 两份共用实现，
+  四个引擎的 `search_keys` 从此只剩"我这家的候选怎么折"这一段差异。
+  - `fold_window` 能提前收手，并且**能续跑第二轮**：折叠在键这一层判得了"命不命中 pattern"，
+    但"这行取不取到值"（blob 指针、TTL 是否过期）要取了值才知道 ⇒ 提前收手可能少数几条，
+    于是从上一轮最后一个键续跑、预算翻倍 ⇒ 总代价与最终那一轮同阶，最坏退化成走完全库
+    （那正是 `need_total = true` 的语义）。同一个几何重试的形状在 `vacuum_bounded` 里用过一次。
+  - 取值放在 `keep` 而不是折在 `round` 里：bitcask/bplus/lsm 的取值要拿 blob 锁，
+    而候选是**拿着 kv 锁走元数据**折出来的 —— 两段式就是为了不在这两把锁上打结。
+  - `scan_candidates`（四家同名新方法）：折出"一把逻辑 key 一组"的候选，带 `after` 续跑游标、
+    `accept` 键级过滤、`budget` 组数上限。交出一组只能发生在**组边界**（版本大端接在 key 后面
+    ⇒ 组内升序 ⇒ 半截组上收手会把旧版本当最新行交出去）。
+  - 新增两把尺子：bitcask `keydir_visits()`、lsm `light_visits()`。**为什么必须新加**：
+    第一版守卫用的是 bitcask `read_value_calls()` / lsm `block_reads()`（取值次数），
+    把预算临时忽略掉之后这两条**照样绿** —— 值确实只读了窗口那几条，而键流仍然走完了全库。
+    尺子量错了等于没量，这条按"先证明会红"补的。
 - **`KvEngine::tuning()`：写进去的旋钮要读得回来**（M13）。返回 `EngineTuning`
   （`Vec<{key, value:String}>` + `get(key)`，定义在 `src/common/types.rs`，与 `MvccHealth` 同层），
   各引擎的 `MVCC::tuning()` 自己列自己有的键 ⇒ 它同时是"这家能调什么"的清单，而不是门面里
@@ -386,7 +420,7 @@
 
 ### 测试
 
-254 个单元测试（250 跑 + 4 个 `#[ignore]` 的大库基线/长跑基线）+ 4 个集成测试 + 5 个文档测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆/索引比较次数/超载写次数），不用计时：原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
+261 个单元测试（257 跑 + 4 个 `#[ignore]` 的大库基线/长跑基线）+ 4 个集成测试 + 5 个文档测试。新增的都是**计数断言**（读盘/页/块/解码/物化/克隆/索引比较次数/超载写次数），不用计时：原有用例结构上抓不到这类病 —— 每条用例的版本链都是个位数长。每引擎每通道各有自己的守卫，
 并且复杂度守卫都先验证过"它会红"（临时短路被测代码跑一遍）才算数。
 - **B+ 树重组四条（M14）**：
   - `test_reorg_packs_leaves_instead_of_leaving_them_half_empty`：**页数**是唯一对这件事敏感的尺子
@@ -405,6 +439,19 @@
     拿字节数当尺子会把这条合法的 Begin 算成罪状，我第一版就是这么误报的）。
     把守卫挪到 append 之后 ⇒ `left: 1 / right: 0` 当场红。同一条里还断言"探针数得到那条
     真实写入的 `Write`"，否则 `== 0` 是空转。
+- **窗口分页五条（M15）**：四引擎各一条 `test_search_window_costs_the_window_not_the_library`
+  （尺子 = 本引擎的走键/走页计数：bitcask 22/2000、bplus 2/62 页、lsm 22/2000、memory 22/2000），
+  每条都同时断言"窗口内容 == 全量同一页"、`total` 是 `None`、`has_next` 在首页为真/末页为假。
+  共用件另有两条自己的守卫：`search_page_kernel_distinguishes_unmeasured_from_exhausted`
+  （分页核的三条分支：`total`/`total_pages`/`has_next`，重点是**"没数"与"到底了"必须分得开** —
+  写错任何一侧，翻页要么提前停、要么永远停不下来）与
+  `fold_window_resumes_when_keep_drops_candidates`（驱动的续跑那一支：引擎级守卫的库里没有
+  过期行，那条分支一次都踩不到，所以直接喂给它 —— 断言窗口不被交短、第二轮预算确实变大）。
+  再加一条门面的 `windowed_search_agrees_across_engines`（四家必须给同一页的同一份内容 ——
+  一家不同，下游 wrapper 里就多一句 `if engine == ...`）。
+  证红方式：把 `fold_window` 的预算改成"永远走完全库"，四条**全红**（首页 2000 / 全量 2000）；
+  把守卫换成只数取值的尺子时 bitcask 与 lsm 会**假绿**，因此另加了两把走键的计数器。
+
 - **配置旋钮三条（M13）**：
   - `engine_config_knobs_reach_the_engine_and_are_readable_back`：`EngineConfig` 的每个字段都要
     在**那个引擎**里读得回（B+ 树 `order`/`max_cache_pages`、bitcask `max_file_bytes`、LSM

@@ -235,9 +235,9 @@ fn test_bplus_tree() {
             let page = mvcc.search_keys(&SearchQuery::contains(b"pp", 0, 10));
             println!(
                 "[search contains \"pp\"] total={} page={}/{} items={}",
-                page.total,
+                page.total.unwrap(),
                 page.page + 1,
-                page.total_pages.max(1),
+                page.total_pages.unwrap_or(1),
                 page.items.len()
             );
             for r in &page.items {
@@ -255,7 +255,7 @@ fn test_bplus_tree() {
                 println!(
                     "  [page {}/{}] count={} has_next={}",
                     p.page + 1,
-                    p.total_pages.max(1),
+                    p.total_pages.unwrap_or(1),
                     p.items.len(),
                     p.has_next()
                 );

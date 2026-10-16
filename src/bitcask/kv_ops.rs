@@ -28,6 +28,7 @@
 use std::time::Duration;
 
 use crate::bitcask::bitcask_mvcc::{encode_key, MVCC, Transaction};
+use crate::bitcask::storage::decode_stored_value;
 use crate::common::codec::parse_i64_user;
 
 /// 公共类型与编解码工具现由 [`crate::common`] 统一定义。
@@ -250,33 +251,21 @@ impl Transaction {
 
     /// 按 key 模糊/前缀搜索并分页
     pub fn search_keys(&self, query: &SearchQuery) -> SearchPage {
+        // 分页核只有一份：[`crate::common::search_page_from`]。这里唯一的分支是"要不要精确
+        // total"—— 不要的时候折叠能提前收手，首页代价从 O(全库) 变成 O(窗口宽)。
         let page_size = query.page_size.max(1);
-        let page = query.page;
+        let limit = if query.need_total {
+            None
+        } else {
+            Some(query.page.saturating_mul(page_size) + page_size + 1)
+        };
         let matched = self.collect_for_search(
             query.include_deleted,
             Some(query.pattern.as_slice()),
             query.mode,
+            limit,
         );
-        let total = matched.len();
-        let total_pages = if total == 0 {
-            0
-        } else {
-            (total + page_size - 1) / page_size
-        };
-        let start = page.saturating_mul(page_size);
-        let items = if start >= total {
-            Vec::new()
-        } else {
-            let end = (start + page_size).min(total);
-            matched[start..end].to_vec()
-        };
-        SearchPage {
-            items,
-            total,
-            page,
-            page_size,
-            total_pages,
-        }
+        crate::common::search_page_from(matched, query)
     }
 
     fn collect_for_search(
@@ -284,54 +273,61 @@ impl Transaction {
         include_deleted: bool,
         pattern: Option<&[u8]>,
         mode: KeyMatchMode,
+        limit: Option<usize>,
     ) -> Vec<ExportRecord> {
         // 前缀匹配的键是有界的 ⇒ 界下推给折叠。Contains 要逐键比子串，全库是它的本质代价，
-        // 不在这条里"优化"掉。
+        // 但只要窗口那么宽的结果就不必走到底 ⇒ `limit` 与 `accept` 都交给驱动。
         let (lo, hi) = match mode {
             KeyMatchMode::Prefix => (
-                if pattern.unwrap_or_default().is_empty() { None } else { pattern },
+                if pattern.unwrap_or_default().is_empty() {
+                    None
+                } else {
+                    pattern
+                },
                 prefix_upper_bound(pattern.unwrap_or_default()),
             ),
             KeyMatchMode::Contains => (None, None),
         };
-        self.collect_latest_raw_in(true, lo, hi.as_deref())
-            .into_iter()
-            .filter_map(|(key, _ver, raw)| {
-                if let Some(pat) = pattern {
-                    if !key_matches(&key, pat, mode) {
-                        return None;
+        let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
+        crate::common::fold_window(
+            limit,
+            |after, budget| self.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
+            |cand| {
+                // 命中几条读几条：值留到这里才取
+                let logical = {
+                    let mut kvengine = self.kv.lock().unwrap();
+                    let mut blob = self.blob.lock().unwrap();
+                    match kvengine.get_entry(&cand.row) {
+                        Ok(Some(Some(stored))) => {
+                            decode_stored_value(&mut blob, &stored).ok().flatten()
+                        }
+                        _ => None,
                     }
-                }
-                match raw {
+                };
+                match logical {
                     None => {
                         if include_deleted {
-                            Some(ExportRecord {
-                                key,
-                                value: None,
-                            })
+                            Some(ExportRecord { key: cand.key, value: None })
                         } else {
                             None
                         }
                     }
                     Some(bytes) => match logical_to_user(bytes) {
                         Some(user) => Some(ExportRecord {
-                            key,
+                            key: cand.key,
                             value: Some(user),
                         }),
                         None => {
                             if include_deleted {
-                                Some(ExportRecord {
-                                    key,
-                                    value: None,
-                                })
+                                Some(ExportRecord { key: cand.key, value: None })
                             } else {
                                 None
                             }
                         }
                     },
                 }
-            })
-            .collect()
+            },
+        )
     }
 
     // ── 元数据 ──
@@ -572,6 +568,56 @@ mod tests {
         cleanup(&path);
     }
 
+
+    /// 不要精确 total 的翻页，代价必须只看**窗口宽**，不看库有多大（M15 的验收）。
+    ///
+    /// 以前 `search_keys` 为了报一个 `total` 把整库折一遍 ⇒ 首页与末页一样贵
+    /// （实测 20000 键时首页也要 100 ms 量级）。尺子是本引擎自己的代价单位。
+    /// 顺序是**先量窗口、再量全量**：后跑那次缓存更热，偏差只会让断言更难通过，不会骗人。
+    #[test]
+    fn test_search_window_costs_the_window_not_the_library() {
+        const N: usize = 2000;
+        const PAGE: usize = 20;
+        let path = tmp("search_window");
+        {
+            let mvcc = MVCC::open(&path);
+            let tx = mvcc.begin_transaction();
+            for i in 0..N {
+                assert!(tx.set(format!("user{i:05}").as_bytes(), pack_plain(b"x")), "第 {i} 行没写进去");
+            }
+            tx.commit();
+
+            let base = crate::bitcask::bitcask::keydir_visits();
+            let w = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE).without_total());
+            let window_cost = crate::bitcask::bitcask::keydir_visits() - base;
+
+            let base = crate::bitcask::bitcask::keydir_visits();
+            let full = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE));
+            let full_cost = crate::bitcask::bitcask::keydir_visits() - base;
+
+            assert_eq!(full.total, Some(N), "要 total 时语义与改前完全一致");
+            assert_eq!(w.total, None, "没数就不许报一个数出来");
+            assert_eq!(w.total_pages, None);
+            assert_eq!(w.items.len(), PAGE);
+            assert_eq!(w.items, full.items, "窗口必须是同一页的全量结果：分页语义一个字节都不许变");
+            assert!(w.has_next(), "后面还有 {} 条，必须报得出来", N - PAGE);
+            eprintln!("[search 窗口] 首页走了 {window_cost} 把键；要精确 total 走 {full_cost} 把（N={N}）");
+            assert!(
+                full_cost > 0 && window_cost * 2 <= full_cost,
+                "首页付了 {window_cost} / 全量 {full_cost} ⇒ 还在走全库"
+            );
+
+            // 最后一面：探不到"多出来的那一条"就必须如实报"没有下一页"
+            let last = N / PAGE - 1;
+            let w2 = mvcc.search_keys(&SearchQuery::contains(b"user", last, PAGE).without_total());
+            let f2 = mvcc.search_keys(&SearchQuery::contains(b"user", last, PAGE));
+            assert_eq!(w2.items.len(), PAGE);
+            assert_eq!(w2.items, f2.items, "同一页的内容与要不要 total 无关");
+            assert!(!w2.has_next(), "最后一页之后没有东西了");
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn test_search_pagination() {
         let path = tmp("search");
@@ -584,11 +630,11 @@ mod tests {
             tx.commit();
 
             let page = mvcc.search_keys(&SearchQuery::contains(b"pp", 0, 10));
-            assert_eq!(page.total, 2);
+            assert_eq!(page.total, Some(2));
             assert_eq!(page.items.len(), 2);
 
             let p0 = mvcc.search_keys(&SearchQuery::prefix(b"user:", 0, 1));
-            assert_eq!(p0.total, 1);
+            assert_eq!(p0.total, Some(1));
             assert!(!p0.has_next());
         }
         cleanup(&path);

@@ -189,6 +189,111 @@ impl WalPolicy {
     }
 }
 
+/// 分页核（四引擎共用的一份）：从"已按 pattern 过滤好的命中序列"里跳 `skip` 条取 `page_size` 条。
+///
+/// 存在的理由：这四行逻辑原先在四个引擎里各抄一遍，而 M15 的改动恰好只动这四行 ——
+/// 一处改完，四家一起变，不存在"三家改了、一家漏了"。
+///
+/// `matched` 有两种长度，含义不同，所以 `has_next` 分两条路算：
+/// - **要 total**（`need_total = true`）：调用方把整段（界内）命中都交过来，
+///   `total` 就是它的长度，"还有没有下一页"由页码推出来。
+/// - **不要 total**（`need_total = false`）：调用方最多交 `skip + page_size + 1` 条
+///   （多取那一条就是用来探边的）。此时要么正好数到"窗口外还有一条"，要么已经走到库尾 /
+///   界尾 —— 后者 `matched.len() <= end` ⇒ 没有下一页。**不许把"没数"报成"到底了"是
+///   靠这条区分的**：走到库尾是真的到底，而探到第 `end+1` 条说明后面还有。
+pub fn search_page_from(
+    matched: Vec<crate::common::ExportRecord>,
+    query: &crate::common::SearchQuery,
+) -> crate::common::SearchPage {
+    let page_size = query.page_size.max(1);
+    let page = query.page;
+    let skip = page.saturating_mul(page_size);
+    let total = query.need_total.then_some(matched.len());
+    let items = if skip >= matched.len() {
+        Vec::new()
+    } else {
+        let end = (skip + page_size).min(matched.len());
+        matched[skip..end].to_vec()
+    };
+    let has_next = if query.need_total {
+        let total = matched.len();
+        total > 0 && page + 1 < (total + page_size - 1) / page_size
+    } else {
+        matched.len() > skip + page_size
+    };
+    let total_pages = if query.need_total {
+        let total = matched.len();
+        Some(if total == 0 {
+            0
+        } else {
+            (total + page_size - 1) / page_size
+        })
+    } else {
+        None
+    };
+    crate::common::SearchPage {
+        items,
+        total,
+        page,
+        page_size,
+        total_pages,
+        has_next,
+    }
+}
+
+/// 折叠一轮产出的**候选组**：一把逻辑 key 的胜出版本行，值**还没取**。
+///
+/// `row` 是各家自己的"再拿到这一行的凭据"，形状本来就不一样，所以留成泛型：
+/// memory / bitcask / lsm 是编码键（值在另一处，要再读一次），bplus 是叶子条目里
+/// 顺手带出来的原始字节。共同点只有一个，也正是驱动需要的那个：**键已经折好了、
+/// 按 key 升序、每组一条**。
+pub struct WinCandidate<V> {
+    pub key: Vec<u8>,
+    pub version: u64,
+    pub row: V,
+}
+
+/// 窗口折叠的共用驱动（四引擎一份）。
+///
+/// `round(after, budget)`：从 `after` 这组**之后**开始折，最多交 `budget` 组候选，
+/// 返回 `(候选, 是否已走到界尾)`。`keep(candidate)`：候选 ⇒ 记录（取值 + 剥壳 +
+/// TTL/墓碑过滤），`None` = 这一条不算命中窗口。`wanted = None` = 一趟走完全库。
+///
+/// 为什么要能续跑第二轮：**"这把键命不命中 pattern"在键这一层就能判，而"这行到底
+/// 取不取到值"（blob 指针、TTL 是否过期）要取了值才知道** ⇒ 提前收手有可能少数几条。
+/// 于是从上一轮的最后一个键续跑、预算翻倍 ⇒ 总代价仍是最终那一轮的同阶，最坏退化成
+/// "走完全库"，而那正好是 `wanted = None`（要精确 total）的语义。同一个几何重试的形状
+/// 在 `vacuum_bounded` 的窗口放大里已经用过一次。
+///
+/// 为什么值读取放在 `keep` 而不是折在 `round` 里：bitcask/bplus/lsm 的取值要拿 blob 锁，
+/// 而候选是**拿着 kv 锁走元数据**折出来的 —— 今天的两段式就是为了不在这两把锁上打结。
+pub fn fold_window<V, R, K, T>(wanted: Option<usize>, mut round: R, mut keep: K) -> Vec<T>
+where
+    R: FnMut(Option<&[u8]>, usize) -> (Vec<WinCandidate<V>>, bool),
+    K: FnMut(WinCandidate<V>) -> Option<T>,
+{
+    let mut out: Vec<T> = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    let mut budget = wanted.unwrap_or(usize::MAX);
+    loop {
+        let (batch, reached_end) = round(after.as_deref(), budget);
+        let produced = batch.len();
+        for cand in batch {
+            after = Some(cand.key.clone());
+            if let Some(kept) = keep(cand) {
+                out.push(kept);
+                if wanted.is_some_and(|w| out.len() >= w) {
+                    return out;
+                }
+            }
+        }
+        if reached_end || produced == 0 {
+            return out;
+        }
+        budget = budget.saturating_mul(2).max(64);
+    }
+}
+
 /// 漏网事务的判据：活跃表里还留着"自己"，就说明既没 `commit` 也没 `rollback`。
 ///
 /// 为什么用成员关系而不是额外标志位：`commit` / `rollback` 都以 `remove` 收尾，
@@ -209,6 +314,125 @@ pub fn is_unfinished(active_txn: &Mutex<HashMap<u64, Vec<Vec<u8>>>>, version: u6
 
 #[cfg(test)]
 mod tests {
+    /// 驱动"续跑第二轮"那一支的守卫：`keep` 丢掉候选时，必须从上一轮最后一个键接着折，
+    /// 而不是把窗口交短。四家的 `search_keys` 都走这条路，而引擎级守卫里
+    /// 没有过期行 ⇒ 那条分支一次都不会被踩到，只能在这里直接喂给它。
+    #[test]
+    fn fold_window_resumes_when_keep_drops_candidates() {
+        let mut rounds = 0usize;
+        let mut seen_budgets: Vec<usize> = Vec::new();
+
+        let out: Vec<usize> = fold_window(
+            Some(5),
+            |after, budget| {
+                rounds += 1;
+                seen_budgets.push(budget);
+                // 假想的键流：0..60，`after` 之后严格续跑
+                let start = after.map(|a| a[0] as usize + 1).unwrap_or(0);
+                let mut batch = Vec::new();
+                for i in start..60usize {
+                    if batch.len() >= budget {
+                        return (batch, false); // 被预算拦下 ⇒ 还能续
+                    }
+                    batch.push(WinCandidate {
+                        key: vec![i as u8],
+                        version: 1,
+                        row: i,
+                    });
+                }
+                (batch, true) // 走到界尾
+            },
+            // 偶数下标全被丢掉：模拟"TTL 正好过期 / 是墓碑"的那些行
+            |c| if c.row % 2 == 0 { None } else { Some(c.row) },
+        );
+
+        assert_eq!(out, vec![1, 3, 5, 7, 9], "被丢掉的候选必须由第二轮补上，窗口不许交短");
+        assert_eq!(rounds, 2, "第一轮 5 组里只活下来 2 条 ⇒ 必须续跑，一次都不续就是走不到窗口");
+        assert!(
+            seen_budgets[1] > seen_budgets[0],
+            "续跑的预算必须变大（几何 ⇒ 总代价与最终那一轮同阶）：{seen_budgets:?}"
+        );
+    }
+
+    /// 分页核自己的守卫：四家都靠它，所以它错了就是四个地方一起错。
+    ///
+    /// 重点盯 `has_next` 的两条分支 —— "没数"与"到底了"必须能区分开，
+    /// 把任何一侧写错都会让翻页提前停（少数据）或永远停不下来（死循环）。
+    #[test]
+    fn search_page_kernel_distinguishes_unmeasured_from_exhausted() {
+        use crate::common::{ExportRecord, KeyMatchMode, SearchQuery};
+
+        let rec = |i: usize| ExportRecord {
+            key: format!("k{i:02}").into_bytes(),
+            value: Some(vec![b'v']),
+        };
+        let keys = |p: &crate::common::SearchPage| {
+            p.items.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
+        };
+
+        // ① 要 total：7 条 / 每页 3 ⇒ 三页，最后一页不满，翻页判据由总数算出来
+        let q = SearchQuery {
+            pattern: Vec::new(),
+            page: 0,
+            page_size: 3,
+            mode: KeyMatchMode::Contains,
+            include_deleted: false,
+            need_total: true,
+        };
+        let all: Vec<_> = (0..7).map(rec).collect();
+        let p0 = search_page_from(all.clone(), &q);
+        assert_eq!(p0.total, Some(7));
+        assert_eq!(p0.total_pages, Some(3));
+        assert_eq!(keys(&p0), vec![b"k00".to_vec(), b"k01".to_vec(), b"k02".to_vec()]);
+        assert!(p0.has_next());
+
+        let p2 = search_page_from(all.clone(), &SearchQuery { page: 2, ..q.clone() });
+        assert_eq!(p2.items.len(), 1, "最后一页只剩一条");
+        assert!(!p2.has_next(), "第三页之后没了");
+
+        let p9 = search_page_from(all.clone(), &SearchQuery { page: 9, ..q.clone() });
+        assert!(p9.items.is_empty(), "越界的页给空，不许给尾");
+        assert!(!p9.has_next());
+
+        // ② 不要 total：上层最多交 `skip + page_size + 1` 条 —— 多出来的那一条就是证据
+        let qn = SearchQuery {
+            need_total: false,
+            ..q.clone()
+        };
+        let w = search_page_from(all.iter().take(4).cloned().collect(), &qn);
+        assert_eq!(w.total, None, "没数就不许报一个数");
+        assert_eq!(w.total_pages, None);
+        assert_eq!(w.items.len(), 3);
+        assert!(w.has_next(), "手里有第 4 条 ⇒ 后面确实还有");
+
+        // 交过来的正好不超过窗口 ⇒ 说明键流走到了头，这就是"到底了"，不是"没数"
+        let end = search_page_from(all.iter().take(3).cloned().collect(), &qn);
+        assert_eq!(end.items.len(), 3);
+        assert!(!end.has_next(), "拿不满窗口 = 已经到底，必须报假");
+
+        // 深一页：上层会交 skip+page_size+1 = 4+3+1 = 8 条，窗口从第 4 条起
+        let deep = search_page_from(
+            all.iter().take(7).cloned().collect(),
+            &SearchQuery { page: 1, need_total: false, ..q.clone() },
+        );
+        assert_eq!(keys(&deep), vec![b"k03".to_vec(), b"k04".to_vec(), b"k05".to_vec()]);
+        assert!(deep.has_next());
+        let last = search_page_from(
+            all.iter().take(7).cloned().collect(),
+            &SearchQuery { page: 2, need_total: false, ..q.clone() },
+        );
+        assert_eq!(keys(&last), vec![b"k06".to_vec()]);
+        assert!(!last.has_next(), "最后一页之后没有东西");
+
+        // ③ `page_size` 至少为 1：传 0 不许把自己除尽
+        let zero = search_page_from(
+            all.clone(),
+            &SearchQuery { page_size: 0, need_total: false, ..q.clone() },
+        );
+        assert_eq!(zero.items.len(), 1, "page_size=0 按 1 处理");
+        assert!(zero.has_next());
+    }
+
     use super::*;
 
     #[test]

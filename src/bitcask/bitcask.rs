@@ -107,6 +107,26 @@ thread_local! {
 pub(crate) fn read_value_calls() -> u64 {
     READ_VALUE_CALLS.with(|c| c.get())
 }
+
+// 测试专用：一轮候选折叠里**看了多少把编码键**（不是读了几次盘）。
+// 为什么必须有它：`read_value_calls()` 只数取值，而窗口分页要证明的是"键流没走到底"——
+// 第一版守卫就是拿取值次数当尺子，把预算整个忽略掉它照样绿。
+#[cfg(test)]
+thread_local! {
+    static KEYDIR_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_keydir_visit() {
+    KEYDIR_VISITS.with(|c| c.set(c.get() + 1));
+}
+
+/// 当前线程折候选时检查过的编码键数（测试探针用）
+#[cfg(test)]
+pub(crate) fn keydir_visits() -> u64 {
+    KEYDIR_VISITS.with(|c| c.get())
+}
+
 /// IO 结果
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 

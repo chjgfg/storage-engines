@@ -481,11 +481,60 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        // 两段式（同 bitcask）：先只比键折叠出每个 raw_key 的胜出版本行，
-        // 再只为这批行取 value。旧实现用 `store.iter()` 把每一行的键与 value 都克隆一遍。
+        crate::common::fold_window(
+            None,
+            |after, budget| self.scan_candidates(start, end, None, after, budget),
+            |c| (c.row.is_some() || include_deleted).then(|| (c.key, c.version, c.row)),
+        )
+    }
+
+    /// 折出**候选组**（一把逻辑 key 一组，值已在手里）：按 enc 升序，组内最后一次覆盖
+    /// 就是最大可见版本。`after` 是续跑游标（上一轮最后一个键），`accept` 是键级过滤
+    /// —— 放在这里而不是放上层，是为了让"整库折完再筛"变成"不命中的键一个值都不取"。
+    ///
+    /// ⚠️ 交出一组只能在**组边界**：一组的胜出行要等看见下一组的第一行才算收齐
+    /// （版本大端接在 key 后面 ⇒ 组内升序）。在半截组上收手会把旧版本当成最新行。
+    /// 返回的 `bool` = 是否已走到界尾（`false` = 是被 `budget` 拦下的，还能续跑）。
+    pub(crate) fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
         let hi_enc = end.map(version_key_upper_bound);
         let store = self.store.lock().unwrap();
+        let mut out: Vec<crate::common::WinCandidate<Option<Vec<u8>>>> = Vec::new();
         let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        let mut pending: Option<Vec<u8>> = None;
+        // 组边界处理写成一个嵌套 fn：闭包会把 `winners`/`out` 一直借在手里，
+        // 循环体里就再也插不进去（E0499，借用检查器在这里是对的）。
+        fn hand_off(
+            out: &mut Vec<crate::common::WinCandidate<Option<Vec<u8>>>>,
+            winners: &mut BTreeMap<Vec<u8>, (u64, Vec<u8>)>,
+            store: &MemStore,
+            accept: Option<&dyn Fn(&[u8]) -> bool>,
+            key: Vec<u8>,
+        ) {
+            let Some((ver, win_enc)) = winners.remove(&key) else {
+                return;
+            };
+            if accept.is_some_and(|f| !f(&key)) {
+                return;
+            }
+            // 刚还在 winners 里的行不见了：单写者模型下不会发生，宁可跳过这组也不猜
+            let Some(row) = store.get(&win_enc).cloned() else {
+                return;
+            };
+            out.push(crate::common::WinCandidate {
+                key,
+                version: ver,
+                row,
+            });
+        }
+
+        let mut stopped_by_budget = false;
         for enc in store.iter_keys_in(start, hi_enc.as_deref()) {
             #[cfg(test)]
             FOLD_KEYS.with(|c| c.set(c.get() + 1));
@@ -498,24 +547,30 @@ impl Transaction {
             if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
                 continue;
             }
+            if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                continue; // 上一轮已经交出去的那组
+            }
             if !self.is_visible(vk.version) {
                 continue;
             }
-            winners.insert(vk.raw_key, (vk.version, enc.clone()));
-        }
-
-        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
-        for (key, (ver, enc)) in winners {
-            let Some(row) = store.get(&enc) else {
-                continue;
-            };
-            let row = row.clone();
-            if row.is_none() && !include_deleted {
-                continue;
+            if pending.as_deref() != Some(vk.raw_key.as_slice()) {
+                if let Some(key) = pending.take() {
+                    hand_off(&mut out, &mut winners, &store, accept, key);
+                    if out.len() >= budget {
+                        stopped_by_budget = true;
+                        break;
+                    }
+                }
+                pending = Some(vk.raw_key.clone());
             }
-            out.push((key, ver, row));
+            winners.insert(vk.raw_key.clone(), (vk.version, enc.to_vec()));
         }
-        out
+        if !stopped_by_budget {
+            if let Some(key) = pending {
+                hand_off(&mut out, &mut winners, &store, accept, key);
+            }
+        }
+        (out, !stopped_by_budget)
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {

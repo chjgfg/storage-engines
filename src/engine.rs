@@ -1456,6 +1456,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 门面层：`without_total()` 在四家必须给出**同一页的同一份内容**，而 `total` 如实是 `None`。
+    ///
+    /// 分页是下游直接面对的 API：一家行为不同，wrapper 里就多一句 `if engine == ...`。
+    /// 这条与四家各自的窗口代价守卫不重复 —— 那边量的是"付多少"，这里对的是"给的答案一样吗"。
+    #[test]
+    fn windowed_search_agrees_across_engines() {
+        const N: usize = 500;
+        const PAGE: usize = 20;
+
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            {
+                let tx = db.begin();
+                for i in 0..N {
+                    assert!(
+                        tx.set(format!("user{i:04}").as_bytes(), format!("v{i}").into_bytes()),
+                        "{name}: 第 {i} 行没写进去"
+                    );
+                }
+                tx.commit();
+            }
+
+            // 事务对象有 `Drop`（漏 commit 就自动回滚），所以每次都关在自己的块里 ——
+            // 不然借用活到循环体末尾，下面的 `drop(db)` 会打架。
+            let q = SearchQuery::contains(b"user", 0, PAGE);
+            let with = {
+                let tx = db.begin();
+                let page = tx.search_keys(&q);
+                tx.commit();
+                page
+            };
+            let without = {
+                let tx = db.begin();
+                let page = tx.search_keys(&q.clone().without_total());
+                tx.commit();
+                page
+            };
+            assert_eq!(with.total, Some(N), "{name}: 要 total 时照旧数得出来");
+            assert_eq!(without.total, None, "{name}: 没数就必须是 None，不许报一个数");
+            assert_eq!(without.total_pages, None, "{name}: 没数就不许报页数");
+            assert_eq!(without.items, with.items, "{name}: 窗口内容必须与全量同一页一致");
+            assert!(without.has_next(), "{name}: 首页之后当然还有");
+
+            // 最后一页：两边都必须说"没有下一页"
+            let last = N / PAGE - 1;
+            let q2 = SearchQuery::contains(b"user", last, PAGE);
+            let a = {
+                let tx = db.begin();
+                let page = tx.search_keys(&q2);
+                tx.commit();
+                page
+            };
+            let b = {
+                let tx = db.begin();
+                let page = tx.search_keys(&q2.clone().without_total());
+                tx.commit();
+                page
+            };
+            assert_eq!(a.items, b.items, "{name}: 尾页内容一致");
+            assert_eq!(a.items.len(), PAGE, "{name}: 尾页也该是满页");
+            assert!(!b.has_next(), "{name}: 最后一页之后没有东西了，不许虚报");
+            drop(db);
+        }
+        cleanup(dirs);
+    }
+
     /// 门面必须让上层**不看引擎源码**就能问出「最长版本链有多长」。
     ///
     /// 换引擎只是换了涨速（LSM 一天、Bitcask 一个多月），盯的指标是同一个 ——
@@ -2115,12 +2183,21 @@ mod tests {
                 let tx = db.begin();
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, page_size))
             });
-            line(label, "search 首页", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", one.total));
+            line(label, "search 首页", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", one.total.unwrap_or_default()));
+
+            // 同一页、只是**不要精确 total**：这一行存在的意义就是和上面那条并排看
+            // （翻页的 UI 只要"还有没有下一页"，而数 total 的代价是走完整库）
+            let (d, live, peak, one_nt) = timed(|| {
+                let tx = db.begin();
+                tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, page_size).without_total())
+            });
+            line(label, "search 首页(免 total)", d.as_secs_f64() * 1e6, "µs/次", live, peak,
+                 &format!("拿了 {} 条, has_next={}", one_nt.items.len(), one_nt.has_next()));
             let (d, live, peak, deep) = timed(|| {
                 let tx = db.begin();
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", last_page, page_size))
             });
-            line(label, "search 末页(深翻)", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", deep.total));
+            line(label, "search 末页(深翻)", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", deep.total.unwrap_or_default()));
             let (d, live, peak, cnt) = timed(|| {
                 let tx = db.begin();
                 tx.key_count(&key(0)[..2])

@@ -930,18 +930,55 @@ impl Transaction {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        // ① 轻量视图：每个 enc key 只拿到「胜者的 seq + 种类」，**不克隆任何 value**。
-        //    旧实现走 `iter()`，而它会先把每个源（含每个 SST 的每行）连 value 一起
-        //    `collect()` 进内存 ⇒ 一次全库折叠的峰值内存约等于整个库。
-        //    kind==2 即 EntryValue::Drop：与 `iter()` 的 filter 一致，整行不可见
-        //    （注意是「该 key 不可见」，不是「回退到更旧源里同 key 的 Put」）。
+        crate::common::fold_window(
+            None,
+            |after, budget| self.scan_candidates(start, end, None, after, budget),
+            |c| {
+                let val = {
+                    let kvengine = self.kv.lock().unwrap();
+                    // get_value_at 而不是 get_raw_key_at：大 value 存的是 blob 指针，
+                    // 交给调用方之前必须解回真值（GC 那种"要看指针本身"的读法才用 raw 版）
+                    kvengine.get_value_at(&c.row, u64::MAX)
+                };
+                // 双层 Option：外层 `None` = 这一行已经不在视图里（跳过，与旧实现一致），
+                // 内层 `None` = 墓碑（只有 include_deleted 才留）
+                match val {
+                    Some(v) => (v.is_some() || include_deleted).then(|| (c.key, c.version, v)),
+                    None => None,
+                }
+            },
+        )
+    }
+
+    /// 折出**候选组**（一把逻辑 key 一组，值还没取）。
+    ///
+    /// ① 轻量视图：每个 enc key 只拿到「胜者的 seq + 种类」，**不克隆任何 value**。
+    ///    旧实现走 `iter()`，而它会先把每个源（含每个 SST 的每行）连 value 一起
+    ///    `collect()` 进内存 ⇒ 一次全库折叠的峰值内存约等于整个库。
+    ///    kind==2 即 `EntryValue::Drop`：与 `iter()` 的 filter 一致，整行不可见
+    ///    （注意是「该 key 不可见」，不是「回退到更旧源里同 key 的 Put」）。
+    ///
+    /// `after` 是续跑游标、`accept` 是键级过滤、`budget` 是组数上限；返回的 `bool` =
+    /// 已走到界尾（`false` = 被预算拦下，还能续）。⚠️ 交出一组只能在组边界。
+    pub(crate) fn scan_candidates(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Vec<u8>>>, bool) {
         let hi_enc = end.map(version_key_upper_bound);
-        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        let mut out: Vec<crate::common::WinCandidate<Vec<u8>>> = Vec::new();
+        let mut walk_done = true;
         {
             let kvengine = self.kv.lock().unwrap();
-            for (enc, le) in
-                kvengine.scan_latest_light_range(start, hi_enc.as_deref(), u64::MAX)
+            let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+            let mut pending: Option<Vec<u8>> = None;
+            for (enc, le) in kvengine.scan_latest_light_range(start, hi_enc.as_deref(), u64::MAX)
             {
+                #[cfg(test)]
+                crate::lsm_tree::sst::note_light_visit();
                 if le.kind == 2 {
                     continue;
                 }
@@ -954,29 +991,48 @@ impl Transaction {
                 if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
                     continue;
                 }
+                if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                    continue; // 上一轮已经交出去的那组
+                }
                 if !self.is_visible(vk.version) {
                     continue;
                 }
+                if pending.as_deref() != Some(vk.raw_key.as_slice()) {
+                    if let Some(key) = pending.take() {
+                        if let Some((ver, win_enc)) = winners.remove(&key) {
+                            if accept.is_none_or(|f| f(&key)) {
+                                out.push(crate::common::WinCandidate {
+                                    key,
+                                    version: ver,
+                                    row: win_enc,
+                                });
+                                if out.len() >= budget {
+                                    walk_done = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    pending = Some(vk.raw_key.clone());
+                }
                 // enc 升序 ⇒ 同一 raw_key 最后一次覆盖即最大可见版本
-                winners.insert(vk.raw_key, (vk.version, enc));
+                winners.insert(vk.raw_key.clone(), (vk.version, enc));
+            }
+            if walk_done {
+                if let Some(key) = pending {
+                    if let Some((ver, win_enc)) = winners.remove(&key) {
+                        if accept.is_none_or(|f| f(&key)) {
+                            out.push(crate::common::WinCandidate {
+                                key,
+                                version: ver,
+                                row: win_enc,
+                            });
+                        }
+                    }
+                }
             }
         }
-
-        // ② 只给胜出行取值：跨源点查，取胜规则与归并一致
-        let kvengine = self.kv.lock().unwrap();
-        let mut out: Vec<(Vec<u8>, u64, Option<Vec<u8>>)> = Vec::with_capacity(winners.len());
-        for (key, (ver, enc)) in winners {
-            // get_value_at 而不是 get_raw_key_at：大 value 存的是 blob 指针，
-            // 交给调用方之前必须解回真值（GC 那种"要看指针本身"的读法才用 raw 版）
-            let Some(val) = kvengine.get_value_at(&enc, u64::MAX) else {
-                continue;
-            };
-            if val.is_none() && !include_deleted {
-                continue;
-            }
-            out.push((key, ver, val));
-        }
-        out
+        (out, walk_done)
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {

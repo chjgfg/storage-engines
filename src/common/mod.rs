@@ -42,5 +42,6 @@ pub(crate) fn tmp_test_path(prefix: &str, tag: &str, suffix: &str) -> std::path:
     ))
 }
 pub use kernel::{
-    is_unfinished, visible_at, HealthFold, VacuumScheduler, WalPolicy,
+    fold_window, is_unfinished, search_page_from, visible_at, HealthFold, VacuumScheduler, WalPolicy,
+    WinCandidate,
 };

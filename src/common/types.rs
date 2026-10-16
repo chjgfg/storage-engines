@@ -227,6 +227,13 @@ pub struct SearchQuery {
     pub mode: KeyMatchMode,
     /// 是否包含 tombstone（`value=None`）
     pub include_deleted: bool,
+    /// 要不要**精确的 total**。默认 `true`（行为与旧版一致）。
+    ///
+    /// 为什么这是一个开关而不是"总是数一遍"：`Contains` 要逐键比子串，数清匹配总数意味着
+    /// **走完整库**，代价与库总量同阶、与页宽无关（实测 20000 键时首页也要 104 ms）。
+    /// 翻页的 UI 其实只需要"还有没有下一页"，那条可以用"多取一条"探出来，代价 = 一条记录。
+    /// 设 `false` 后 [`SearchPage::total`] 是 `None`（没数），`has_next` 仍然如实。
+    pub need_total: bool,
 }
 
 impl SearchQuery {
@@ -238,6 +245,7 @@ impl SearchQuery {
             page_size,
             mode: KeyMatchMode::Contains,
             include_deleted: false,
+            need_total: true,
         }
     }
 
@@ -249,7 +257,14 @@ impl SearchQuery {
             page_size,
             mode: KeyMatchMode::Prefix,
             include_deleted: false,
+            need_total: true,
         }
+    }
+
+    /// 不要精确总数：只取"窗口 + 一条"就收手（翻页场景的默认姿势）
+    pub fn without_total(mut self) -> Self {
+        self.need_total = false;
+        self
     }
 
     pub fn with_deleted(mut self, include: bool) -> Self {
@@ -263,23 +278,26 @@ impl SearchQuery {
 pub struct SearchPage {
     /// 本页记录（按 key 字节序升序）
     pub items: Vec<ExportRecord>,
-    /// 匹配总数（未分页前）
-    pub total: usize,
+    /// 匹配总数（未分页前）。`None` = **没数**（[`SearchQuery::without_total`]），
+    /// 因为数清它的代价是走完整库，而不是这一页。
+    pub total: Option<usize>,
     /// 请求的页码（从 0）
     pub page: usize,
     /// 每页大小
     pub page_size: usize,
-    /// 总页数（total=0 时为 0）
-    pub total_pages: usize,
+    /// 总页数；`None` 同上（没数总数就不说有"多少页"）
+    pub total_pages: Option<usize>,
+    /// 后面还有没有：靠"多取一条"探出来，代价 = 一条记录 ⇒ 不要 total 也答得出
+    pub has_next: bool,
 }
 
 impl SearchPage {
     pub fn has_next(&self) -> bool {
-        self.total_pages > 0 && self.page + 1 < self.total_pages
+        self.has_next
     }
 
     pub fn has_prev(&self) -> bool {
-        self.page > 0 && self.total > 0
+        self.page > 0 && !self.items.is_empty()
     }
 }
 

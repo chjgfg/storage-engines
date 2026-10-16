@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 254 个单元测试 + 4 个集成测试
+- 261 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -295,6 +295,53 @@ loop {
   单轮最多 40 行;扫完的终态与 `vacuum()` 一致(每 key 剩一行)。
 - `budget_rows = u64::MAX` 的那一轮**等价于** `vacuum()`(同一份保留规则,不是两套),
   也只有这一轮做 blob 回收与日志压缩 —— 两者都是全库代价,放进中间轮等于每轮重写一遍库。
+
+**分页搜索:要不要 `total` 是两个代价**(M15)。翻页的 UI 通常只想知道"还有没有下一页",
+而数清总数必须把整库折一遍 —— 以前没有开关,首页和末页一样贵:
+
+```rust
+use storage_engines::SearchQuery;
+
+// 默认(要精确 total):走完整库,`total`/`total_pages` 是 Some(n)
+let page = db.begin().search_keys(&SearchQuery::contains(b"user", 0, 100));
+println!("{}/{} 页", page.page + 1, page.total_pages.unwrap());
+
+// 只要窗口:`total` 与 `total_pages` 是 None(没数就不许报一个数),`has_next` 仍然如实
+let win = db.begin().search_keys(&SearchQuery::contains(b"user", 0, 100).without_total());
+if win.has_next() { /* 还有下一页 */ }
+```
+
+实测(2000 键、页宽 20,尺子=本引擎的"走了多少把键/页"),**四家都是 90 倍上下**:
+
+| 引擎 | 首页(免 total) | 首页(要 total) | 倍 |
+|---|---|---|---|
+| bitcask | 22 把编码键 | 2000 | 91× |
+| bplus_tree | 2 次页读 | 62 | 31× |
+| lsm_tree | 22 把键(轻量视图) | 2000 | 91× |
+| memory | 22 把键 | 2000 | 91× |
+
+同一件事在 release / 20000 行的台架上的墙钟(页宽 100,首页):
+
+| 引擎 | 要 total | 免 total | 省 |
+|---|---|---|---|
+| bitcask | 48.1 ms | **0.25 ms** | 196× |
+| bplus_tree | 25.6 ms | **0.14 ms** | 180× |
+| lsm_tree | 64.4 ms | **18.2 ms** | 3.5× ⚠️ |
+| memory | 24.3 ms | **0.16 ms** | 149× |
+
+⚠️ **LSM 只降到 3.5× 是有原因的,别把它当"已经到底"**:它的归并要为**每个 SST 源**初始化一次
+(读该源第一块),所以窗口再小也躲不开"源数 × 一块"这一项 ⇒ 首页代价从 O(全库行数) 变成
+**O(SST 文件数)**。计数尺已经证明窗口生效(22 把键 vs 2000),剩下那 18 ms 属于另一条通道
+(源启动的固定开销,与 M10 量到的"点读代价 ∝ 版本散在几个 SST"同源),已进未修队列。
+
+三条要说清的边界:
+- **深页照旧贵**:跳到第 25 页要把前面 24 页的命中都走过去 —— 没有索引就省不掉这一步,
+  `without_total()` 省的是"为 total 而走完剩下的库",不是"任意页都便宜"。
+- 窗口内**可能少于 `page_size` 条**:窗口里正好有 TTL 刚过期或被删的行时如此,`has_next`
+  仍如实。要严格每页满数就设 `need_total = true`。
+- 折叠是"命中几条读几条":不命中 pattern 的键**连值都不取**。四家各有守卫
+  `test_search_window_costs_the_window_not_the_library`,门面另有一条
+  `windowed_search_agrees_across_engines`(四家必须给同一页的同一份内容)。
 
 ### 6. 选型:别只看速度
 
@@ -935,7 +982,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:254 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:261 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

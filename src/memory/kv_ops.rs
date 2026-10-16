@@ -225,42 +225,32 @@ impl Transaction {
     // ── 模糊 / 前缀搜索 + 分页 ──
 
     pub fn search_keys(&self, query: &SearchQuery) -> SearchPage {
+        // 分页核只有一份：[`crate::common::search_page_from`]。这里唯一的分支是"要不要
+        // 精确 total"—— 不要的时候折叠可以提前收手，代价从 O(全库) 变成 O(窗口宽)。
         let page_size = query.page_size.max(1);
-        let page = query.page;
+        let limit = if query.need_total {
+            None
+        } else {
+            // 多取一条：它就是 `has_next` 的证据，代价 = 一条记录
+            Some(query.page.saturating_mul(page_size) + page_size + 1)
+        };
         let matched = self.collect_for_search(
             query.include_deleted,
             Some(query.pattern.as_slice()),
             query.mode,
+            limit,
         );
-        let total = matched.len();
-        let total_pages = if total == 0 {
-            0
-        } else {
-            (total + page_size - 1) / page_size
-        };
-        let start = page.saturating_mul(page_size);
-        let items = if start >= total {
-            Vec::new()
-        } else {
-            let end = (start + page_size).min(total);
-            matched[start..end].to_vec()
-        };
-        SearchPage {
-            items,
-            total,
-            page,
-            page_size,
-            total_pages,
-        }
+        crate::common::search_page_from(matched, query)
     }
-
     fn collect_for_search(
         &self,
         include_deleted: bool,
         pattern: Option<&[u8]>,
         mode: KeyMatchMode,
+        limit: Option<usize>,
     ) -> Vec<ExportRecord> {
-        // 前缀匹配的键是有界的 ⇒ 界下推给折叠。Contains 要逐键比子串，全库是它的本质代价。
+        // 前缀匹配的键是有界的 ⇒ 界下推给折叠。Contains 要逐键比子串，全库是它的本质代价，
+        // 但**只要窗口那么宽的结果**就不必走到底 —— 于是 `limit` 与 `accept` 都交给驱动。
         let (lo, hi) = match mode {
             KeyMatchMode::Prefix => (
                 if pattern.unwrap_or_default().is_empty() {
@@ -272,40 +262,36 @@ impl Transaction {
             ),
             KeyMatchMode::Contains => (None, None),
         };
-        self.collect_latest_raw_in(true, lo, hi.as_deref())
-            .into_iter()
-            .filter_map(|(key, _ver, raw)| {
-                if let Some(pat) = pattern {
-                    if !key_matches(&key, pat, mode) {
-                        return None;
+        let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
+        crate::common::fold_window(
+            limit,
+            |after, budget| self.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
+            |cand| match cand.row {
+                // 墓碑：只在 include_deleted 时出现（与旧实现同口径）
+                None => {
+                    if include_deleted {
+                        Some(ExportRecord { key: cand.key, value: None })
+                    } else {
+                        None
                     }
                 }
-                match raw {
+                Some(bytes) => match logical_to_user(bytes) {
+                    Some(user) => Some(ExportRecord {
+                        key: cand.key,
+                        value: Some(user),
+                    }),
+                    // 过期与墓碑同待：算"取不到值"，不静默当成有效行
                     None => {
                         if include_deleted {
-                            Some(ExportRecord { key, value: None })
+                            Some(ExportRecord { key: cand.key, value: None })
                         } else {
                             None
                         }
                     }
-                    Some(bytes) => match logical_to_user(bytes) {
-                        Some(user) => Some(ExportRecord {
-                            key,
-                            value: Some(user),
-                        }),
-                        None => {
-                            if include_deleted {
-                                Some(ExportRecord { key, value: None })
-                            } else {
-                                None
-                            }
-                        }
-                    },
-                }
-            })
-            .collect()
+                },
+            },
+        )
     }
-
     // ── 元数据 ──
 
     pub fn exists(&self, key: &[u8]) -> bool {
@@ -443,6 +429,7 @@ impl MVCC {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::memory_mvcc::fold_keys;
 
     #[test]
     fn test_value_meta_roundtrip() {
@@ -612,21 +599,21 @@ mod tests {
         tx.commit();
 
         let p0 = mvcc.search_keys(&SearchQuery::contains(b"pp", 0, 10));
-        assert_eq!(p0.total, 2);
-        assert_eq!(p0.total_pages, 1);
+        assert_eq!(p0.total, Some(2));
+        assert_eq!(p0.total_pages, Some(1));
         assert_eq!(p0.items.len(), 2);
         assert_eq!(p0.items[0].key, b"apple");
         assert_eq!(p0.items[1].key, b"apply");
         assert!(!p0.has_next());
 
         let pref = mvcc.search_keys(&SearchQuery::prefix(b"user:", 0, 10));
-        assert_eq!(pref.total, 3);
+        assert_eq!(pref.total, Some(3));
         let keys: Vec<_> = pref.items.iter().map(|r| r.key.as_slice()).collect();
         assert_eq!(keys, vec![b"user:1".as_slice(), b"user:10", b"user:2"]);
 
         let all = mvcc.search_keys(&SearchQuery::contains(Vec::<u8>::new(), 0, 3));
-        assert_eq!(all.total, 7);
-        assert_eq!(all.total_pages, 3);
+        assert_eq!(all.total, Some(7));
+        assert_eq!(all.total_pages, Some(3));
         assert_eq!(all.items.len(), 3);
         assert!(all.has_next());
         assert!(!all.has_prev());
@@ -642,20 +629,73 @@ mod tests {
         assert_eq!(p2.page, 2);
 
         let p9 = mvcc.search_keys(&SearchQuery::contains(b"user:", 99, 2));
-        assert_eq!(p9.total, 3);
+        assert_eq!(p9.total, Some(3));
         assert!(p9.items.is_empty());
 
         let with_del =
             mvcc.search_keys(&SearchQuery::contains(b"rape", 0, 10).with_deleted(true));
-        assert_eq!(with_del.total, 1);
+        assert_eq!(with_del.total, Some(1));
         assert!(with_del.items[0].value.is_none());
 
         let t2 = mvcc.begin_transaction();
         assert!(t2.set(b"user:draft", b"d".to_vec()));
         let mine = t2.search_keys(&SearchQuery::prefix(b"user:", 0, 20));
-        assert_eq!(mine.total, 4);
+        assert_eq!(mine.total, Some(4));
         assert!(mine.items.iter().any(|r| r.key == b"user:draft"));
         t2.rollback();
+    }
+
+    /// 不要精确 total 的翻页，代价必须只看**窗口宽**，不看库有多大（M15 的验收）。
+    ///
+    /// 以前 `search_keys` 为了报一个 `total` 把整库折一遍 ⇒ 首页与末页一样贵
+    /// （实测 20000 键时首页也要 100 ms 量级）。尺子是本引擎的折叠计数 `fold_keys()`。
+    /// 顺序是**先量窗口、再量全量**：后跑的那次缓存更热，把偏差留给"全量更贵"那一侧，
+    /// 这条断言只会因此更难通过，不会反过来骗人。
+    #[test]
+    fn test_search_window_costs_the_window_not_the_library() {
+        const N: usize = 2000;
+        const PAGE: usize = 20;
+
+        let mvcc = MVCC::new();
+        let tx = mvcc.begin_transaction();
+        for i in 0..N {
+            assert!(tx.set(format!("user{i:05}").as_bytes(), b"x".to_vec()));
+        }
+        tx.commit();
+
+        let base = fold_keys();
+        let w = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE).without_total());
+        let window_keys = fold_keys() - base;
+
+        let base = fold_keys();
+        let full = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE));
+        let full_keys = fold_keys() - base;
+
+        assert_eq!(full.total, Some(N), "要 total 时语义与改前完全一致");
+        assert_eq!(w.total, None, "没数就不许报一个数出来");
+        assert_eq!(w.total_pages, None);
+        assert_eq!(w.items.len(), PAGE);
+        assert_eq!(
+            w.items, full.items,
+            "窗口必须是全量结果的前缀：分页语义一个字节都不许变"
+        );
+        assert!(w.has_next(), "后面还有 {} 条，必须报得出来", N - PAGE);
+        eprintln!(
+            "[search 窗口] 折了 {window_keys} 把键就拿回首页；要精确 total 折了 {full_keys} 把（N={N}）"
+        );
+        assert!(
+            window_keys * 2 <= full_keys,
+            "首页折了 {window_keys} 把 / 全量 {full_keys} 把 ⇒ 还在走全库"
+        );
+
+        // 最后一面：探不到"多出来的那一条"就必须如实报"没有下一页"（既不许把"没数"
+        // 说成"到底了"，也不许反过来吓唬人）
+        let last = N / PAGE - 1;
+        let w2 = mvcc.search_keys(&SearchQuery::contains(b"user", last, PAGE).without_total());
+        let f2 = mvcc.search_keys(&SearchQuery::contains(b"user", last, PAGE));
+        assert_eq!(w2.items.len(), PAGE);
+        assert_eq!(w2.items, f2.items, "同一页的内容与要不要 total 无关");
+        assert!(!w2.has_next(), "最后一页之后没有东西了");
     }
 
     #[test]
