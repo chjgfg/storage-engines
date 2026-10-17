@@ -893,37 +893,6 @@ impl LSMTree {
         out
     }
 
-    /// memtable 的 `[from, to)` 轻量视图：界走 BTreeMap 的 `range`，界外的键根本不遍历。
-    fn mem_view_light_range(
-        map: &MemMap,
-        from: Option<&[u8]>,
-        to: Option<&[u8]>,
-        snap_seq: u64,
-    ) -> Vec<(Vec<u8>, LightEntry)> {
-        use std::ops::Bound;
-        let lo = match from {
-            Some(k) => Bound::Included(k),
-            None => Bound::Unbounded,
-        };
-        let hi = match to {
-            Some(k) => Bound::Excluded(k),
-            None => Bound::Unbounded,
-        };
-        let mut out = Vec::new();
-        for (k, vers) in map.range::<[u8], _>((lo, hi)) {
-            if let Some((seq, ev)) = vers.iter().rev().find(|(s, _)| **s <= snap_seq) {
-                out.push((
-                    k.clone(),
-                    LightEntry {
-                        seq: *seq,
-                        kind: ev.kind_byte(),
-                    },
-                ));
-            }
-        }
-        out
-    }
-
     /// 全库「每个 enc key 的胜者」的**轻量**视图（跨源取胜规则与 [`Self::iter`] 一致：
     /// 源新→旧优先，同 src 取更大 seq）。
     ///
