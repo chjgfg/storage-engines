@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 278 个单元测试 + 4 个集成测试
+- 280 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M25**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -980,7 +980,27 @@ data.db.lock       单写者锁(内含 pid)
   ⇒ O(驻留块数),容量放大就跟着变贵(40000 键有序读 17.4 → **36.0** µs/次,而未命中次数一动不动),
   已改成定长槽 + 双向链表(命中/换出都 O(1),守卫 `lru_touch_cost_does_not_scale_with_residency` 实测
   每次命中固定检查 6 个槽位,驻留 64 与 1024 同价)。
-- `fix_level_overlaps` 发现层内 key range 重叠**只打印警告,不修复**
+- ~~`fix_level_overlaps` 发现层内 key range 重叠**只打印警告,不修复**~~ **已修(M26)**:改名
+  `repair_level_overlaps`,把连续重叠的一段当成**同层归并**真折掉(分组取传递闭包,A∩B、B∩C 即使
+  A∩C=∅ 也整段一起折,否则留下新重叠)。取胜判据从"源序优先"改成 **seq 优先**(见下条),因为
+  **同层两个文件谁新谁旧没有元数据可依据**(L1→L2 压实会用新 id 写老数据)。实测代价:造出来的
+  重叠层里 40 把键要点 **60** 次文件,折完同样 40 把键点 **40** 次(每键 1 次)。
+  ⚠️ 正常压实**造不出**重叠(L0 整层并入、同层输出按键有序)——它是"先记 MANIFEST 再删旧文件"
+  那两步之间崩掉的恢复产物;而这条改动之前的顺序恰恰相反(**先删后记**),那才是真窟窿:
+  `load_manifest` 对不在盘的条目是 `path.exists()` 静默跳过 ⇒ 崩在窗口里 = manifest 指着已删的
+  文件、新写出的文件没人记 = **静默丢数据**。现在 `compact_level` 自己先写 MANIFEST 再删,
+  并且删除点前面长了探针(`test_compaction_repairs_level_overlap`;把顺序退回先删后记,
+  当场红在"删旧 SST 之前 MANIFEST 里还找不到新文件 5")。
+- **折叠的胜者判据必须是 seq,不是"源序号小=更新"(M26 实测,不是推理)**:同层重叠时旧判据会把
+  **旧版**当胜者交出去 —— 守卫 `test_fold_agrees_with_point_read_on_overlapping_level` 在旧写法上
+  红在 `折叠与点查不一致："k10" left: Some([111,108,100]) right: Some([110,101,119])`(即 `old` vs `new`)。
+  重量折叠(`merge_streaming`)改好了;**轻量折叠那条本来就已经对** —— 它的胜者由 `LightMerge`
+  里"待定键 + 取更大 seq"那一步决定,不靠堆的出队顺序(我照着改了一遍才发现改了等于没改,已退回;
+  把待定那步摘掉才会红,实测证过)。⇒ 两条折叠路径判据同源但**担责的位置不同**,别照抄。
+- **压实与修复的输入是整篇物化**:`merge_to_ssts` 收的是 `Vec<Vec<(键, 条目)>>`,而
+  `SstFile::iter_entries()` 把一个文件全读进内存 ⇒ 一次压实的瞬时内存 ≈ **所有输入文件的条目总和**
+  (不是"约一个 SST")。`SstBuilder` 侧确实是流式的,`sst.rs` 那句注释只写对了一半。修复重叠共用
+  同一条账单,没有额外恶化;把它改成真正的流式源是独立的一条待办。
 - compact 时每个 key 只保留最新一条,`enable_snapshot_gc` 并未真正按 snapshot 水位保留旧版本(源码注释已自陈)
 - `blobs/` 旁路的回收挂在 `vacuum()` 的全库轮次上(compact 判不了"别的层里还有更新的版本引用同一个 blob");**有界轮次不动 blob**,引用关系只有全库才看得全
 - `start_bg_compact` 只建控制块不起线程,真正的后台线程要显式调 `spawn_bg_compactor`
@@ -1211,7 +1231,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:278 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:280 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

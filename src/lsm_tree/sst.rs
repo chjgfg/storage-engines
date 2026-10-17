@@ -1681,7 +1681,15 @@ impl LightEntry {
     }
 }
 
-/// 多路归并：sources 新→旧；同 key 取最高优先级中 `seq` 最大者；流式回调。
+/// 多路归并：**同键取 `seq` 最大者**，seq 相同才按源序（sources 传进来时新→旧）。
+///
+/// 为什么主判据是 seq 而不是源序（M26 改的，原先是"源序优先，同序才比 seq"）：
+/// 跨层压实之后，**源序回答不了"谁是新版"** —— L1→L2 的压实会用**新 id** 写出**老数据**，
+/// 而同层两个范围重叠的文件里同一把键的先后更是没有元数据可依据（层内只按 `min_key` 排序）。
+/// seq 才是那份权威：它和跨源点查 `LSMTree::get_entry_at`（取所有源里最大的可见 seq）用的是
+/// 同一个判据 ⇒ **折叠的答案 == 逐把点查的答案**。正常形状里两者本来就一致（后建的 L0 文件
+/// 只会装更晚的 seq、内存表比任何已落盘的都新），所以这次改动对既有路径是**语义不变**；
+/// 变的是重叠/崩溃恢复那两种以前会给出错误答案的形状。
 pub fn merge_streaming<T, F, K>(sources: Vec<Vec<(Vec<u8>, T)>>, mut keep: K, mut emit: F)
 where
     T: MergeSeq,
@@ -1697,8 +1705,9 @@ where
     impl<T: MergeSeq> Ord for Node<T> {
         fn cmp(&self, other: &Self) -> CmpOrdering {
             match other.key.cmp(&self.key) {
-                CmpOrdering::Equal => match other.src.cmp(&self.src) {
-                    CmpOrdering::Equal => self.se.seq().cmp(&other.se.seq()), // 同 src 更大 seq 优先
+                CmpOrdering::Equal => match self.se.seq().cmp(&other.se.seq()) {
+                    // 同键：**seq 大的先出**；seq 也相同才回到源序（小 = 更新）
+                    CmpOrdering::Equal => other.src.cmp(&self.src),
                     o => o,
                 },
                 o => o,
@@ -1752,20 +1761,18 @@ where
             continue;
         }
 
-        // 收集所有同 key 条目，选最优：src 更小（更新）优先，同 src 取更大 seq
+        // 收集所有同 key 条目，选最优：**seq 大者赢**；seq 相同才回到"源序小者赢"。
         let key = n.key.clone();
         let mut best_src = n.src;
         let mut best = n.se.clone();
         while heap.peek().map(|p| p.key == key).unwrap_or(false) {
             let m = heap.pop().unwrap();
             push_next(&mut heap, &sources, m.src, m.idx);
-            if m.src < best_src || (m.src == best_src && m.se.seq() > best.seq()) {
+            if m.se.seq() > best.seq() || (m.se.seq() == best.seq() && m.src < best_src) {
                 best_src = m.src;
                 best = m.se.clone();
             }
         }
-        // 也包括首个 n 与后续比较（n 已是堆顶，src 应最小；同 src 需比 seq）
-        // 重新扫：n 已在 best；上面循环处理其余
 
         if keep(&key, &best) {
             emit(key.clone(), best);

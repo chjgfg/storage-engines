@@ -1304,6 +1304,41 @@ impl LSMTree {
         self.sst_block_count()
     }
 
+    /// 测试专用：把一批**已按键升序**的条目直接写成一个 SST 挂进某一层。
+    ///
+    /// 为什么要它：`repair_level_overlaps` 要收拾的那个形状（同层两个范围重叠的文件）
+    /// **正常压实造不出来** —— L0 是整层并入、同层输出按键有序。它是**崩溃恢复**的产物：
+    /// 按 M26 的正确顺序（先记 MANIFEST 再删旧文件），崩在那两步之间就会留下"新+旧同时在层里"。
+    /// 手工造那个状态比工程化一次真崩溃便宜，而且造的正是恢复后内存里会出现的那份形状。
+    #[cfg(test)]
+    pub(crate) fn inject_sst_for_test(
+        &mut self,
+        level: usize,
+        entries: Vec<(Vec<u8>, StoredEntry)>,
+    ) -> std::io::Result<()> {
+        let id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let path = self.sst_path(id);
+        let mut b = SstBuilder::with_options(
+            id,
+            &path,
+            self.opts.sst_block_entries,
+            self.opts.enable_bloom,
+        )
+        .with_bloom_bits(self.opts.bloom_bits_per_key);
+        for (k, se) in entries {
+            b.add(k, se);
+        }
+        let mut sst = b.finish()?;
+        sst.set_cache_ns(Self::dir_cache_ns(&self.dir));
+        sst.set_block_cache(self.block_cache.clone());
+        while self.levels.len() <= level {
+            self.levels.push(Vec::new());
+        }
+        self.levels[level].push(sst);
+        self.stats_dirty = true;
+        self.write_manifest()
+    }
+
     /// 跨源点查：**每个源都要走一遍，取最大可见 seq**，不能"在第一个含它的源就收手"。
     ///
     /// L0 那一段看着确实可以收手（flush 单调：后建的文件只装更晚的 seq），但 L1+ 不行：
@@ -1849,7 +1884,7 @@ impl LSMTree {
 
         let mut new_files = merge_to_ssts(
             inputs_cur,
-            keep,
+            &keep,
             || {
                 let id = next_id.fetch_add(1, Ordering::SeqCst);
                 let path = dir.join("sst").join(format!("{id:08}.sst"));
@@ -1870,40 +1905,135 @@ impl LSMTree {
         let mut all_next = std::mem::take(&mut self.levels[next]);
         all_next.append(&mut new_files);
         all_next.sort_by(|a, b| a.min_key.cmp(&b.min_key));
-        // L1+：检测并修复重叠（合并重叠文件对）
+        // L1+：层内重叠**真的折掉**（M26）。旧实现只 `eprintln!` 告警、把文件原样交回去 ⇒
+        // 重叠一旦出现就永远没人修：常规压实只会拉"与所选文件重叠的**下一层**"，从不碰同层兄弟，
+        // 而这一层的输出又只在被压实到时才重写。
+        let mut replaced: Vec<PathBuf> = Vec::new();
         if next >= 1 {
-            all_next = Self::fix_level_overlaps(all_next);
+            self.repair_level_overlaps(&mut all_next, &mut replaced, &keep)?;
         }
         self.levels[next] = all_next;
         self.stats_dirty = true;
         self.reevaluate_cache_capacity();
-        // 通知后台
-        self.notify_bg();
-
-        for p in paths {
-            let _ = fs::remove_file(p);
-        }
-        Ok(())
-    }
-
-    /// 合并层内 key range 重叠的相邻文件（按 min_key 排序后扫描）
-    fn fix_level_overlaps(files: Vec<SstFile>) -> Vec<SstFile> {
-        if files.len() <= 1 {
-            return files;
-        }
-        // 仅检测；若重叠则保留两者但写警告到 stderr（完整修复需再 compact）
-        for i in 1..files.len() {
-            if files[i].min_key <= files[i - 1].max_key {
-                eprintln!(
-                    "[lsm] level overlap detected: {:?}..{:?} vs {:?}..{:?}",
-                    String::from_utf8_lossy(&files[i - 1].min_key),
-                    String::from_utf8_lossy(&files[i - 1].max_key),
-                    String::from_utf8_lossy(&files[i].min_key),
-                    String::from_utf8_lossy(&files[i].max_key),
+        // ⚠️ 顺序：**先把新文件集记进 MANIFEST，再删旧文件**（M26）。
+        // 旧写法是"删完就等调用方去写 manifest"，中间崩掉 ⇒ manifest 还指着已经删掉的文件、
+        // 而新写出的文件没人记 —— `load_manifest` 对不在盘的条目是 `path.exists()` 静默跳过，
+        // 于是重开之后那批数据**既不在 manifest 里也不在盘上**，一句话不报。
+        // 反过来留的窗口是"新+旧同时在 manifest 里"（重叠），那正是上面 `repair_level_overlaps`
+        // 负责收拾的形状，读答案两边同键同 seq ⇒ 折叠与点查都不受影响。
+        self.write_manifest()?;
+        #[cfg(test)]
+        {
+            // 顺序守卫读的是**盘上的 MANIFEST 内容**，不是"我有没有在删之前调用过一次写"：
+            // 删任何一个旧文件之前，这一层现在每个文件的 id 都必须已经在 MANIFEST 里。
+            // 把上面那次 `write_manifest` 挪回删除之后（旧写法：删完等调用方去记），这段当场红 ——
+            // 而且**不需要谁"记得把探针一起搬"**，因为探针就长在删除点前面。
+            let text = fs::read_to_string(self.manifest_path()).unwrap_or_default();
+            for sst in &self.levels[next] {
+                assert!(
+                    text.split_whitespace().any(|w| w == sst.id.to_string()),
+                    "删旧 SST 之前 MANIFEST 里还找不到新文件 {}（层 {next}）⇒ 崩在这个窗口就是静默丢数据",
+                    sst.id
                 );
             }
         }
-        files
+        for p in paths.iter().chain(replaced.iter()) {
+            let _ = fs::remove_file(p);
+        }
+        // 通知后台
+        self.notify_bg();
+        Ok(())
+    }
+
+    /// 把一层里范围连续重叠的文件折成不重叠的新文件。
+    ///
+    /// 分组：传进来的 `files` 已按 `min_key` 排序，扫一遍把"与当前段上界相交"的文件并进同一段，
+    /// 并且是**传递闭包**（A∩B、B∩C 而 A∩C=∅ 也得整段一起折，否则留下新的重叠）。
+    /// 长度 1 的段原样留着 —— 那是常态：正常压实不会产生重叠（L0 全量并入、同层输出按键有序）。
+    ///
+    /// 取胜规则直接用 [`merge_to_ssts`](→ `merge_streaming`)：**同键取 seq 最大者**，与跨源点查
+    /// `get_entry_at` 同一个判据 ⇒ 修复前后的读答案逐键相同（这条有守卫对拍，不是说法）。
+    /// 过滤条件沿用**本次 compaction 的 `keep`**（TTL / Drop / 用户 filter）：同一次压实里
+    /// "新写出的文件过滤过、修复出来的没过滤"会更难解释。
+    ///
+    /// ⚠️ 内存：`iter_entries()` 会把段里每个文件**整篇**读进 `Vec` —— 这和常规压实是同一条账单
+    /// （`merge_to_ssts` 收的就是 `Vec<Vec<…>>`），不是这条新添的；把压实与修复都改成流式源
+    /// 是另一件事，已单独记进 README 的未修队列。
+    ///
+    /// 被替换掉的旧文件路径追加进 `replaced`，**由调用方在 MANIFEST 记完之后**再删。
+    fn repair_level_overlaps<F>(
+        &mut self,
+        files: &mut Vec<SstFile>,
+        replaced: &mut Vec<PathBuf>,
+        keep: &F,
+    ) -> std::io::Result<()>
+    where
+        F: Fn(&[u8], &StoredEntry) -> bool,
+    {
+        let taken = std::mem::take(files);
+        let mut runs: Vec<Vec<SstFile>> = Vec::new();
+        let mut cur: Vec<SstFile> = Vec::new();
+        let mut cur_hi: Vec<u8> = Vec::new();
+        for f in taken {
+            if cur.is_empty() || f.min_key.as_slice() <= cur_hi.as_slice() {
+                if f.max_key > cur_hi {
+                    cur_hi = f.max_key.clone();
+                }
+                cur.push(f);
+            } else {
+                runs.push(std::mem::take(&mut cur));
+                cur_hi = f.max_key.clone();
+                cur.push(f);
+            }
+        }
+        if !cur.is_empty() {
+            runs.push(cur);
+        }
+
+        let block_entries = self.opts.sst_block_entries;
+        let enable_bloom = self.opts.enable_bloom;
+        let bloom_bits = self.opts.bloom_bits_per_key;
+        let target = self.opts.target_sst_bytes;
+        let dir = self.dir.clone();
+        let cache = self.block_cache.clone();
+        let use_mmap = self.opts.use_mmap;
+        let ns = Self::dir_cache_ns(&self.dir);
+        let next_id = &self.next_sst_id;
+
+        let mut out: Vec<SstFile> = Vec::new();
+        for run in runs {
+            if run.len() <= 1 {
+                out.extend(run);
+                continue;
+            }
+            let old_paths: Vec<PathBuf> = run.iter().map(|s| s.path.clone()).collect();
+            let sources: Vec<Vec<(Vec<u8>, StoredEntry)>> =
+                run.iter().map(|s| s.iter_entries()).collect();
+            drop(run);
+            let mut merged = merge_to_ssts(
+                sources,
+                keep,
+                || {
+                    let id = next_id.fetch_add(1, Ordering::SeqCst);
+                    let path = dir.join("sst").join(format!("{id:08}.sst"));
+                    SstBuilder::with_options(id, path, block_entries, enable_bloom)
+                        .with_bloom_bits(bloom_bits)
+                },
+                target,
+            )?;
+            for sst in &mut merged {
+                sst.set_cache_ns(ns);
+                sst.set_block_cache(cache.clone());
+                if use_mmap {
+                    let _ = sst.enable_mmap();
+                }
+            }
+            replaced.extend(old_paths);
+            out.extend(merged);
+        }
+        out.sort_by(|a, b| a.min_key.cmp(&b.min_key));
+        *files = out;
+        Ok(())
     }
 
     // ─── merge views ─────────────────────────────────────────────────────────
@@ -2763,14 +2893,193 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// 折叠的答案必须**逐键等于**跨源点查的答案（M26 的主判据）。
+    ///
+    /// 造的正是以前会给出错误答案的形状：L1 里两个范围重叠的文件，**排序在前的那个装着更旧的一份**
+    /// —— 同层文件谁新谁旧没有元数据可依据（L1→L2 压实会用**新 id 写老数据**，层内又只按
+    /// `min_key` 排序）。旧判据"源序号小者赢"在这种形状上会把旧版当胜者交出去：
+    /// 重量折叠 `range_scan` 与轻量折叠 `light_iter_range` 都交旧值，而点查 `get` 取 max seq
+    /// 交新值 ⇒ 同一个库两种读法两个答案。改成 seq 优先之后三者必须一致。
+    #[test]
+    fn test_fold_agrees_with_point_read_on_overlapping_level() {
+        fn key(i: usize) -> Vec<u8> {
+            format!("k{i:02}").into_bytes()
+        }
+        let dir = tmp_dir("fold_vs_point");
+        {
+            let mut db = LSMTree::open(&dir).unwrap();
+            let a: Vec<(Vec<u8>, StoredEntry)> =
+                (0..30).map(|i| (key(i), StoredEntry::put(1, Some(b"old".to_vec())))).collect();
+            let b: Vec<(Vec<u8>, StoredEntry)> =
+                (10..40).map(|i| (key(i), StoredEntry::put(5, Some(b"new".to_vec())))).collect();
+            db.inject_sst_for_test(1, a).unwrap();
+            db.inject_sst_for_test(1, b).unwrap();
+            assert_eq!(db.stats().level_files[1], 2, "重叠形状没造出来");
+
+            // 点查 = 判据的基准（`get_entry_at`：所有源里取最大可见 seq）
+            for i in 0..10 {
+                assert_eq!(db.get(&key(i)), Some(b"old".to_vec()), "k{i:02} 只住在旧文件里");
+            }
+            for i in 10..30 {
+                assert_eq!(db.get(&key(i)), Some(b"new".to_vec()), "重叠区 k{i:02} 点查没拿到新版");
+            }
+            for i in 30..40 {
+                assert_eq!(db.get(&key(i)), Some(b"new".to_vec()), "k{i:02} 只住在新文件里");
+            }
+
+            // 重量折叠：每个键的答案必须和点查一字不差
+            let rows = db.range_scan(Vec::new(), vec![0xffu8; 8]);
+            assert_eq!(rows.len(), 40, "折叠把同一把键吐了两遍（去重坏了）");
+            for (k, v) in &rows {
+                assert_eq!(v.as_deref(), db.get(k).as_deref(), "折叠与点查不一致：{:?}", String::from_utf8_lossy(k));
+            }
+
+            // 轻量折叠（翻页 / 窗口搜索 / 有界回收走的就是这条）：比的也是 seq
+            let light: Vec<(Vec<u8>, u64)> = db
+                .light_iter_range(None, None, u64::MAX)
+                .map(|(k, le)| (k, le.seq))
+                .collect();
+            assert_eq!(light.len(), 40, "轻量折叠的键数");
+            for (k, seq) in &light {
+                let want = if k.as_slice() < key(10).as_slice() { 1 } else { 5 };
+                assert_eq!(
+                    *seq, want,
+                    "轻量折叠在 {:?} 上选错了版本（seq {seq}，点查会给 {want}）",
+                    String::from_utf8_lossy(k)
+                );
+            }
+            db.flush().unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 层内重叠**真的被折掉**（M26）。旧实现叫 `fix_level_overlaps`，但函数体只有
+    /// `eprintln!` + 原样返回 ⇒ 重叠一旦出现就永远没人修：常规压实只拉"与所选文件重叠的
+    /// **下一层**"，从不碰同层兄弟。这条守卫钉四件事：折之前多探的文件数、折之后层内两两
+    /// 不重叠、每一把键的读答案一字未变、旧文件被删且 MANIFEST 认得新文件（重开读得回）。
+    #[test]
+    fn test_compaction_repairs_level_overlap() {
+        fn key(i: usize) -> Vec<u8> {
+            format!("k{i:02}").into_bytes()
+        }
+        let dir = tmp_dir("overlap_repair");
+        let old_paths: Vec<PathBuf>;
+        let probes_before;
+        let probes_after;
+        {
+            let mut db = LSMTree::open(&dir).unwrap();
+            let a: Vec<(Vec<u8>, StoredEntry)> =
+                (0..30).map(|i| (key(i), StoredEntry::put(1, Some(b"old".to_vec())))).collect();
+            let b: Vec<(Vec<u8>, StoredEntry)> =
+                (10..40).map(|i| (key(i), StoredEntry::put(5, Some(b"new".to_vec())))).collect();
+            db.inject_sst_for_test(1, a).unwrap();
+            db.inject_sst_for_test(1, b).unwrap();
+            old_paths = db.levels[1].iter().map(|s| s.path.clone()).collect();
+            assert!(
+                ranges_overlap(&db.levels[1][0].min_key, &db.levels[1][0].max_key,
+                               &db.levels[1][1].min_key, &db.levels[1][1].max_key),
+                "两个文件必须真的重叠，否则这条什么都没测"
+            );
+
+            let p0 = crate::lsm_tree::sst::sst_probes();
+            for i in 0..40 {
+                assert!(db.get(&key(i)).is_some());
+            }
+            // 精确账：k00..k09 只在 A、k30..k39 只在 B、k10..k29 两个文件都过范围判定
+            probes_before = crate::lsm_tree::sst::sst_probes() - p0;
+            assert_eq!(probes_before, 60, "重叠层每次点读的探文件数");
+
+            // 触发一次会重写 L1 的压实
+            db.put(b"zz".to_vec(), b"l0".to_vec());
+            db.flush().unwrap();
+            let rounds = db.compact_l0_until(0, 8).unwrap();
+            assert!(rounds >= 1, "压实没跑，修复也就没被调用");
+
+            let l1 = &db.levels[1];
+            assert_eq!(l1.len(), 2, "折完该剩「合并后的 40 键文件 + zz 文件」（实测 {}）", l1.len());
+            for i in 0..l1.len() {
+                for j in (i + 1)..l1.len() {
+                    assert!(
+                        !ranges_overlap(&l1[i].min_key, &l1[i].max_key, &l1[j].min_key, &l1[j].max_key),
+                        "L1 里 {} 与 {} 还重叠 ⇒ 修复没做事",
+                        l1[i].id, l1[j].id
+                    );
+                }
+            }
+            for p in &old_paths {
+                assert!(!p.exists(), "被替换掉的旧文件没删：{p:?}");
+            }
+
+            let p1 = crate::lsm_tree::sst::sst_probes();
+            for i in 0..40 {
+                assert!(db.get(&key(i)).is_some());
+            }
+            probes_after = crate::lsm_tree::sst::sst_probes() - p1;
+            assert_eq!(probes_after, 40, "折干净之后每把键只该探一个文件");
+
+            // 读答案一字未变（含重叠区那 20 把：旧版住在排序靠前的文件里，修复不许把它们改旧）
+            for i in 0..10 {
+                assert_eq!(db.get(&key(i)), Some(b"old".to_vec()));
+            }
+            for i in 10..40 {
+                assert_eq!(db.get(&key(i)), Some(b"new".to_vec()), "修复之后 k{i:02} 变了");
+            }
+            assert_eq!(db.get(b"zz"), Some(b"l0".to_vec()));
+            db.flush().unwrap();
+        }
+
+        // 重开 = 崩溃恢复后看到的那份形状：MANIFEST 记了新文件，盘上没有孤儿
+        {
+            let db = LSMTree::open(&dir).unwrap();
+            for i in 10..40 {
+                assert_eq!(db.get(&key(i)), Some(b"new".to_vec()), "重开之后 k{i:02} 读不回新版");
+            }
+            let text = fs::read_to_string(dir.join("MANIFEST")).unwrap();
+            let listed: Vec<String> = text
+                .lines()
+                .filter(|l| l.starts_with('L'))
+                .flat_map(|l| l.split_whitespace().skip(1).map(|s| s.to_string()))
+                .collect();
+            let on_disk: Vec<String> = fs::read_dir(dir.join("sst"))
+                .unwrap()
+                .flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.strip_suffix(".sst").map(|s| s.to_string())
+                })
+                .collect();
+            for id in &listed {
+                // ⚠️ 必须按**数值**补零：`format!("{id:08}")` 对 String 是空格补齐，
+                //    会把 "5" 找成 "       5.sst"（这条测试第一版就是这么假红的）
+                let n = id.parse::<u64>().expect("MANIFEST 里的 id 不是数字");
+                assert!(
+                    dir.join("sst").join(format!("{n:08}.sst")).exists(),
+                    "MANIFEST 指着不在盘上的文件 {id}
+MANIFEST={text:?}
+盘上={on_disk:?}"
+                );
+            }
+            for f in &on_disk {
+                let id = f.parse::<u64>().unwrap().to_string();
+                assert!(listed.contains(&id), "盘上有没人引用的孤儿 SST {f}（修复/压实没把它记进 MANIFEST）");
+            }
+        }
+        eprintln!(
+            "[层内重叠] 折之前 40 把键探文件 {probes_before} 次 → 折之后 {probes_after} 次（每个键 1 次）"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 /// [`LSMTree::light_iter_range`] 的状态机：k 路归并，每次 `next()` 只往前拉一条。
 ///
 /// 堆里只放 `(键, 源序号)`，每个源至多一个候选在堆里；真正的值在 `head` 里等着。
 /// 输出**非降序** ⇒ 跨源的同键去重只需一个"待定键"的先行量：
-/// - 同一键由更新的源（序号小）定论 ⇒ 后到的同键丢掉
-/// - 同源同键的多个 seq（正常写入不会出现，防的是.compaction 产物里同键多版）⇒ 取最大 seq
+/// - 同一键取 **seq 最大者**定论（由下面那道"待定键"比较做到 —— 不是靠堆的出队顺序）
+/// - 为什么必须是 seq：层内两个范围重叠的文件里谁新谁旧，源序答不了（M26 的实测结论：
+///   `merge_streaming` 那边走的是"堆的 tie-break 选胜者"，所以它必须比 seq；这边是"先出者待定、
+///   后到者比 seq 换掉"，所以判据在待定那一步）
 /// 没有这个先行量就会把"该键还有更新的源"的键提前吐出去。
 pub struct LightMerge<'a> {
     sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>,
@@ -2784,7 +3093,12 @@ struct MergeNode {
     src: usize,
 }
 
-/// 最小键优先；同键时源序号小的优先（新→旧）
+/// 最小键优先；同键时源序号小的先出（新→旧）。
+///
+/// ⚠️ 这里**不需要**像 `merge_streaming` 那样把 seq 排进比较（M26 试过，证不出来）：
+/// 同键的胜者由 `next()` 里那道"待定键 + 取更大 seq"的比较定论，堆序只决定谁先来。
+/// 反过来说，**那道比较才是这条路径的判据**，把它当冗余删掉就会在层内重叠时交出旧版本
+/// （守卫 `test_fold_agrees_with_point_read_on_overlapping_level` 会红，实测证过）。
 impl Ord for MergeNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match other.key.cmp(&self.key) {
@@ -2848,8 +3162,8 @@ impl<'a> Iterator for LightMerge<'a> {
             match self.pending.take() {
                 None => self.pending = Some((key, le)),
                 Some((pk, ple)) if pk == key => {
-                    // 同一个键：更新的源已经先出（堆的 tie-break 保证），这里只防
-                    // "同源同键多版"那种畸形产物 ⇒ 取更大的 seq，别让旧版赢
+                    // 同一个键：**这道比较才是胜者判据** —— 先出的是源序里更新的那个，
+                    // 但层内重叠文件的"更新"只有 seq 能回答 ⇒ 后到的 seq 更大就换掉它。
                     self.pending = Some((pk, if ple.seq >= le.seq { ple } else { le }));
                 }
                 Some((pk, ple)) => {
