@@ -835,10 +835,6 @@ impl WriteSide for TxnSide<'_, '_> {
         let _ = self.kv.remove(enc);
     }
 
-    fn wal_begin(&mut self, xid: u64) -> bool {
-        self.wal.append(WalRecord::Begin { xid }).is_ok()
-    }
-
     fn wal_write(&mut self, xid: u64, enc: &[u8], stored: Option<&[u8]>) -> bool {
         self.wal
             .append(WalRecord::Write {
@@ -1618,6 +1614,8 @@ mod tests {
             let mut wal = Wal::open(wal_path(&path)).unwrap();
             let xid = 1u64;
             let enc = encode_key(b"recover", xid);
+            // 老日志的形状：M25 起写侧不再落 `Begin`，这里手写一份**带 Begin** 的日志，
+            // 恢复必须照样是对的那份（读侧兼容由 `plan_is_identical_with_or_without_begin` 钉死）
             wal.append(WalRecord::Begin { xid }).unwrap();
             wal.append(WalRecord::Write {
                 xid,
@@ -1653,6 +1651,7 @@ mod tests {
                 let enc = encode_key(b"ghost", xid);
                 tree.insert(enc.clone(), Some(b"should-vanish".to_vec()));
                 tree.flush().unwrap();
+                // 同上：带 `Begin` 的老日志形状
                 wal.append(WalRecord::Begin { xid }).unwrap();
                 wal.append(WalRecord::Write {
                     xid,
@@ -2069,7 +2068,7 @@ mod tests {
             assert!(tx.set(b"k", b"w".to_vec()));
             tx.commit();
             let size2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-            assert!(size2 > size1, "写入必须留下 Begin/Write/Commit 记录，持久化点不能被省掉");
+            assert!(size2 > size1, "写入必须留下 Write/Commit 记录，持久化点不能被省掉");
 
             // 字节数当尺子**不够**：只落一条 `Commit` 也能让体积涨，于是"`Write` 记录整个没写"
             // 这种形状照样绿（M18d 实测：把 `wal_write` 改成不 append 直接返回成功，bitcask 那条
@@ -2086,6 +2085,13 @@ mod tests {
                     "两次真写要在 WAL 里各留一条 Write，实际 {writes} 条 \
                      （只数 Begin/Commit 的尺子抓不到丢了的 Write）"
                 );
+                // M25：写侧不再落 `Begin`（恢复不读它）。老日志**还能读**那半边由
+                // `plan_is_identical_with_or_without_begin` 钉住，两边缺一条都是洞。
+                let begins = records
+                    .iter()
+                    .filter(|e| matches!(&e.record, WalRecord::Begin { .. }))
+                    .count();
+                assert_eq!(begins, 0, "写侧不再落 Begin，实际留下 {begins} 条");
             }
 
             // 只读事务也不能把数据读坏（版本号照旧推进，快照语义不变）

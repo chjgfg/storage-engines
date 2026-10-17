@@ -277,6 +277,96 @@ mod tests {
         ))
     }
 
+    /// M25 守卫：**恢复计划不许依赖 `Begin`**。
+    ///
+    /// 同一条事务流写两遍 —— 一遍带 `Begin`（0.4.0~M24 的形状，老库里就是这么存的），一遍不带 ——
+    /// 再从文件里读回来折 plan，**REDO 与 UNDO 两边必须一字不差**。
+    ///
+    /// 为什么必须有它：M8 之后 `Begin` 只剩"把 xid 提前登记成一个空条目"这一件事，而 `Write`
+    /// 走的也是同一句 `open_writes.entry(xid).or_default()` ⇒ 它承载的信息是零。
+    /// **零信息的记录 + 零覆盖的假设** = 下一个人以为"事务开始在日志里有凭据"
+    /// （M18d 记在案：把整步作废之后全量测试一条都不红）。写侧从 M25 起不再落 `Begin`，
+    /// 而老日志必须还能读 —— 这条就是那半边的守卫，同时也是"变体不能删"的理由。
+    ///
+    /// ⚠️ 唯一合法的差别是 `max_xid`：**只留下一条 `Begin` 就崩掉**的事务（只有老日志可能有），
+    /// 去掉 Begin 之后版本号起点小 1。那一笔一行都没写 ⇒ REDO/UNDO 都不受影响，
+    /// 但这条差别必须**看得见**，否则有人会拿它当"Begin 有用"的证据。
+    #[test]
+    fn plan_is_identical_with_or_without_begin() {
+        // 一段真实形状的事务流：1 提交、2 撤销、3 崩在提交之前（只有 Write）、4 只留 Begin 就崩了
+        fn script(wal: &mut Wal, with_begin: bool) {
+            for xid in 1..=4u64 {
+                if with_begin {
+                    wal.append(WalRecord::Begin { xid }).unwrap();
+                }
+                let rec = match xid {
+                    1 => WalRecord::Write {
+                        xid,
+                        key: b"k1".to_vec(),
+                        value: Some(b"v1".to_vec()),
+                    },
+                    2 => WalRecord::Write {
+                        xid,
+                        key: b"k2".to_vec(),
+                        value: None,
+                    },
+                    3 => WalRecord::Write {
+                        xid,
+                        key: b"k3".to_vec(),
+                        value: Some(b"v3".to_vec()),
+                    },
+                    // 4 号只有 Begin 就崩了（老日志里那种"补了 Begin 还没写"的形状）
+                    _ => continue,
+                };
+                wal.append(rec).unwrap();
+                match xid {
+                    1 => {
+                        wal.append(WalRecord::Commit { xid }).unwrap();
+                    }
+                    2 => {
+                        wal.append(WalRecord::Abort { xid }).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            wal.sync().unwrap();
+        }
+
+        fn read_plan(tag: &str, with_begin: bool) -> (usize, RecoveryPlan) {
+            let path = tmp_wal(tag);
+            {
+                let mut wal = Wal::open(&path).unwrap();
+                script(&mut wal, with_begin);
+            }
+            let mut wal = Wal::open(&path).unwrap();
+            let entries = wal.read_all().unwrap();
+            let plan = analyze_recovery(&entries);
+            let _ = std::fs::remove_file(&path);
+            (entries.len(), plan)
+        }
+
+        let (n_with, with) = read_plan("begin_on", true);
+        let (n_without, without) = read_plan("begin_off", false);
+        // 带 Begin 的那份必须真读出 Begin（否则这份对拍是空转）
+        assert!(
+            n_with > n_without,
+            "带 Begin 的日志只有 {n_with} 条，不带的有 {n_without} 条 ⇒ Begin 根本没写进去"
+        );
+        assert_eq!(
+            with.committed_writes, without.committed_writes,
+            "REDO 列表因为 Begin 的有无而变了 ⇒ 恢复其实依赖它"
+        );
+        assert_eq!(
+            with.uncommitted_writes, without.uncommitted_writes,
+            "UNDO 列表因为 Begin 的有无而变了 ⇒ 恢复其实依赖它"
+        );
+        // 唯一允许的差：那笔"只有 Begin"的事务把 max_xid 抬了一格
+        assert_eq!(without.max_xid, 3, "不带 Begin 时日志里最大的 xid 是 3");
+        assert_eq!(with.max_xid, 4, "Begin 把 4 号那笔空事务的 xid 也抬进来了");
+        assert_eq!(with.committed_writes.len(), 1, "只有 1 号提交");
+        assert_eq!(with.uncommitted_writes.len(), 2, "2 号撤销 + 3 号崩在提交前");
+    }
+
     #[test]
     fn test_wal_append_and_read() {
         let path = tmp_wal("basic");

@@ -16,17 +16,22 @@
 //! 2. is_visible(latest)?       —— 不可见 ⇒ 写冲突，返回 false（此刻库里一个字都没动）
 //! 3. encode_value(value)       —— blob 旁路在这里（默认：原样）
 //! 4. row_fits(enc, stored)?    —— bplus 的"这行装不进一页"必须在这里就拒（默认：装得下）
-//! 5. wal_begin(xid)            —— 第一次写才补 Begin（默认：什么都不做）
-//! 6. wal_write(xid, enc, ...)  —— 落 WAL 在先，改库在后（默认：成功）
-//! 7. put_versioned(enc, ...)   —— 真正改库（**可失败**：bitcask 写数据文件会 Err）
-//! 8. 写集登记                   —— 只登记真落进库的那一行
+//! 5. wal_write(xid, enc, ...)  —— 落 WAL 在先，改库在后（默认：成功）；同时把"进过 WAL"记账
+//! 6. put_versioned(enc, ...)   —— 真正改库（**可失败**：bitcask 写数据文件会 Err）
+//! 7. 写集登记                   —— 只登记真落进库的那一行
 //! ```
 //!
-//! 3~6 都在 7 之前是**刻意的**：任何一步失败都不能留下"写集里有、库里没有"的悬账，否则随后的
+//! 3~5 都在 6 之前是**刻意的**：任何一步失败都不能留下"写集里有、库里没有"的悬账，否则随后的
 //! `rollback` 会去删一批根本不存在的行、`commit` 的回收账还会多算。
-//! 4 必须在 5/6 之前：bplus 原先把容量判定放在 `Begin` 之后 ⇒ 一条被拒收的超大行仍然会在 WAL 里
-//! 留下"开了张但没写"的 `Begin`。内核把判定提到它前面，于是拒收的那次连 `Begin` 都不落
-//! （`Begin` 本身不承载恢复信息 —— 实测整条去掉 265 条测试全绿，理由见 [`WriteSide::wal_begin`]）。
+//! 4 必须在 5 之前：bplus 原先把容量判定放在 WAL 之后 ⇒ 一条被拒收的超大行在盘上留下
+//! 一条永远写不进去的记录。内核把判定提到它前面，于是拒收的那次**一个字都不落**。
+//!
+//! ⚠️ M25 之前这里是**八步**，第 5 步是"第一次写补一条 `WalRecord::Begin`"。那条记录被删掉了，
+//! 不是因为它贵，而是因为**恢复不读它**：`analyze_recovery` 要的信息全在 `Write`/`Commit`/`Abort` 里
+//! （`Write` 自己就把 `open_writes` 的条目建起来、`max_xid` 也从它取），把整步作废之后全量测试
+//! 一条都不红 —— 也就是说它一直是个**没有守卫覆盖的假设**。留着它的害处不是字节，是下一个人会
+//! 以为"事务开始"这件事在日志里有凭据。`WalRecord::Begin` 变体与解析分支**保留**（0.4.0 建的库
+//! 里那些老日志必须还能读），兼容由守卫钉：`plan_is_identical_with_or_without_begin`。
 //!
 //! ## 锁的顺序
 //!
@@ -141,17 +146,6 @@ pub trait WriteSide {
     /// 只有定长页的引擎需要实现（bplus：单行超过一页载荷就**必须**在落 WAL 之前拒掉，
     /// 否则盘上会留下永远写不进去的记录）。
     fn row_fits(&mut self, _enc: &[u8], _stored: Option<&[u8]>) -> bool {
-        true
-    }
-
-    /// 本事务第一次写：往 WAL 补一条 `Begin`。`false` = 失败 ⇒ 整次写作废。
-    ///
-    /// ⚠️ **实测：这条记录目前不承载恢复信息**。把整次调用作废（一家都不落 `Begin`）之后
-    /// 265 条测试全绿 —— [`crate::common::wal::analyze_recovery`] 里 `Write` 走的也是
-    /// `open_writes.entry(xid).or_default()`，`Begin` 建的那个空条目没有额外作用，`max_xid`
-    /// 也照样从 `Write` 得到。所以它是**格式的框架**而不是正确性依赖：将来要改它（或删它）
-    /// 得先决定"要不要让它承载信息"，不能顺手当成已验证的行为。
-    fn wal_begin(&mut self, _xid: u64) -> bool {
         true
     }
 
@@ -276,13 +270,14 @@ impl TxnCore {
         if !side.row_fits(&enc, stored.as_deref()) {
             return false;
         }
-        // begin 不进 WAL，所以第一次写要补 Begin；补失败就当这次写没发生
-        if self.wal_policy.open_on_first_write() && !side.wal_begin(self.version) {
-            return false;
-        }
         if !side.wal_write(self.version, &enc, stored.as_deref()) {
             return false;
         }
+        // M25：第一次写只**记账**，不再落 `Begin`（恢复不读它，守卫
+        // `plan_is_identical_with_or_without_begin`）。标记打在 `wal_write` **成功之后**：
+        // 这样 "进过 WAL ⇒ commit 要写 `Commit` + fsync" 这句话字面成立，
+        // 而一次 WAL 都没落成的事务也不会去付那次无意义的 fsync。
+        self.wal_policy.mark_opened();
 
         let writes = reg.entry(self.version).or_default();
         if side.put_versioned(&enc, stored) {

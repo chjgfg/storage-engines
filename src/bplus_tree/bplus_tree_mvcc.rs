@@ -1117,10 +1117,6 @@ impl WriteSide for TxnSide<'_, '_, '_> {
         false
     }
 
-    fn wal_begin(&mut self, xid: u64) -> bool {
-        self.wal.append(WalRecord::Begin { xid }).is_ok()
-    }
-
     fn wal_write(&mut self, xid: u64, enc: &[u8], stored: Option<&[u8]>) -> bool {
         self.wal
             .append(WalRecord::Write {
@@ -1557,6 +1553,8 @@ mod tests {
             let mut wal = Wal::open(wal_path(&path)).unwrap();
             let xid = 1u64;
             let enc = encode_key(b"recover", xid);
+            // 老日志的形状：M25 起写侧不再落 `Begin`，这里手写一份**带 Begin** 的日志，
+            // 恢复必须照样是对的那份（读侧兼容由 `plan_is_identical_with_or_without_begin` 钉死）
             wal.append(WalRecord::Begin { xid }).unwrap();
             wal.append(WalRecord::Write {
                 xid,
@@ -1592,6 +1590,7 @@ mod tests {
                 let enc = encode_key(b"ghost", xid);
                 tree.insert(enc.clone(), RowId(Some(b"should-vanish".to_vec())));
                 tree.flush_all();
+                // 同上：带 `Begin` 的老日志形状
                 wal.append(WalRecord::Begin { xid }).unwrap();
                 wal.append(WalRecord::Write {
                     xid,
@@ -1808,7 +1807,7 @@ mod tests {
                 assert!(t.set(format!("k{i}").as_bytes(), b"x".to_vec()));
                 t.commit();
             }
-            // 故意不 checkpoint：WAL 里保留 Begin/Write/Commit
+            // 故意不 checkpoint：WAL 里保留 Write/Commit
         }
         {
             let mvcc = MVCC::open(&path, 16, 32);
@@ -1988,7 +1987,7 @@ mod tests {
             assert!(tx.set(b"k", b"w".to_vec()));
             tx.commit();
             let size2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-            assert!(size2 > size1, "写入必须留下 Begin/Write/Commit 记录，持久化点不能被省掉");
+            assert!(size2 > size1, "写入必须留下 Write/Commit 记录，持久化点不能被省掉");
 
             // 字节数当尺子**不够**：只落一条 `Commit` 也能让体积涨，于是"`Write` 记录整个没写"
             // 这种形状照样绿（M18d 实测：把 `wal_write` 改成不 append 直接返回成功，bitcask 那条
@@ -2005,6 +2004,13 @@ mod tests {
                     "两次真写要在 WAL 里各留一条 Write，实际 {writes} 条 \
                      （只数 Begin/Commit 的尺子抓不到丢了的 Write）"
                 );
+                // M25：写侧不再落 `Begin`（恢复不读它）。老日志**还能读**那半边由
+                // `plan_is_identical_with_or_without_begin` 钉住，两边缺一条都是洞。
+                let begins = records
+                    .iter()
+                    .filter(|e| matches!(&e.record, WalRecord::Begin { .. }))
+                    .count();
+                assert_eq!(begins, 0, "写侧不再落 Begin，实际留下 {begins} 条");
             }
 
             // 只读事务也不能把数据读坏（版本号照旧推进，快照语义不变）
@@ -2160,9 +2166,9 @@ mod tests {
             assert!(tx.get(&big_key).is_none());
             tx.commit();
 
-            // 判据要精确到**记录类型**：被拒的那行不许留下 `Write`。
-            // （M18e 之前 `Begin` 会长出来 —— 内核那八步把 `row_fits` 提到了 `wal_begin` 之前，
-            //  于是"一次写都没成"的事务如今连 `Begin` 都不该留，所以下面两条分开数。）
+            // 判据要精确到**记录类型**：被拒的那行不许留下 `Write`（带键的记录只有 `Write` 一种，
+            // 所以"容量判定必须在落 WAL 之前"这条顺序就由下面这两条计数守着 —— M25 之前还多一条
+            // `Begin` 可以数，现在它整个不再落盘）。
             let mut wal = Wal::open(wal_path(&path)).expect("打开 WAL 读记录");
             let records = wal.read_all().expect("读 WAL");
             let writes_for = |prefix: &[u8]| {
@@ -2175,14 +2181,16 @@ mod tests {
             assert_eq!(writes_for(&big_key), 0, "拒收的一行不许在 WAL 里留下 Write 记录");
             // 对照：同一把尺子量得到"真写进去的那行"，否则上面那条断言是空转
             assert_eq!(writes_for(b"small"), 1, "探针必须能数到一条真实写入");
+            // ⚠️ M18e 时这里断的是 `begins == 1`（"拒收的那次连 `Begin` 都不留"，用来钉
+            // `row_fits` 必须在落 WAL **之前**）。M25 起写侧一个字 `Begin` 都不落，那条断言
+            // 会退化成"常数等于 0"而看不见顺序 —— 顺序现在由上面那两条 `Write` 计数守着
+            // （带键的记录只有 `Write` 一种，`row_fits` 一旦挪到落 WAL 之后，`writes_for(big_key)`
+            // 立刻变 1）。下面这条只守新不变量："写侧不再产生 `Begin`"。
             let begins = records
                 .iter()
                 .filter(|e| matches!(&e.record, WalRecord::Begin { .. }))
                 .count();
-            assert_eq!(
-                begins, 1,
-                "只有那个真写成功的事务该留下 `Begin`；拒收的一行连 `Begin` 都不留（实际 {begins} 条）"
-            );
+            assert_eq!(begins, 0, "写侧不再落 Begin，实际留下 {begins} 条");
             drop(mvcc);
         }
         // 重开：小行还在，大行不在，恢复流程也没被那条不存在的记录卡住

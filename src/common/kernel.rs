@@ -159,8 +159,11 @@ impl VacuumScheduler {
 /// 对一个要轮询存储的交易进程来说这不是"慢一点"，是每秒四百次读的天花板，
 /// 外加只读负载把 WAL 撑到阈值、去触发本该由写入才做的 checkpoint。
 ///
-/// 规矩：**begin 时还不该进 WAL**（此时不知道会不会写）；第一次 `write()` 时补一条
-/// `Begin`，`commit` 只在"真的开过 WAL"时才写 `Commit` + fsync。
+/// 规矩：**begin 时还不该进 WAL**（此时不知道会不会写）；第一次 `write()` 才算"这条事务进过
+/// WAL"，`commit` 只在进过 WAL 时才写 `Commit` + fsync。
+///
+/// ⚠️ M25 起这条"第一次写"只**记账**，不再落 `Begin` 记录 —— 见 [`crate::common::WalRecord::Begin`]：
+/// 恢复要的信息全在 `Write`/`Commit`/`Abort` 里，`Begin` 只是把 xid 提前一步登记成一个空条目。
 ///
 /// 为什么少一条 `Begin` 不影响恢复：`analyze_recovery` 的 `max_xid` 是从
 /// `Begin`/`Write`/`Commit`/`Abort` **四种记录一起**取的，写过的事务必然带 `Write`，
@@ -173,15 +176,13 @@ pub struct WalPolicy {
 }
 
 impl WalPolicy {
-    /// 第一次写之前调用：返回 `true` 表示"这条事务还没进过 WAL，调用方该补 `Begin`"。
-    /// 幂等 —— 只有第一次返回 `true`。
-    pub fn open_on_first_write(&self) -> bool {
-        if self.opened.get() {
-            false
-        } else {
-            self.opened.set(true);
-            true
-        }
+    /// 第一次写之前调用：把"这条事务进过 WAL"记下来。幂等 —— 调几次都是同一个状态。
+    ///
+    /// M25 之前它返回"是不是第一次"，因为第一次要补一条 `Begin`；`Begin` 不再落盘之后
+    /// 这个返回值没有调用方了，所以改成纯粹的置位（留着返回 `bool` 只会让人以为
+    /// "返回 true 的那一次要做点什么"）。
+    pub fn mark_opened(&self) {
+        self.opened.set(true);
     }
 
     /// 本事务是否进过 WAL ⇒ `commit` 要不要写 `Commit` 并 fsync、`rollback` 要不要写 `Abort`
@@ -499,9 +500,10 @@ mod tests {
     fn wal_policy_opens_only_on_first_write() {
         let p = WalPolicy::default();
         assert!(!p.opened(), "刚 begin 的事务不该写 Commit、也不该 fsync");
-        assert!(p.open_on_first_write(), "第一次写必须补 Begin");
-        assert!(!p.open_on_first_write(), "第二次写不该再补一条 Begin");
+        p.mark_opened();
         assert!(p.opened(), "写过就得写 Commit + fsync，否则持久化点丢了");
+        p.mark_opened();
+        assert!(p.opened(), "重复标记不许把状态打回去（M25 起这里只记账，不再有「第一次」的返回值）");
     }
 
     #[test]

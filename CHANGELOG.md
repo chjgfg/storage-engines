@@ -57,6 +57,13 @@
   `has_next` 由"多取一条"探出来（代价 = 一条记录）。
 
 
+- **`WriteSide::wal_begin` 这个槽被删掉；WAL 里不再新增 `Begin` 记录**（M25）：
+  自己实现过 `WriteSide` 的（不是用本仓库四个引擎的）要把那条 `fn wal_begin` 删掉 —— 它是**带默认实现**
+  的方法，所以只有主动覆盖过的人才受影响。**磁盘格式没动**：`WalRecord::Begin` 变体与解析分支保留，
+  0.4.0 建的库里那些老日志照样读（守卫 `plan_is_identical_with_or_without_begin`）。
+  为什么删：这条记录不承载恢复信息（`max_xid` 与 REDO/UNDO 全从 `Write`/`Commit`/`Abort` 取），
+  而 M18d 实测"整步作废 ⇒ 全量测试一条都不红"= **它一直是个没有守卫覆盖的假设**。
+
 ### 新增
 
 - **自动回收，默认开着**：提交时给 `vac_pending` 记账，`begin_transaction()` 发现攒够一个切片
@@ -377,6 +384,35 @@
     （30.9×）**当场红 —— 两条尺子互为对照，一条盯形状、一条盯代价。
   - ⚠️ 这条**不是** 200k 台架那条超线性（那边每 1000 行一事务，写集最长 1000）；它的形状是
     "下游一次导入塞一个大事务"，所以量出来的是上面那条台架，不是 `SCALE_ROWS`。
+- **`WalRecord::Begin` 不再落盘（M25）—— 把"零信息的记录 + 零覆盖的假设"这条洞关掉**：
+  内核写序列从**八步**收成**七步**（`latest_version → 可见性判定 → encode_value → row_fits →
+  wal_write → put_versioned → 写集登记`），`WriteSide::wal_begin` 这个槽整个删掉，
+  `WalPolicy::open_on_first_write()`（返回"是不是第一次"）改成 `mark_opened()`（只置位 ——
+  留着返回值只会让人以为"返回 true 的那一次要做点什么"）。
+  - 为什么是"删"而不是"让它承载信息"：恢复要的每样东西都不经过它 —— `max_xid` 从
+    `Write`/`Commit`/`Abort` 也能取到（写过的事务必然带 `Write`），`open_writes` 的条目
+    `Write` 自己就建起来了，而"只留下一条 `Begin` 就崩了"的那种事务**一行都没写** ⇒ 没有东西要撤销。
+    给一条记录硬派个工作（比如把快照写进去）才是新增风险。M18d 记下的是**实测**：整步作废之后
+    全量测试一条都不红 —— 也就是这句话一直没有守卫覆盖。
+  - **磁盘格式没动**：`Begin` 变体与解析分支都留着，0.4.0 建的库里的老日志照样读。
+    两边各一条守卫，缺一条都是洞：
+    ① 写侧不再产生它 —— bitcask / bplus / lsm **各自**在自己那条 WAL 形状守卫里数
+      `begins == 0`（把 `Begin` 加回去 ⇒ 三家**逐家实测会红**，报 `left: 20000, right: 0`）；
+    ② 读侧兼容它 —— `plan_is_identical_with_or_without_begin`（`common/wal.rs`）把同一条事务流写两遍
+      （1 提交 / 2 撤销 / 3 崩在提交前 / 4 只留 Begin 就崩了），折出的 **REDO 与 UNDO 必须一字不差**；
+      让恢复真去依赖 Begin（改成"没见过 Begin 的 `Write` 不算数"）⇒ 当场红在
+      `left: [(1, "k1", Some("v1"))], right: []`。唯一合法的差是那笔空事务把 `max_xid` 从 3 抬到 4，
+      这条也钉死了（不许有人拿它当"`Begin` 有用"的证据）。
+    另外三家原有的"手写 WAL 日志"崩溃用例（redo / undo 两条通道）刻意**保留 `Begin`** ——
+    那正是老库的形状，它们本身就是兼容证据，注释已写明。
+  - bplus 那条"被拒收的超大行连 `Begin` 都不留"的顺序守卫（M18e 加的 `begins == 1`）**换了守法**：
+    带键的记录只剩 `Write` 一种，所以顺序由 `writes_for(big_key) == 0` + 对照
+    `writes_for(b"small") == 1` 守着；`begins == 1` 改成 `begins == 0`，否则它会退化成
+    "常数等于 0"而看不见顺序。
+  - 代价数字（台架 `wal_cost_per_single_write_txn`，`#[ignore]`，bitcask，release，
+    20000 笔"只改一把键"的事务）：每笔 **118.4 B / 3.00 条记录 → 90.4 B / 2.00 条记录**
+    （−23.6% 字节、−33% 记录）。挑 `wal_checkpoint_bytes` 的人要的就是这个换算 ——
+    恢复重放的量按**记录数**走，不是按总字节。
 - **`KvTxn::set_raw(key, value)`（M16，非破坏）**：存**任意字节**的原样写入口 —— 信封由引擎打
   （内部就是 `set(key, pack_plain(value))`），`get` 一字不差还回来。存在的理由：`set` 的约定是
   "传进来的字节已经是打过信封的逻辑值"，直接拿它存裸字节会按首字节偶发丢数据 —— `0x00` 打头少

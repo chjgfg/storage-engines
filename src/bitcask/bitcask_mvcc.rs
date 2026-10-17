@@ -1175,10 +1175,6 @@ impl WriteSide for TxnSide<'_, '_, '_> {
         }
     }
 
-    fn wal_begin(&mut self, xid: u64) -> bool {
-        self.wal.append(WalRecord::Begin { xid }).is_ok()
-    }
-
     fn wal_write(&mut self, xid: u64, enc: &[u8], stored: Option<&[u8]>) -> bool {
         self.wal
             .append(WalRecord::Write {
@@ -1901,6 +1897,82 @@ mod tests {
         cleanup(&path);
     }
 
+    /// 每笔"单行事务"在 WAL 里到底留下多少字节、几条记录（`#[ignore]`，手动 release 跑）。
+    ///
+    /// 存在的理由有两个：
+    /// 1. **M25 的代价数字**。交易进程的常态是"一笔事务就改一两把键"，所以 WAL 的**每条记录**
+    ///    都要算钱：`wal_checkpoint_bytes` 那个阈值什么时候到、恢复要重放多少条，都按记录数走。
+    /// 2. 挑 WAL 收口阈值的人需要"多少笔事务撑满一 MiB"这种换算，而不是只有一个总字节数。
+    ///
+    /// ```text
+    /// WAL_COST_TXNS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 wal_cost_per_single_write_txn
+    /// ```
+    #[test]
+    #[ignore = "WAL 单价台架，手动 release 单线程跑：WAL_COST_TXNS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 wal_cost_per_single_write_txn"]
+    fn wal_cost_per_single_write_txn() {
+        let txns: u64 = std::env::var("WAL_COST_TXNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20000);
+        let path = tmp_db("wal_cost");
+        cleanup(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        let bytes;
+        let counts;
+        {
+            let mvcc = MVCC::open(&path);
+            let wal = crate::bitcask::storage::wal_path(&path);
+            // 基线从**空 WAL** 起算：`checkpoint()` 会把 WAL 截断并把 `Checkpoint` 写成第一条，
+            // 所以先写一笔、再 checkpoint，之后量到的字节就只剩"每笔事务的价"。
+            {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"seed", b"v0".to_vec()));
+                tx.commit();
+            }
+            mvcc.checkpoint();
+            let base = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            for i in 0..txns {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(b"hot", format!("v{i}").into_bytes()));
+                tx.commit();
+            }
+            bytes = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) - base;
+            let mut reader = Wal::open(&wal).expect("打开 WAL 读记录");
+            let records = reader.read_all().expect("读 WAL");
+            let of = |kind: u8| {
+                records
+                    .iter()
+                    .filter(|e| {
+                        let tag = match &e.record {
+                            WalRecord::Begin { .. } => 0,
+                            WalRecord::Write { .. } => 1,
+                            WalRecord::Commit { .. } => 2,
+                            WalRecord::Abort { .. } => 3,
+                            WalRecord::Checkpoint { .. } => 4,
+                        };
+                        tag == kind
+                    })
+                    .count()
+            };
+            counts = (of(0), of(1), of(2), records.len());
+        }
+        eprintln!(
+            "[WAL 单价] {txns} 笔单行事务：{} B 合计 / {:.1} B 每笔 —— \
+             Begin {} 条、Write {} 条、Commit {} 条、总 {} 条（每笔 {:.2} 条）",
+            bytes,
+            bytes as f64 / txns as f64,
+            counts.0,
+            counts.1,
+            counts.2,
+            counts.3,
+            counts.3 as f64 / txns as f64
+        );
+        assert_eq!(counts.1, txns as usize, "每笔写必须留下一条 Write");
+        assert_eq!(counts.2, txns as usize, "每笔写必须留下一条 Commit");
+        assert_eq!(counts.0, 0, "M25 起写侧不再落 Begin");
+        cleanup(&path);
+    }
+
     /// 只读事务不许往 WAL 落一个字节，也不许付 fsync 的代价。
     ///
     /// 反向那半同样重要：**写过就必须有 `Commit` 记录 + fsync** —— 不然这条优化会悄悄
@@ -1931,7 +2003,7 @@ mod tests {
             assert!(tx.set(b"k", b"w".to_vec()));
             tx.commit();
             let size2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-            assert!(size2 > size1, "写入必须留下 Begin/Write/Commit 记录，持久化点不能被省掉");
+            assert!(size2 > size1, "写入必须留下 Write/Commit 记录，持久化点不能被省掉");
 
             // 字节数当尺子**不够**：只落一条 `Commit` 也能让体积涨，于是"`Write` 记录整个没写"
             // 这种形状照样绿（实测把 `wal_write` 改成不 append 直接返回成功，本函数一路通过）。
@@ -1948,6 +2020,15 @@ mod tests {
                     "两次真写要在 WAL 里各留一条 Write，实际 {writes} 条 \
                      （只数 Begin/Commit 的尺子抓不到丢了的 Write）"
                 );
+                // M25：写侧不再落 `Begin` —— 恢复要的信息全在 Write/Commit/Abort 里，
+                // 而"只留一条 Begin 就崩了"的那种事务本来一行都没写。
+                // ⚠️ 这条断言守的是"别再写它"；老日志**还能读**那半边由
+                // `plan_is_identical_with_or_without_begin` 钉住，两边缺一条都是洞。
+                let begins = records
+                    .iter()
+                    .filter(|e| matches!(&e.record, WalRecord::Begin { .. }))
+                    .count();
+                assert_eq!(begins, 0, "写侧不再落 Begin，实际留下 {begins} 条");
             }
 
             let tx = mvcc.begin_transaction();
@@ -2230,6 +2311,8 @@ mod tests {
             let mut wal = Wal::open(wal_path(&path)).unwrap();
             let xid = 1u64;
             let enc = encode_key(b"recover", xid);
+            // 老日志的形状：M25 起写侧不再落 `Begin`，这里手写一份**带 Begin** 的日志，
+            // 恢复必须照样是对的那份（读侧兼容由 `plan_is_identical_with_or_without_begin` 钉死）
             wal.append(WalRecord::Begin { xid }).unwrap();
             wal.append(WalRecord::Write {
                 xid,
@@ -2266,6 +2349,7 @@ mod tests {
                 tree.insert(enc.clone(), Some(b"should-vanish".to_vec()))
                     .unwrap();
                 tree.flush().unwrap();
+                // 同上：带 `Begin` 的老日志形状
                 wal.append(WalRecord::Begin { xid }).unwrap();
                 wal.append(WalRecord::Write {
                     xid,
