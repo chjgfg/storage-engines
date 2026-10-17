@@ -240,12 +240,28 @@ impl Transaction {
     }
 
     /// 定位 **≤ key** 的最后一条存活记录
+    /// 反向找"≤ key 的最大一把活着的键"：**逐步退，不物化前缀**（M20）。
+    ///
+    /// 循环与判定在 [`crate::common::seek_prev_with`]（四引擎共用）；反向一步走
+    /// [`BPlusTree::find_back`]（本来就是点读的热路径，跨叶反向有进度守卫），单键可见行走
+    /// `latest_visible_raw`。改之前是 `scan(None, Some(key‖0))` + `retain` + `pop`。
     pub fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
-        let mut upper = key.to_vec();
-        upper.push(0);
-        let mut v = self.scan(None, Some(&upper));
-        v.retain(|r| r.key.as_slice() <= key);
-        v.pop()
+        crate::common::seek_prev_with(
+            key,
+            |bound| {
+                let mut kv = self.kv.lock().unwrap();
+                kv.find_back(b"", bound, |_| true)
+                    .and_then(|(enc, _)| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+            },
+            |raw| {
+                let logical = self.latest_visible_raw(raw).and_then(|(_, v)| v);
+                crate::common::live_record_of_logical(
+                    raw.to_vec(),
+                    logical,
+                    now_unix_secs(),
+                )
+            },
+        )
     }
 
     // ── 模糊 / 前缀搜索 + 分页 ──
@@ -661,7 +677,7 @@ mod tests {
             }
             let _ = mvcc.flush();
             let b0 = crate::bplus_tree::page::page_reads();
-            let (first, mut cur) = {
+            let (_first, mut cur) = {
                 let tx = mvcc.begin_transaction();
                 let p = tx.scan_page(None, PAGE);
                 tx.commit();
@@ -697,7 +713,7 @@ mod tests {
                     "第 {pages} 页的起点不是全库第 {want} 把键 ⇒ 翻页漏行或重行"
                 );
                 assert_eq!(
-                    all[(want + last_rows.len() - 1)].key,
+                    all[want + last_rows.len() - 1].key,
                     last_rows.last().unwrap().key,
                     "最后一页的终点也对不上"
                 );

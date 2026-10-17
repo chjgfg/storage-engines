@@ -238,12 +238,30 @@ impl Transaction {
     }
 
     /// 定位 **≤ key** 的最后一条存活记录
+    /// 反向找"≤ key 的最大一把活着的键"：**逐步退，不物化前缀**（M20）。
+    ///
+    /// 循环与判定在 [`crate::common::seek_prev_with`]（四引擎共用）；反向一步走
+    /// [`LSMTree::find_back`]（逐源、命中即停），单键可见行走 `latest_visible_raw`。
+    /// ⚠️ 这里**不能**用整段 `scan`：LSM 的 scan 要跨源归并，一次 seek_prev 会把窗口内所有源
+    /// 都拖一遍（200k 实测单次 610 ms，四家最贵）。
     pub fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
-        let mut upper = key.to_vec();
-        upper.push(0);
-        let mut v = self.scan(None, Some(&upper));
-        v.retain(|r| r.key.as_slice() <= key);
-        v.pop()
+        crate::common::seek_prev_with(
+            key,
+            |bound| {
+                let kv = self.kv.lock().unwrap();
+                kv.find_back(b"", bound, u64::MAX, |_, _| true)
+                    .map(|(enc, _)| enc)
+                    .and_then(|enc| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+            },
+            |raw| {
+                let logical = self.latest_visible_raw(raw).and_then(|(_, v)| v);
+                crate::common::live_record_of_logical(
+                    raw.to_vec(),
+                    logical,
+                    now_unix_secs(),
+                )
+            },
+        )
     }
 
     // ── 模糊 / 前缀搜索 + 分页 ──
@@ -546,7 +564,7 @@ mod tests {
             }
             let _ = mvcc.flush();
             let b0 = crate::lsm_tree::sst::light_visits();
-            let (first, mut cur) = {
+            let (_first, mut cur) = {
                 let tx = mvcc.begin_transaction();
                 let p = tx.scan_page(None, PAGE);
                 tx.commit();
@@ -582,7 +600,7 @@ mod tests {
                     "第 {pages} 页的起点不是全库第 {want} 把键 ⇒ 翻页漏行或重行"
                 );
                 assert_eq!(
-                    all[(want + last_rows.len() - 1)].key,
+                    all[want + last_rows.len() - 1].key,
                     last_rows.last().unwrap().key,
                     "最后一页的终点也对不上"
                 );

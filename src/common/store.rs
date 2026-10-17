@@ -202,3 +202,75 @@ pub fn scan_page<S: VersionedStore>(
     }
     (out, if more { cursor } else { None })
 }
+
+
+/// 从"某把键的可见逻辑行"造出对外那一行：墓碑 / 过期 / 读不到都返回 `None`。
+///
+/// 这是 `scan_foreach` 里那四行的镜像。之所以要抽出来：`seek_prev` 现在按**单键**问"这把键活着吗"，
+/// 那段判定再抄一遍就会出现"scan 认为它过期、seek_prev 认为它活着"这种两口不一致。
+pub fn live_record_of_logical(
+    key: Vec<u8>,
+    logical: Option<Vec<u8>>,
+    now: u64,
+) -> Option<ExportRecord> {
+    let bytes = logical?;
+    let m = decode_value_meta(&bytes);
+    if m.is_expired_at(now) {
+        return None;
+    }
+    Some(ExportRecord {
+        key,
+        value: Some(m.user().to_vec()),
+    })
+}
+
+// 测试专用：`seek_prev_with` 为了返回一行，往回退过几把键。
+//
+// M20 的复杂度尺。旧实现把 `[库头, key]` 整段折成 `Vec` 再 `pop()` ⇒ 一次调用 O(库大小) 的
+// 时间和内存（200k 实测单次 140~610 ms，同库一次点读 2.9~57 µs）。改成反向逐步之后，代价只由
+// "要跳过几把死键"决定，与库大小无关 ⇒ 守卫断言的是**步数**，不是墙钟。
+#[cfg(test)]
+thread_local! {
+    static SEEK_PREV_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 本线程 `seek_prev` 往回退过的键数（测试探针用）
+#[cfg(test)]
+pub fn seek_prev_steps() -> u64 {
+    SEEK_PREV_STEPS.with(|c| c.get())
+}
+
+/// `seek_prev` 的一份循环：**反向一步取候选键，判定复用引擎现成的单键路径**。
+///
+/// - `prev_raw(bound)`：编码键 `≤ bound` 的**最大那一行**属于哪把逻辑键；`None` = 走到库头了
+/// - `live(raw)`：这把键对**当前事务**可见、未过期、非墓碑时交出那一行（用
+///   [`live_record_of_logical`] 配引擎的 `latest_visible_raw`，别在这里另写判定）
+///
+/// 上界那两条规则都不显然：
+/// - 第一轮用 `version_key_upper_bound(key)` ⇒ 含 `key` **自己那一组**（语义是"≤ key"不是"< key"）；
+/// - 之后用被拒的那把 raw 本身当上界：它的每行都是 `raw ‖ version_be` > `raw` ⇒ 整组自动排除，
+///   而所有更小的键都还在。
+///
+/// ⚠️ "反向第一个见到的 raw 就是最大的那把键"依赖版本键的老合同 **`version < 2^56`**
+/// （见 [`crate::common::version_key_upper_bound`]）：首字节 0x00 小于任何 ASCII，短前缀键的版本行
+/// 才翻不到更长键之上。合同破了这里会**静默返回偏小的键** —— 那条合同自己有守卫，别拆。
+pub fn seek_prev_with(
+    at_or_below: &[u8],
+    mut prev_raw: impl FnMut(&[u8]) -> Option<Vec<u8>>,
+    mut live: impl FnMut(&[u8]) -> Option<ExportRecord>,
+) -> Option<ExportRecord> {
+    let mut bound = crate::common::version_key_upper_bound(at_or_below);
+    loop {
+        #[cfg(test)]
+        SEEK_PREV_STEPS.with(|c| c.set(c.get() + 1));
+        let raw = prev_raw(&bound)?;
+        if let Some(rec) = live(&raw) {
+            return Some(rec);
+        }
+        if raw.as_slice() >= bound.as_slice() {
+            // 只有某家的 `prev_raw` 没按界排除整组时才会走到这里；宁可返回 None 也不原地打转
+            return None;
+        }
+        bound = raw;
+    }
+}

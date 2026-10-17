@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 271 个单元测试 + 4 个集成测试
+- 272 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -584,7 +584,7 @@ loop {
 |---|---|
 | `version.rs`:版本键编解码 + vacuum「留哪一版」判定 | 遍历原语:`iter_meta_from` / `scan_entries_break_from` / `scan_latest_light_window` / `scan_entries_from` —— KeyDir、叶子链、SST 分层、BTreeMap 根本不是一种东西 |
 | `kernel.rs`:可见性判据 `visible_at`、`HealthFold`、`VacuumScheduler`(含"取账不能 swap")、`is_unfinished`、**`fold_window`**(窗口折叠驱动)、**`search_page_from`**(分页核) |
-| **`store.rs`(M18a):`VersionedStore` trait + `collect_rows` + `search_window`** —— "按 enc 升序折出每把 key 的胜出行、界内过滤、取值、剥壳、窗口化"从此只有一份 | 有界遍历的**早停与起点**:谁能反向走、谁只有单向 `next_leaf`、谁的窗口要按源封顶 |
+| **`store.rs`(M18a):`VersionedStore` trait + `collect_rows` + `search_window`** —— "按 enc 升序折出每把 key 的胜出行、界内过滤、取值、剥壳、窗口化"从此只有一份。**M20 又添两句**:`seek_prev_with`(反向逐步的循环 + 按组退界)与 `live_record_of_logical`(单键"活着吗"的判定,与 `scan` 同一份口径) | 有界遍历的**早停与起点**:谁能反向走、谁只有单向 `next_leaf`、谁的窗口要按源封顶。**反向一步**同一家一个样子:mem `range_back` / bitcask `range_meta_back`(只读 KeyDir,不碰 value)/ bplus `find_back`(跨叶有进度守卫)/ lsm `find_back`(逐源取最大) |
 | `types.rs`:`MvccHealth` / `VacuumStats` / `VacuumRound` / `DurabilityProfile` | 各自的守卫测试:同一条通道在不同引擎的**量尺不同**(读盘次数 / value 解码次数 / 物化次数 / 克隆次数),拿一把尺量不到另外三家 |
 | **`txn.rs`(M18b~M18e):`TxnCore` + `WriteSide` + `WalTail`** —— begin 的版本号与活跃快照登记、**整条写序列**(冲突判定 → 值编码 → 页容量判定 → WAL Begin → WAL Write → 落行 → 写集登记)、`commit` 销账 + 回收记账、`rollback` 按写集撤销、批量写的**部分撤销**、bulk 会话的版本与收尾幂等 | 写路径上"这一行的字节去哪、WAL 记录怎么排、大值走不走旁路、装不装得下一页" —— 那些是 `WriteSide` 的槽(有 WAL / blob / 页容量的人家只实现自己那几条,其余走默认实现 = 不做也不失败) |
 | `VersionedStore` 的**两个方法**:`scan_candidates`(我这家的键怎么折)与 `materialize`(一组的字节在哪儿 —— KeyDir 在日志另一处、B+ 树在叶子里、LSM 要跨源点查、内存就在同一个 map)。**三态** `RowValue{Value,Tombstone,Missing}` 是刻意的:折叠侧必须分得开"读不到"与"墓碑", 合成 `Option` 就会把 lsm 那行"视图里有、值里没"的跳过语义改掉 |
@@ -669,12 +669,12 @@ cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline 
 
 新加进去的是**之前没量过的功能**，不是重复旧项：`multi_get` 全未命中的单价、`scan_page` 翻完整库、
 `seek_prev`、`reverse_scan`、`set_with_ttl` + `get_ttl`、`vacuum_bounded` 一片、`export` 全库物化、
-`migrate` → memory。**两条新的超线性就是这一轮抓到的**（都还没修，已写进[已知局限](#已知局限)）：
+`migrate` → memory。**两条新的超线性就是这一轮抓到的**（M21 修一条、M20 修一条，都还留着各自的表行）：
 
 | 操作（单位写全） | 20k | 200k | 比值 | 判读 |
 |---|---|---|---|---|
-| ⚠️ `seek_prev` 单次（µs/次） bitcask | 52 192 | 382 234 | 7.3× | **一次调用只为返回一行，却把整段前缀物化进 `Vec`** ⇒ O(库) |
-| ⚠️ `seek_prev`（µs/次） bplus / lsm / memory | 32 444 / 46 961 / 31 583 | 328 583 / 610 488 / 139 960 | 10.1× / 13× / 4.4× | 同上，四家各一份同一形状；**M21 帮不到它**（反向要的是按 raw 排序的游走） |
+| ⚠️→✅ `seek_prev` 单次（µs/次） bitcask | 52 192 → **20.6** | 382 234 → **39.8** | 改前 7.3× → **改后 1.9×** | **已修(M20)**：改前一次调用只为返回一行，却把整段前缀物化进 `Vec` ⇒ O(库)；200k 便宜 **9 600 倍** |
+| ⚠️→✅ `seek_prev`（µs/次） bplus / lsm / memory | 32 444 / 46 961 / 31 583 → **16.5 / 24.9 / 10.4** | 328 583 / 610 488 / 139 960 → **98.3 / 93.6 / 16.7** | 改后 6.0× / 3.8× / 1.6×（改前 10.1× / 13× / 4.4×） | ✅ 同一份循环（便宜 3 300~9 600 倍）。⚠️ 剩下的 1.6~6× 是**各家的老账**（bplus 页覆盖 / lsm 版本散在更多 SST），不是整段物化；bplus 因此仍是四家里最贵的一次调用 |
 | `scan_page` 每页（µs/页，页宽 500） bplus | 12 480 | 189 151 → **1 361**（M21 后） | 改前 15.2× → **改后 0.11×** | ✅ **已修(M21)**：游标下推成迭代起点 |
 | `scan_page` 每页（µs/页） lsm / bitcask / memory | 9 685 / 4 544 / 4 489 | 132 601→**1 522** / 18 821→**1 495** / 16 817→**620** | 改后 0.16× / 0.33× / 0.14× | ✅ 已修；改前 bplus 翻完整库 400 页 × 189 ms ≈ **75.7 s**，改后 **0.54 s**（同库一次全量 `scan` 是 0.58 s ⇒ 翻页现在≈扫一遍） |
 | `migrate` → memory（µs/行） bplus | 36.2 | 216.2 → **16.3** | 改后 0.45× | ✅ 同一个根，一起修好了（13 倍） |
@@ -687,7 +687,11 @@ cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline 
 
 两条 ⚠️ 的形状不是猜的，是读代码读出来的：
 
-- `seek_prev` 四家都是同一份 `scan(None, Some(key‖0x00))` → `retain(≤ key)` → `pop()`。
+- ⚠️→✅ `seek_prev` 四家原先都是同一份 `scan(None, Some(key‖0x00))` → `retain(≤ key)` → `pop()`；
+  **已修(M20)**：循环收成 `common::store.rs` 的 `seek_prev_with` 一份，每家只交两个口子 —— 反向一步
+  （mem `range_back` / bitcask `range_meta_back` / bplus `find_back` / lsm `find_back`）+ 单键可见行
+  （复用现成的 `latest_visible_raw`，判定走 `live_record_of_logical`，与 `scan` 同一份口径）。
+  被拒的那把 raw 直接当下一轮上界 ⇒ 它的整组版本行自动排在界外，**一步跨一整把键**。
 - `scan_candidates` 的 `after` 只在循环里 `continue` 过滤，迭代起点仍用 `start` ⇒ 游标退化成过滤器。
   于是"顺序翻页"不是 O(库) 而是 **O(库²/页宽)**；`migrate` 与 `search` 的续跑共用这条路径。
 
@@ -988,10 +992,21 @@ data.db.lock       单写者锁(内含 pid)
   ⚠️ 刻意**没有**加 `get_raw`:`get` 本来就是它的读侧对应物,再造一个同名不同义的口只会让人问"该用哪个";
   真要"不经剥壳的存储字节"那是另一个能力(目前只有引擎内部的 `latest_visible_raw`),未对外承诺。
   仍留的坑:`set` 本身还是要求调用方自己打过信封(现有调用点按这个约定写,改它是破坏性变更)
-- ⚠️ **`seek_prev` 是"整段物化再挑一条"**（四家各一份同一形状，2026-10-17 的 200k 补测抓到）：
-  实现是 `scan(None, Some(key‖0x00))` + `retain` + `pop` ⇒ 一次调用 = O(库大小) 的时间**和内存**。
-  200k 实测单次 **140~610 ms**（同库一次点读 2.9~57 µs，差 3~4 个数量级）。正解是走各家已有的反向
-  定位原语（mem `range` 反向 / `find_back` / 叶子反向 / KeyDir 回退），还没做。
+- ~~⚠️ **`seek_prev` 是"整段物化再挑一条"**~~ **已修(M20)**：四家原先各一份
+  `scan(None, Some(key‖0x00))` + `retain` + `pop` ⇒ 一次调用 = O(库大小) 的时间**和内存**
+  （200k 实测单次 **140~610 ms**，同库一次点读 2.9~57 µs）。现在循环只有
+  `common::store.rs::seek_prev_with` 一份，每家交两个口子：反向一步（mem `range_back` /
+  bitcask `range_meta_back` / bplus `find_back` / lsm `find_back` —— 都是现成的点读热路径原语）
+  与"这把键活着吗"（配 `live_record_of_logical`，判定与 `scan` 同一份，不另写第二份）。
+  20k / 200k 台架复测（µs/次）：bitcask 52 192→**20.6** / 382 234→**39.8**，bplus 32 444→**16.5** /
+  328 583→**98.3**，lsm 46 961→**24.9** / 610 488→**93.6**，memory 31 583→**10.4** / 139 960→**16.7**
+  ⇒ 200k 便宜 **3 300~9 600 倍**，规模比值从 4.4~13× 收到 1.6~6×（剩下的那点是 bplus 页覆盖 /
+  lsm 版本散在更多 SST 的**老账**，见上表，不是这条通道）。
+  换掉形状之后代价单位也换了：一次 `seek_prev` 现在等于**个位数次点读**（200k 实测 1.9~6.3× 同库
+  随机点读），改之前是 **6 100~48 000×**（bitcask 382 234 µs ÷ 9.6 µs、memory 139 960 ÷ 2.7）。
+  ⚠️ 那条"O(库) 的**内存**"是读代码读出来的，台架量不到：`seek_prev` 的峰值一直是 `+0.0 MB` ——
+  物化的 `Vec` 在函数内部就析构了，而采样发生在调用边界上（同一次跑里"一次全量 scan"能把
+  `+48 MB` 报出来，正因为它的 Vec 交到了调用方手里）。尺子看不见 ≠ 没有，这条别记反了。
 - ~~⚠️ **`scan_page` 的游标 `after` 没有下推成迭代下界**~~ **已修(M21)**：`common::store.rs` 新增
   `fold_lower_bound(start, after)`，四家把游标抬成**迭代起点**（过滤器原样保留）⇒ 每页只付页宽。
   计数守卫（N=2000、页宽 50）：首页 52 / 最后一页 **51** 把键，bplus 3 / 3 次页读；把下推退回
@@ -1004,13 +1019,16 @@ data.db.lock       单写者锁(内含 pid)
   （50 行的余量够盖住 40 次页读），改成 `2*first+8` 才会红。
   ③ 下界必须取 `after‖0x00×8` 而不是 `after‖0xFF×8`：后者会把 `"abcd"`（比 `"abc"` 大、字节序却小于
   `"abc"‖FF…`）**整把键跳掉** —— 静默少行。
-- ⚠️ **`seek_prev` 仍是"整段物化再挑一条"**（四家各一份，200k 实测单次 140~610 ms；**未修**）：
-  实现是 `scan(None, Some(key‖0x00))` + `retain` + `pop`。**快速实现有个静默陷阱**：版本键按
-  `raw ‖ version_be` 排序 ⇒ 短前缀键的高版本行会插进更长键的区间（`enc("ab",MAX) > enc("abc",0)`），
-  所以"反向走第一个见到的 raw"**给出的不是最大的那把键**（反例：bound=`"abd"`、库里有 `"ab"` 与
-  `"abc"` ⇒ 会返回 `"ab"`）。要么返回错答案，要么一路走到底（＝现状）。真正的解是一把
-  **按 raw 排序、可定位、可反向**的索引；"把正向折叠镜像一遍"这条已经判死（收口条件无法在
-  enc 字节序上表达）。
+- ⚠️→✅ **`seek_prev` 为什么可以"反向走、第一个见到的 raw 就当是最大的键"**（这条判断在 M20 里翻过一次，
+  记录下来免得再翻）：版本键按 `raw ‖ version_be` 排序，所以**短前缀键的高版本行**理论上会插进更长键
+  的区间（`enc("ab", MAX) > enc("abc", 0)`），于是"反向第一个 raw"可能给出 `"ab"` 而不是 `"abc"`。
+  但本仓库的老合同是 **`version < 2^56`**（见 `common::version_key_upper_bound` 的文档与其守卫）⇒
+  版本首字节恒为 `0x00`，小于任何 ASCII，那条交错**在合同内不成立** ⇒ 反向游走是正确的，
+  **不需要**新造一把"按 raw 排序、可定位、可反向"的索引。
+  ⚠️ 依赖是实的：合同一破（有人把版本推到 ≥2^56），`seek_prev_with` 会**静默返回偏小的键** ——
+  所以它引用的就是那条已有合同，而那条合同有自己的守卫，别拆。
+  顺带订正我早先的一句判死："把正向折叠镜像一遍"当时判死是因为收口条件无法在 enc 字节序上表达 ——
+  那个判断只对**不带界的镜像**成立；按组退不需要收口条件，界本身就是收口。
 - ⚠️ **单个事务内的写集查重是 O(写集²)**:内核 `TxnCore::write` 登记写集时用
   `writes.iter().any(|k| k == key)` 判"这把键是否已登记"。2026-10-17 实测它**不是**灌行超线性的
   主导项(同一事务里第 1~200 行与第 1801~2000 行单价相同:1463 vs 1387 µs,因为事务宽度只有 1000),
@@ -1128,7 +1146,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:271 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:272 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

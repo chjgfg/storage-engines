@@ -1371,6 +1371,166 @@ mod tests {
         assert_eq!(finals[0].1, vec![(b"hot".to_vec(), Some(b"v1".to_vec()))]);
     }
 
+    /// M20 守卫：一次 `seek_prev` 的代价 = "往回跳过几把死键"，**不是** "库里有多少把键"。
+    ///
+    /// 改之前四家各写一份 `scan(None, Some(key‖0))` + `retain` + `pop`：为了拿"≤key 的最后一条
+    /// 活记录"，把整个前缀物化出来（200k 行实测单次 140~610 ms，还带 O(库) 的瞬时内存）。
+    /// 现在循环只有一份 [`crate::common::seek_prev_with`]，每家只给两个口子：反向一步 + 单键可见行。
+    ///
+    /// 三条断言各抓一种**互不重叠**的退化，顺序是刻意的（②③在前、①在后：三种退化各由第一条撞上
+    /// 它的断言报出来，实测都能撞红，下面就是当时留下的数字）：
+    /// ② **步数**：共用内核的探针 `seek_prev_steps()`，断的是**精确形状** `DEAD + 1` = 9：死串每把
+    ///    一步、答案一步。每把死键都带 5 个版本 ⇒ 按「组」跳才是 9 步。把 memory 的反向一步改成
+    ///    交回编码键（忘记剥版本后缀）实测报 2 步 ⇒ 撞红。
+    /// ③ **本引擎的尺子**：抓"这一次调用又把前缀折了一遍"。老写法（不调内核 ⇒ ②读到 0）实测 ——
+    ///    bitcask `keydir_visits` 2017 / lsm `light_visits` 2017 / memory `fold_keys` 2017 /
+    ///    bplus `page_reads` 63；新写法 0（memory 是 `range_back` 取回的 35 行）。⚠️ 预算必须按各家
+    ///    **单位**给：bplus 的 2000 把键只摊在 63 片叶子上，拿"键数"当预算抓不到它 ⇒ 按"每步 4 页"给。
+    /// ① **等价**：与"从 probe 往回逐把点读、第一把读得通的就是答案"这个语义参考比对，还要求答案
+    ///    正是死串下面那把活键。只测快不测对，就是拿错数据换性能：把共用判定里的过期检查摘掉，
+    ///    ②③全绿而这条报红（把已过期的那把交了出去）。
+    ///    ⚠️ ②③ 数的是**内核圈的步数**与**折叠/取回的量**，看不见各家反向原语内部走了多少把键；
+    ///    那层有界性靠 `take(1)` 与 bplus 的跨叶进度守卫，另有各自的测试。
+    #[test]
+    fn seek_prev_costs_a_walk_not_the_library() {
+        const N: usize = 2000;
+        const DEAD: usize = 8;
+        const CHAIN: usize = 5;
+        let dead_start = N - DEAD;
+        let answer = format!("k{:05}", dead_start - 1);
+        let probe = format!("k{:05}", N - 1);
+
+        for (name, db, dir) in open_all() {
+            {
+                let tx = db.begin();
+                for i in 0..N {
+                    assert!(
+                        tx.set(format!("k{i:05}").as_bytes(), b"v".to_vec()),
+                        "{name}: 灌第 {i} 把"
+                    );
+                }
+                tx.commit();
+            }
+            // 顶上 DEAD 把（含答案键）各再写几份 ⇒ 每把都有 CHAIN 个版本：
+            // 反向一步必须按"组"跳，一步只该跨过一把键的全部版本
+            {
+                let tx = db.begin();
+                for i in dead_start..N {
+                    for _ in 1..CHAIN {
+                        tx.set(format!("k{i:05}").as_bytes(), b"v".to_vec());
+                    }
+                }
+                for _ in 1..CHAIN {
+                    tx.set(answer.as_bytes(), b"v".to_vec());
+                }
+                tx.commit();
+            }
+            // 前 DEAD-1 把删除，最后一把写成"入库时就已经过期"
+            // （`set` 收的是已打信封的逻辑值，`pack_ttl(…, 1)` = 1970 年到期）
+            {
+                let tx = db.begin();
+                for i in dead_start..N - 1 {
+                    tx.delete(format!("k{i:05}").as_bytes());
+                }
+                assert!(
+                    tx.set(
+                        format!("k{:05}", N - 1).as_bytes(),
+                        crate::common::codec::pack_ttl(b"v", 1),
+                    ),
+                    "{name}: 写过期键"
+                );
+                tx.commit();
+            }
+
+            // 参考值只用点读算：从 probe 往回逐把 `get`，第一把读得通的就是"≤probe 的最大活键"。
+            // 单独开一个事务，是为了不让这 9 次点读混进下面要量的尺子里。
+            let mut want: Option<Vec<u8>> = None;
+            {
+                let tx = db.begin();
+                for i in (0..N).rev() {
+                    let k = format!("k{i:05}");
+                    if tx.get(k.as_bytes()).is_some() {
+                        want = Some(k.into_bytes());
+                        break;
+                    }
+                }
+                tx.commit();
+            }
+
+            // 先量再断：退化时那一步的形状要在打印里看得见，别让它被前面一条断言挡掉
+            let s0 = crate::common::store::seek_prev_steps();
+            let m_rows = crate::memory::mem_store::rows_touched();
+            let m_fold = crate::memory::memory_mvcc::fold_keys();
+            let bc = crate::bitcask::bitcask::keydir_visits();
+            let lv = crate::lsm_tree::sst::light_visits();
+            let br = crate::lsm_tree::sst::block_reads();
+            let pr = crate::bplus_tree::page::page_reads();
+            let ph = crate::bplus_tree::page::cache_hits();
+            let tx = db.begin();
+            let hit = tx.seek_prev(probe.as_bytes());
+            tx.commit();
+            let steps = crate::common::store::seek_prev_steps() - s0;
+            let d_rows = crate::memory::mem_store::rows_touched() - m_rows;
+            let d_fold = crate::memory::memory_mvcc::fold_keys() - m_fold;
+            let d_bc = crate::bitcask::bitcask::keydir_visits() - bc;
+            let d_lv = crate::lsm_tree::sst::light_visits() - lv;
+            let d_br = crate::lsm_tree::sst::block_reads() - br;
+            let d_pr = crate::bplus_tree::page::page_reads() - pr;
+            let d_ph = crate::bplus_tree::page::cache_hits() - ph;
+            let ruler = match name {
+                "memory" => d_rows.max(d_fold),
+                "bitcask" => d_bc,
+                "lsm_tree" => d_lv.max(d_br),
+                _ => d_pr.max(d_ph),
+            };
+            eprintln!(
+                "[seek_prev] {name}: {steps} 步 / 尺子 {ruler}（库 {N} 把、顶上 {DEAD} 把已死、每把 {CHAIN} 版）\
+                 rows={d_rows} fold={d_fold} keydir={d_bc} light={d_lv} block={d_br} page={d_pr} cache={d_ph}"
+            );
+            // ② 步数断的是**精确形状** = 死串每把一步 + 答案一步（实测四家都是 9）。
+            // 不写 `<=` 是因为这轮的代价模型没有"多走几步也算对"的余地：多步 = 有组没被界挡住，
+            // 少步 = 界把活键也一起跳了（那必然同时错答案，只是 ① 先报还是 ② 先报的区别）。
+            assert_eq!(
+                steps,
+                DEAD as u64 + 1,
+                "{name}: 一次 seek_prev 往退了 {steps} 把键，而死串只有 {DEAD} 把 ⇒ \
+                 界没按「组」跳（步数偏多），或者反向一步的界把活键也跳过了（步数偏少）"
+            );
+            // 预算按各家的**单位**分别给：bplus 数的是页，2000 把键只摊在 63 片叶子上 ⇒ 拿"键数"
+            // 当预算抓不到 bplus 的老写法（实测老写法只付 63，低于 160）。
+            let budget = match name {
+                "bplus_tree" => steps * 4 + 8,
+                _ => (DEAD * CHAIN) as u64 * 4,
+            };
+            assert!(
+                ruler <= budget,
+                "{name}: 一次 seek_prev 付了 {ruler}（本引擎尺子），预算 {budget}；库 {N} 把、死串只有 {DEAD} 把 ⇒ \
+                 又在折全库（老写法实测：bitcask/lsm/memory 2017 把键、bplus 63 页）"
+            );
+            // ① 等价放最后：上面两条撞红时报的是"形状"，这一条报的是"数据"。三种退化各由第一条
+            // 撞上它的断言报出来 —— 老写法不调共用内核（②读到 0 步），界算错但答案仍可能对（只有
+            // ②看得见），判定漏了过期/墓碑（前两条都绿，答案错，只有 ①看得见）。
+            assert_eq!(
+                hit.as_ref().map(|r| r.key.clone()),
+                want,
+                "{name}: seek_prev 与「逐把点读往回找」的参考不一致"
+            );
+            assert_eq!(
+                hit.as_ref().map(|r| r.key.clone()),
+                Some(answer.as_bytes().to_vec()),
+                "{name}: seek_prev 应落在死串下面第一把活键 {answer}（删掉的、过期的都不许交出去）"
+            );
+            assert_eq!(
+                hit.as_ref().and_then(|r| r.value.clone()).as_deref(),
+                Some(&b"v"[..]),
+                "{name}: seek_prev 交出来的 value 不该是信封裸字节"
+            );
+            if let Some(d) = dir {
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
+    }
+
     #[test]
     fn all_engines_bulk_load() {
         let engines = open_all();
