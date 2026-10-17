@@ -259,6 +259,29 @@
     `write` / 写冲突检测 / `commit` / `rollback` / `rollback_keys` / bulk 版本编排现在只有
     `common/txn.rs` 一份实现；各家剩下的就是自己那几个槽（内存 3 个方法、LSM 5 个、
     bitcask 6 个、bplus 7 个）。新增第五个引擎要写的东西从"抄 100 行事务层"变成"实现这几个方法"。
+- **修掉 LSM 灌数据的 O(N²)（M19）**：`LSMTree::maybe_flush_mem` 原先每次插入都
+  `self.mem.values().map(|v| v.len()).sum()` 一遍 —— 只为回答"要不要 flush"。改成**增量计数器**
+  `mem_entries`（`mem_insert_no_wal` 里新增版本时 +1、同 seq 覆盖不加、`flush_mem` 清零），
+  `maybe_flush_mem` 与 `stats()` 都改读它，**判定语义一字未动**（阈值比的仍是"版本条数"）。
+  - 怎么撞出来的：200k 大规模基线（`SCALE_ROWS=200000`）显示 lsm 灌行从 20k 的 38.8 µs/行涨到
+    200k 的 **227.8 µs/行**（每行贵 5.87 倍 ⇒ 十倍量花约五十九倍时间），而 bitcask 同一项是
+    **1.04× 平的** —— 所以不是机器、不是台架。新加的归因台架 `lsm_fill_attribution` 逐块排除：
+    块读全程 0（前十万行 `total_sst=0`，所以**不是**"写侧冲突探测在探 SST"）、自动回收开/关
+    两条曲线一模一样、三段计时里 `begin`≈1 µs 且 `commit`≈2.7 ms 恒定而 `set` 段 69 ms→1001 ms、
+    **完全不经 MVCC 的裸 `insert` 曲线与灌入曲线重合**（89→1429 µs/行）⇒ 定位在存储层。
+  - 复测（同一台架、release）：灌行 **20k = 14.5 µs/行、200k = 21.0 µs/行（比值 1.45×）**，
+    归因整轮 82 s → **5.0 s**；顺带 `vacuum() 全库` 2050 → 1265 ms、`search 首页(要 total)`
+    1086 → 687 ms（它们的落盘/重插也走同一条判定）。墙钟本机 ±2×，只报方向；
+    定性结论靠计数尺。
+  - 两把守卫，各自都证过会红：
+    `test_mem_entry_counter_matches_slow_scan` —— 计数器与慢算法**口径对拍**（含多版本、同 seq
+    覆盖、墓碑、flush 清零四个形状）；把 flush 的清零去掉 ⇒ 当场红。
+    `test_flush_check_does_not_scan_memtable_per_insert` —— 复杂度尺：灌 4000 行期间"为判定走过的
+    memtable 条目数"必须是 **0**；把整表 `sum` 放回热路径 ⇒ 当场红。同一条用例里**主动慢数一次**
+    作为对照，证明这把尺子不是空转（`scan_mem_entry_count()` 因此是留着当对照与探针的，不是死代码）。
+  - ⚠️ 顺带记下一笔还没修的：内核 `TxnCore::write` 登记写集用 `writes.iter().any(|k| k == key)`
+    查重 ⇒ **单个事务内**是 O(写集²)。实测它不是灌行超线性的主导项（同一事务里第 1~200 行与
+    第 1801~2000 行单价相同：1463 vs 1387 µs），但一个大事务塞几万行时它会浮出来。
 - **`KvTxn::set_raw(key, value)`（M16，非破坏）**：存**任意字节**的原样写入口 —— 信封由引擎打
   （内部就是 `set(key, pack_plain(value))`），`get` 一字不差还回来。存在的理由：`set` 的约定是
   "传进来的字节已经是打过信封的逻辑值"，直接拿它存裸字节会按首字节偶发丢数据 —— `0x00` 打头少

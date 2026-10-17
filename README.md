@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 265 个单元测试 + 4 个集成测试
+- 267 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -644,6 +644,36 @@ cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline 
    这条已在同批改掉（见上表"改之前/改之后"），教训留下：**耗时数字要先归因再动手**，
    否则很容易拿"点读 1 ms"去怀疑本来已经修好的查找路径。
 
+### 大规模复测（200k 行，release，同一份构建对照跑 20k 与 200k）
+
+判据是**每行/每次成本的比值**：10× 数据量 ⇒ 线性就是 10×，比值 >10 才叫"随规模恶化"。
+别拿 `µs/行` 一个数下结论 —— 20k 时看着正常的数字，10× 之后可能已经是 O(N²)。
+
+| 指标 | 20k | 200k | 每行成本比 | 结论 |
+|---|---|---|---|---|
+| bitcask 灌行 | 14.7 | 15.3 µs/行 | 1.04× | 平 —— 写侧的参照系 |
+| **lsm 灌行（M19 之前）** | 38.8 | **227.8** | **5.87×** | O(N²)：每插一行都为"要不要 flush"重数整个 memtable |
+| **lsm 灌行（M19 之后）** | **14.5** | **21.0** | **1.45×** | 基本持平；残差是 flush/compaction 与 WAL checkpoint |
+| bitcask 首页(免 total) | 306.8 | 290.5 µs/次 | 0.95× | 平 —— 窗口分页在大库上站住了 |
+| bplus 首页(免 total) | 133.7 | 146.4 µs/次 | 1.10× | 平 |
+| lsm 首页(免 total) | 266.9 | 385.0 µs/次 | 1.44× | O(SST 文件数)，M15b 之后不再随行数涨 |
+| bplus `health()` | 13.2 | 272.7 ms | **2.06×** | ⚠️ 未修：200k 行约 12000 页 > `max_cache_pages` 1024 ⇒ 走查每行重读 |
+| bplus 随机点读 / multi_get | 11.6 / 10.5 | 39.8 / 39.6 µs | **3.4× / 3.8×** | ⚠️ 同上；**有序**只 1.3× ⇒ 差的是覆盖率，不是复杂度 |
+| lsm 随机点读 / multi_get | 9.6 / 9.5 | 50.0 / 41.6 µs | **5.2× / 4.4×** | ⚠️ 版本散在更多 SST（M10 那条通道） |
+| memory 全项 | — | — | ≈1.0–1.4× | 平 |
+
+另外量出来的一条：**200k 行做 `一次全量 scan` 的瞬时峰值 +48 MB**（返回的是物化 `Vec`，
+常驻 30.7 MB ≈ 结果集本身）—— 翻页请走 `KvTxn::scan_page`，它每页只折 `limit + 1` 组。
+
+复现与归因（都是 `#[ignore]`，必须 `--test-threads=1`，内存计数是进程级的）：
+
+```bash
+SCALE_ROWS=200000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
+# 写侧归因台架：报块读 / SST 数 / memtable 字节 / begin·set·commit 三段耗时 / 裸 insert 单价
+LSM_FILL_ROWS=200000 LSM_FILL_CHUNK=20000 cargo test --release --lib -- --ignored --nocapture \
+    --test-threads=1 lsm_fill_attribution
+```
+
 ### WAL 与崩溃恢复
 
 WAL 有 5 种记录:`Begin` / `Write` / `Commit` / `Abort` / `Checkpoint`,帧格式带 CRC32,损坏或不完整的尾部会被直接丢弃(模拟崩溃截断)。
@@ -868,6 +898,14 @@ data.db.lock       单写者锁(内含 pid)
   但"句柄可共享"不等于"并发写" —— 上面那条单写者没变。
 
 **LSM**
+- ~~事务式灌数据是 **O(N²)**:每次插入都为"要不要 flush"把整个 memtable 数一遍~~ **已修(M19)**:
+  条数改成增量计数器 `mem_entries`(`mem_insert_no_wal` 里 +1、`flush_mem` 清零),判定语义一字未动。
+  200k 大规模基线抓到它的形状是"每行代价随 memtable 规模涨"(裸 `insert` 不经 MVCC 也一样涨 89→1429 µs/行,
+  所以不在事务层)。两把守卫:`test_mem_entry_counter_matches_slow_scan`(口径对拍,慢算法留着当对照 ——
+  **条数是"版本条数"不是"键数"**),`test_flush_check_does_not_scan_memtable_per_insert`(计数尺:灌 4000 行
+  期间"为判定走过的 memtable 条目数"必须是 **0**,同一条用例里主动慢数一次证明探针不是空转)。
+  ⚠️ 归因台架 `lsm_fill_attribution`(`#[ignore]`)留着:它同时报块读、SST 数、memtable 字节和
+  begin/set/commit 三段耗时 —— 这条病的教训正是"**µs/行 一个数不能替整条路径说话**"。
 - `fix_level_overlaps` 发现层内 key range 重叠**只打印警告,不修复**
 - compact 时每个 key 只保留最新一条,`enable_snapshot_gc` 并未真正按 snapshot 水位保留旧版本(源码注释已自陈)
 - `blobs/` 旁路的回收挂在 `vacuum()` 的全库轮次上(compact 判不了"别的层里还有更新的版本引用同一个 blob");**有界轮次不动 blob**,引用关系只有全库才看得全
@@ -924,6 +962,10 @@ data.db.lock       单写者锁(内含 pid)
   ⚠️ 刻意**没有**加 `get_raw`:`get` 本来就是它的读侧对应物,再造一个同名不同义的口只会让人问"该用哪个";
   真要"不经剥壳的存储字节"那是另一个能力(目前只有引擎内部的 `latest_visible_raw`),未对外承诺。
   仍留的坑:`set` 本身还是要求调用方自己打过信封(现有调用点按这个约定写,改它是破坏性变更)
+- ⚠️ **单个事务内的写集查重是 O(写集²)**:内核 `TxnCore::write` 登记写集时用
+  `writes.iter().any(|k| k == key)` 判"这把键是否已登记"。2026-10-17 实测它**不是**灌行超线性的
+  主导项(同一事务里第 1~200 行与第 1801~2000 行单价相同:1463 vs 1387 µs,因为事务宽度只有 1000),
+  但"一个事务塞几万行"时它会浮出来。要改就换成 `HashSet` 副账,代价是回滚时多一趟差集。
 - ~~**门面还缺的三项**~~ → 已补两项(M13):`EngineConfig` 现在装着四家的旋钮(bitcask 分片上限、
   LSM 整份 `LSMTreeOptions`、WAL 收口阈值、自动回收切片),`vacuum_bounded` / WAL 阈值读写 /
   `tuning()` 也都上了 `KvEngine`。仍缺的一项是跨引擎 `migrate()` 的库 API(只有 CLI)。
@@ -1037,7 +1079,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:265 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:267 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

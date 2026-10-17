@@ -147,6 +147,29 @@ impl LSMTreeOptions {
 /// user_key -> (seq -> value)；同 key 多版本以支持 Snapshot
 type MemMap = BTreeMap<Vec<u8>, BTreeMap<u64, EntryValue>>;
 
+// 测试专用：本线程「为了数 memtable 条目而走过的条目数」。
+//
+// M19 的复杂度尺子。它数的不是" flush 判定的结果对不对"，而是**判定本身花了多少步**：
+// 旧写法每次 insert 都为"要不要 flush"把整表数一遍 ⇒ 灌 N 行是 O(N²)（200k 大规模基线抓到：
+// 裸 insert 每行 89 µs → 1429 µs，与 memtable 规模同步）。改成增量计数器之后这个数**不该再涨**；
+// 对照（同一条用例里主动调一次慢口径）证明这把尺子本身不是空转。
+#[cfg(test)]
+thread_local! {
+    static MEM_SCAN_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 记一次「把 memtable 数了一遍」的步数（只由 `scan_mem_entry_count` 调用）
+#[cfg(test)]
+pub(crate) fn note_mem_scan_steps(n: u64) {
+    MEM_SCAN_STEPS.with(|c| c.set(c.get() + n));
+}
+
+/// 当前线程为"数 memtable 条目"走过的条目总数（测试探针用）
+#[cfg(test)]
+pub(crate) fn mem_scan_steps() -> u64 {
+    MEM_SCAN_STEPS.with(|c| c.get())
+}
+
 /// compaction filter：返回 `true` 保留，`false` 丢弃。
 pub type CompactionFilter =
     Arc<dyn Fn(&[u8], &StoredEntry) -> bool + Send + Sync + 'static>;
@@ -162,6 +185,12 @@ pub struct LSMTree {
     dir: PathBuf,
     opts: LSMTreeOptions,
     mem: MemMap,
+    /// memtable 里的**版本条数**（Σ 每个键的版本数），与 `scan_mem_entry_count` 同口径。
+    ///
+    /// ⚠️ 必须是增量维护的计数，不许现算：2026-10-17 的 200k 大规模基线抓到旧写法在这里
+    /// 每次插入都把整个 memtable 数一遍（只为回答"要不要 flush"），于是灌 N 行是 O(N²) ——
+    /// 裸 `insert`（不经 MVCC）每行代价从 89 µs 涨到 1429 µs，与灌入曲线重合。
+    mem_entries: usize,
     mem_bytes: usize,
     immutables: Vec<MemMap>,
     levels: Vec<Vec<SstFile>>,
@@ -255,6 +284,7 @@ impl LSMTree {
             dir: dir.clone(),
             opts,
             mem: BTreeMap::new(),
+            mem_entries: 0,
             mem_bytes: 0,
             immutables: Vec::new(),
             levels: (0..max_levels).map(|_| Vec::new()).collect(),
@@ -793,14 +823,32 @@ impl LSMTree {
     fn mem_insert_no_wal(&mut self, key: Vec<u8>, val: StoredEntry) {
         let add = key.len() + val.estimate_bytes();
         let versions = self.mem.entry(key).or_default();
-        if let Some(old) = versions.insert(val.seq, val.value) {
-            self.mem_bytes = self
-                .mem_bytes
-                .saturating_sub(old.estimate_bytes())
-                .saturating_add(add);
-        } else {
-            self.mem_bytes = self.mem_bytes.saturating_add(add);
+        let replaced = versions.insert(val.seq, val.value);
+        // 上面那句之后 `versions` 的借用就结束了，所以这里才允许动 `self` 的其它字段
+        match replaced {
+            // 同 seq 被覆盖：条数不变，只换字节账
+            Some(old) => {
+                self.mem_bytes = self
+                    .mem_bytes
+                    .saturating_sub(old.estimate_bytes())
+                    .saturating_add(add);
+            }
+            None => {
+                self.mem_bytes = self.mem_bytes.saturating_add(add);
+                self.mem_entries += 1;
+            }
         }
+    }
+
+    /// 慢口径：真把整个 memtable 数一遍。**只给测试当对照**——生产路径一律读 `mem_entries`。
+    ///
+    /// 留着它有两个用处：① 与增量计数器对拍口径（"版本条数"不是"键数"）；
+    /// ② 当复杂度守卫的探针 —— 它每被调一次就把"走过的条目数"记账，所以"热路径有没有偷偷
+    /// 现算"是能直接数出来的（M19 的守卫断言灌 4000 行期间这个计数**一点没涨**）。
+    #[cfg(test)]
+    fn scan_mem_entry_count(&self) -> usize {
+        note_mem_scan_steps(self.mem.len() as u64);
+        self.mem.values().map(|v| v.len()).sum()
     }
 
     fn mem_get_at(map: &MemMap, key: &[u8], snap_seq: u64) -> Option<StoredEntry> {
@@ -1164,9 +1212,10 @@ impl LSMTree {
     }
 
     fn maybe_flush_mem(&mut self) {
-        let mem_entry_count: usize = self.mem.values().map(|v| v.len()).sum();
+        // ⚠️ 读增量计数器，不是现算。旧写法 `self.mem.values().map(|v| v.len()).sum()` 每次
+        // 插入都走一遍整表 ⇒ 灌 N 行 O(N²)。判定语义（"版本条数 ≥ 阈值就 flush"）一字未动。
         let by_entries = self.opts.mem_threshold_entries > 0
-            && mem_entry_count >= self.opts.mem_threshold_entries;
+            && self.mem_entries >= self.opts.mem_threshold_entries;
         let by_bytes = self.mem_bytes >= self.opts.mem_threshold_bytes;
         if by_entries || by_bytes {
             let _ = self.flush_mem();
@@ -1446,7 +1495,8 @@ impl LSMTree {
         LsmStats {
             live_keys: self.cached_live,
             tombstones: self.cached_tomb,
-            mem_entries: self.mem.values().map(|v| v.len()).sum(),
+            // 与 flush 判定同一个来源（增量计数器），所以 `stats()` 也是 O(层数) 而不是 O(memtable)
+            mem_entries: self.mem_entries,
             mem_bytes: self.mem_bytes,
             l0_files: self.levels.first().map(|l| l.len()).unwrap_or(0),
             l1_files: self.levels.get(1).map(|l| l.len()).unwrap_or(0),
@@ -1528,6 +1578,7 @@ impl LSMTree {
             return Ok(());
         }
         let frozen = std::mem::take(&mut self.mem);
+        self.mem_entries = 0;
         self.mem_bytes = 0;
         self.immutables.insert(0, frozen);
         self.flush_one_immutable()?;
@@ -2229,6 +2280,75 @@ mod tests {
         let p = crate::common::tmp_test_path("lsm", tag, "");
         let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    /// M19 守卫①：增量计数器 `mem_entries` 的**口径**必须与慢算法一字不差。
+    ///
+    /// 口径是「版本条数」（Σ 每键版本数），不是「键数」—— 当年正是为此才去 `sum` 整表。
+    /// 计数器只要漏了一条路径（同 seq 覆盖该不该加、flush 有没有清零），这条对拍当场红。
+    #[test]
+    fn test_mem_entry_counter_matches_slow_scan() {
+        let dir = tmp_dir("mem_counter");
+        {
+            let mut db = LSMTree::open(&dir).unwrap();
+            let check = |db: &LSMTree, at: &str| {
+                assert_eq!(
+                    db.stats().mem_entries,
+                    db.scan_mem_entry_count(),
+                    "{at}：计数器与慢口径不一致"
+                );
+            };
+            check(&db, "空库");
+            for i in 0..50 {
+                db.put(format!("k{i}").into_bytes(), b"v".to_vec());
+            }
+            check(&db, "50 把新键");
+            // 同一把键堆版本：条数按版本算，不按键算
+            for _ in 0..7 {
+                db.put(b"k0".to_vec(), b"v2".to_vec());
+            }
+            check(&db, "k0 多版本");
+            db.delete(b"k1".to_vec());
+            check(&db, "含墓碑");
+            assert_eq!(db.stats().mem_entries, 58, "条数口径 = 版本条数（50 + 追加 7 + 墓碑 1）");
+            db.flush().unwrap();
+            check(&db, "flush 之后");
+            assert_eq!(db.stats().mem_entries, 0, "flush 没清零 ⇒ 下一次判定会提前触发");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M19 守卫②：**插一行不该为「要不要 flush」去数整个 memtable**。
+    ///
+    /// 这条是 M19 的病根。2026-10-17 的 200k 大规模基线抓到 LSM 灌行是 O(N²)：每次插入都
+    /// `self.mem.values().map(len).sum()` 一遍，于是裸 `insert` 每行从 89 µs 涨到 1429 µs。
+    /// 尺子数的不是墙钟而是**为判定走过的 memtable 条目数** —— 改成增量计数器之后它必须是 0。
+    ///
+    /// 对照段是必需的：探针如果空转，`assert_eq!(steps, 0)` 会永远绿。所以同一条用例里主动
+    /// 慢数一次，要求它**真的**被记进账（步数 == 表大小），证明这把尺子量得到东西。
+    #[test]
+    fn test_flush_check_does_not_scan_memtable_per_insert() {
+        const N: usize = 4000;
+        let dir = tmp_dir("mem_counter_hot");
+        {
+            let mut db = LSMTree::open(&dir).unwrap();
+            let s0 = mem_scan_steps();
+            for i in 0..N {
+                db.put(format!("key{i:06}").into_bytes(), b"x".to_vec());
+            }
+            let steps = mem_scan_steps() - s0;
+            assert_eq!(
+                steps, 0,
+                "灌 {N} 行为回答「要不要 flush」走了 {steps} 个 memtable 条目 ⇒ 热路径又变回\
+                 每插一行数一遍整表（旧形状实测 ≈ {} 步）",
+                (N * (N - 1) / 2) as u64
+            );
+            // 对照：主动慢数一次，探针必须数得到
+            let slow = db.scan_mem_entry_count() as u64;
+            assert_eq!(mem_scan_steps() - s0, slow, "探针空转：慢口径没被记进账，上一条断言不算数");
+            assert!(slow >= N as u64, "对照必须真数到 ≥{N} 条，实际 {slow}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
