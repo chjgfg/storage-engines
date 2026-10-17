@@ -5,12 +5,13 @@
 //! `swap` 当成取账写进了四份代码里，四家一起坏。所以这里把它们收成一份，
 //! 各引擎仍然保留自己的遍历原语和自己的守卫（合并的是判定与记账，不是扫描）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
 
+use crate::common::txn::Registry;
 use crate::common::types::MvccHealth;
 
 /// 快照可见性判据：版本 `v` 对「拿着 `my_version` 快照、看见活跃表 `active_xid`」的事务可见吗。
@@ -299,13 +300,13 @@ where
 /// 为什么用成员关系而不是额外标志位：`commit` / `rollback` 都以 `remove` 收尾，
 /// 所以「还在表里」就是「未终结」的充要条件，多一个标志位就多一处会写漏的可能。
 ///
-/// ⚠️ 这里**只查不删**。删除必须留给引擎自己的 `rollback()` —— 它还要按表里那份 key 列表
-/// 把本事务写过的版本行挨个清掉；在这里删掉，`rollback()` 就拿到空列表，
+/// ⚠️ 这里**只查不删**。删除必须留给引擎自己的 `rollback()` —— 它还要按表里那份写集
+/// 把本事务写过的版本行挨个清掉；在这里删掉，`rollback()` 就拿到空写集，
 /// 事务的行会留在库里（判据写成 `remove` 是我第一版的想法，看了 rollback 才否掉）。
 ///
 /// 锁中毒（别的线程 panic 过）时返回 `false`：Drop 里 panic 会直接 abort 进程，
 /// 宁可不回滚也不能把宿主进程带下去。
-pub fn is_unfinished(active_txn: &Mutex<HashMap<u64, Vec<Vec<u8>>>>, version: u64) -> bool {
+pub fn is_unfinished(active_txn: &Mutex<Registry>, version: u64) -> bool {
     match active_txn.lock() {
         Ok(guard) => guard.contains_key(&version),
         Err(_) => false,
@@ -505,8 +506,9 @@ mod tests {
 
     #[test]
     fn unfinished_is_answered_by_membership() {
-        let active: Mutex<HashMap<u64, Vec<Vec<u8>>>> =
-            Mutex::new(HashMap::from([(7u64, vec![b"k".to_vec()])]));
+        let mut ledger: crate::common::txn::Registry = std::collections::HashMap::new();
+        ledger.insert(7u64, [b"k".to_vec()].into_iter().collect());
+        let active: Mutex<crate::common::txn::Registry> = Mutex::new(ledger);
         assert!(is_unfinished(&active, 7), "还在活跃表里 ⇒ 未终结");
         // 判据必须**只查不删**：删除是引擎 rollback 的活，它要按表里那份 key 列表清行
         assert!(is_unfinished(&active, 7), "查一次不能把条目吃掉，否则 rollback 拿到空列表、行留在库里");

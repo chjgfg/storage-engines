@@ -22,7 +22,7 @@ pub use crate::common::{
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
 use crate::common::version_key_upper_bound;
-use crate::common::txn::{BulkCore, TxnCore, WriteSide};
+use crate::common::txn::{BulkCore, Registry, TxnCore, WriteSide};
 use crate::memory::mem_store::MemStore;
 
 // 测试专用：本线程在「每个逻辑 key 的胜出行」那次折叠里**走了多少个版本键**。
@@ -43,7 +43,7 @@ pub(crate) fn fold_keys() -> u64 {
 /// MVCC 引擎（单进程内存）
 pub struct MVCC {
     store: Arc<Mutex<MemStore>>,
-    active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
+    active_txn: Arc<Mutex<Registry>>,
     next_version: Arc<AtomicU64>,
     /// 自动回收：切片宽度 / 记账 / 游标（策略与实现在 [`crate::common::VacuumScheduler`]）
     vac: Arc<VacuumScheduler>,
@@ -394,7 +394,7 @@ impl Drop for Transaction {
 impl Transaction {
     pub fn begin(
         store: Arc<Mutex<MemStore>>,
-        active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
+        active_txn: Arc<Mutex<Registry>>,
         next_version: Arc<AtomicU64>,
         vac: Arc<VacuumScheduler>,
     ) -> Self {

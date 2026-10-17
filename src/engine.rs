@@ -1531,6 +1531,116 @@ mod tests {
         }
     }
 
+    /// M24 守卫：**写集登记每写一行只许考察一把键**，不许遍历写集。
+    ///
+    /// 老形状是 `writes.iter().any(|k| k == key)` ⇒ **单个事务内** O(写集²)（2026-10-17 记在案的那条：
+    /// 它不是灌行超线性的主导项，因为台架每 1000 行一事务，但"一个大事务塞几万行"就浮出来 ——
+    /// 那正是下游导历史数据的形状）。现在写集是 `HashSet`，查重与部分撤销的减法都走哈希。
+    ///
+    /// 尺子 [`crate::common::txn::write_set_scans`] 长在**唯一的写集入口** `register_write` /
+    /// `unregister_write` 里，数的是"为判重复考察过多少把已登记的键"：哈希每次 1，遍历每次
+    /// 是写集当前长度。断的是**精确值**（等号），所以"先 `contains` 再 `insert"` 这种双倍查重
+    /// 也会报红。⚠️ 同一条用例里用 [`crate::common::txn::write_set_contains_linear`] **主动慢数一次**
+    /// 当对照：既证明这把尺子不是空转，也当场量出退化版本一次查重要走多少把键（M19 同一手法）。
+    ///
+    /// ⚠️ **这把尺子有一处已知的盲角，所以另配一条代价尺**：探针写在 `register_write` 里面，
+    /// 谁把算法改回遍历、却忘了搬那行计数，计数照样读 1 次/行。堵它的是 `big_transaction_write_cost`
+    /// （墙钟台架，`#[ignore]`）—— 实测"只改算法、不改探针"那份退化在 bitcask 报头 200 行 9.3 /
+    /// 尾 200 行 **288.8 µs/行（30.9×）**当场红，而修好的形状是 0.48~1.37×。
+    /// 一条盯形状、一条盯代价：缺一条就有一种退化溜过去。
+    #[test]
+    fn write_set_registration_costs_a_hash_not_a_walk() {
+        const K: usize = 2000;
+        for (name, db, dir) in open_all() {
+            let s0 = crate::common::txn::write_set_scans();
+            {
+                let tx = db.begin();
+                for i in 0..K {
+                    assert!(
+                        tx.set(format!("w{i:05}").as_bytes(), b"v".to_vec()),
+                        "{name}: 灌第 {i} 把"
+                    );
+                }
+                // 同一把键反复写：一个事务里只算一行账，而成本也只该多一次查重
+                for _ in 0..10 {
+                    tx.set(b"w00000", b"v2".to_vec());
+                }
+                tx.commit();
+            }
+            let scans = crate::common::txn::write_set_scans() - s0;
+            eprintln!("[写集] {name}: {scans} 次查重 / {} 次写（老写法这里会是 {} 量级）", K + 10, K * K / 2);
+            assert_eq!(
+                scans,
+                (K + 10) as u64,
+                "{name}: 登记 {} 次却考察了 {scans} 把已登记的键 ⇒ 查重不再走哈希\
+                 （等号是刻意的：多出来的那次 `contains` 也算一次退化）",
+                K + 10
+            );
+
+            // 减法那条链（批量写撞墙后的部分撤销）同样不许遍历写集：
+            // 49 把落地 + 第 50 把冲突 ⇒ 49 次登记 + 49 次摘账
+            let holder = db.begin();
+            assert!(holder.set(b"zzz_conflict", b"h".to_vec()), "{name}: holder 占住键");
+            let mut items: Vec<(Vec<u8>, Vec<u8>)> = (0..49)
+                .map(|i| (format!("b{i:03}").into_bytes(), b"v".to_vec()))
+                .collect();
+            items.push((b"zzz_conflict".to_vec(), b"v".to_vec()));
+            let s1 = crate::common::txn::write_set_scans();
+            let (got, back) = {
+                let tx = db.begin();
+                let err = tx
+                    .batch_set(&items)
+                    .expect_err("{name}: batch_set 必须在占住的键上冲突");
+                let walked = crate::common::txn::write_set_scans() - s1;
+                tx.rollback();
+                (err, walked)
+            };
+            holder.rollback();
+            assert_eq!(got, b"zzz_conflict".to_vec(), "{name}: 冲突键");
+            eprintln!("[写集 减法] {name}: 49 落账 + 49 撤账 = {back} 次查重");
+            assert_eq!(
+                back, 98,
+                "{name}: 一批 49 把键的落账+撤账共考察 {back} 把 ⇒ 摘写集又在遍历写集了"
+            );
+
+            // 语义没被换掉：反复写的那把键读得到最后一次的值，事务收尾不留活跃事务
+            let tx = db.begin();
+            assert_eq!(
+                tx.get(b"w00000").as_deref(),
+                Some(&b"v2"[..]),
+                "{name}: 去重不许丢掉后写的值"
+            );
+            assert_eq!(
+                tx.get(b"w01999").as_deref(),
+                Some(&b"v"[..]),
+                "{name}: 集合里最后一把键必须照样提交（去重不许吞行）"
+            );
+            // 批量里第 50 把冲突 ⇒ 前 49 把（含 b048）必须整体退回，不能留在库里
+            assert_eq!(tx.get(b"b048"), None, "{name}: 部分撤销必须把已落地的行退掉");
+            assert_eq!(tx.get(b"b000"), None, "{name}: 同上（第一批那把）");
+            tx.commit();
+            assert_eq!(db.health().active_txns, 0, "{name}: 不许留活跃事务");
+
+            // 对照：慢算法在同规模的写集上，一次查重就走 K 把键 —— 证明这把尺子看得见东西
+            let ledger: std::collections::HashSet<Vec<u8>> =
+                (0..K).map(|i| format!("w{i:05}").into_bytes()).collect();
+            let c0 = crate::common::txn::write_set_scans();
+            assert!(
+                !crate::common::txn::write_set_contains_linear(&ledger, b"nobody"),
+                "{name}: 对照算法本身要能给出正确答案"
+            );
+            let control = crate::common::txn::write_set_scans() - c0;
+            eprintln!("[写集 对照] 老写法一次查重走 {control} 把键（K={K}）");
+            assert!(
+                control >= K as u64,
+                "{name}: 对照的慢算法只走了 {control} 把键 ⇒ 这把尺子空转，断言等于没测"
+            );
+            if let Some(d) = dir {
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
+    }
+
     #[test]
     fn all_engines_bulk_load() {
         let engines = open_all();
@@ -2516,6 +2626,61 @@ mod tests {
         eprintln!(
             "{engine:<10} {op:<24} {per:>11.1} {unit:<7} 常驻 {live_mb:>9.1} MB  峰值 +{peak_mb:>8.1} MB  {extra}"
         );
+    }
+
+    /// M24 的墙钟台架：**一个事务塞几万行**时，头几百行与尾几百行的单价必须同阶。
+    ///
+    /// 计数守卫 `write_set_registration_costs_a_hash_not_a_walk` 钉的是形状（每写一行只许考察一把键），
+    /// 这条是把同一个形状的**代价**量出来：老写法（遍历写集判重复）在这里是 O(写集²)，
+    /// 一个 20 000 行的事务走到第 19 800 行时，一次查重要走过 19 800 把已登记的键。
+    /// ⚠️ 断言故意给得松（墙钟本机 ±2×，且这里连存储层自己的增长也算在内）——
+    /// 精确的那半由计数尺守着，这条只报方向。
+    ///
+    /// ```text
+    /// BIG_TXN_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 big_transaction_write_cost
+    /// ```
+    #[test]
+    #[ignore = "大事务墙钟台架，手动 release 单线程跑：BIG_TXN_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 big_transaction_write_cost"]
+    fn big_transaction_write_cost() {
+        let rows: usize = std::env::var("BIG_TXN_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20000);
+        let edge = rows.min(200);
+        for (name, db, dir) in open_all() {
+            let tx = db.begin();
+            let mut head = 0u128;
+            let mut tail = 0u128;
+            for i in 0..rows {
+                let t = std::time::Instant::now();
+                assert!(
+                    tx.set(format!("k{i:06}").as_bytes(), b"v".to_vec()),
+                    "{name}: 灌第 {i} 把"
+                );
+                let spent = t.elapsed().as_nanos();
+                if i < edge {
+                    head += spent;
+                } else if i >= rows - edge {
+                    tail += spent;
+                }
+            }
+            tx.commit();
+            let head_us = head as f64 / edge as f64 / 1000.0;
+            let tail_us = tail as f64 / edge as f64 / 1000.0;
+            eprintln!(
+                "[大事务] {name}: 头 {edge} 行 {head_us:.1} µs/行 / 尾 {edge} 行 {tail_us:.1} µs/行\
+                 （同一事务共 {rows} 行，比值 {:.2}×）",
+                tail_us / head_us.max(0.001)
+            );
+            assert!(
+                tail_us <= head_us * 6.0 + 50.0,
+                "{name}: 一个事务里第 {rows} 行的单价 {tail_us:.1} µs 比第 1 行 {head_us:.1} µs 贵这么多 ⇒ \
+                 写集登记又在随写集长度涨（O(写集²) 回来了）"
+            );
+            if let Some(d) = dir {
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
     }
 
     #[test]

@@ -49,8 +49,64 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::common::version::encode_key;
 use crate::common::{WalPolicy, is_unfinished, visible_at, VacuumScheduler};
 
-/// 活跃事务表：`xid → 本事务写过的逻辑 key`。四家同一个类型，所以这里给个名字。
-pub type Registry = HashMap<u64, Vec<Vec<u8>>>;
+/// 活跃事务表：`xid → 本事务写过的逻辑 key 集合`。四家同一个类型，所以这里给个名字。
+///
+/// ⚠️ 值是**集合**不是 `Vec`：登记一把键之前要判"这把是否已经登记过"（同一把键在一个事务里
+/// 写三次只算一行账），遍历写集去判就是**单个事务内 O(写集²)** —— 与 M19 之前 LSM 的 flush
+/// 判定（每插一行把整个 memtable 重数一遍）是同一个形状，只是这次藏在事务里，只有"一个大事务
+/// 塞几万行"才浮出来（2026-10-17 实测它不是灌行超线性的主导项，因为台架每 1000 行一事务）。
+///
+/// 这里也**不需要顺序**：`rollback` 是逐把自己写过的版本行物理删掉，删的先后互不影响；
+/// `undo` 是集合减法。刻意只留一份账（不并存 `Vec` 顺序表）—— 两份账就会有一份写漏。
+pub type Registry = HashMap<u64, HashSet<Vec<u8>>>;
+
+// 测试专用：写集**加减一次要考察多少把已登记的键**。
+//
+// M24 的复杂度尺。哈希 = 每次 1（一次查重）；写成遍历写集就是每次 `写集当前长度`
+// ⇒ K 行合计 K(K−1)/2 次。⚠️ 这把尺子只有长在**唯一的写集入口** [`register_write`] /
+// [`unregister_write`] 里才有意义：绕过它再抄一份查重，计数就看不见那一份。
+#[cfg(test)]
+thread_local! {
+    static WRITE_SET_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_write_set_scan(n: u64) {
+    WRITE_SET_SCANS.with(|c| c.set(c.get() + n));
+}
+
+/// 本线程"写集加减考察过的已登记键数"（测试探针用）
+#[cfg(test)]
+pub fn write_set_scans() -> u64 {
+    WRITE_SET_SCANS.with(|c| c.get())
+}
+
+/// 登记一行进写集：`true` = 这行是新登记的那把键（同一把键在一个事务里只记一次账）。
+///
+/// 查重走哈希 —— **不许**退回 `writes.iter().any(|k| k == key)`，那是单事务内 O(写集²)。
+/// 尺子就在这个唯一入口里，所以退化会当场被 [`write_set_scans`] 看见。
+fn register_write(writes: &mut HashSet<Vec<u8>>, key: &[u8]) -> bool {
+    #[cfg(test)]
+    note_write_set_scan(1);
+    writes.insert(key.to_vec())
+}
+
+/// 从写集摘掉一行（批量写撞墙后的部分撤销）。同样是哈希减法，不是遍历。
+fn unregister_write(writes: &mut HashSet<Vec<u8>>, key: &[u8]) {
+    #[cfg(test)]
+    note_write_set_scan(1);
+    writes.remove(key);
+}
+
+/// **对照用的慢算法**：把写集整个走一遍来找重复。
+///
+/// 只为守卫存在（M19 同一手法）：同一条用例里主动慢数一次，既证明那把尺子不是空转，
+/// 也当场量出"退回遍历写集"要走多少把键。
+#[cfg(test)]
+pub fn write_set_contains_linear(writes: &HashSet<Vec<u8>>, key: &[u8]) -> bool {
+    note_write_set_scan(writes.len() as u64);
+    writes.iter().any(|k| k.as_slice() == key)
+}
 
 /// 一家的**写侧**：这一行的字节住在哪、WAL 与 blob 怎么落。
 ///
@@ -152,7 +208,7 @@ impl TxnCore {
         let active_xid = {
             let mut guard = active_txn.lock().unwrap();
             let snapshot: HashSet<u64> = guard.keys().cloned().collect();
-            guard.insert(version, Vec::new());
+            guard.insert(version, HashSet::new());
             snapshot
         };
         Self {
@@ -230,9 +286,7 @@ impl TxnCore {
 
         let writes = reg.entry(self.version).or_default();
         if side.put_versioned(&enc, stored) {
-            if !writes.iter().any(|k| k == key) {
-                writes.push(key.to_vec());
-            }
+            register_write(writes, key);
             return true;
         }
         // 落行失败：写集里一行都不许留（上面 `entry` 建的那个空条目不算账，
@@ -288,7 +342,10 @@ impl TxnCore {
             side.remove_versioned(&enc);
         }
         if let Some(writes) = reg.get_mut(&self.version) {
-            writes.retain(|w| !keys.iter().any(|k| k == w));
+            // 减法也走哈希：`writes.retain(|w| !keys.iter().any(...))` 是 O(写集 × 撤销数)
+            for k in keys {
+                unregister_write(writes, k);
+            }
         }
     }
 }

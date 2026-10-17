@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 272 个单元测试 + 4 个集成测试
+- 273 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -699,6 +699,8 @@ cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline 
 
 ```bash
 SCALE_ROWS=200000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
+# M24 的大事务台架：一个事务塞 20000 行，报头 200 行与尾 200 行的单价（µs/行）
+BIG_TXN_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 big_transaction_write_cost
 # 写侧归因台架：报块读 / SST 数 / memtable 字节 / begin·set·commit 三段耗时 / 裸 insert 单价
 LSM_FILL_ROWS=200000 LSM_FILL_CHUNK=20000 cargo test --release --lib -- --ignored --nocapture \
     --test-threads=1 lsm_fill_attribution
@@ -1029,10 +1031,16 @@ data.db.lock       单写者锁(内含 pid)
   所以它引用的就是那条已有合同，而那条合同有自己的守卫，别拆。
   顺带订正我早先的一句判死："把正向折叠镜像一遍"当时判死是因为收口条件无法在 enc 字节序上表达 ——
   那个判断只对**不带界的镜像**成立；按组退不需要收口条件，界本身就是收口。
-- ⚠️ **单个事务内的写集查重是 O(写集²)**:内核 `TxnCore::write` 登记写集时用
-  `writes.iter().any(|k| k == key)` 判"这把键是否已登记"。2026-10-17 实测它**不是**灌行超线性的
-  主导项(同一事务里第 1~200 行与第 1801~2000 行单价相同:1463 vs 1387 µs,因为事务宽度只有 1000),
-  但"一个事务塞几万行"时它会浮出来。要改就换成 `HashSet` 副账,代价是回滚时多一趟差集。
+- ~~⚠️ **单个事务内的写集查重是 O(写集²)**~~ **已修(M24)**：内核 `TxnCore::write` 登记写集用
+  `writes.iter().any(|k| k == key)` 判重复，部分撤销的摘账是 `retain` + `any` ⇒ 两条都是单事务内
+  O(写集²)。活跃表的值类型现在收成 `HashSet`（`Registry` 一个别名，四家的 `active_txn` 与
+  `is_unfinished` 都用它），**只留一份账**（不并存顺序 `Vec` + 哈希副账 —— 写集不需要顺序，
+  两份账就会有一份写漏）。实测（一个 20 000 行的事务，release，µs/行，头 200 vs 尾 200）：
+  bitcask 20.6/10.0、bplus 36.8/50.6、lsm 11.4/8.7、memory 1.5/1.5 ⇒ 平的；同一台架下把查重
+  改回遍历写集，bitcask 报 **9.3 → 288.8 µs/行（30.9×）**。
+  ⚠️ 这条**不是** 200k 台架那条超线性（那边每 1000 行一事务），它的形状是"一次导入塞一个大事务"。
+  ⚠️ 它也只有**一条计数尺守不住**：探针长在 `register_write` 里，谁改算法却忘了搬探针，尺子照样读
+  1 次/行 —— 所以形状尺（精确计数 2010/98）与代价尺（上面那条墙钟台架）是两条，互为对照。
 - ~~**门面还缺的三项**~~ → 已补两项(M13):`EngineConfig` 现在装着四家的旋钮(bitcask 分片上限、
   LSM 整份 `LSMTreeOptions`、WAL 收口阈值、自动回收切片),`vacuum_bounded` / WAL 阈值读写 /
   `tuning()` 也都上了 `KvEngine`。仍缺的一项是跨引擎 `migrate()` 的库 API(只有 CLI)。
@@ -1146,7 +1154,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:272 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:273 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

@@ -28,7 +28,7 @@ pub use crate::common::{
     DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
 use crate::common::{HealthFold, VacuumScheduler};
-use crate::common::txn::{BulkCore, TxnCore, WalTail, WriteSide};
+use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 use crate::common::vacuum_plan;
 use crate::common::version_key_upper_bound;
 
@@ -38,7 +38,7 @@ pub struct MVCC {
     /// 大 value 外置存储（与 kv 同库目录）
     blob: Arc<Mutex<BlobStore>>,
     wal: Arc<Mutex<Wal>>,
-    active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
+    active_txn: Arc<Mutex<Registry>>,
     next_version: Arc<AtomicU64>,
     /// WAL 增长到多少字节就在下一次提交后自动 checkpoint（0 = 关闭自动触发）
     wal_limit: Arc<AtomicU64>,
@@ -710,7 +710,7 @@ impl Transaction {
         kv: Arc<Mutex<BPlusTree>>,
         blob: Arc<Mutex<BlobStore>>,
         wal: Arc<Mutex<Wal>>,
-        active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
+        active_txn: Arc<Mutex<Registry>>,
         next_version: Arc<AtomicU64>,
         wal_limit: Arc<AtomicU64>,
         vac: Arc<VacuumScheduler>,
