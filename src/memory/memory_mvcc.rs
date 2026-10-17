@@ -293,19 +293,23 @@ impl Default for MVCC {
 
 impl BulkLoader {
     pub fn put(&mut self, key: &[u8], value: Vec<u8>) {
-        self.core.put(&self.store, key, value);
+        let mut side = self.store.lock().unwrap();
+        self.core.put(&mut *side, key, value);
     }
 
     pub fn put_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) {
-        self.core.put_batch_ref(&self.store, items);
+        let mut side = self.store.lock().unwrap();
+        self.core.put_batch_ref(&mut *side, items);
     }
 
     pub fn put_batch_owned(&mut self, items: Vec<(Vec<u8>, Vec<u8>)>) {
-        self.core.put_batch(&self.store, items);
+        let mut side = self.store.lock().unwrap();
+        self.core.put_batch(&mut *side, items);
     }
 
     pub fn delete(&mut self, key: &[u8]) {
-        self.core.delete(&self.store, key);
+        let mut side = self.store.lock().unwrap();
+        self.core.delete(&mut *side, key);
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -327,14 +331,15 @@ impl BulkLoader {
     }
 
     pub fn finish(mut self) {
-        self.core.finish();
+        self.core.first_finish();
     }
 }
 
 impl Drop for BulkLoader {
     fn drop(&mut self) {
-        // 忘了 `finish()` 也得把这次会话的版本号占掉（bulk 不写 WAL、不回滚，见 [`BulkCore`]）
-        self.core.finish();
+        // 忘了 `finish()` 也得把这次会话的版本号占掉（bulk 不写 WAL、不回滚，见 [`BulkCore`]）。
+        // 内存引擎收尾没有别的事要做，所以这里只剩幂等守卫本身。
+        self.core.first_finish();
     }
 }
 
@@ -356,6 +361,9 @@ impl WriteSide for MemStore {
         self.delete(enc);
     }
 }
+
+/// 内存引擎没有 WAL：收尾两条都用默认实现（空 impl 就是"什么都不做"的声明）。
+impl crate::common::WalTail for MemStore {}
 
 /// 链尾反向查找的首轮预算，不够再翻倍重试。
 ///
@@ -424,8 +432,11 @@ impl Transaction {
     }
 
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> bool {
-        // 冲突判定 → 写集登记 → 落行，那一段顺序在 [`TxnCore::write`]（四引擎共用的一份）
-        self.core.write(&self.store, key, value)
+        // 锁序：先活跃表，再存储侧（理由见 [`crate::common::TxnCore`] 的模块头）。
+        // 那 8 步序列（冲突判定 → 编码 → WAL → 落行 → 写集登记）在 [`TxnCore::write`] 里，四引擎一份。
+        let mut reg = self.core.lock_registry();
+        let mut side = self.store.lock().unwrap();
+        self.core.write(&mut reg, &mut *side, key, value)
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -600,12 +611,15 @@ impl Transaction {
     }
 
     pub fn commit(&self) {
-        // 销账 + 给自动回收记一笔账，都在 [`TxnCore::commit`]（四引擎共用的一份）
-        self.core.commit();
+        // 销账 + 给自动回收记一笔账，都在 [`TxnCore::commit`]；内存引擎没有 WAL，收尾交个空占位
+        let mut reg = self.core.lock_registry();
+        self.core.commit(&mut reg, &mut ());
     }
 
     pub fn rollback(&self) {
-        self.core.rollback(&self.store);
+        let mut reg = self.core.lock_registry();
+        let mut side = self.store.lock().unwrap();
+        self.core.rollback(&mut reg, &mut *side);
     }
 
     fn is_visible(&self, version: u64) -> bool {
@@ -615,7 +629,9 @@ impl Transaction {
 
     /// 部分撤销：批量写撞墙时把已落下的那几把 key 退回（连同写集一起摘掉）。
     pub(crate) fn undo(&self, keys: &[Vec<u8>]) {
-        self.core.undo(&self.store, keys);
+        let mut reg = self.core.lock_registry();
+        let mut side = self.store.lock().unwrap();
+        self.core.undo(&mut reg, &mut *side, keys);
     }
 
     /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键。

@@ -24,7 +24,7 @@ pub use types::{
 pub use store::{
     RowValue, VersionedStore, collect_rows, scan_page, search_bounds, search_window,
 };
-pub use txn::{BulkCore, TxnCore, WriteSide};
+pub use txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 pub use version::{decode_key, encode_key, vacuum_plan, version_key_upper_bound, VersionedKey};
 
 /// 测试专用的临时路径。**必须带进程内单调序号**，不能只靠时间戳。

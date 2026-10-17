@@ -586,7 +586,7 @@ loop {
 | `kernel.rs`:可见性判据 `visible_at`、`HealthFold`、`VacuumScheduler`(含"取账不能 swap")、`is_unfinished`、**`fold_window`**(窗口折叠驱动)、**`search_page_from`**(分页核) |
 | **`store.rs`(M18a):`VersionedStore` trait + `collect_rows` + `search_window`** —— "按 enc 升序折出每把 key 的胜出行、界内过滤、取值、剥壳、窗口化"从此只有一份 | 有界遍历的**早停与起点**:谁能反向走、谁只有单向 `next_leaf`、谁的窗口要按源封顶 |
 | `types.rs`:`MvccHealth` / `VacuumStats` / `VacuumRound` / `DurabilityProfile` | 各自的守卫测试:同一条通道在不同引擎的**量尺不同**(读盘次数 / value 解码次数 / 物化次数 / 克隆次数),拿一把尺量不到另外三家 |
-| **`txn.rs`(M18b):`TxnCore` + `WriteSide`** —— begin 的版本号与活跃快照登记、写冲突判定、写集登记、`commit` 销账 + 回收记账、`rollback` 按写集撤销、批量写的**部分撤销**、bulk 会话的版本与收尾 | 写路径上"动手之前先落哪条 WAL 记录 / 大值走不走 blob 旁路 / 这一行装不装得下一页" —— 内核只规定**锁序**(`active_txn` 必须先于存储),不规定字节往哪儿去 |
+| **`txn.rs`(M18b/M18c):`TxnCore` + `WriteSide` + `WalTail`** —— begin 的版本号与活跃快照登记、**整条写序列**(冲突判定 → 值编码 → WAL Begin → 页容量判定 → WAL Write → 写集登记 → 落行)、`commit` 销账 + 回收记账、`rollback` 按写集撤销、批量写的**部分撤销**、bulk 会话的版本与收尾幂等 | 写路径上"这一行的字节去哪、WAL 记录怎么排、大值走不走旁路、装不装得下一页" —— 那些是 `WriteSide` 的槽(有 WAL / blob / 页容量的人家只实现自己那几条,其余走默认实现 = 不做也不失败) |
 | `VersionedStore` 的**两个方法**:`scan_candidates`(我这家的键怎么折)与 `materialize`(一组的字节在哪儿 —— KeyDir 在日志另一处、B+ 树在叶子里、LSM 要跨源点查、内存就在同一个 map)。**三态** `RowValue{Value,Tombstone,Missing}` 是刻意的:折叠侧必须分得开"读不到"与"墓碑", 合成 `Option` 就会把 lsm 那行"视图里有、值里没"的跳过语义改掉 |
 
 判据、记账、折叠这些纯逻辑一旦复制,就会长成"一个 bug 四个实例"—— 自动回收那回我把 `swap`
@@ -594,12 +594,14 @@ loop {
 M18a 之后四家各自剩的只有"键怎么折 + 字节在哪"这两件事(每处 ~25 行,合计比原来少 80 行),
 **新增一个引擎只要实现 `VersionedStore` 那两个方法**,窗口/分页/界下推不用再抄第四遍。
 
-事务内核那条(M18b)同一判据,但**按引擎切里程碑搬**:读侧折叠一次就四家统一了(它只有两个方法),
-写侧要动的资源三家各不相同(纯内存 / WAL+blob / WAL+blob+页容量判定),所以内核先只收"四家算的是
-同一件事"那部分,`memory` 已用上,`bitcask` / `bplus_tree` / `lsm_tree` 挨个跟。搬一家就要当场
-证明它没改语义 —— 靠的是 `txn_kernel_agrees_across_engines`:同一段事务脚本(抢同一把 key、
+事务内核那条(M18b/M18c)同一判据,但**按引擎切里程碑搬**:读侧折叠一次就四家统一了(它只有两个方法),
+写侧要动的资源三家各不相同(纯内存 / WAL+blob / WAL+blob+页容量判定),所以内核把**整条写序列**收成一处、
+把"这一步这一家要不要做"做成槽,`memory` 与 `lsm_tree` 已用上,`bitcask` / `bplus_tree` 挨个跟。搬一家
+就要当场证明它没改语义 —— 靠的是 `txn_kernel_agrees_across_engines`:同一段事务脚本(抢同一把 key、
 回滚自己写过的行、批量写撞墙后的部分撤销、未收尾即丢弃)在四家跑出**同一个终态**,四家原有测试
-只测自家那一份副本,跨引擎对拍才看得见"内核写歪了"。
+只测自家那一份副本,跨引擎对拍才看得见"内核写歪了"。另外三条用变异测试钉住序列里最贵的三处:
+`commit` 无视"进过 WAL 才收尾" ⇒ 红在 `test_read_only_transaction_touches_no_wal`;把 WAL Write 挪到
+改库之后 ⇒ 红在 `test_disk_persist_across_reopen` + `test_export_latest_visible`。
 
 ### 长跑基线（事故形状，实测）
 

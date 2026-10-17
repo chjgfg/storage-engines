@@ -28,7 +28,7 @@
 use std::time::Duration;
 
 use crate::common::codec::parse_i64_user;
-use crate::lsm_tree::lsm_tree_mvcc::{encode_key, MVCC, Transaction};
+use crate::lsm_tree::lsm_tree_mvcc::{MVCC, Transaction, TxnSide};
 
 /// 公共类型与编解码工具现由 [`crate::common`] 统一定义。
 ///
@@ -82,19 +82,12 @@ impl Transaction {
 
     /// 回滚本事务对给定 keys 的当前 version 写入（不 Abort 整个事务）
     fn rollback_keys(&self, keys: &[Vec<u8>]) {
-        if keys.is_empty() {
-            return;
-        }
-        let ver = self.version();
+        // 撤行 + 摘写集那一段在 [`crate::common::TxnCore::undo`]（四引擎共用的一份）
+        let mut reg = self.core.lock_registry();
+        let mut wal = self.wal.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
-        for k in keys {
-            let _ = kv.remove(&encode_key(k, ver));
-        }
-        if let Ok(mut active) = self.active_txn.lock() {
-            if let Some(writes) = active.get_mut(&ver) {
-                writes.retain(|w| !keys.iter().any(|k| k == w));
-            }
-        }
+        self.core
+            .undo(&mut reg, &mut TxnSide { wal: &mut wal, kv: &mut kv }, keys);
     }
 
     // ── multi_get ──

@@ -192,12 +192,37 @@
     三家不同（纯内存 / WAL+blob / WAL+blob+页容量判定），所以按引擎各切一个里程碑搬，每搬一家
     就往 `WriteSide` 上加一个口子。净行数此刻是 **＋272**（内核 232 + 对拍测试 96 − memory 少掉
     的 111）：一家用上看不出收益，收益要在第三家搬完才兑现（每家还各留 ~100 行内核本体）。
+    —— **当天就被 M18c 更新**：口子（槽）一次加齐了，`lsm_tree` 同一天搬上，所以"三家各留一份"
+    当天变成"两家各留一份"；`＋272` 那笔账也从"一家用上"变成"两家用上"。
   - 守卫 `txn_kernel_agrees_across_engines`：同一段事务脚本在四家跑出**同一个终态**（逐字节比
     对 scan 结果）+ 跑完 `active_txns == 0`。为什么必须有它：`memory` 一家搬上共用内核时另三家
     还是各自的实现，而每家原有测试只测自家那一份 —— 内核写歪了单引擎测试看不见。四条断言各自
     证明会红（实测）：去掉冲突判定 ⇒ 红在"t2 必须是写冲突"；不登记写集 ⇒ 红在"丢弃的事务必须
     等于没写"；`undo` 变空操作 ⇒ 红在"部分撤销必须把 first 也退回"；`unfinished` 恒 `false`
     ⇒ 红在"不许留下活跃事务"。
+- **内核的写序列补上 WAL / blob / 页容量三个槽，`lsm_tree` 搬上（M18c）**：
+  `TxnCore::write` 从此是**整条八步序列**（冲突判定 → `encode_value` → `row_fits` → `wal_begin`
+  → `wal_write` → 写集登记 → `put_versioned`），后四步全是**带默认实现的槽**：没有 blob 的人家
+  不实现 `encode_value`（默认原样）、定长页之外不实现 `row_fits`（默认装得下）、没有 WAL 就
+  不实现 `wal_begin` / `wal_write`（默认成功）。于是内存引擎给的守卫只有三个必需方法，
+  LSM 多给两条 WAL，而"哪一步在什么之后"这份顺序只有一份实现。
+  - `commit` 的收尾另立 [`WalTail`] trait而不是并进写侧：commit 只需要 WAL，硬要它交一个写侧
+    守卫就等于让 LSM 在 fsync 期间一直握着 kv 锁把读者全挡在门外（改前就是先释放再收尾）。
+  - 一处行为差别如实记：容量判定（`row_fits`）提到 `wal_begin` **之前**，所以 bplus 那种
+    "被拒收的超大行"从此连 `Begin` 都不落（原先会留下一条开张没写的 `Begin`）。它不影响恢复
+    —— 见下面第三条。
+  - **三条变异测试**（每条都要证明会红）：① `commit` 无视"进过 WAL 才收尾" ⇒ 红在
+    `test_read_only_transaction_touches_no_wal`；② 把 `wal_write` 挪到改库之后（崩溃安全
+    不变量的反面）⇒ 红在 `test_disk_persist_across_reopen` + `test_export_latest_visible`；
+    ③ **`wal_begin` 整条去掉 ⇒ 265 条全绿**。第三条是本刀的**发现**而不是遗漏：
+    `analyze_recovery` 里 `Write` 走的也是 `open_writes.entry(xid).or_default()`，`Begin` 建的
+    空条目不承载任何信息，`max_xid` 也从 `Write` 就够。所以 WAL 里的 `Begin` 目前是**格式的
+    框架**、没有守卫覆盖 —— 谁要动它得先决定"要不要让它承载信息"，不能当成已验证的行为。
+  - 复测（release / 20000 行，同一台架）没有引入回归：LSM 灌 20000 行(事务) 52.3 → 55.7 µs/行、
+    点读乱序 13.1 → 15.0、有序 4.9 → 4.1、首页(免 total) 357.6 → 360.2 µs、bulk 6.1 → 5.9 µs/行；
+    memory 灌行 5.0 → 4.9、点读 2.2 → 2.2。本机墙钟 run 间 ±2×，这些全在噪声带内。
+  - 还没搬的：`bitcask`（要 `encode_value`）、`bplus_tree`（要 `encode_value` + `row_fits`），
+    各自一个里程碑。
 - **`KvTxn::set_raw(key, value)`（M16，非破坏）**：存**任意字节**的原样写入口 —— 信封由引擎打
   （内部就是 `set(key, pack_plain(value))`），`get` 一字不差还回来。存在的理由：`set` 的约定是
   "传进来的字节已经是打过信封的逻辑值"，直接拿它存裸字节会按首字节偶发丢数据 —— `0x00` 打头少
