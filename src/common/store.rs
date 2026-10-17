@@ -94,6 +94,28 @@ pub fn collect_rows<S: VersionedStore>(
     (rows, more)
 }
 
+/// 折叠的**迭代下界**：`start`（含）与 `after`（不含）里字节序更大的那个。
+///
+/// 为什么可以拿 `after` 当起点而不是只在循环里过滤它：任何 `raw > after` 的键，它的版本键
+/// `raw ‖ version_be` 一定 `≥ raw > after` ⇒ 从字节界 `after` 起升序走，需要的那些行**一行都不会漏**；
+/// 而 `raw == after` 那一组与"以 after 为前缀的更短键"的高版本仍会被走到，靠调用方那句
+/// `raw <= after ⇒ continue` 挡掉（版本键前缀交错的坑，见 [`crate::common::version`]）。
+/// 反过来**不能**用 `after ‖ 0xFF×8` 当下界：那会把 `"abcd"`（比 `"abc"` 大、字节序却小于
+/// `"abc"‖FF…`）整把键跳掉 —— 静默少行。
+///
+/// 没有这一条，`scan_page` 每翻一页都要从库头重走：每页代价 ∝ 库大小（2026-10-17 的 200k
+/// 实测：bplus 每页 12.5 ms → 189 ms），`migrate` 与 `search` 的续跑共用这条路径。
+pub fn fold_lower_bound<'a>(
+    start: Option<&'a [u8]>,
+    after: Option<&'a [u8]>,
+) -> Option<&'a [u8]> {
+    match (start, after) {
+        (Some(s), Some(a)) => Some(if a > s { a } else { s }),
+        (None, Some(a)) => Some(a),
+        (s, None) => s,
+    }
+}
+
 /// 模式 ⇒ 折叠界。前缀是有界的（可以把界下推给折叠），Contains 只能全库走。
 pub fn search_bounds<'a>(
     pattern: Option<&'a [u8]>,

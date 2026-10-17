@@ -506,6 +506,8 @@ impl Transaction {
         budget: usize,
     ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
         let hi_enc = end.map(version_key_upper_bound);
+        // 游标下推：`after` 不只是过滤器，它同时抬高迭代起点（M21，否则翻每页都从库头重走）
+        let lo = crate::common::fold_lower_bound(start, after);
         let store = self.store.lock().unwrap();
         let mut out: Vec<crate::common::WinCandidate<Option<Vec<u8>>>> = Vec::new();
         let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
@@ -537,7 +539,7 @@ impl Transaction {
         }
 
         let mut stopped_by_budget = false;
-        for enc in store.iter_keys_in(start, hi_enc.as_deref()) {
+        for enc in store.iter_keys_in(lo, hi_enc.as_deref()) {
             #[cfg(test)]
             FOLD_KEYS.with(|c| c.set(c.get() + 1));
             let Some(vk) = decode_key(enc) else {

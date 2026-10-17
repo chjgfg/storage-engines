@@ -606,6 +606,80 @@ mod tests {
     /// （实测 20000 键时首页也要 100 ms 量级）。尺子是本引擎的折叠计数 `fold_keys()`。
     /// 顺序是**先量窗口、再量全量**：后跑的那次缓存更热，把偏差留给"全量更贵"那一侧，
     /// 这条断言只会因此更难通过，不会反过来骗人。
+    /// M21 守卫：**翻页的代价要跟着页宽走，不能跟着库大小走** —— 而且必须测"后面的页"。
+    ///
+    /// 首页从库头起，游标 `after` 就算没下推它也一样便宜 ⇒ 只测首页会一路绿灯（bitcask 那条
+    /// `scan_page_costs_the_page_and_walks_the_whole_library_once` 量的就是首页，这个洞在它眼皮
+    /// 底下活了一整个版本）。所以这里量**最后一页**，并要求它与首页同阶。
+    /// 尺子用本引擎自己的（`fold_keys()`（比过多少把编码键）），判完代价还判**等价**：最后一页的起点必须正好是全库
+    /// 第 `(pages-1)×PAGE` 把键 —— 只测便宜不测内容，就是拿错数据换性能。
+    #[test]
+    fn test_scan_page_later_pages_cost_the_page_not_the_library() {
+        const N: usize = 2000;
+        const PAGE: usize = 50;
+        {
+            let mvcc = MVCC::new();
+            {
+                let tx = mvcc.begin_transaction();
+                for i in 0..N {
+                    assert!(tx.set(format!("k{i:05}").as_bytes(), b"x".to_vec()));
+                }
+                tx.commit();
+            }
+            
+            let b0 = fold_keys();
+            let (first, mut cur) = {
+                let tx = mvcc.begin_transaction();
+                let p = tx.scan_page(None, PAGE);
+                tx.commit();
+                p
+            };
+            let first_cost = fold_keys() - b0;
+
+            let mut pages = 1usize;
+            let mut last_rows = Vec::new();
+            // **只量最后一页**：把整段翻页的总和当一页看，会把 39 页的成本当成一页去断言
+            let mut last_cost = 0u64;
+            while let Some(c) = cur {
+                let b1 = fold_keys();
+                let tx = mvcc.begin_transaction();
+                let (rows, next) = tx.scan_page(Some(&c), PAGE);
+                tx.commit();
+                last_cost = fold_keys() - b1;
+                last_rows = rows;
+                pages += 1;
+                cur = next;
+                assert!(pages <= N / PAGE + 2, "游标不前进？已 {pages} 页");
+            }
+
+            let want = (pages - 1) * PAGE;
+            assert!(!last_rows.is_empty(), "最后一页不能是空的");
+            {
+                let tx = mvcc.begin_transaction();
+                let all = tx.scan(None, None);
+                tx.commit();
+                assert_eq!(all.len(), N, "全库应折出 {N} 行");
+                assert_eq!(
+                    last_rows[0].key, all[want].key,
+                    "第 {pages} 页的起点不是全库第 {want} 把键 ⇒ 翻页漏行或重行"
+                );
+                assert_eq!(
+                    all[(want + last_rows.len() - 1)].key,
+                    last_rows.last().unwrap().key,
+                    "最后一页的终点也对不上"
+                );
+            }
+            eprintln!(
+                "[scan_page 翻页] 首页 {first_cost} / 最后一页 {last_cost}（页宽 {PAGE}，共 {pages} 页，N={N}）"
+            );
+            assert!(
+                last_cost <= 2 * (first_cost + PAGE as u64),
+                "最后一页付了 {last_cost}，首页只 {first_cost} ⇒ 游标 `after` 没下推成迭代起点，\
+                 每页都从库头重走（翻完整库 = O(库²/页宽)）"
+            );
+        }
+    }
+
     #[test]
     fn test_search_window_costs_the_window_not_the_library() {
         const N: usize = 2000;

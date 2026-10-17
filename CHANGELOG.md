@@ -299,6 +299,27 @@
     2.8~9.3 ms（≈1×，与库大小无关）；TTL 往返、`export` 单价、窗口 `scan` 全平。
     `multi_get` 全未命中只要 0.5~0.9 µs/键（bitcask/lsm），而命中要 9~58 µs ⇒ 未命中几乎免费，
     命中的钱全在"定位并读出值"上 —— 这把 M10 那条"点读 ∝ SST 分散度"的口径钉得更实了。
+- **翻页游标下推成迭代起点（M21）—— `scan_page` 不再是 O(库²/页宽)**：`common::store.rs` 新增
+  `fold_lower_bound(start, after)`，四家的 `scan_candidates` 从"只在循环里 `continue` 过滤 `after`"
+  改成"把 `after` 抬成迭代下界"（`iter_meta_from` / `scan_entries_break_from` / `light_iter_range` /
+  `iter_keys_in` 的起点），过滤器原样保留。
+  - 为什么下界必须取 `after ‖ 0x00×8` 而不是 `after ‖ 0xFF×8`：任何 `K > after` 的版本键都
+    `≥ K > after` ⇒ 一行不漏；而用 `0xFF` 上界当起点会把 `"abcd"`（比 `"abc"` 大、字节序却小于
+    `"abc"‖FF…`）**整把键跳掉** —— 静默少行。`raw == after` 那一组与交错进来的更短前缀键，
+    仍由原有那句 `raw <= after ⇒ continue` 挡掉（代价 = 重看游标那一组的链，摊销后是常数）。
+  - 守卫四份（每家用自己的尺子）：`test_scan_page_later_pages_cost_the_page_not_the_library`，
+    断言**最后一页**与首页同价。实测修完：bitcask/lsm/memory 首页 52 / 最后一页 51 把键，
+    bplus 3 / 3 次页读；把 `fold_lower_bound` 退回"只按 `start`" ⇒ **四家全红**。
+  - 200k 台架复测（同一构建，µs/页、页宽 500）：bplus 189 151 → **1 361**（139×）、lsm 132 601 →
+    **1 522**（87×）、bitcask 18 821 → **1 495**（12.7×）、memory 16 817 → **620**（27×）
+    ⇒ bplus 翻完整库从 **75.7 s 变成 0.54 s**（同库一次全量 `scan` 是 0.58 s，即翻页现在≈扫一遍）；
+    `migrate` 跟着修好：bplus 216.2 → **16.3 µs/行**、lsm 167.1 → **13.6**、bitcask 27.2 → **10.6**、
+    memory 27.5 → **8.0**。整个 31 项 × 4 引擎的台架从 325.7 s 跑到 **97.6 s**。
+  - ⚠️ **只测首页的守卫抓不到这条**：bitcask 早就有一条 `scan_page_costs_the_page_...`，量的正是
+    首页 —— 首页从库头起，游标没下推它也便宜，于是这个洞在它眼皮底下活了一整个版本。新守卫
+    因此把"最后一页"写进断言名里。bplus 还额外踩到一次"余量按谁的单位给"：照抄键-counting 的
+    `2*(first+PAGE)` 时，它在缺陷版上照样绿（它的尺子数页，50 行的余量够盖住 40 次页读）⇒
+    按页重定成 `2*first+8` 才会红。
 - **`KvTxn::set_raw(key, value)`（M16，非破坏）**：存**任意字节**的原样写入口 —— 信封由引擎打
   （内部就是 `set(key, pack_plain(value))`），`get` 一字不差还回来。存在的理由：`set` 的约定是
   "传进来的字节已经是打过信封的逻辑值"，直接拿它存裸字节会按首字节偶发丢数据 —— `0x00` 打头少

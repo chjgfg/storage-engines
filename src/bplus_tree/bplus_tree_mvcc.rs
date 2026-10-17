@@ -873,7 +873,7 @@ impl Transaction {
             let mut winners: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
             let mut pending: Option<Vec<u8>> = None;
             let accept: Option<&dyn Fn(&[u8]) -> bool> = accept;
-            kvengine.scan_entries_break_from(start, |enc, row| {
+            kvengine.scan_entries_break_from(crate::common::fold_lower_bound(start, after), |enc, row| {
                 if hi_enc.as_deref().is_some_and(|h| enc >= h) {
                     return true; // 按 enc 定界 ⇒ 有序迭代后面只会更大，可以真停
                 }

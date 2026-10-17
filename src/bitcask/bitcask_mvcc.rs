@@ -936,7 +936,7 @@ impl Transaction {
             let kvengine = self.kv.lock().unwrap();
             let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
             let mut pending: Option<Vec<u8>> = None;
-                for (enc, _loc) in kvengine.iter_meta_from(start) {
+                for (enc, _loc) in kvengine.iter_meta_from(crate::common::fold_lower_bound(start, after)) {
                 #[cfg(test)]
                 crate::bitcask::bitcask::note_keydir_visit();
                 if hi_enc.as_deref().is_some_and(|h| enc.as_slice() >= h) {
