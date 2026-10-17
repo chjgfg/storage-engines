@@ -6,8 +6,8 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 276 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** M10–M13(10-16 之后的提交:LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 278 个单元测试 + 4 个集成测试
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M25**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -18,13 +18,15 @@
 (发布于 2026-10-15,未 yank)。**这一版已经包含**七条"随 uptime 恶化"通道的修复与 M9 的门面
 改造(`KvEngine: Send + Sync`、类型化选型、`EngineName`)⇒ 版本号依赖就能拿到。
 
-但 0.4.0 那个发布件**不含 10-16 之后的 M10–M13**:LSM 点查的常驻文件句柄与稀疏索引二分
+但 0.4.0 那个发布件**不含 10-16 之后的 M10–M25**:LSM 点查的常驻文件句柄与稀疏索引二分
 (下游实测单次点查 0.86 ms 那条就是它)、四引擎窗口/前缀 scan 的界下推、bitcask 懒分配写缓冲、
-B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`。
-磁盘格式这五批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
+B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`、四引擎
+事务内核合成一份、`migrate` + `scan_page`、LSM 灌行 O(N²)、`seek_prev` 整段物化、游标未下推、
+B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`。
+磁盘格式这十六批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M13
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M25
 storage-engines = { path = "../storage-engines" }
 
 # (b) 走远端:git 依赖(gitee 与 github 内容一致)
@@ -34,7 +36,7 @@ storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branc
 storage-engines = "0.4"
 ```
 
-`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M13 又想要版本号依赖,
+`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M25 又想要版本号依赖,
 只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
 MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
@@ -157,6 +159,11 @@ let t = db.tuning();
 assert_eq!(t.get("block_cache_blocks"), Some("1024"));
 assert_eq!(t.get("wal_checkpoint_bytes"), Some("16777216")); // memory 上这条是 None
 ```
+
+⚠️ **`*_blocks` 是配置值，`block_cache_capacity` 才是生效值**（M23）。LSM 的 MVCC 档开着块缓存
+自动档：`生效容量 = clamp(库的 SST 块数, block_cache_blocks, block_cache_auto_max)`，默认
+256 地板 / 1024 上限，并在每次 flush / compact 之后重算。所以长跑进程里"这个数在动"是设计如此，
+不是旋钮失效；要钉死就把 `block_cache_auto_max` 设成 0（配置值即生效值）或把地板抬到上限。
 
 三条边界,都由守卫钉住(`engine_config_knobs_reach_the_engine_and_are_readable_back`、
 `lsm_mvcc_pins_the_two_fields_that_would_break_crash_safety`):
@@ -659,8 +666,15 @@ cargo test --release --lib bitcask::bitcask_mvcc::tests::test_long_run_baseline 
 | lsm 首页(免 total) | 266.9 | 385.0 µs/次 | 1.44× | O(SST 文件数)，M15b 之后不再随行数涨 |
 | bplus `health()` | 20.7 | 357.9 ms | **2.06× → 17.3×** | ✅ 已修(M22)：绝对值两头都降（23.96→20.66 / 438.2→357.9 ms），**比值变大是因为小库那一头掉到地板价** —— 判超线性要看每单位成本的绝对值，比值只在"两边都没装满"时才有意义 |
 | bplus 随机点读 / multi_get | 11.6 / 10.5 → **8.5 / 6.0** | 39.8 / 39.6 → **43.8 / 39.2** µs | 改后 5.2× / 6.5×（**绝对值两头都在降**） | ✅ 已修(M22)：20k 那一档现在就是台架的"全焐热地板"(7.8 µs/次)；200k 仍受自动档 2048 页上限约束 ⇒ 覆盖率 16.9%，要更快得自己把容量调大（价签：+8.4 MB 常驻） |
-| lsm 随机点读 / multi_get | 9.6 / 9.5 | 50.0 / 41.6 µs | **5.2× / 4.4×** | ⚠️ 版本散在更多 SST（M10 那条通道） |
+| lsm 随机点读 / multi_get | 9.6 / 9.5 | 50.0 / 41.6 µs | **5.2× / 4.4×** | ⚠️ 这两列是 **M23 之前那份构建**的数，别拿今天的 µs 去对照它 —— 见下面那段"噪声标定"。M23 给块缓存加了自动档，凭据是同构建 A/B 的**计数**（5002 键：乱序 27.9 → **8.5** µs/次、未命中 0.39 → 0.03，块/次两边都是 4.00；200k：一次未命中 ≈ 94 µs，冷启动读 4 条 1027.5 → **289.5**） |
 | memory 全项 | — | — | ≈1.0–1.4× | 平 |
+
+**噪声标定（M23 当天补测，方法学要留档）**：同一份构建连跑三轮 `SCALE_ROWS=20000`，
+**没被这条改动碰过的 bitcask 灌行**本身就落在 19.2 / 24.6 / 28.2 µs/行（本表记的是 14.7），
+lsm 灌行 20.7 / 20.6 / 23.5（记 14.5）⇒ 本机（`D:` 是 5400 转机械盘）跨构建、跨时段的墙钟
+可以差到 **1.3~1.9×**。所以：① 上面这些 µs 列只在"同一轮同一份构建"内可比；
+② 一条改动的因果凭据只能取**同构建 A/B 的计数**（块/次、未命中/次、槽位检查次数）；
+③ 刚编译完的那一轮别读数（编译器还没退出时量到的 lsm 点读 11.6 µs/次，安静复跑三轮是 6.2~6.9）。
 
 另外量出来的一条：**200k 行做 `一次全量 scan` 的瞬时峰值 +48 MB**（返回的是物化 `Vec`，
 常驻 30.7 MB ≈ 结果集本身）—— 翻页请走 `KvTxn::scan_page`，它每页只折 `limit + 1` 组。
@@ -908,7 +922,7 @@ match db.merge() {
 | 大 value 阈值 | 256 B / 256 B / 4096 B | B+树 / Bitcask / LSM |
 | 默认 order / 页缓存 | 64 / 1024 页 | B+ Tree |
 | WAL 单帧 body 上限 | 16 MB | 全部 |
-| **MVCC 档**（`LSMTreeOptions::for_mvcc`，与上面裸 LSM 默认值**不同**）| mem 32 MB / 262144 条、L0 8/12/32、目标 SST 2 MB、块缓存 256、`enable_mem_wal=false`、`enable_bg_compact=false` | LSM |
+| **MVCC 档**（`LSMTreeOptions::for_mvcc`，与上面裸 LSM 默认值**不同**）| mem 32 MB / 262144 条、L0 8/12/32、目标 SST 2 MB、块缓存 256 **地板** + 自动档上限 1024（生效值读 `tuning()` 的 `block_cache_capacity`）、`enable_mem_wal=false`、`enable_bg_compact=false` | LSM |
 | 自动回收切片 | 16 Ki 行(四引擎同值;`0` = 关闭) | 全部 |
 | WAL 自动收口阈值 | 16 MiB(`0` = 关闭;`memory` 没有 WAL) | 三个磁盘引擎 |
 
@@ -950,6 +964,22 @@ data.db.lock       单写者锁(内含 pid)
   期间"为判定走过的 memtable 条目数"必须是 **0**,同一条用例里主动慢数一次证明探针不是空转)。
   ⚠️ 归因台架 `lsm_fill_attribution`(`#[ignore]`)留着:它同时报块读、SST 数、memtable 字节和
   begin/set/commit 三段耗时 —— 这条病的教训正是"**µs/行 一个数不能替整条路径说话**"。
+- ~~块缓存容量写死 256 槽 ⇒ 随机点读单价随库长~~ **已修(M23)**:新增 `block_cache_auto_max`,
+  生效容量 = `clamp(库的 SST 块数, block_cache_blocks, 上限)`,在 flush / compact / bulk ingest /
+  打开四处重算(不重建缓存,只改上限),`for_mvcc` 档默认 256 地板 / 1024 上限。
+  归因是**同构建、同库目录、只换这一档**的 A/B:5002 键那一档乱序点读 **27.9 → 8.5 µs/次**
+  (未命中/次 0.39 → 0.03,而块/次两边都是 **4.00** —— 省掉的不是访问次数,是访问里"真去读盘"那一步),
+  下游那条"启动后只读 4 条"**57.5 → 11.5 µs/次**;40000 键(2681 块,装不下)117.3 → 90.6。
+  200k 键(7941 块 / 54.8 MB)那一档只降到 209.0(未命中 3.42 → 2.53,覆盖率 12.9%)——
+  ⚠️ **这一档救不了"库远大于预算"**,同一形状的冷启动读 4 条倒是从 **1027.5 → 289.5 µs/次**
+  (与下游报的"单次点查 0.86 ms"同一格)。一次未命中的单价可以从表里直接除出来:
+  40000 档 ≈ 54 µs、200k 档 ≈ 94 µs(散在 5 篇 L0 里,跨文件更贵)。
+  ⚠️ 上限 1024 是**预算**不是正确性:同一档把上限放到 4096(= 全库驻留 ≈ 18.7 MB)实测 21.0 µs/次,
+  残差 ≈ 未命中次数 × 一次随机读(这台上 ≈ 54 µs) ⇒ 要不要把库复制进 RAM 该调用方决定(同 M22 口径)。
+  ⚠️ 这条顺手抓到**自己引入**的一处回归:`BlockCache` 的 LRU 原先每次命中都 `order.iter().position()`
+  ⇒ O(驻留块数),容量放大就跟着变贵(40000 键有序读 17.4 → **36.0** µs/次,而未命中次数一动不动),
+  已改成定长槽 + 双向链表(命中/换出都 O(1),守卫 `lru_touch_cost_does_not_scale_with_residency` 实测
+  每次命中固定检查 6 个槽位,驻留 64 与 1024 同价)。
 - `fix_level_overlaps` 发现层内 key range 重叠**只打印警告,不修复**
 - compact 时每个 key 只保留最新一条,`enable_snapshot_gc` 并未真正按 snapshot 水位保留旧版本(源码注释已自陈)
 - `blobs/` 旁路的回收挂在 `vacuum()` 的全库轮次上(compact 判不了"别的层里还有更新的版本引用同一个 blob");**有界轮次不动 blob**,引用关系只有全库才看得全
@@ -1181,10 +1211,16 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:276 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:278 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)
+LSM_POINT_ROWS=5002 cargo test --release --lib -- --ignored --nocapture --test-threads=1 point_read_baseline
+LSM_CACHE_AUTO=0 LSM_POINT_ROWS=5002 cargo test --release --lib -- --ignored --nocapture \
+  --test-threads=1 point_read_baseline
+                              # LSM 点读台架:换规模(`LSM_POINT_ROWS`)、换块缓存自动档
+                              # (`LSM_CACHE_AUTO=0` = 关掉,回到钉死 256 槽)做**同构建 A/B** ——
+                              # 结论取计数(块/次、未命中/次、探文件/次、条目比较/次),不取墙钟
 cargo test --test test_lsm_tree
 ```
 

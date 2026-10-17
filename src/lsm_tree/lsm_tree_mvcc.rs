@@ -172,6 +172,12 @@ impl MVCC {
     /// let db = MVCC::try_open_with(Path::new("./data/lsm_tree"), Some(opts)).unwrap();
     /// ```
     ///
+    /// ⚠️ `for_mvcc` 档开着块缓存**自动档**（`block_cache_auto_max: 1024`），所以
+    /// `block_cache_blocks` 在这里是**地板**而不是生效值：
+    /// `生效容量 = clamp(库的 SST 块数, block_cache_blocks, block_cache_auto_max)`。
+    /// 上面那个例子读作"至少 1024 块、最多 1024 块"= 钉死 1024。想要钉死别的数就把上限
+    /// 一起改（`block_cache_auto_max: 0` = 关自动档，回到"配置值即生效值"）。
+    ///
     /// 两个字段**传了也不算**，恒被钉回 `false`（见 [`MVCC::set_options`] 同处的理由）：
     /// `enable_mem_wal`、`enable_bg_compact`。
     pub fn try_open_with(
@@ -331,7 +337,7 @@ impl MVCC {
     /// 热更新旋钮（打开之后也能改，不用重开库）。
     ///
     /// `enable_mem_wal` / `enable_bg_compact` 会被钉回 `false`，理由见
-    /// [`pin_mvcc_invariants`]。其余字段立刻生效：`block_cache_blocks` 会重建块缓存，
+    /// [`pin_mvcc_invariants`]。其余字段立刻生效：块缓存**就地改容量**（不清空已驻留的块），
     /// compact/l0 阈值影响下一次写路径。
     pub fn set_options(&self, patch: LSMTreeOptions) {
         let mut kv = self.kv.lock().unwrap();
@@ -342,10 +348,15 @@ impl MVCC {
     pub fn tuning(&self) -> EngineTuning {
         let mut t = EngineTuning::default();
         t.push_shared(self.vacuum_auto_slice(), Some(self.wal_checkpoint_limit()));
-        let o = self.options();
+        let kv = self.kv.lock().unwrap();
+        let o = kv.options().clone();
         t.push("mem_threshold_bytes", o.mem_threshold_bytes);
         t.push("mem_threshold_entries", o.mem_threshold_entries);
         t.push("block_cache_blocks", o.block_cache_blocks);
+        t.push("block_cache_auto_max", o.block_cache_auto_max);
+        // 生效值，不是配置值：自动档下 `block_cache_blocks` 只是地板
+        t.push("block_cache_capacity", kv.block_cache_capacity());
+        drop(kv);
         t.push("use_mmap", o.use_mmap);
         t.push("l0_compact_threshold", o.l0_compact_threshold);
         t.push("l0_slowdown_trigger", o.l0_slowdown_trigger);
@@ -1274,6 +1285,127 @@ mod tests {
         );
     }
 
+    /// 块缓存自动档：容量跟着库长，而不是让人盯着块数过日子（M23）。
+    ///
+    /// 归因出自下面那条 `LSM_POINT_ROWS` 台架：200k 键那一档乱序点读 220.9 µs/次，块/次 6.24、
+    /// **未命中/次 3.42**；同样 6.24 块/次 的**有序**读只要 21.7 µs（未命中 0.11）
+    /// ⇒ 随规模涨的那一段是"未命中的随机读"（一次 ≈ 60 µs），不是条目比较，也不是文件数本身。
+    /// 而容量固定 256 槽在 ~1.6 万行之后就不再装得下工作集 —— 于是点读单价随库长，且没人能
+    /// 提前算出该设多少。
+    ///
+    /// 钉四件事：① 库比地板小 ⇒ 容量停在地板（不凭空开槽）② 库长在中间 ⇒ 容量 = 实际块数
+    /// ③ 超过天花板 ⇒ 封顶（内存是有价的，不是想花多少花多少）④ 装得下 ⇒ 第二趟乱序重读
+    /// **0 未命中**；把自动档关掉、钉回地板，同一趟读**必须**重新出现未命中 —— 最后这半句是
+    /// 尺子自检，没有它这条测试可以永远绿。
+    #[test]
+    fn test_block_cache_capacity_follows_the_library() {
+        const BLOCK_ENTRIES: usize = 8; // 故意把块做小：让"块数"在测试里廉价地涨起来
+        const FLOOR: usize = 4;
+        const CEIL: usize = 16;
+
+        fn opts(ceil: usize) -> LSMTreeOptions {
+            LSMTreeOptions {
+                sst_block_entries: BLOCK_ENTRIES,
+                block_cache_blocks: FLOOR,
+                block_cache_auto_max: ceil,
+                ..LSMTreeOptions::for_mvcc()
+            }
+        }
+
+        let path = tmp_db("cache_auto_tier");
+        let keys: Vec<Vec<u8>> = (0..200).map(|i| format!("k{i:04}").into_bytes()).collect();
+        {
+            let mvcc = MVCC::try_open_with(&path, Some(opts(CEIL))).unwrap();
+            let write = |range: std::ops::Range<usize>| {
+                let items: Vec<(Vec<u8>, Vec<u8>)> = range
+                    .map(|i| (keys[i].clone(), format!("v{i}").into_bytes()))
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("batch_set 冲突: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+                mvcc.flush();
+            };
+            let shape = || {
+                let kv = mvcc.kv.lock().unwrap();
+                (kv.sst_blocks_for_test(), kv.block_cache_capacity())
+            };
+
+            // ① 一小撮键 ⇒ 块数远低于地板 ⇒ 容量就该停在地板
+            write(0..3);
+            let (blocks_small, cap_small) = shape();
+            assert!(blocks_small < FLOOR, "形状没造出来：{blocks_small} 块不算小");
+            assert_eq!(cap_small, FLOOR, "库比地板小 ⇒ 容量该停在地板");
+
+            // ② 长到地板与天花板之间 ⇒ 容量 = 实际块数
+            write(3..100);
+            let (blocks, cap) = shape();
+            assert!(
+                blocks > FLOOR && blocks < CEIL,
+                "形状没造出来：块数 {blocks} 不在 ({FLOOR},{CEIL}) 里"
+            );
+            assert_eq!(cap, blocks, "容量该跟着库长（块数 {blocks}，实测 {cap}）");
+
+            // ④ 全都装得下 ⇒ 第二趟乱序重读不该有未命中
+            // ⚠️ 读的顺序只覆盖**此刻已经写进去的** 100 把键（后面 100 把是拿来把块数顶过天花板的）
+            let mut order: Vec<usize> = (0..100).collect();
+            let mut s = 0x853c_49e6_77b9_5b3eu64;
+            for i in (1..order.len()).rev() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (s >> 33) as usize % (i + 1);
+                order.swap(i, j);
+            }
+            let tx = mvcc.begin_transaction();
+            for &i in &order {
+                assert!(tx.get(&keys[i]).is_some(), "读第 {i} 把键落空");
+            }
+            let m0 = crate::lsm_tree::sst::block_misses();
+            for &i in &order {
+                assert!(tx.get(&keys[i]).is_some());
+            }
+            let warm_misses = crate::lsm_tree::sst::block_misses() - m0;
+            drop(tx);
+            assert_eq!(
+                warm_misses, 0,
+                "块数 {blocks} ≤ 容量 {cap} 时，第二趟重读不该有未命中（实测 {warm_misses}）"
+            );
+
+            // ③ 再长过天花板 ⇒ 封顶，一槽不多占
+            write(100..200);
+            let (blocks_big, cap_big) = shape();
+            assert!(blocks_big > CEIL, "形状没造出来：{blocks_big} 块没超过天花板 {CEIL}");
+            assert_eq!(cap_big, CEIL, "容量必须封顶（块数 {blocks_big}，实测 {cap_big}）");
+
+            // ④ 的对照 ⇒ 关掉自动档就回到"配置值即生效值"，同一趟读必须有未命中
+            mvcc.set_options(opts(0));
+            let (_, cap_pinned) = shape();
+            assert_eq!(cap_pinned, FLOOR, "auto_max=0 就该钉死配置值");
+            let tx = mvcc.begin_transaction();
+            let m0 = crate::lsm_tree::sst::block_misses();
+            for &i in order.iter().take(100) {
+                assert!(tx.get(&keys[i]).is_some());
+            }
+            let cold_misses = crate::lsm_tree::sst::block_misses() - m0;
+            drop(tx);
+            assert!(
+                cold_misses > 0,
+                "{FLOOR} 槽装 {blocks_big} 块，重读居然一次未命中都没有 ⇒ 这把尺子在空转"
+            );
+            eprintln!(
+                "[块缓存自动档] 地板 {FLOOR} / 天花板 {CEIL}：小块库容量 {cap_small}，\
+                 {blocks} 块时容量 {cap}（第二趟未命中 {warm_misses}），{blocks_big} 块时容量 {cap_big}；\
+                 关掉自动档钉回 {FLOOR} 槽 ⇒ 同一趟未命中 {cold_misses}"
+            );
+
+            // 生效值得看得见：运维调完要知道现在到底是多少
+            let t = mvcc.tuning();
+            assert_eq!(t.get("block_cache_auto_max"), Some("0"), "{t}");
+            assert_eq!(t.get("block_cache_capacity"), Some("4"), "{t}");
+        }
+        cleanup(&path);
+    }
+
     /// WAL 阈值触发必须真的把文件截住（对照「关闭自动触发」），且截断之后重开仍能读到
     /// 全部已提交数据 —— 后半段守的是「先 flush（mem→L0）再收口 WAL」这个顺序。
     ///
@@ -2170,14 +2302,35 @@ mod tests {
     //           定论一趟）× 未命中的解码，属于下一条里程碑（一次定论 + 索引二分 + 缓存容量）。
     // 结论"用法也有份"的另一半：读全部键时一次 `scan` 是 19 µs/行，逐条 `get` 是它的 1~6 倍。
     //
+    // M23 把这条通道量到底，靠的是同一个台架换两个旋钮：`LSM_POINT_ROWS` 换规模、
+    // `LSM_CACHE_AUTO=0` 关掉块缓存自动档（= 改造前那个钉死的 256 槽）。同构建、同库目录的读法：
+    //   5002 键（314 块）   钉死 256：乱序 27.9 µs/次、未命中 0.39  vs  自动档 314：**8.5**、0.03
+    //                      块/次两边都是 4.00、条目比较/次 128 ⇒ 省掉的只有"其中几次真读盘"
+    //                      "启动后只读 4 条"这一格最扎眼：57.5 → 11.5 µs/次（下游的进程启动形状）
+    //   40000 键（2681 块） 256：117.3、未命中 1.81  vs  自动档 1024：90.6、1.24
+    //                      vs 上限放到 4096（全库驻留 18.7 MB）：21.0、0.03
+    //                      ⇒ 残差 ≈ 未命中次数 × 一次随机读（这台上 ≈ 54 µs），上限是**预算**不是正确性
+    //   ⚠️ 第一版自动档在这里抓到自己的回归：容量 256→1024 后**未命中次数不动而有序读 22.2→36.0**
+    //     —— `BlockCache` 每次命中都 `order.iter().position()`，代价 O(驻留块数)。换成定长槽 +
+    //     双向链表（O(1)）之后同一档有序读 17.1 ≈ 地板那臂的 17.4。守卫见 `lru_touch_cost_...`。
+    //
     // 复现命令（本仓库）：
     //   cargo test --release --lib -- --ignored --nocapture point_read_baseline
+    //   LSM_POINT_ROWS=40000 LSM_CACHE_AUTO=0 cargo test --release --lib -- --ignored \
+    //     --nocapture --test-threads=1 point_read_baseline   # 关掉自动档做对照
     #[test]
     #[ignore = "墙钟基线，手动 release 跑：cargo test --release --lib -- --ignored --nocapture point_read_baseline"]
     fn test_lsm_point_read_baseline_5000_keys() {
         use std::time::Instant;
 
-        const N: usize = 5002;
+        // 键数可由 `LSM_POINT_ROWS` 调（默认 5002 = 下游那份现场）：M23 要判"点读单价随什么长"，
+        // 只能同一份构建跑两个规模比每单位成本 —— 单规模只能看见"贵"，看不见"超线性"。
+        #[allow(non_snake_case)]
+        let N: usize = std::env::var("LSM_POINT_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5002);
+        type Snap = (u64, u64, u64, u64);
 
         // 键形状照抄下游：1 字节标签 + 4 字节项目 id + 路径文本 ≈ 40 字节
         fn make_key(i: usize) -> Vec<u8> {
@@ -2226,17 +2379,61 @@ mod tests {
                 "形状: rows={} live_keys={} max_chain={} active_txns={}",
                 h.total_rows, h.live_keys, h.max_chain, h.active_txns
             );
-            assert_eq!(h.total_rows as usize, N * 2 + 1);
+            // ⚠️ 物理行数与链长都只断"不超过"：自动回收是按提交记账触发的，N 大了它就在写过程中
+            // 已经把部分链压平了（实测 40000 键那一档 rows=68505 < 80001、max_chain=2；
+            // 200k 那一档 rows=341868 < 400001）。这条台架量的是**读代价**，回收的口径由 M4
+            // 那批守卫守着；这里唯一硬合同是 live_keys —— 键不能丢也不能凭空多。
+            assert!(
+                (h.total_rows as usize) <= N * 2 + 1,
+                "物理行数超过形状上限：{} > {}",
+                h.total_rows,
+                N * 2 + 1
+            );
             assert_eq!(h.live_keys as usize, N);
-            assert_eq!(h.max_chain, 3);
+            assert!(h.max_chain <= 3, "链长不该超过写入轮数 3：实测 {}", h.max_chain);
         }
 
         // 重新打开，模拟"进程启动后读"
-        let mvcc = MVCC::open(&path);
-        let stats = mvcc.kv.lock().unwrap().stats();
+        //
+        // `LSM_CACHE_AUTO=0` ⇒ 关掉块缓存自动档，回到改造前那个"钉死 256 槽"。M23 的 A/B
+        // 只能这样做：同一份构建、同一个库目录，只换这一档 ⇒ "点读单价随规模涨"到底是不是缓存容量
+        // 造成的，才有凭据（墙钟在本机 run 间能差 ±2 倍，结论只能落在计数上）。
+        let auto_max = std::env::var("LSM_CACHE_AUTO")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| LSMTreeOptions::for_mvcc().block_cache_auto_max);
+        let mvcc = MVCC::try_open_with(
+            &path,
+            Some(LSMTreeOptions {
+                block_cache_auto_max: auto_max,
+                ..LSMTreeOptions::for_mvcc()
+            }),
+        )
+        .map_err(|e| format!("重开失败: {e}"))
+        .unwrap();
+        let (stats, cap, blocks) = {
+            let kv = mvcc.kv.lock().unwrap();
+            (kv.stats(), kv.block_cache_capacity(), kv.sst_blocks_for_test())
+        };
+        let sst_bytes: u64 = stats.level_bytes.iter().sum();
+        // 缓存的价位用"实测每块平均多少字节"来推，不靠估：块是按条数切的，条子大小才是分母
+        let per_block = if blocks == 0 { 0.0 } else { sst_bytes as f64 / blocks as f64 };
         eprintln!(
-            "布局: levels={:?} total_sst={} l0={} mem_entries={}",
-            stats.level_files, stats.total_sst, stats.l0_files, stats.mem_entries
+            "布局: levels={:?} total_sst={} l0={} mem_entries={} 块={blocks} 容量={cap} \
+             自动档={auto_max} SST={:.1} MB 每块均值={per_block:.0} B ⇒ 满缓存价位≈{:.1} MB",
+            stats.level_files,
+            stats.total_sst,
+            stats.l0_files,
+            stats.mem_entries,
+            sst_bytes as f64 / 1048576.0,
+            cap as f64 * per_block / 1048576.0,
+        );
+        // A/B 的有效性凭据：这一档必须真的落到容量上了，否则两个臂量的是同一件事
+        let floor = LSMTreeOptions::for_mvcc().block_cache_blocks;
+        let expect = if auto_max == 0 { floor } else { blocks.clamp(floor, auto_max) };
+        assert_eq!(
+            cap, expect,
+            "自动档={auto_max} 下容量该是 {expect}（块 {blocks}，地板 {floor}），实测 {cap}"
         );
 
         // 乱序（≈ 目录序 / NTFS 哈希序）与有序两种访问顺序，分开量：局部性影响块缓存命中率
@@ -2250,79 +2447,66 @@ mod tests {
 
         let tx = mvcc.begin_transaction();
 
-        let report = |name: &str, dur: std::time::Duration, n: usize, blocks: u64, opens: u64| {
+        let report = |name: &str, dur: std::time::Duration, n: usize, a: Snap, b: Snap| {
             let us = dur.as_micros() as f64;
+            let per = |x: u64| x as f64 / n.max(1) as f64;
             eprintln!(
-                "{name:<22} 合计 {:>9.1} ms | 单次 {:>8.1} µs | 块/次 {:>5.2} | 未命中/次 {:>5.2}",
+                "{name:<22} 合计 {:>9.1} ms | 单次 {:>8.1} µs | 块/次 {:>5.2} | 未命中/次 {:>5.2} \
+                 | 探文件/次 {:>5.2} | 条目比较/次 {:>9.1}",
                 us / 1000.0,
                 if n == 0 { 0.0 } else { us / n as f64 },
-                blocks as f64 / n.max(1) as f64,
-                opens as f64 / n.max(1) as f64
+                per(b.0 - a.0),
+                per(b.1 - a.1),
+                per(b.2 - a.2),
+                per(b.3 - a.3),
             );
+        };
+        let snap = || {
+            (
+                crate::lsm_tree::sst::block_reads(),
+                crate::lsm_tree::sst::block_misses(),
+                crate::lsm_tree::sst::sst_probes(),
+                crate::lsm_tree::sst::sst_entry_walks(),
+            )
         };
 
         // (a) 同一个事务里连读 5002 次 —— 乱序
-        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let a = snap();
         let t = Instant::now();
         for &i in &shuffled {
             assert!(tx.get(&keys[i]).is_some(), "乱序读第 {i} 个键落空");
         }
-        let (d, db, do_) = (
-            t.elapsed(),
-            crate::lsm_tree::sst::block_reads() - b0,
-            crate::lsm_tree::sst::block_misses() - o0,
-        );
-        report("点读×N 乱序", d, N, db, do_);
+        report("点读×N 乱序", t.elapsed(), N, a, snap());
 
         // (b) 同一个事务里连读 5002 次 —— 有序（键升序 = 块升序）
-        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let a = snap();
         let t = Instant::now();
         for k in &keys {
             assert!(tx.get(k).is_some(), "有序读落空");
         }
-        let (d, db, do_) = (
-            t.elapsed(),
-            crate::lsm_tree::sst::block_reads() - b0,
-            crate::lsm_tree::sst::block_misses() - o0,
-        );
-        report("点读×N 有序", d, N, db, do_);
+        report("点读×N 有序", t.elapsed(), N, a, snap());
 
         // (c) multi_get：门面把它实现成 `map(get)`，所以理论上和 (a) 同价 —— 量出来才算数
-        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let a = snap();
         let t = Instant::now();
         let got = tx.multi_get(&keys);
-        let (d, db, do_) = (
-            t.elapsed(),
-            crate::lsm_tree::sst::block_reads() - b0,
-            crate::lsm_tree::sst::block_misses() - o0,
-        );
         assert_eq!(got.len(), N);
-        report("multi_get×N", d, N, db, do_);
+        report("multi_get×N", t.elapsed(), N, a, snap());
 
         // (d) 一次全量 scan —— "干脆整段读回来"那条路
-        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let a = snap();
         let t = Instant::now();
         let rows = tx.scan(None, None);
-        let (d, db, do_) = (
-            t.elapsed(),
-            crate::lsm_tree::sst::block_reads() - b0,
-            crate::lsm_tree::sst::block_misses() - o0,
-        );
         eprintln!("全量 scan 命中 {} 行", rows.len());
-        report("一次全量 scan", d, rows.len().max(1), db, do_);
+        report("一次全量 scan", t.elapsed(), rows.len().max(1), a, snap());
 
         // (e) 只要 4 条（下游"进程启动 + 打开 + 扫 4 条"那一段）
-        let (b0, o0) = (crate::lsm_tree::sst::block_reads(), crate::lsm_tree::sst::block_misses());
+        let a = snap();
         let t = Instant::now();
         for k in &keys[..4] {
             assert!(tx.get(k).is_some());
         }
-        let (d, db, do_) = (
-            t.elapsed(),
-            crate::lsm_tree::sst::block_reads() - b0,
-            crate::lsm_tree::sst::block_misses() - o0,
-        );
-        report("点读×4", d, 4, db, do_);
+        report("点读×4", t.elapsed(), 4, a, snap());
 
         drop(tx);
         drop(mvcc);
@@ -2333,7 +2517,12 @@ mod tests {
         //     该键的 SST，点查就多探一次块。compact 的意义就是把这件事压回层数。
         //     造法：每轮全量写一遍再 flush ⇒ 每个键在每个文件里都有一份。
         eprintln!("--- 覆盖同一把键的 SST 数 → 单次点查代价 ---");
-        for files in [1usize, 2, 4, 7] {
+        if N > 50_000 {
+            // 这一段要按 1/2/4/7 轮**全量重写**来造分散度，N=200k 时是 320 万行写 + 压实，
+            // 一台架跑不动；分散度那一档已经在 5002 键上量过（M10 的结论就是从它来的）。
+            eprintln!("    （跳过：N={N} > 50000，这段要全量重写 1+2+4+7 轮）");
+        }
+        for files in [1usize, 2, 4, 7].into_iter().take(if N > 50_000 { 0 } else { 4 }) {
             let p2 = tmp_db(&format!("point_spread_{files}"));
             {
                 let mv = MVCC::open(&p2);
@@ -2355,18 +2544,13 @@ mod tests {
                 let st = mv.kv.lock().unwrap().stats();
                 let h = mv.health();
                 let tx = mv.begin_transaction();
-                let b0 = crate::lsm_tree::sst::block_reads();
-                let m0 = crate::lsm_tree::sst::block_misses();
+                let a = snap();
                 let t = Instant::now();
                 for &i in &shuffled {
                     assert!(tx.get(&keys[i]).is_some());
                 }
-                let (d, db, dm) = (
-                    t.elapsed(),
-                    crate::lsm_tree::sst::block_reads() - b0,
-                    crate::lsm_tree::sst::block_misses() - m0,
-                );
-                report(&format!("乱序点读 (每键 {files} 份)"), d, N, db, dm);
+                let d = t.elapsed();
+                report(&format!("乱序点读 (每键 {files} 份)"), d, N, a, snap());
                 eprintln!(
                     "    ↳ total_sst={} levels={:?} rows={} max_chain={}",
                     st.total_sst, st.level_files, h.total_rows, h.max_chain

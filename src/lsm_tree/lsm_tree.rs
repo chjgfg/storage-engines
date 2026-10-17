@@ -48,8 +48,26 @@ pub struct LSMTreeOptions {
     pub enable_bloom: bool,
     /// 后台 compact 线程（默认关；MVCC 关）
     pub enable_bg_compact: bool,
-    /// block cache 容量（块数）；0=关
+    /// block cache 容量（块数）；0=关。
+    /// 开了 [`Self::block_cache_auto_max`] 时它是**地板**（下限），不是生效值。
     pub block_cache_blocks: usize,
+    /// block cache **自动档的上限**（块数）；0=关自动档（容量恒等于 `block_cache_blocks`）。
+    ///
+    /// 非 0 时生效容量 = `clamp(当前 SST 块总数, block_cache_blocks, 本值)`，并在文件集变化
+    /// （打开 / flush / compact / bulk ingest）时重算。为什么要有这一档：点读的钱几乎全落在
+    /// "块缓存未命中"上（M23 同构建 A/B，5002 键那一档：钉死 256 槽 27.9 µs/次、未命中 0.39，
+    /// 自动档给到 314 槽 ⇒ **8.5 µs/次、未命中 0.03**，而块/次两边都是 4.00 —— 少的不是访问次数，
+    /// 是访问里"真去读盘"那一步）。固定 256 槽在 ~1.6 万行之后就不再装下工作集 ⇒ **单价随库长**。
+    ///
+    /// 上限是**预算**不是正确性：40000 键那一档 2681 块，放到 4096 槽（全库驻留 ≈ 18.7 MB）
+    /// 乱序点读 117.3 → 21.0 µs/次，一次未命中实测 ≈ 54 µs（200k 那一档 ≈ 94 µs）。要不要把库
+    /// 复制进 RAM 该调用方决定，与 B+ 树页缓存自动档（M22）同一口径。
+    ///
+    /// ⚠️ 与 `block_cache_blocks: 0`（关缓存）不冲突：地板为 0 时直接不缓存，上限不参与。
+    /// ⚠️ 放大这个数之前先想清楚：**驻留块数本身就是别处的代价分母**。第一版自动档就是在
+    /// `BlockCache` 的 LRU 上踩到这一格（每次命中 O(驻留块数) 的 `position()` 扫），已改成 O(1)，
+    /// 守卫见 `lru_touch_cost_does_not_scale_with_residency`。
+    pub block_cache_auto_max: usize,
     /// 单次 flush 后最多 compact 轮数
     pub max_compactions_per_flush: usize,
     /// 使用 memmap2 映射 SST 文件（真 mmap）
@@ -84,6 +102,7 @@ impl Default for LSMTreeOptions {
             enable_bloom: true,
             enable_bg_compact: false,
             block_cache_blocks: 64,
+            block_cache_auto_max: 0,
             max_compactions_per_flush: 8,
             use_mmap: false,
             default_ttl_secs: None,
@@ -111,11 +130,14 @@ impl LSMTreeOptions {
             level_base_bytes: 16 * 1024 * 1024,
             max_compactions_per_flush: 4,
             blob_threshold: 4 * 1024,
-            // 块缓存从 64 提到 256：实测 5002 键 / 10005 行的小库就有 ~157 个块，64 槽装不下
-            // 工作集 ⇒ 乱序点读每次 1.61 个未命中（一次未命中实测 ≈ 40µs）。256 槽按块容量
-            // 64 条 × ~100B 估 ≈ 2MB 上限，对单核小机器是可控的；再大的库靠它也不可能全装下，
-            // 那时决定代价的是"同一把键散在几个 SST"（见 lsm_tree_mvcc 的基线用例）。
+            // 块缓存地板 256（M10 那次从 64 提上来）+ 自动档上限 1024（M23）。
+            // 实测形状（`LSM_POINT_ROWS=5002` 台架，就是下游那份现场）：314 块、每块均值 7403 B
+            // ⇒ 钉死 256 槽**装不下**（差 58 块就整份覆盖），乱序点读因此 27.9 µs/次、未命中 0.39；
+            // 自动档把容量给到 314 ⇒ 8.5 µs/次、未命中 0.03，常驻多 0.4 MB。
+            // 上限 1024 的价签：1024 × 7.4 KB ≈ **7.1 MB**（40000 键那一档实测就是这个数），
+            // 与 B+ 树页缓存自动档的 4~8 MB 同一量级；再大的库不再靠缓存，靠 `scan`（顺序读摊薄）。
             block_cache_blocks: 256,
+            block_cache_auto_max: 1024,
             ..Self::default()
         }
     }
@@ -211,6 +233,10 @@ pub struct LSMTree {
     bg: Option<BgCompactCtrl>,
     /// bulk 导入：flush 不触发同步 compact，stall 放宽
     bulk_mode: bool,
+    /// 块缓存是不是别人的（CF 模式共享一份）。true ⇒ **自动档不再动容量**：
+    /// 一棵树按自己的块数改上限，会把同进程里另一棵树的驻留块换出去，那是净负收益。
+    /// 共享缓存的容量由装配方（`cf.rs`）自己定。
+    cache_shared: bool,
 }
 
 struct BgCompactCtrl {
@@ -302,6 +328,7 @@ impl LSMTree {
             manifest_edit_id: 0,
             bg: None,
             bulk_mode: false,
+            cache_shared: false,
         };
 
         let manifest = db.manifest_path();
@@ -364,6 +391,7 @@ impl LSMTree {
         }
 
         db.attach_cache_to_levels();
+        db.reevaluate_cache_capacity();
         // 启动不扫全库：stats 懒算（stats_dirty=true 已设），避免 O(全部 SST)
         if db.opts.enable_bg_compact {
             db.start_bg_compact();
@@ -409,15 +437,47 @@ impl LSMTree {
         &self.opts
     }
 
+    /// SST 里需要缓存槽位的块总数（v1 文件记 0，见 [`SstFile::blocks`]）
+    fn sst_block_count(&self) -> usize {
+        self.levels.iter().flatten().map(|s| s.blocks()).sum()
+    }
+
+    /// 自动档的**生效**容量（不是配置值）。关掉自动档就等于 `block_cache_blocks`。
+    pub fn block_cache_capacity(&self) -> usize {
+        self.block_cache.lock().unwrap().capacity()
+    }
+
+    /// 文件集变了之后重算块缓存容量；**不重建缓存**（见 [`BlockCache::set_capacity`]）。
+    ///
+    /// 为什么挂在文件集变化处：块数是"要装多少"的唯一凭据，而 flush / compact 是唯一改它的两处。
+    /// 放在读路径上会让一次点读顺带改容量，那不可预测；放在写路径末尾则一次库的代价只有 O(文件数)。
+    fn reevaluate_cache_capacity(&mut self) {
+        let floor = self.opts.block_cache_blocks;
+        let ceil = self.opts.block_cache_auto_max;
+        let target = if ceil == 0 || floor == 0 {
+            // 关自动档：配置值就是生效值。地板 0 = 显式关缓存，上限不参与
+            // （否则"关"会被自动档悄悄打开）
+            floor
+        } else if self.cache_shared {
+            // 共享缓存（CF 模式）：每棵树只看得见自己的块数，谁后算谁赢 ⇒ 自动档不动，
+            // 容量由装配方（`cf.rs`）定。
+            return;
+        } else {
+            self.sst_block_count().clamp(floor, ceil)
+        };
+        self.block_cache.lock().unwrap().set_capacity(target);
+    }
+
     /// 热更新部分 option（阈值 / compact 触发 / bloom 新文件 / fsync 策略等）。
     /// 不改变：`enable_mem_wal`（开/关需 reopen）、已有 SST 格式。
     pub fn set_options(&mut self, patch: LSMTreeOptions) {
         let keep_wal = self.opts.enable_mem_wal;
         self.opts = patch;
         self.opts.enable_mem_wal = keep_wal;
-        // block cache 容量：重建
-        *self.block_cache.lock().unwrap() =
-            BlockCache::new(self.opts.block_cache_blocks);
+        // 块缓存容量：**就地改上限**，不重建。
+        // 旧写法 `*cache = BlockCache::new(n)` 会把已经装进来的块全丢掉 ⇒ 改一次旋钮
+        // 等于把点读打回冷启动，而且自动档每重算一次就自己清一次自己。
+        self.reevaluate_cache_capacity();
     }
 
     /// 设置 compaction filter（`None` 清除）
@@ -428,6 +488,7 @@ impl LSMTree {
     /// 安装共享 block cache（多 CF 复用）
     pub fn install_shared_block_cache(&mut self, cache: Arc<Mutex<BlockCache>>) {
         self.block_cache = cache.clone();
+        self.cache_shared = true;
         self.attach_cache_to_levels();
     }
 
@@ -618,6 +679,7 @@ impl LSMTree {
         self.levels[0].push(sst);
         self.cached_live = self.cached_live.saturating_add(n);
         self.dirty = true;
+        self.reevaluate_cache_capacity();
         if self.bulk_mode {
             let l0 = self.levels[0].len();
             if l0 >= self.opts.l0_stop_trigger {
@@ -1236,6 +1298,19 @@ impl LSMTree {
         self.get_entry_at(key, u64::MAX)
     }
 
+    /// 测试专用：SST 块总数（自动档的容量凭据）
+    #[cfg(test)]
+    pub(crate) fn sst_blocks_for_test(&self) -> usize {
+        self.sst_block_count()
+    }
+
+    /// 跨源点查：**每个源都要走一遍，取最大可见 seq**，不能"在第一个含它的源就收手"。
+    ///
+    /// L0 那一段看着确实可以收手（flush 单调：后建的文件只装更晚的 seq），但 L1+ 不行：
+    /// `merge_to_ssts` 只按 `target_bytes` 切文件，切的粒度是**编码键**，而同一把 raw key 的
+    /// 各版本是各不相同的编码键 ⇒ 一个版本组可以被劈成相邻两个文件（`sst.rs` 里那段
+    /// `if b.estimated_bytes() >= target_bytes`）。层内又按 `min_key` 排序，而版本键大端有序
+    /// ⇒ **同一个 raw key 的新版本住在后面那个文件**。先命中即停会读回旧版本，而且是静默读回。
     fn get_entry_at(&self, key: &[u8], snap_seq: u64) -> Option<StoredEntry> {
         let mut best: Option<StoredEntry> = None;
         let consider = |best: &mut Option<StoredEntry>, se: StoredEntry| {
@@ -1618,6 +1693,7 @@ impl LSMTree {
             let _ = sst.enable_mmap();
         }
         self.levels[0].push(sst);
+        self.reevaluate_cache_capacity();
         Ok(())
     }
 
@@ -1800,6 +1876,7 @@ impl LSMTree {
         }
         self.levels[next] = all_next;
         self.stats_dirty = true;
+        self.reevaluate_cache_capacity();
         // 通知后台
         self.notify_bg();
 

@@ -9,7 +9,7 @@
 //! compact：[`SstEntryIter`] 流式 + [`merge_to_builder`]
 
 use std::{
-    cmp::Ordering as CmpOrdering, collections::{BinaryHeap, HashMap, VecDeque}, fs::File, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex}, vec,
+    cmp::Ordering as CmpOrdering, collections::{BinaryHeap, HashMap}, fs::File, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex}, vec,
 };
 
 use memmap2::Mmap;
@@ -158,6 +158,43 @@ pub(crate) fn light_visits() -> u64 {
     LIGHT_VISITS.with(|c| c.get())
 }
 
+// 测试专用：一次点读在 SST 里**比较过多少个条目键**，以及探过多少个 SST 文件。
+//
+// 为什么必须分开数：bloom 通过之后，取那一行有两条路 —— 稀疏索引二分 + 定位块（`find_block`），
+// 或者在 `entries_cache` 那份"整文件条目"上从头扫。两者差着文件大小的量级，而"探了几个文件"
+// 与"读了几块"都看不见这笔账（M23 归因时就是被这一格卡住：5002 键与 40000 键两档的块/次都稳定在
+// 4.00、条目比较/次 128，而乱序点读是 27.9 → 117.3 µs/次 ⇒ 钱既不在访问次数也不在比较，
+// 只在"其中几次真去读盘"上）。
+#[cfg(test)]
+thread_local! {
+    static SST_ENTRY_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SST_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 记一次「点读真的进了这个 SST 文件」（范围 + bloom 都过了才算；被 bloom 挡掉的不算代价）
+#[cfg(test)]
+pub(crate) fn note_sst_probe() {
+    SST_PROBES.with(|c| c.set(c.get() + 1));
+}
+
+/// 记 n 次「条目键比较」
+#[cfg(test)]
+pub(crate) fn note_sst_entry_walks(n: u64) {
+    SST_ENTRY_WALKS.with(|c| c.set(c.get() + n));
+}
+
+/// 当前线程点读探过的 SST 文件数（测试探针用）
+#[cfg(test)]
+pub(crate) fn sst_probes() -> u64 {
+    SST_PROBES.with(|c| c.get())
+}
+
+/// 当前线程点读比较过的 SST 条目键数（测试探针用）
+#[cfg(test)]
+pub(crate) fn sst_entry_walks() -> u64 {
+    SST_ENTRY_WALKS.with(|c| c.get())
+}
+
 // 测试专用：本线程「把带 value 的条目整个物化出来」的次数。
 //
 // 这是全库折叠那条通道真正的代价单位：重量路径（`iter_all` / `mem_view_at`）每行都要
@@ -188,11 +225,51 @@ struct CacheKey {
     offset: u64,
 }
 
+// 测试专用：本线程「动一次块缓存时检查过几个槽位」。
+//
+// M23 自己引入的回归留下的账：旧实现在**每一次命中**里做 `order.iter().position()` ⇒ 代价是
+// O(驻留块数)，而自动档正是去加大驻留块数的那一刀，于是"缓存越大、每次命中越贵"，收益被自己的
+// LRU 吃回去（40000 键那一档容量 256→1024，未命中次数不动 0.15/次，有序点读 22.2→36.0 µs/次）。
+// 改成定长槽 + 双向链表之后每次命中只碰常数个槽，这条尺子才看得见区别。
+#[cfg(test)]
+thread_local! {
+    static LRU_INSPECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_lru_inspection() {
+    LRU_INSPECTIONS.with(|c| c.set(c.get() + 1));
+}
+
+/// 当前线程检查过的缓存槽位数（测试探针用）
+#[cfg(test)]
+pub(crate) fn lru_inspections() -> u64 {
+    LRU_INSPECTIONS.with(|c| c.get())
+}
+
+const NIL: usize = usize::MAX;
+
+/// 一个驻留块 + 它在 LRU 链表里的前后位置（槽下标，`NIL` = 无）
+#[derive(Debug)]
+struct Slot {
+    key: CacheKey,
+    block: Arc<DataBlock>,
+    prev: usize,
+    next: usize,
+}
+
 #[derive(Debug)]
 pub struct BlockCache {
     cap: usize,
-    map: HashMap<CacheKey, Arc<DataBlock>>,
-    order: VecDeque<CacheKey>,
+    /// key → 槽下标
+    map: HashMap<CacheKey, usize>,
+    /// 定长槽位表（只长不缩：一个槽 ≈ 48 B，上限 4096 槽也就 200 KB，比反复回收省心）
+    slots: Vec<Option<Slot>>,
+    /// 空闲槽下标栈
+    free: Vec<usize>,
+    /// LRU 链表的头（最久未用）与尾（刚用过）
+    head: usize,
+    tail: usize,
 }
 
 impl BlockCache {
@@ -200,20 +277,95 @@ impl BlockCache {
         Self {
             cap,
             map: HashMap::new(),
-            order: VecDeque::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: NIL,
+            tail: NIL,
         }
+    }
+
+    #[inline]
+    fn slot(&self, i: usize) -> &Slot {
+        #[cfg(test)]
+        note_lru_inspection();
+        debug_assert!(i != NIL && i < self.slots.len());
+        self.slots[i].as_ref().expect("槽位在用却为空")
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, i: usize) -> &mut Slot {
+        #[cfg(test)]
+        note_lru_inspection();
+        debug_assert!(i != NIL && i < self.slots.len());
+        self.slots[i].as_mut().expect("槽位在用却为空")
+    }
+
+    /// 把槽 i 从链表摘下来（不动内容）
+    fn detach(&mut self, i: usize) {
+        let (p, n) = {
+            let s = self.slot(i);
+            (s.prev, s.next)
+        };
+        match p {
+            NIL => self.head = n,
+            p => self.slot_mut(p).next = n,
+        }
+        match n {
+            NIL => self.tail = p,
+            n => self.slot_mut(n).prev = p,
+        }
+        let s = self.slot_mut(i);
+        s.prev = NIL;
+        s.next = NIL;
+    }
+
+    /// 把槽 i 挂到链表尾（= 最近用过）
+    fn attach_back(&mut self, i: usize) {
+        // 先把 tail 抄出来：`slot_mut` 借走 self 之后不能再读 self.tail
+        let t = self.tail;
+        {
+            let s = self.slot_mut(i);
+            s.prev = t;
+            s.next = NIL;
+        }
+        if t == NIL {
+            self.head = i;
+        } else {
+            self.slot_mut(t).next = i;
+        }
+        self.tail = i;
+    }
+
+    /// 换出最久未用的那块
+    fn evict_lru(&mut self) {
+        let i = self.head;
+        if i == NIL {
+            return;
+        }
+        let key = self.slot(i).key.clone();
+        self.detach(i);
+        self.slots[i] = None;
+        self.map.remove(&key);
+        self.free.push(i);
+    }
+
+    /// 取一个可用槽：先把表长到容量，再用回收来的空闲槽
+    fn take_slot(&mut self) -> usize {
+        if self.slots.len() < self.cap {
+            self.slots.push(None);
+            return self.slots.len() - 1;
+        }
+        self.free
+            .pop()
+            .expect("未满的缓存里必须有空闲槽（不变量：slots.len()==cap=map.len()+free.len()）")
     }
 
     fn get(&mut self, ns: u64, sst_id: u64, offset: u64) -> Option<Arc<DataBlock>> {
         let k = CacheKey { ns, sst_id, offset };
-        if let Some(b) = self.map.get(&k) {
-            if let Some(pos) = self.order.iter().position(|x| x == &k) {
-                self.order.remove(pos);
-                self.order.push_back(k);
-            }
-            return Some(b.clone());
-        }
-        None
+        let i = *self.map.get(&k)?;
+        self.detach(i);
+        self.attach_back(i);
+        Some(self.slot(i).block.clone())
     }
 
     fn put(&mut self, ns: u64, sst_id: u64, offset: u64, block: Arc<DataBlock>) {
@@ -221,19 +373,51 @@ impl BlockCache {
             return;
         }
         let k = CacheKey { ns, sst_id, offset };
-        if self.map.contains_key(&k) {
-            self.map.insert(k, block);
+        if let Some(&i) = self.map.get(&k) {
+            self.slot_mut(i).block = block;
+            self.detach(i);
+            self.attach_back(i);
             return;
         }
         while self.map.len() >= self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
-            } else {
-                break;
-            }
+            self.evict_lru();
         }
-        self.map.insert(k.clone(), block);
-        self.order.push_back(k);
+        let i = self.take_slot();
+        self.slots[i] = Some(Slot {
+            key: k.clone(),
+            block,
+            prev: NIL,
+            next: NIL,
+        });
+        self.map.insert(k, i);
+        self.attach_back(i);
+    }
+
+    /// 改容量：**不重建缓存**，只换上限。
+    ///
+    /// 调大不用做事（下一次回填自然装得下）；调小按 LRU 顺序换出到上限为止。
+    /// 必须有这条路，否则"跟着库长"的自动档只能靠 `BlockCache::new` 把已装进来的块全丢掉 ——
+    /// 那等于每写满一次 memtable 就把缓存清空，自动档反而让点读更贵。
+    pub fn set_capacity(&mut self, cap: usize) {
+        self.cap = cap;
+        while self.map.len() > cap {
+            self.evict_lru();
+        }
+    }
+
+    /// 当前上限（块数）。自动档的守卫读的是这个生效值，不是配置值。
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// 当前驻留块数
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// 与 [`Self::len`] 配对（clippy 要求 `len` 必须有 `is_empty`）
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 
@@ -294,6 +478,18 @@ impl SstFile {
         self.iter_all().count()
     }
 
+    /// 这个文件里**需要缓存槽位**的数据块数（自动档用来跟着库长）。
+    ///
+    /// v1 文件整份常驻在 `entries_cache` 里（没有块索引、也永不按 offset 读盘）⇒ 记 0：
+    /// 给它留槽位等于凭空把上限抬高，而它根本不参与块缓存。
+    pub fn blocks(&self) -> usize {
+        if self.entries_cache.is_some() {
+            0
+        } else {
+            self.index.len()
+        }
+    }
+
     pub fn may_overlap(&self, low: &[u8], high: &[u8]) -> bool {
         if self.min_key.is_empty() && self.max_key.is_empty() {
             return false;
@@ -313,6 +509,8 @@ impl SstFile {
         if !self.bloom.may_contain(key) {
             return None;
         }
+        #[cfg(test)]
+        note_sst_probe();
         if let Some(e) = &self.entries_cache {
             // 可能同 key 多版本：取 seq 最大且 <= snap
             let mut best: Option<StoredEntry> = None;
@@ -323,6 +521,8 @@ impl SstFile {
                     }
                 }
             }
+            #[cfg(test)]
+            note_sst_entry_walks(e.len() as u64);
             return best;
         }
         let bi = self.find_block(key)?;
@@ -335,6 +535,8 @@ impl SstFile {
                 }
             }
         }
+        #[cfg(test)]
+        note_sst_entry_walks(block.entries.len() as u64);
         best
     }
 
@@ -1640,6 +1842,44 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         crate::common::tmp_test_path("sst", tag, ".sst")
+    }
+
+    /// 命中一次的代价**不随驻留块数涨**（M23 自己引入的回归，留下的守卫）。
+    ///
+    /// 旧实现每次命中都要在 `VecDeque<CacheKey>` 里 `position()` 找那个键 ⇒ O(驻留块数)。
+    /// 而自动档恰恰是去加大驻留块数的那一刀：40000 键那一档容量 256→1024，**未命中次数一动不动
+    /// （0.15/次），有序点读却从 22.2 µs/次 涨到 36.0 µs/次** —— 缓存越大每次命中越贵，省下来的
+    /// 未命中被自己的 LRU 吃了回去。所以这条尺子量的是"检查过几个槽位"，不看墙钟。
+    #[test]
+    fn lru_touch_cost_does_not_scale_with_residency() {
+        // 返回：每次命中检查的槽位数 × 100（整数比，避免浮点）
+        fn per_get(resident: usize, cap: usize) -> u64 {
+            let mut c = BlockCache::new(cap);
+            let blk = Arc::new(DataBlock {
+                entries: Vec::new(),
+            });
+            for i in 0..resident {
+                c.put(1, i as u64, 0, blk.clone());
+            }
+            assert_eq!(c.len(), resident, "必须全都驻留，否则量的就不是命中");
+
+            let before = lru_inspections();
+            for _ in 0..4 {
+                for i in 0..resident {
+                    assert!(c.get(1, i as u64, 0).is_some(), "读第 {i} 块落空（不该未命中）");
+                }
+            }
+            (lru_inspections() - before) * 100 / (resident as u64 * 4)
+        }
+
+        let small = per_get(64, 128);
+        let big = per_get(1024, 2048);
+        eprintln!("[LRU] 每次命中检查的槽位数×100：驻留 64 → {small}，驻留 1024 → {big}");
+        assert!(small > 0, "尺子在空转：一次命中都没检查过槽位");
+        assert!(
+            big * 100 <= small * 150 + 100,
+            "驻留 64→1024（16 倍）时每次命中的代价不该跟着涨：{small} vs {big}"
+        );
     }
 
     /// `range_at` 改成用稀疏索引定位起始块之后，命中结果必须与「扫全文件再筛」逐条一致，
