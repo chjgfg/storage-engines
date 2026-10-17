@@ -72,20 +72,8 @@ impl Transaction {
     }
 
     fn rollback_keys(&self, keys: &[Vec<u8>]) {
-        use crate::memory::memory_mvcc::encode_key;
-        if keys.is_empty() {
-            return;
-        }
-        let ver = self.version();
-        let mut store = self.store.lock().unwrap();
-        for k in keys {
-            let _ = store.delete(&encode_key(k, ver));
-        }
-        if let Ok(mut active) = self.active_txn.lock() {
-            if let Some(writes) = active.get_mut(&ver) {
-                writes.retain(|w| !keys.iter().any(|k| k == w));
-            }
-        }
+        // 撤行 + 摘写集那一段在 [`crate::common::TxnCore::undo`]（四引擎共用的一份）
+        self.undo(keys);
     }
 
     // ── multi_get ──

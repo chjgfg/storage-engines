@@ -9,7 +9,7 @@
 //! 存储落到 [`crate::mem_store::MemStore`]。
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -22,6 +22,7 @@ pub use crate::common::{
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::vacuum_plan;
 use crate::common::version_key_upper_bound;
+use crate::common::txn::{BulkCore, TxnCore, WriteSide};
 use crate::memory::mem_store::MemStore;
 
 // 测试专用：本线程在「每个逻辑 key 的胜出行」那次折叠里**走了多少个版本键**。
@@ -49,21 +50,18 @@ pub struct MVCC {
 }
 
 /// 普通 MVCC 事务
+///
+/// 事务语义那部分（版本、活跃快照、写集、回收记账、冲突判定、回滚）在
+/// [`TxnCore`]（[`crate::common::txn`]，四引擎共用）；这里只留"这一家的字节住在哪"。
 pub struct Transaction {
     pub(crate) store: Arc<Mutex<MemStore>>,
-    pub(crate) active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
-    /// 提交时把本事务写的版本行数记到自动回收的账上
-    vac: Arc<VacuumScheduler>,
-    version: u64,
-    active_xid: HashSet<u64>,
+    pub(crate) core: TxnCore,
 }
 
-/// 批量导入：无冲突检测、不登记活跃表（单写者假定）
+/// 批量导入：无冲突检测、不登记活跃表（单写者假定）。会话号与收尾顺序在 [`BulkCore`]。
 pub struct BulkLoader {
     store: Arc<Mutex<MemStore>>,
-    next_version: Arc<AtomicU64>,
-    version: u64,
-    finished: bool,
+    core: BulkCore,
 }
 
 /// 逻辑键 + 版本（调试用）与版本键编解码
@@ -136,12 +134,9 @@ impl MVCC {
 
     /// bulk load：单写者、无冲突检测。结束必须 `finish()`。
     pub fn begin_bulk(&self) -> BulkLoader {
-        let version = self.next_version.fetch_add(1, Ordering::SeqCst);
         BulkLoader {
             store: self.store.clone(),
-            next_version: self.next_version.clone(),
-            version,
-            finished: false,
+            core: BulkCore::begin(self.next_version.clone()),
         }
     }
 
@@ -298,29 +293,19 @@ impl Default for MVCC {
 
 impl BulkLoader {
     pub fn put(&mut self, key: &[u8], value: Vec<u8>) {
-        let enc = encode_key(key, self.version);
-        self.store.lock().unwrap().insert(enc, Some(value));
+        self.core.put(&self.store, key, value);
     }
 
     pub fn put_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) {
-        let mut store = self.store.lock().unwrap();
-        for (key, value) in items {
-            let enc = encode_key(key, self.version);
-            store.insert(enc, Some(value.clone()));
-        }
+        self.core.put_batch_ref(&self.store, items);
     }
 
     pub fn put_batch_owned(&mut self, items: Vec<(Vec<u8>, Vec<u8>)>) {
-        let mut store = self.store.lock().unwrap();
-        for (key, value) in items {
-            let enc = encode_key(&key, self.version);
-            store.insert(enc, Some(value));
-        }
+        self.core.put_batch(&self.store, items);
     }
 
     pub fn delete(&mut self, key: &[u8]) {
-        let enc = encode_key(key, self.version);
-        self.store.lock().unwrap().insert(enc, None);
+        self.core.delete(&self.store, key);
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -330,7 +315,7 @@ impl BulkLoader {
         let mut best: Option<Vec<u8>> = None;
         for (enc, row) in store.range_scan(&low, &high) {
             if let Some(vk) = decode_key(&enc) {
-                if vk.raw_key.as_slice() == key && vk.version <= self.version {
+                if vk.raw_key.as_slice() == key && vk.version <= self.core.version {
                     best = match row {
                         None => None,
                         Some(raw) => crate::memory::kv_ops::logical_to_user(raw),
@@ -342,24 +327,33 @@ impl BulkLoader {
     }
 
     pub fn finish(mut self) {
-        self.finish_inner();
-    }
-
-    fn finish_inner(&mut self) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        // 确保 next_version 已越过本 bulk version（begin 时已 fetch_add）
-        let _ = self.next_version.load(Ordering::SeqCst);
+        self.core.finish();
     }
 }
 
 impl Drop for BulkLoader {
     fn drop(&mut self) {
-        if !self.finished {
-            self.finish_inner();
-        }
+        // 忘了 `finish()` 也得把这次会话的版本号占掉（bulk 不写 WAL、不回滚，见 [`BulkCore`]）
+        self.core.finish();
+    }
+}
+
+/// 写侧：内存引擎的"这一行的字节住在哪"= 同一张 `BTreeMap`，所以三个方法都是薄壳。
+///
+/// ⚠️ [`WriteSide::latest_version`] 走的是链尾反向早停（[`Transaction::find_version_back`]），
+/// 不是整链扫 —— 与点读同一条路径，所以"点写陪跑整条版本链"这个洞只会在一处出现。
+impl WriteSide for MemStore {
+    fn latest_version(&mut self, key: &[u8]) -> Option<u64> {
+        Transaction::find_version_back(self, key, |_| true)
+            .and_then(|enc| decode_key(&enc).map(|vk| vk.version))
+    }
+
+    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) {
+        self.insert(enc.to_vec(), value);
+    }
+
+    fn remove_versioned(&mut self, enc: &[u8]) {
+        self.delete(enc);
     }
 }
 
@@ -379,10 +373,10 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         // 判据与"只查不删"的理由见 [`crate::common::is_unfinished`]：
         // 删除必须留给下面的 rollback()，它要按表里那份 key 列表把本事务写过的版本行清掉
-        if !crate::common::is_unfinished(&self.active_txn, self.version) {
+        if !self.core.unfinished() {
             return;
         }
-        log::warn!("事务 {} 未 commit/rollback 即被丢弃，已自动回滚", self.version);
+        log::warn!("事务 {} 未 commit/rollback 即被丢弃，已自动回滚", self.core.version);
         self.rollback();
     }
 }
@@ -394,25 +388,14 @@ impl Transaction {
         next_version: Arc<AtomicU64>,
         vac: Arc<VacuumScheduler>,
     ) -> Self {
-        let version = next_version.fetch_add(1, Ordering::SeqCst);
-        let active_txn_arc = Arc::clone(&active_txn);
-
-        let mut guard = active_txn.lock().unwrap();
-        let active_xid: HashSet<u64> = guard.keys().cloned().collect();
-        guard.insert(version, Vec::new());
-        drop(guard);
-
         Transaction {
             store,
-            active_txn: active_txn_arc,
-            vac,
-            version,
-            active_xid,
+            core: TxnCore::begin(active_txn, &next_version, vac),
         }
     }
 
     pub fn version(&self) -> u64 {
-        self.version
+        self.core.version
     }
 
     pub fn set(&self, key: &[u8], value: Vec<u8>) -> bool {
@@ -441,24 +424,8 @@ impl Transaction {
     }
 
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> bool {
-        let mut active_txn = self.active_txn.lock().unwrap();
-        let mut store = self.store.lock().unwrap();
-
-        if let Some(latest_version) = Self::latest_version_of(&store, key) {
-            if !self.is_visible(latest_version) {
-                return false;
-            }
-        }
-
-        let enc_key = encode_key(key, self.version);
-
-        let writes = active_txn.entry(self.version).or_default();
-        if !writes.iter().any(|k| k == key) {
-            writes.push(key.to_vec());
-        }
-
-        store.insert(enc_key, value);
-        true
+        // 冲突判定 → 写集登记 → 落行，那一段顺序在 [`TxnCore::write`]（四引擎共用的一份）
+        self.core.write(&self.store, key, value)
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -633,30 +600,22 @@ impl Transaction {
     }
 
     pub fn commit(&self) {
-        let rows_written = {
-            let mut active_txn = self.active_txn.lock().unwrap();
-            active_txn.remove(&self.version).map(|k| k.len()).unwrap_or(0)
-        };
-        // 给自动回收记一笔账（近似：算逻辑 key 数，宁可少算也不为了精确再走一遍写集）
-        self.vac.on_commit(rows_written as u64);
+        // 销账 + 给自动回收记一笔账，都在 [`TxnCore::commit`]（四引擎共用的一份）
+        self.core.commit();
     }
 
     pub fn rollback(&self) {
-        let mut active_txn = self.active_txn.lock().unwrap();
-        let keys = active_txn.remove(&self.version).unwrap_or_default();
-
-        if !keys.is_empty() {
-            let mut store = self.store.lock().unwrap();
-            for k in keys {
-                let enc_key = encode_key(&k, self.version);
-                let _ = store.delete(&enc_key);
-            }
-        }
+        self.core.rollback(&self.store);
     }
 
     fn is_visible(&self, version: u64) -> bool {
         // 判据在 [`crate::common::visible_at`]（四引擎共用的一份）
-        crate::common::visible_at(version, self.version, &self.active_xid)
+        self.core.is_visible(version)
+    }
+
+    /// 部分撤销：批量写撞墙时把已落下的那几把 key 退回（连同写集一起摘掉）。
+    pub(crate) fn undo(&self, keys: &[Vec<u8>]) {
+        self.core.undo(&self.store, keys);
     }
 
     /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键。
@@ -687,11 +646,6 @@ impl Transaction {
             }
             budget = budget.saturating_mul(2);
         }
-    }
-
-    fn latest_version_of(store: &MemStore, key: &[u8]) -> Option<u64> {
-        Self::find_version_back(store, key, |_| true)
-            .and_then(|enc| decode_key(&enc).map(|vk| vk.version))
     }
 }
 

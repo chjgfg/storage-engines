@@ -1275,6 +1275,102 @@ mod tests {
         cleanup(dirs);
     }
 
+    /// 事务内核（M18b）的跨引擎对拍：同一段事务脚本在四家跑出**同一个结果**。
+    ///
+    /// 为什么必须有它：`memory` 一家搬上共用内核时，另三家还各留一份自己的实现，
+    /// 而每家原有的测试只测自家那一份 —— 内核写错、或搬的时候漏了一条语义，
+    /// 单引擎测试全都发现不了（各家的断言本来就是对各家实现写的）。这条按"脚本 + 终态"对拍，
+    /// 覆盖内核的全部四条通道：
+    /// ①冲突拒写（且被拒的那一行**没落库**）②回滚撤销自己写过的行 ③批量写撞墙时的部分撤销
+    /// ④未收尾即丢弃 ⇒ 自动回滚且不漏活跃事务。终态逐字节比对，四家必须一模一样。
+    #[test]
+    fn txn_kernel_agrees_across_engines() {
+        let mut finals: Vec<(&str, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = Vec::new();
+        let mut actives: Vec<(&str, u64)> = Vec::new();
+        for (name, db, dir) in open_all() {
+            // ① 两条事务抢同一把 key：后来者拒写，且那一行不许留在库里
+            let t1 = db.begin();
+            let t2 = db.begin();
+            assert!(t1.set(b"hot", b"v1".to_vec()), "{name}: t1 写 hot");
+            assert!(
+                !t2.set(b"hot", b"v2".to_vec()),
+                "{name}: t2 写 hot 必须是写冲突"
+            );
+            // ② t2 另一把 key 写得成，回滚后要消失
+            assert!(t2.set(b"mine", b"v3".to_vec()), "{name}: t2 写 mine");
+            assert!(
+                t2.get(b"mine").is_some(),
+                "{name}: t2 自己得看得见刚写的行"
+            );
+            assert!(
+                t1.get(b"mine").is_none(),
+                "{name}: t1 不该看见 t2 未提交的行"
+            );
+            t1.commit();
+            t2.rollback();
+
+            // ③ 批量写撞墙：已落的那几条要退回去（部分撤销），整笔事务随后回滚
+            let t3 = db.begin();
+            let t4 = db.begin();
+            assert!(t3.set(b"hot", b"v5".to_vec()), "{name}: t3 抢 hot");
+            let err = t4
+                .batch_set(&[
+                    (b"first".to_vec(), b"v6".to_vec()),
+                    (b"hot".to_vec(), b"v7".to_vec()),
+                ])
+                .expect_err("{name}: batch_set 必须在 hot 上冲突");
+            assert_eq!(err, b"hot".to_vec(), "{name}: 冲突键");
+            assert!(
+                t4.get(b"first").is_none(),
+                "{name}: 部分撤销必须把 first 也退回"
+            );
+            t3.rollback();
+            t4.rollback();
+
+            // ④ 未收尾即丢弃 ⇒ 自动回滚，且活跃表不许漏下这一笔
+            let t5 = db.begin();
+            t5.set(b"leak", b"v8".to_vec());
+            let leaked_version = t5.version();
+            drop(t5);
+            let after_drop = db.begin();
+            assert!(
+                after_drop.get(b"leak").is_none(),
+                "{name}: 丢弃的事务必须等于没写"
+            );
+            after_drop.commit();
+            let _ = leaked_version;
+
+            let tx = db.begin();
+            let mut rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = tx
+                .scan(None, None)
+                .into_iter()
+                .map(|r| (r.key, r.value))
+                .collect();
+            rows.sort();
+            tx.commit();
+            finals.push((name, rows));
+            actives.push((name, db.health().active_txns));
+            if let Some(d) = dir {
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
+        let want = &finals[0];
+        for got in &finals[1..] {
+            assert_eq!(
+                want.1,
+                got.1,
+                "终态不一致：{} vs {}（内核搬完必须逐家对得上）",
+                want.0,
+                got.0
+            );
+        }
+        for (name, n) in actives {
+            assert_eq!(n, 0, "{name}: 一轮脚本跑完不许留下活跃事务（漏网会永久停掉回收）");
+        }
+        // 脚本本身也钉住：四家终态都是这一把 committed 的行
+        assert_eq!(finals[0].1, vec![(b"hot".to_vec(), Some(b"v1".to_vec()))]);
+    }
+
     #[test]
     fn all_engines_bulk_load() {
         let engines = open_all();
