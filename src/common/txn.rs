@@ -36,9 +36,10 @@
 //! **调用方先 [`TxnCore::lock_registry`]，再按自己家的顺序锁存储侧，然后把两个守卫一起交给内核**。
 //! 顺序由调用方的两行保证，判定与序列由内核保证。
 //!
-//! 搬的进度：`memory`（M18b）、`lsm_tree`（M18c）、`bitcask`（M18d）已用上；只剩 `bplus_tree`
-//! （它要多用两个槽：`encode_value` 走 blob，`row_fits` 判页容量）。
-//! 每搬一家都要当场证明它没改语义 —— 靠的是 `txn_kernel_agrees_across_engines`（同一段事务脚本
+//! 搬的进度：四家都跑在这份内核上（`memory` M18b、`lsm_tree` M18c、`bitcask` M18d、
+//! `bplus_tree` M18e）。各家剩的是自己那几个槽：内存只给三个必需方法，LSM 多给两条 WAL，
+//! bitcask 再多给一条 `encode_value`，bplus 用满（`encode_value` + `row_fits`）。
+//! 每搬一家都当场证明它没改语义 —— 靠的是 `txn_kernel_agrees_across_engines`（同一段事务脚本
 //! 在四家跑出同一个终态），各家原有测试只测自家那一份副本，跨引擎对拍才看得见"内核写歪了"。
 
 use std::collections::{HashMap, HashSet};

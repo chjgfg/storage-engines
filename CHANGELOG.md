@@ -237,6 +237,28 @@
     量过（这条洞是 M18d 的变异测试撞出来的，不是搬内核搬坏的）。现在三家都按**记录类型**数
     `WalRecord::Write`（`bitcask` / `lsm_tree` 数 `wal_write` 槽、`bplus_tree` 数它自己的直接
     append），同一处变异打上去三家各自红（逐家实测）。
+- **`bplus_tree` 搬上事务内核（M18e）—— 四家的写侧从此一份**：写侧守卫按 `活跃表 → wal → blob → kv`
+  拿好三把锁，这一家是四家里唯一**用满** [`WriteSide`] 槽的：`encode_value`（blob 旁路）+
+  `row_fits`（定长页容量判定），而 `put_versioned` 直接把 `BPlusTree::insert` 的 `bool` 交给内核
+  （原先那条 `false` 被丢掉过，M14 之后它有了返回值通道，现在再接到了记账上）。
+  - `row_fits` 槽里保留那句 `log::error!` —— 它是"拒收一行"唯一的对外说明（`false` 分不清冲突
+    还是拒收，门面没为它开 `EngineError` 通道），搬的时候容易当成冗余日志删掉。
+  - 内核把容量判定放在 `wal_begin` **之前**，于是被拒收的一行连 `Begin` 都不再留（原先会留下一条
+    "开张没写"的 `Begin`）。守卫里新增 `begins == 1` 那条钉住它：把顺序退回旧形状实测红在
+    "实际 2 条"。`BPlusTree::row_fits` 的签名顺手从 `&Key` 换成 `&[u8]`（内核给槽的是切片，
+    而它本来就要 clone 一份来算字节账）。
+  - 两处变异实测：`row_fits` 槽恒真 ⇒ 红在 `test_oversized_row_is_refused_before_the_wal`；
+    `encode_value` 槽退回原样 ⇒ 红在 `test_large_value_blob_roundtrip` +
+    `test_incr_and_incr_with_ttl` + `test_ttl_and_purge`。
+  - 复测（release / 20000 行同一台架，与 M15b 那一轮同形状对照）没引入回归：`更新 2000 键`
+    69.5 → **58.7 µs/次**、`search 首页(免 total)` 259.1 → **149.3 µs**、`health()`
+    17.1 → **14.0 ms**、`vacuum() 全库` 311 → **244 ms**、`bulk 灌 2000 行` 38.2 → **34.9 µs/行**
+    （本机墙钟 run 间 ±2×，这些只报方向；`灌 20000 行(事务)` 63.1 µs/行、点读乱序 14.3 µs/次
+    与上一轮同档）。
+  - **四家总账**（M18b~M18e，`src/` 累计 +1142 / −430，其中测试与文档占大头）：
+    `write` / 写冲突检测 / `commit` / `rollback` / `rollback_keys` / bulk 版本编排现在只有
+    `common/txn.rs` 一份实现；各家剩下的就是自己那几个槽（内存 3 个方法、LSM 5 个、
+    bitcask 6 个、bplus 7 个）。新增第五个引擎要写的东西从"抄 100 行事务层"变成"实现这几个方法"。
 - **`KvTxn::set_raw(key, value)`（M16，非破坏）**：存**任意字节**的原样写入口 —— 信封由引擎打
   （内部就是 `set(key, pack_plain(value))`），`get` 一字不差还回来。存在的理由：`set` 的约定是
   "传进来的字节已经是打过信封的逻辑值"，直接拿它存裸字节会按首字节偶发丢数据 —— `0x00` 打头少

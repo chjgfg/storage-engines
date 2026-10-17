@@ -433,8 +433,8 @@ impl BPlusTree {
     /// 树拒收之后 WAL 里就留下一条"提交了但这行不存在"的记录，恢复时按它重放只会再拒一次，
     /// 表现成"WAL 说有、树里查无此键"。所以拒绝必须发生在写 WAL **之前**。
     /// 判据与分裂用的是同一套字节账（`leaf_total_bytes`），不留两边不一致。
-    pub fn row_fits(&self, key: &Key, row: &Option<Vec<u8>>) -> bool {
-        Self::leaf_total_bytes(&[(key.clone(), RowId(row.clone()))], None) <= MAX_PAYLOAD as i64
+    pub fn row_fits(&self, key: &[u8], row: &Option<Vec<u8>>) -> bool {
+        Self::leaf_total_bytes(&[(key.to_vec(), RowId(row.clone()))], None) <= MAX_PAYLOAD as i64
     }
 
     /// 插入一行。返回 `false` = **这一行没进去**，只有一种成因：这一条比一整页还大，
