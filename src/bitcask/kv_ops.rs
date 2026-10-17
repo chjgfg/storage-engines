@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use crate::bitcask::bitcask_mvcc::{encode_key, MVCC, Transaction};
+use crate::bitcask::bitcask_mvcc::{MVCC, Transaction};
 use crate::common::codec::parse_i64_user;
 
 /// 公共类型与编解码工具现由 [`crate::common`] 统一定义。
@@ -81,19 +81,8 @@ impl Transaction {
 
     /// 回滚本事务对给定 keys 的当前 version 写入（不 Abort 整个事务）
     fn rollback_keys(&self, keys: &[Vec<u8>]) {
-        if keys.is_empty() {
-            return;
-        }
-        let ver = self.version();
-        let mut kv = self.kv.lock().unwrap();
-        for k in keys {
-            let _ = kv.remove(&encode_key(k, ver));
-        }
-        if let Ok(mut active) = self.active_txn.lock() {
-            if let Some(writes) = active.get_mut(&ver) {
-                writes.retain(|w| !keys.iter().any(|k| k == w));
-            }
-        }
+        // 撤行 + 摘写集那一段在 [`crate::common::TxnCore::undo`]（四引擎共用的一份）
+        self.undo(keys);
     }
 
     // ── multi_get ──

@@ -353,8 +353,10 @@ impl WriteSide for MemStore {
             .and_then(|enc| decode_key(&enc).map(|vk| vk.version))
     }
 
-    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) {
+    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool {
         self.insert(enc.to_vec(), value);
+        // 内存引擎的插入不会失败（没有磁盘通道），所以恒真
+        true
     }
 
     fn remove_versioned(&mut self, enc: &[u8]) {

@@ -19,7 +19,7 @@
 //! - bulk 路径：无 WAL + 4MB 写缓冲 + insert_batch，目标 10M / 10min
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -35,6 +35,7 @@ pub use crate::common::{
     DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
 use crate::common::{HealthFold, VacuumScheduler};
+use crate::common::txn::{BulkCore, TxnCore, WalTail, WriteSide};
 use crate::common::vacuum_plan;
 use crate::common::version_key_upper_bound;
 
@@ -55,19 +56,31 @@ pub struct MVCC {
 }
 
 /// 普通 MVCC 事务
+///
+/// 事务语义（版本、活跃快照、写集、冲突判定、整条写序列、回收记账）在 [`TxnCore`]
+/// （[`crate::common::txn`]，四引擎共用）；这一家只留"字节在日志的哪个偏移、大值走不走 blob"。
 pub struct Transaction {
     pub(crate) kv: Arc<Mutex<Bitcask>>,
     pub(crate) blob: Arc<Mutex<BlobStore>>,
-    wal: Arc<Mutex<Wal>>,
-    pub(crate) active_txn: Arc<Mutex<HashMap<u64, Vec<Vec<u8>>>>>,
+    pub(crate) wal: Arc<Mutex<Wal>>,
     next_version: Arc<AtomicU64>,
     wal_limit: Arc<AtomicU64>,
-    /// 提交时把本事务写的版本行数记到自动回收的账上
-    vac: Arc<VacuumScheduler>,
-    /// 本事务是否已经进过 WAL（第一次写时才补 `Begin`）—— 见 [`crate::common::WalPolicy`]
-    wal_policy: crate::common::WalPolicy,
-    version: u64,
-    active_xid: HashSet<u64>,
+    pub(crate) core: TxnCore,
+}
+
+/// 写路径的守卫：三把锁都已按内核要求的顺序（活跃表 → wal → blob → kv）拿好。
+///
+/// 回滚与部分撤销复用同一个守卫（会顺手多锁一次 blob —— 那两条路不碰它，锁是无竞争的，
+/// 换来的是"写侧只有一种守卫形状"）。
+pub(crate) struct TxnSide<'w, 'b, 'k> {
+    pub(crate) wal: &'w mut Wal,
+    pub(crate) blob: &'b mut BlobStore,
+    pub(crate) kv: &'k mut Bitcask,
+}
+
+/// 收尾用的守卫：`commit` 只要往 WAL 落一条 `Commit` 再 fsync，不该在这期间握着 kv/blob 锁。
+struct WalOnly<'w> {
+    wal: &'w mut Wal,
 }
 
 /// 批量导入会话：无 WAL、无冲突检测，单写者假定
@@ -75,9 +88,7 @@ pub struct BulkLoader {
     kv: Arc<Mutex<Bitcask>>,
     blob: Arc<Mutex<BlobStore>>,
     wal: Arc<Mutex<Wal>>,
-    next_version: Arc<AtomicU64>,
-    version: u64,
-    finished: bool,
+    core: BulkCore,
 }
 
 /// 逻辑键 + 版本（调试用）与版本键编解码
@@ -339,14 +350,11 @@ impl MVCC {
     /// **崩溃不安全**：finish 之前进程挂掉可能丢数据。
     /// 导入结束后必须 `finish()`。
     pub fn begin_bulk(&self) -> BulkLoader {
-        let version = self.next_version.fetch_add(1, Ordering::SeqCst);
         BulkLoader {
             kv: self.kv.clone(),
             blob: self.blob.clone(),
             wal: self.wal.clone(),
-            next_version: self.next_version.clone(),
-            version,
-            finished: false,
+            core: BulkCore::begin(self.next_version.clone()),
         }
     }
 
@@ -614,7 +622,7 @@ fn scan_max_version(tree: &mut Bitcask) -> std::io::Result<u64> {
 
 impl BulkLoader {
     pub fn put(&mut self, key: &[u8], value: Vec<u8>) {
-        let enc = encode_key(key, self.version);
+        let enc = encode_key(key, self.core.version);
         let stored = {
             let mut blob = self.blob.lock().unwrap();
             // bulk：不每条 fsync blob
@@ -628,7 +636,7 @@ impl BulkLoader {
     pub fn put_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) {
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
-        let ver = self.version;
+        let ver = self.core.version;
         let batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = items
             .iter()
             .map(|(k, v)| {
@@ -644,7 +652,7 @@ impl BulkLoader {
     pub fn put_batch_owned(&mut self, items: Vec<(Vec<u8>, Vec<u8>)>) {
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
-        let ver = self.version;
+        let ver = self.core.version;
         let batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = items
             .into_iter()
             .map(|(k, v)| {
@@ -657,7 +665,7 @@ impl BulkLoader {
     }
 
     pub fn delete(&mut self, key: &[u8]) {
-        let enc = encode_key(key, self.version);
+        let enc = encode_key(key, self.core.version);
         let mut kv = self.kv.lock().unwrap();
         let _ = kv.insert(enc, None);
     }
@@ -671,7 +679,7 @@ impl BulkLoader {
         if let Ok(range) = kv.range_scan(low, high) {
             for (enc, val) in range {
                 if let Some(vk) = decode_key(&enc) {
-                    if vk.raw_key.as_slice() == key && vk.version <= self.version {
+                    if vk.raw_key.as_slice() == key && vk.version <= self.core.version {
                         best = match val {
                             None => None,
                             Some(stored) => decode_stored_value(&mut blob, &stored)
@@ -699,10 +707,10 @@ impl BulkLoader {
     }
 
     fn finish_inner(&mut self) {
-        if self.finished {
+        // 幂等守卫在内核里（`finish()` 与 `Drop` 都会调），收尾动作本身是 bitcask 自己的事
+        if !self.core.first_finish() {
             return;
         }
-        self.finished = true;
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         let mut wal = self.wal.lock().unwrap();
@@ -710,7 +718,7 @@ impl BulkLoader {
         let _ = kv.flush();
         // bulk 结束后写 hint，避免下次 open 全量扫
         let _ = kv.dump_hint();
-        let next_ver = self.next_version.load(Ordering::SeqCst);
+        let next_ver = self.core.next_version().load(Ordering::SeqCst);
         let _ = wal.append(WalRecord::Checkpoint {
             next_version: next_ver,
             root_page_id: 0,
@@ -723,9 +731,7 @@ impl BulkLoader {
 
 impl Drop for BulkLoader {
     fn drop(&mut self) {
-        if !self.finished {
-            self.finish_inner();
-        }
+        self.finish_inner();
     }
 }
 
@@ -742,13 +748,13 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         // 判据与"只查不删"的理由见 [`crate::common::is_unfinished`]：
         // 删除必须留给下面的 rollback()，它要按表里那份 key 列表把本事务写过的版本行清掉
-        if !crate::common::is_unfinished(&self.active_txn, self.version) {
+        if !self.core.unfinished() {
             return;
         }
         if self.wal.lock().is_err() {
             return;
         }
-        log::warn!("事务 {} 未 commit/rollback 即被丢弃，已自动回滚", self.version);
+        log::warn!("事务 {} 未 commit/rollback 即被丢弃，已自动回滚", self.core.version);
         self.rollback();
     }
 }
@@ -763,33 +769,21 @@ impl Transaction {
         wal_limit: Arc<AtomicU64>,
         vac: Arc<VacuumScheduler>,
     ) -> Self {
-        let version = next_version.fetch_add(1, Ordering::SeqCst);
-        let active_txn_arc = Arc::clone(&active_txn);
-
-        let mut guard = active_txn.lock().unwrap();
-        let active_xid: HashSet<u64> = guard.keys().cloned().collect();
-        guard.insert(version, Vec::new());
-        drop(guard);
-
         // begin 不进 WAL：此刻还不知道这个事务会不会写。第一次 write() 才补 `Begin`
         // （只读事务因此一个字节都不落 —— 详见 [`crate::common::WalPolicy`]）
-
+        let core = TxnCore::begin(active_txn, &next_version, vac);
         Transaction {
             kv,
             blob,
             wal,
-            wal_policy: crate::common::WalPolicy::default(),
-            active_txn: active_txn_arc,
             next_version,
             wal_limit,
-            vac,
-            version,
-            active_xid,
+            core,
         }
     }
 
     pub fn version(&self) -> u64 {
-        self.version
+        self.core.version
     }
 
     pub fn set(&self, key: &[u8], value: Vec<u8>) -> bool {
@@ -818,53 +812,21 @@ impl Transaction {
     }
 
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> bool {
-        let mut active_txn = self.active_txn.lock().unwrap();
+        // 锁序：活跃表 → wal → blob → kv；那八步序列在 [`TxnCore::write`]（四引擎共用的一份）
+        let mut reg = self.core.lock_registry();
         let mut wal = self.wal.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
-        let mut kvengine = self.kv.lock().unwrap();
-
-        if let Some(latest_version) = Self::latest_version_of(&mut kvengine, key) {
-            if !self.is_visible(latest_version) {
-                return false;
-            }
-        }
-
-        let enc_key = encode_key(key, self.version);
-
-        // 逻辑 value → 存储编码（大 value 写 blob）
-        let stored_opt = match value {
-            None => None,
-            Some(v) => match encode_stored_value(&mut blob, v, true) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("blob encode 失败: {e}");
-                    return false;
-                }
+        let mut kv = self.kv.lock().unwrap();
+        self.core.write(
+            &mut reg,
+            &mut TxnSide {
+                wal: &mut wal,
+                blob: &mut blob,
+                kv: &mut kv,
             },
-        };
-
-        if self.wal_policy.open_on_first_write() {
-            let _ = wal.append(WalRecord::Begin { xid: self.version });
-        }
-        if let Err(e) = wal.append(WalRecord::Write {
-            xid: self.version,
-            key: enc_key.clone(),
-            value: stored_opt.clone(),
-        }) {
-            eprintln!("WAL append 失败: {e}");
-            return false;
-        }
-
-        let writes = active_txn.entry(self.version).or_default();
-        if !writes.iter().any(|k| k == key) {
-            writes.push(key.to_vec());
-        }
-
-        if let Err(e) = kvengine.insert(enc_key, stored_opt) {
-            eprintln!("Bitcask insert 失败: {e}");
-            return false;
-        }
-        true
+            key,
+            value,
+        )
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -1074,18 +1036,12 @@ impl Transaction {
     }
 
     pub fn commit_with_options(&self, flush_data: bool) {
-        let rows_written = {
-            let mut active_txn = self.active_txn.lock().unwrap();
-            active_txn.remove(&self.version).map(|k| k.len()).unwrap_or(0)
-        };
-        // 给自动回收记一笔账（近似：算逻辑 key 数，宁可少算也不为了精确再走一遍写集）
-        self.vac.on_commit(rows_written as u64);
-        if self.wal_policy.opened() {
+        // 销账 + 回收记账 + WAL 收尾（`Commit` + fsync）在 [`TxnCore::commit`] 一份。
+        // 收尾只交 wal 守卫：fsync 期间不许握着 kv/blob 把读者挡在门外。
+        {
+            let mut reg = self.core.lock_registry();
             let mut wal = self.wal.lock().unwrap();
-            let _ = wal.append(WalRecord::Commit { xid: self.version });
-            if let Err(e) = wal.sync() {
-                eprintln!("WAL fsync 失败: {e}");
-            }
+            self.core.commit(&mut reg, &mut WalOnly { wal: &mut wal });
         }
         if flush_data {
             let mut kv = self.kv.lock().unwrap();
@@ -1106,27 +1062,41 @@ impl Transaction {
     }
 
     pub fn rollback(&self) {
-        let mut active_txn = self.active_txn.lock().unwrap();
-        let keys = active_txn.remove(&self.version).unwrap_or_default();
+        // 销账 + `Abort` + 按写集撤行，都在 [`TxnCore::rollback`]（锁序与 write 一致）
+        let mut reg = self.core.lock_registry();
+        let mut wal = self.wal.lock().unwrap();
+        let mut blob = self.blob.lock().unwrap();
+        let mut kv = self.kv.lock().unwrap();
+        self.core.rollback(
+            &mut reg,
+            &mut TxnSide {
+                wal: &mut wal,
+                blob: &mut blob,
+                kv: &mut kv,
+            },
+        );
+    }
 
-        if self.wal_policy.opened() {
-            let mut wal = self.wal.lock().unwrap();
-            let _ = wal.append(WalRecord::Abort { xid: self.version });
-            let _ = wal.sync();
-        }
-
-        if !keys.is_empty() {
-            let mut kvengine = self.kv.lock().unwrap();
-            for k in keys {
-                let enc_key = encode_key(&k, self.version);
-                let _ = kvengine.remove(&enc_key);
-            }
-        }
+    /// 部分撤销：批量写撞墙时把已落下的那几把 key 退回（连同写集一起摘掉）。
+    pub(crate) fn undo(&self, keys: &[Vec<u8>]) {
+        let mut reg = self.core.lock_registry();
+        let mut wal = self.wal.lock().unwrap();
+        let mut blob = self.blob.lock().unwrap();
+        let mut kv = self.kv.lock().unwrap();
+        self.core.undo(
+            &mut reg,
+            &mut TxnSide {
+                wal: &mut wal,
+                blob: &mut blob,
+                kv: &mut kv,
+            },
+            keys,
+        );
     }
 
     fn is_visible(&self, version: u64) -> bool {
         // 判据在 [`crate::common::visible_at`]（四引擎共用的一份）
-        crate::common::visible_at(version, self.version, &self.active_xid)
+        self.core.is_visible(version)
     }
 
     /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键（原始 enc 字节）。
@@ -1165,6 +1135,83 @@ impl Transaction {
     fn latest_version_of(kv: &mut Bitcask, key: &[u8]) -> Option<u64> {
         Self::find_version_back(kv, key, |_| true)
             .and_then(|enc| decode_key(&enc).map(|vk| vk.version))
+    }
+}
+
+/// 写侧：bitcask 的"字节住在哪"= 追加式数据日志（`insert` 会更新 keydir，且**会失败** ——
+/// 那条 io::Result 通道原先只 `eprintln!` 一下就被丢掉，于是写集里留着一条库里没有的行；
+/// 现在它经 [`WriteSide::put_versioned`] 的返回值交给内核，内核据此不登记写集）。
+///
+/// 用到 `encode_value` 槽：大 value 走 blob 旁路，而旁路在落 WAL **之前**就可能失败 ——
+/// 失败必须在那里判掉，否则 WAL 里留下一条指向不存在 blob 的记录。
+/// 没用 `row_fits`：日志没有页容量。
+impl WriteSide for TxnSide<'_, '_, '_> {
+    fn latest_version(&mut self, key: &[u8]) -> Option<u64> {
+        Transaction::latest_version_of(self.kv, key)
+    }
+
+    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool {
+        match self.kv.insert(enc.to_vec(), value) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("Bitcask insert 失败: {e}");
+                false
+            }
+        }
+    }
+
+    fn remove_versioned(&mut self, enc: &[u8]) {
+        let _ = self.kv.remove(enc);
+    }
+
+    fn encode_value(&mut self, value: Vec<u8>) -> Option<Vec<u8>> {
+        // 事务路径每条都 fsync blob（崩了不能留下"已提交行指着不存在的字节"）
+        match encode_stored_value(self.blob, value, true) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("blob encode 失败: {e}");
+                None
+            }
+        }
+    }
+
+    fn wal_begin(&mut self, xid: u64) -> bool {
+        self.wal.append(WalRecord::Begin { xid }).is_ok()
+    }
+
+    fn wal_write(&mut self, xid: u64, enc: &[u8], stored: Option<&[u8]>) -> bool {
+        self.wal
+            .append(WalRecord::Write {
+                xid,
+                key: enc.to_vec(),
+                value: stored.map(|v| v.to_vec()),
+            })
+            .is_ok()
+    }
+}
+
+/// 收尾两条：`Commit` + fsync、`Abort` + fsync。fsync 失败只喊出来（与改前一致）——
+/// 事务此刻已从活跃表摘除、行也已落库，没有能回退的通道。
+impl WalTail for TxnSide<'_, '_, '_> {
+    fn wal_commit(&mut self, xid: u64) {
+        let _ = self.wal.append(WalRecord::Commit { xid });
+        if let Err(e) = self.wal.sync() {
+            eprintln!("WAL fsync 失败: {e}");
+        }
+    }
+
+    fn wal_abort(&mut self, xid: u64) {
+        let _ = self.wal.append(WalRecord::Abort { xid });
+        let _ = self.wal.sync();
+    }
+}
+
+impl WalTail for WalOnly<'_> {
+    fn wal_commit(&mut self, xid: u64) {
+        let _ = self.wal.append(WalRecord::Commit { xid });
+        if let Err(e) = self.wal.sync() {
+            eprintln!("WAL fsync 失败: {e}");
+        }
     }
 }
 
@@ -1885,6 +1932,23 @@ mod tests {
             tx.commit();
             let size2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
             assert!(size2 > size1, "写入必须留下 Begin/Write/Commit 记录，持久化点不能被省掉");
+
+            // 字节数当尺子**不够**：只落一条 `Commit` 也能让体积涨，于是"`Write` 记录整个没写"
+            // 这种形状照样绿（实测把 `wal_write` 改成不 append 直接返回成功，本函数一路通过）。
+            // 判据必须精确到记录类型 —— 一次写要在 WAL 里留下一条 `Write`。
+            {
+                let mut reader = Wal::open(&wal).expect("打开 WAL 读记录");
+                let records = reader.read_all().expect("读 WAL");
+                let writes = records
+                    .iter()
+                    .filter(|e| matches!(&e.record, WalRecord::Write { .. }))
+                    .count();
+                assert_eq!(
+                    writes, 2,
+                    "两次真写要在 WAL 里各留一条 Write，实际 {writes} 条 \
+                     （只数 Begin/Commit 的尺子抓不到丢了的 Write）"
+                );
+            }
 
             let tx = mvcc.begin_transaction();
             assert_eq!(tx.get(b"k"), Some(b"w".to_vec()));

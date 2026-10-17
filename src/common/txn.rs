@@ -18,8 +18,8 @@
 //! 4. row_fits(enc, stored)?    —— bplus 的"这行装不进一页"必须在这里就拒（默认：装得下）
 //! 5. wal_begin(xid)            —— 第一次写才补 Begin（默认：什么都不做）
 //! 6. wal_write(xid, enc, ...)  —— 落 WAL 在先，改库在后（默认：成功）
-//! 7. 写集登记                   —— 放在所有会失败的步骤之后
-//! 8. put_versioned(enc, ...)   —— 真正改库
+//! 7. put_versioned(enc, ...)   —— 真正改库（**可失败**：bitcask 写数据文件会 Err）
+//! 8. 写集登记                   —— 只登记真落进库的那一行
 //! ```
 //!
 //! 3~6 都在 7 之前是**刻意的**：任何一步失败都不能留下"写集里有、库里没有"的悬账，否则随后的
@@ -36,7 +36,8 @@
 //! **调用方先 [`TxnCore::lock_registry`]，再按自己家的顺序锁存储侧，然后把两个守卫一起交给内核**。
 //! 顺序由调用方的两行保证，判定与序列由内核保证。
 //!
-//! 搬的进度：`memory`（M18b）与 `lsm_tree`（M18c）已用上；`bitcask` / `bplus_tree` 挨个跟。
+//! 搬的进度：`memory`（M18b）、`lsm_tree`（M18c）、`bitcask`（M18d）已用上；只剩 `bplus_tree`
+//! （它要多用两个槽：`encode_value` 走 blob，`row_fits` 判页容量）。
 //! 每搬一家都要当场证明它没改语义 —— 靠的是 `txn_kernel_agrees_across_engines`（同一段事务脚本
 //! 在四家跑出同一个终态），各家原有测试只测自家那一份副本，跨引擎对拍才看得见"内核写歪了"。
 
@@ -64,7 +65,11 @@ pub trait WriteSide {
     fn latest_version(&mut self, key: &[u8]) -> Option<u64>;
 
     /// 落一行版本：`value = None` 是墓碑。`enc` 已由内核编好（`encode_key(key, version)`）。
-    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>);
+    ///
+    /// 返回 `false` = 这一行**没落进去**（bitcask 的 `insert` 会因写数据文件失败而 Err ——
+    /// 那条通道原先只在引擎里 `eprintln!` 一下就被丢掉，于是写集里留着一条库里不存在的行）。
+    /// 内核据此**不登记写集**，所以"写集里有、库里没有"这种悬账不可能再出现。
+    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool;
 
     /// 物理撤掉本事务写下的一行（回滚用 —— **不是**写墓碑，那会让这行永远留在库里）。
     fn remove_versioned(&mut self, enc: &[u8]);
@@ -223,12 +228,15 @@ impl TxnCore {
         }
 
         let writes = reg.entry(self.version).or_default();
-        if !writes.iter().any(|k| k == key) {
-            writes.push(key.to_vec());
+        if side.put_versioned(&enc, stored) {
+            if !writes.iter().any(|k| k == key) {
+                writes.push(key.to_vec());
+            }
+            return true;
         }
-
-        side.put_versioned(&enc, stored);
-        true
+        // 落行失败：写集里一行都不许留（上面 `entry` 建的那个空条目不算账，
+        // `commit` 数的是 `keys.len()`，空条目 = 0 行）
+        false
     }
 
     /// 提交：从活跃表销账 + 给自动回收记一笔账 + WAL 收尾（进过 WAL 才收尾）。

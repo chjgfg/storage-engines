@@ -825,8 +825,10 @@ impl WriteSide for TxnSide<'_, '_> {
             .and_then(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
     }
 
-    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) {
+    fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool {
         self.kv.insert(enc.to_vec(), value);
+        // memtable 插入没有失败通道（落盘在 flush/compact 那边，失败另有账）
+        true
     }
 
     fn remove_versioned(&mut self, enc: &[u8]) {
@@ -2066,6 +2068,23 @@ mod tests {
             tx.commit();
             let size2 = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
             assert!(size2 > size1, "写入必须留下 Begin/Write/Commit 记录，持久化点不能被省掉");
+
+            // 字节数当尺子**不够**：只落一条 `Commit` 也能让体积涨，于是"`Write` 记录整个没写"
+            // 这种形状照样绿（M18d 实测：把 `wal_write` 改成不 append 直接返回成功，bitcask 那条
+            // 一路通过）。判据必须精确到记录类型 —— 一次写要在 WAL 里留下一条 `Write`。
+            {
+                let mut reader = Wal::open(&wal).expect("打开 WAL 读记录");
+                let records = reader.read_all().expect("读 WAL");
+                let writes = records
+                    .iter()
+                    .filter(|e| matches!(&e.record, WalRecord::Write { .. }))
+                    .count();
+                assert_eq!(
+                    writes, 2,
+                    "两次真写要在 WAL 里各留一条 Write，实际 {writes} 条 \
+                     （只数 Begin/Commit 的尺子抓不到丢了的 Write）"
+                );
+            }
 
             // 只读事务也不能把数据读坏（版本号照旧推进，快照语义不变）
             let tx = mvcc.begin_transaction();

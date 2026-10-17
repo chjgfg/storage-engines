@@ -223,6 +223,20 @@
     memory 灌行 5.0 → 4.9、点读 2.2 → 2.2。本机墙钟 run 间 ±2×，这些全在噪声带内。
   - 还没搬的：`bitcask`（要 `encode_value`）、`bplus_tree`（要 `encode_value` + `row_fits`），
     各自一个里程碑。
+- **`bitcask` 搬上事务内核（M18d）**：写侧守卫 `TxnSide { wal, blob, kv }` 按内核要求的顺序
+  （活跃表 → wal → blob → kv）把三把锁拿好，用到的槽是 `encode_value`（大 value 走 blob 旁路，
+  失败必须在落 WAL **之前**判掉，否则 WAL 里留着一条指向不存在字节的记录）与 `wal_begin` /
+  `wal_write`；`commit` 的收尾换成只锁 wal 的 `WalOnly` —— fsync 期间不该握着 kv/blob 把读者挡在门外。
+  - **接上一条真漏**：`Bitcask::insert` 返回 `io::Result`，原先只 `eprintln!` 一声就丢掉，
+    而写集在那之前**已经登记** ⇒ 库里没有这一行、写集里却留着，随后 `rollback` 去删不存在的行、
+    `commit` 的回收账多算一条。内核因此把 `WriteSide::put_versioned` 改成**返回 bool**，并把
+    写集登记挪到落行**之后**：只有真落进库的行才记账。
+  - ⚠️ **三家共用的尺子修了一条**：`test_read_only_transaction_touches_no_wal` 原先拿
+    **WAL 字节数**判"写入有没有进 WAL"，而只落一条 `Commit` 也能让字节涨。实测把 `wal_write`
+    改成"不 append、直接返回成功"，三家**全绿** —— 也就是"`Write` 记录整个没写"这种形状一直没被
+    量过（这条洞是 M18d 的变异测试撞出来的，不是搬内核搬坏的）。现在三家都按**记录类型**数
+    `WalRecord::Write`（`bitcask` / `lsm_tree` 数 `wal_write` 槽、`bplus_tree` 数它自己的直接
+    append），同一处变异打上去三家各自红（逐家实测）。
 - **`KvTxn::set_raw(key, value)`（M16，非破坏）**：存**任意字节**的原样写入口 —— 信封由引擎打
   （内部就是 `set(key, pack_plain(value))`），`get` 一字不差还回来。存在的理由：`set` 的约定是
   "传进来的字节已经是打过信封的逻辑值"，直接拿它存裸字节会按首字节偶发丢数据 —— `0x00` 打头少
