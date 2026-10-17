@@ -255,44 +255,97 @@ pub struct WinCandidate<V> {
     pub row: V,
 }
 
+/// 无界折叠（`wanted = None`，即"一趟走完全库"）每轮要多少组候选。
+///
+/// 为什么不能"一次要到底"（原先就是 `usize::MAX`）：`round` 把候选交出来就得**先装在 `Vec`
+/// 里**，于是一次全库折叠的瞬时内存 = 全部存活键 ×（raw 键 + 取值凭据 + 结构体）。200k 键
+/// 的实测差额在 bitcask 上是 **峰值 +48 MB**（同一轮里 bplus / lsm 报 `+0`，因为它们那条
+/// 候选流更薄），而这笔钱和调用方拿到的结果 `Vec`（常驻 30.7 MB）是**两笔**——也就是说
+/// 一次 `scan` 的占用能到结果集的两倍。削成固定片之后瞬时只剩"一片候选 + 结果 Vec"。
+///
+/// ⚠️ 片大小与"每轮固定开销"是反向的：每轮都要从游标重新起一条键流（`fold_lower_bound`
+/// 已经把界下推了，见 M21），所以轮数是 `存活键 / 本片`。200k 键 = 49 轮，实测单价没测出
+/// 可分辨的差别（判据见守卫，别凭感觉调这个数字）。
+const FOLD_CHUNK: usize = 4096;
+
 /// 窗口折叠的共用驱动（四引擎一份）。
 ///
 /// `round(after, budget)`：从 `after` 这组**之后**开始折，最多交 `budget` 组候选，
 /// 返回 `(候选, 是否已走到界尾)`。`keep(candidate)`：候选 ⇒ 记录（取值 + 剥壳 +
-/// TTL/墓碑过滤），`None` = 这一条不算命中窗口。`wanted = None` = 一趟走完全库。
+/// TTL/墓碑过滤），`None` = 这一条不算命中窗口。`wanted = None` = 一趟走完全库
+/// （**逐片**走完，每片 `FOLD_CHUNK` 组：语义还是"全库"，只是不再把整库候选一次装进内存）。
 ///
 /// 为什么要能续跑第二轮：**"这把键命不命中 pattern"在键这一层就能判，而"这行到底
 /// 取不取到值"（blob 指针、TTL 是否过期）要取了值才知道** ⇒ 提前收手有可能少数几条。
 /// 于是从上一轮的最后一个键续跑、预算翻倍 ⇒ 总代价仍是最终那一轮的同阶，最坏退化成
 /// "走完全库"，而那正好是 `wanted = None`（要精确 total）的语义。同一个几何重试的形状
 /// 在 `vacuum_bounded` 的窗口放大里已经用过一次。
+/// ⚠️ 几何翻倍只给**有界**窗口：无界折叠要的是"每片固定大小、走到库尾"，跟着翻等于把
+///   刚省下来的瞬时内存又按轮数放大回去。
 ///
 /// 为什么值读取放在 `keep` 而不是折在 `round` 里：bitcask/bplus/lsm 的取值要拿 blob 锁，
 /// 而候选是**拿着 kv 锁走元数据**折出来的 —— 今天的两段式就是为了不在这两把锁上打结。
-pub fn fold_window<V, R, K, T>(wanted: Option<usize>, mut round: R, mut keep: K) -> Vec<T>
+pub fn fold_window<V, R, K, T>(wanted: Option<usize>, round: R, keep: K) -> Vec<T>
 where
     R: FnMut(Option<&[u8]>, usize) -> (Vec<WinCandidate<V>>, bool),
     K: FnMut(WinCandidate<V>) -> Option<T>,
 {
     let mut out: Vec<T> = Vec::new();
+    // `wanted` 那条"多要一条只为知道后面还有没有"的合同留在调用方（collect_rows），
+    // 这里只负责交够数就停
+    fold_window_emit(wanted, round, keep, |t| {
+        out.push(t);
+        true
+    });
+    out
+}
+
+/// [`fold_window`] 的**落点版**：每折出一行立刻交给 `emit`，**一行都不攒**。
+///
+/// 为什么要它（M27）：`KvTxn::scan_foreach` 的文档一直写着"不收集全库到单一大 Vec"，
+/// 可它的实现是 `for … in collect_latest_raw_in(...)` —— 先把全库的
+/// `(key, version, 存储字节)` 元组攒成 `Vec`，再逐条搬成 `ExportRecord`。
+/// 200k 键实测因此多占 ~15 MB（峰值 +45.5 而结果集只有 30.7），而且"提前叫停"根本省不到
+/// 折的那一段。有了落点版，流式才是真的：`emit` 返回 `false` 当场收手，后面的键**不再折**。
+///
+/// 返回值 = 实际交给 `emit` 的行数（`wanted` 凑满或走到界尾或被打断都是它）。
+pub fn fold_window_emit<V, R, K, T, E>(
+    wanted: Option<usize>,
+    mut round: R,
+    mut keep: K,
+    mut emit: E,
+) -> usize
+where
+    R: FnMut(Option<&[u8]>, usize) -> (Vec<WinCandidate<V>>, bool),
+    K: FnMut(WinCandidate<V>) -> Option<T>,
+    E: FnMut(T) -> bool,
+{
+    let mut handed = 0usize;
     let mut after: Option<Vec<u8>> = None;
-    let mut budget = wanted.unwrap_or(usize::MAX);
+    let mut budget = wanted.unwrap_or(FOLD_CHUNK);
     loop {
         let (batch, reached_end) = round(after.as_deref(), budget);
         let produced = batch.len();
         for cand in batch {
             after = Some(cand.key.clone());
             if let Some(kept) = keep(cand) {
-                out.push(kept);
-                if wanted.is_some_and(|w| out.len() >= w) {
-                    return out;
+                if !emit(kept) {
+                    return handed;
+                }
+                handed += 1;
+                if wanted.is_some_and(|w| handed >= w) {
+                    return handed;
                 }
             }
         }
         if reached_end || produced == 0 {
-            return out;
+            return handed;
         }
-        budget = budget.saturating_mul(2).max(64);
+        // 几何放大只服务于**有界窗口**（"这一片没凑够 limit 条"那种情况）；
+        // 无界折叠每片固定 FOLD_CHUNK —— 跟着翻等于把刚省下的瞬时内存按轮数放大回去。
+        if wanted.is_some() {
+            budget = budget.saturating_mul(2).max(64);
+        }
     }
 }
 
@@ -316,6 +369,63 @@ pub fn is_unfinished(active_txn: &Mutex<Registry>, version: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// 无界折叠（`wanted = None`，"一趟走完全库"）必须**逐片**走完，而不是把整库候选
+    /// 一次装进内存（M27）。
+    ///
+    /// 尺子选的是"每轮要了多少组候选"，不是墙钟也不是字节数：字节数要靠进程级分配计数
+    /// （并行跑就把别家算进来，10-17 栽过一次），而这条改动的判据本来就是**每轮的上限**。
+    /// 三件事一起断，缺一半都能被糊过去：① 语义没变（行数与内容 == 一次要到底）；
+    /// ② 每轮要的组数不超过 `FOLD_CHUNK`；③ 确实分了多轮（否则 ② 是空转的）。
+    #[test]
+    fn fold_window_unbounded_walks_in_chunks() {
+        // 故意不是整片：最后那一片必须也能走到底
+        const N: usize = 3 * 4096 + 7;
+
+        fn enc(i: usize) -> Vec<u8> {
+            (i as u64).to_le_bytes().to_vec()
+        }
+        fn dec(k: &[u8]) -> usize {
+            u64::from_le_bytes(k.try_into().unwrap()) as usize
+        }
+
+        let mut budgets: Vec<usize> = Vec::new();
+        let out: Vec<usize> = fold_window(
+            None,
+            |round_after, budget| {
+                let start = round_after.map(dec).map(|i| i + 1).unwrap_or(0);
+                let take = budget.min(N.saturating_sub(start));
+                let batch: Vec<WinCandidate<usize>> = (start..start + take)
+                    .map(|i| WinCandidate {
+                        key: enc(i),
+                        version: i as u64,
+                        row: i,
+                    })
+                    .collect();
+                budgets.push(take);
+                (batch, start + take >= N)
+            },
+            |c| Some(c.row),
+        );
+
+        assert_eq!(out.len(), N, "逐片走完全库却少了行");
+        assert_eq!(
+            out,
+            (0..N).collect::<Vec<usize>>(),
+            "分片之后行序/内容与一次要到底不一致"
+        );
+        let max = budgets.iter().copied().max().unwrap_or(0);
+        assert!(
+            budgets.len() >= 2,
+            "只走了一轮 ⇒ 每轮上限那条断言是空转（轮数 {:?}）",
+            budgets
+        );
+        assert!(
+            max <= super::FOLD_CHUNK,
+            "某一轮要了 {max} 组候选，超过一片（{:?}）",
+            budgets
+        );
+    }
+
     /// 驱动"续跑第二轮"那一支的守卫：`keep` 丢掉候选时，必须从上一轮最后一个键接着折，
     /// 而不是把窗口交短。四家的 `search_keys` 都走这条路，而引擎级守卫里
     /// 没有过期行 ⇒ 那条分支一次都不会被踩到，只能在这里直接喂给它。

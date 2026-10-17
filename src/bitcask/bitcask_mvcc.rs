@@ -855,44 +855,6 @@ impl Transaction {
         Some((version, logical))
     }
 
-    /// 全部最新可见逻辑行（key 有序）：(key, version, raw_or_tombstone)
-    ///
-    /// 两段式：① 只走 KeyDir 元数据（`iter_meta`，不碰 value）按 enc 升序折叠出每个逻辑
-    /// key 的「最后一个可见版本」那一行；② 只对这批胜出行各读一次盘并解码。
-    ///
-    /// 旧实现是 `kv.iter()` 把**每一行连 value** 全读出来再挑，于是走它的公开面 ——
-    /// 扫描 / 搜索分页 / `exists` / `export` / `purge_expired` / `print_all` ——
-    /// 每次调用都是 O(总行数) 次读盘，跟版本链有没有被回收无关。现在读盘次数 =
-    /// O(存活 key 数)。
-    pub(crate) fn collect_latest_raw(
-        &self,
-        include_deleted: bool,
-    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        self.collect_latest_raw_in(include_deleted, None, None)
-    }
-
-    /// `[start, end)` 内每个逻辑 key 的最新可见版本 —— 界**下推到迭代器**的那一版。
-    ///
-    /// 为什么必须有它：旧形状是折完全库、再由调用方逐条筛界，于是"200 行的窗口"和
-    /// "20000 行的全量"一样贵（大库基线实测：窗口 scan 376.6 µs/行，同库全量 scan 3.8 µs/行）。
-    /// 范围查询是下游最主要的读法，代价必须随窗口宽度缩。
-    ///
-    /// 边界判定用**原始 key**，但迭代走的是版本键 `raw ‖ version_be`，所以两边都要兜：
-    /// - 起点：`iter_meta_from(start)` 只保证 `enc ≥ start`；raw < start 却排进来的（前缀
-    ///   交错）用 `continue` 掉。
-    /// - 终点：只有按**迭代键本身** `enc ≥ encode(end, 0)` 才能 break —— 按 raw 判 break
-    ///   不安全，因为交错时后面还可能出现更小的 raw；raw ≥ end 的个别键单独 `continue`。
-    /// 界内折叠：折法在 [`crate::common::collect_rows`]（四家一份），这一家只供
-    /// "候选怎么折"与"一组的值怎么取"两件事。
-    pub(crate) fn collect_latest_raw_in(
-        &self,
-        include_deleted: bool,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        crate::common::collect_rows(self, include_deleted, start, end, None, None).0
-    }
-
     /// 取一组的值：KeyDir 里只有元数据 ⇒ 凭据是编码键，值要按位置回日志读
     /// （大 value 还要过 blob 旁路）。这正是"布局相关的那一半"，各家不同。
     fn read_row(&self, enc: &[u8]) -> crate::common::RowValue {
@@ -1004,21 +966,20 @@ impl Transaction {
 
     /// 导出本事务快照下每个逻辑 key 的最新可见版本（已剥 TTL）。
     pub fn export_latest_visible(&self, include_deleted: bool) -> Vec<ExportRecord> {
-        self.collect_latest_raw(true)
-            .into_iter()
-            .filter_map(|(key, _ver, raw)| match raw {
-                None => {
-                    if include_deleted {
-                        Some(ExportRecord { key, value: None })
-                    } else {
-                        None
-                    }
+        // 行形状在这里就定成 `ExportRecord`（M27）：原先是 `collect_latest_raw(true)` 先攒出
+        // 全库的 `(键, 版本, 字节)` 元组 `Vec`，再逐条搬进 `Vec<ExportRecord>` ⇒ 两份头结构
+        // 同时活着（200k 键实测那一段 ≈ 13 MB）。共用件本来就能自定义行形状，接上就行。
+        crate::common::collect_rows_as(self, None, None, None, None, |key, _ver, value| match value {
+            crate::common::RowValue::Tombstone => {
+                if include_deleted {
+                    Some(ExportRecord { key, value: None })
+                } else {
+                    None
                 }
-                Some(bytes) => match crate::bitcask::kv_ops::logical_to_user(bytes) {
-                    Some(user) => Some(ExportRecord {
-                        key,
-                        value: Some(user),
-                    }),
+            }
+            crate::common::RowValue::Value(bytes) => {
+                match crate::bitcask::kv_ops::logical_to_user(bytes) {
+                    Some(user) => Some(ExportRecord { key, value: Some(user) }),
                     None => {
                         if include_deleted {
                             Some(ExportRecord { key, value: None })
@@ -1026,9 +987,12 @@ impl Transaction {
                             None
                         }
                     }
-                },
-            })
-            .collect()
+                }
+            }
+            // 读不到与墓碑不是一回事：整行不参与（与改造前 `collect_rows` 同一判据）
+            crate::common::RowValue::Missing => None,
+        })
+        .0
     }
 
     pub fn commit(&self) {
@@ -1516,6 +1480,67 @@ mod tests {
     /// 2000 行的全量读盘次数一样（大库基线实测：窗口 scan 376.6 µs/行 vs 全量 3.8 µs/行）。
     /// 现在界下推进折叠，这条用例同时钉两件事：① 结果与"全量之后筛"逐条一致（界判得对），
     /// ② 读盘次数随窗口缩（不是又对又慢，也不是快了但筛错）。
+    /// `scan_foreach` 提前叫停时，**不许先把整库折一遍**（M27）。
+    ///
+    /// 这条路径的文档从写下那天起就声称「不收集全库到单一大 Vec」，而实现是
+    /// `for … in collect_latest_raw_in(...)` —— 那一句会把界内每一行都先折出来，再逐条搬成
+    /// `ExportRecord`。200k 键实测因此比结果集本身还多占 ≈ 15 MB（`一次全量 scan`
+    /// 峰值 +45.5 MB / 常驻 30.7 MB）。现在走共用件 `fold_rows_streaming`：折一行交一行，
+    /// 叫停之后的键不再碰。
+    ///
+    /// 判据用**取值次数**（本引擎那把尺子）：交 1 行只该取 1 次值，老写法是 N 次 ——
+    /// 差三个数量级，不必按各家单位调预算。
+    #[test]
+    fn test_scan_foreach_stops_without_folding_the_library() {
+        const N: usize = 2000;
+        fn ruler() -> u64 {
+            crate::bitcask::bitcask::read_value_calls()
+        }
+        let path = tmp_db("foreach_stop");
+        {
+            let mvcc = MVCC::open(&path);
+            for base in (0..N).step_by(2000) {
+                let end = (base + 2000).min(N);
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end)
+                    .map(|i| {
+                        (
+                            format!("k{i:05}").into_bytes(),
+                            format!("v{i}").into_bytes(),
+                        )
+                    })
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("灌第 {base} 批: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            let tx = mvcc.begin_transaction();
+            let base = ruler();
+            let mut handed = 0usize;
+            tx.scan_foreach(None, None, |rec| {
+                assert!(rec.value.is_some(), "交出来的行没有值");
+                handed += 1;
+                false // 只要第一行
+            });
+            let early = ruler() - base;
+            let base = ruler();
+            let all = tx.scan(None, None);
+            let full = ruler() - base;
+            tx.commit();
+
+            assert_eq!(handed, 1, "回调明明叫停了");
+            assert_eq!(all.len(), N, "参照量：全量 scan 要折出所有行");
+            assert!(full >= N as u64, "取值尺子在空转（全量只取 {full} 次）");
+            assert!(
+                early <= 2,
+                "只要 1 行却取了 {early} 次值（老写法：先把全库 {N} 行折出来）"
+            );
+            eprintln!("[scan_foreach 早停] 交 1 行付 {early}，全量 {N} 行付 {full}");
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn test_windowed_scan_cost_scales_with_window_not_library() {
         const KEYS: u64 = 2000;

@@ -813,31 +813,6 @@ impl Transaction {
         Some((version, logical))
     }
 
-    /// 全部最新可见逻辑行（key 有序）= 无界版的 [`Self::collect_latest_raw_in`]。
-    pub(crate) fn collect_latest_raw(
-        &self,
-        include_deleted: bool,
-    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        self.collect_latest_raw_in(include_deleted, None, None)
-    }
-
-    /// `[start, end)` 内每个逻辑 key 的最新可见版本 —— 界**下推到树的下降与叶子链表**上。
-    ///
-    /// 旧形状是折完全库再由调用方逐条筛界 ⇒ 10 行的窗口也要从最左叶子走到最右叶子。
-    /// 现在起点直接下降到 containing 叶子（前面的叶子一篇都不读），终点靠回调喊停
-    /// （有序 ⇒ 越过上界就是尾巴）。
-    ///
-    /// B+ 树的 value 就住在叶子条目里，没有 Bitcask KeyDir 那样的独立键索引，所以
-    /// 「把窗口覆盖的那些页反序列化出来」这一步省不掉 —— 省掉的是**页数**，不是每页的解析。
-    pub(crate) fn collect_latest_raw_in(
-        &self,
-        include_deleted: bool,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        crate::common::collect_rows(self, include_deleted, start, end, None, None).0
-    }
-
     /// 取一组的值：叶子条目里带出来的就是存储字节，只有超过 blob 阈值的那部分要再解一次
     /// （内联行的"无 tag"与解码失败都按墓碑算，与改动前同口径）。
     fn read_row(&self, row: &Option<Vec<u8>>) -> crate::common::RowValue {
@@ -958,37 +933,33 @@ impl Transaction {
     /// 同 key 多版本按 version 升序扫描，后者覆盖前者 → 最终为最新可见。
     /// 模糊搜索与分页见 [`crate::kv_ops::Transaction::search_keys`]。
     pub fn export_latest_visible(&self, include_deleted: bool) -> Vec<ExportRecord> {
-        self.collect_latest_raw(true)
-            .into_iter()
-            .filter_map(|(key, _ver, raw)| match raw {
-                None => {
-                    if include_deleted {
-                        Some(ExportRecord {
-                            key,
-                            value: None,
-                        })
-                    } else {
-                        None
-                    }
+        // 行形状在这里就定成 `ExportRecord`（M27）：原先是 `collect_latest_raw(true)` 先攒出
+        // 全库的 `(键, 版本, 字节)` 元组 `Vec`，再逐条搬进 `Vec<ExportRecord>` ⇒ 两份头结构
+        // 同时活着（200k 键实测那一段 ≈ 13 MB）。共用件本来就能自定义行形状，接上就行。
+        crate::common::collect_rows_as(self, None, None, None, None, |key, _ver, value| match value {
+            crate::common::RowValue::Tombstone => {
+                if include_deleted {
+                    Some(ExportRecord { key, value: None })
+                } else {
+                    None
                 }
-                Some(bytes) => match crate::bplus_tree::kv_ops::logical_to_user(bytes) {
-                    Some(user) => Some(ExportRecord {
-                        key,
-                        value: Some(user),
-                    }),
+            }
+            crate::common::RowValue::Value(bytes) => {
+                match crate::bplus_tree::kv_ops::logical_to_user(bytes) {
+                    Some(user) => Some(ExportRecord { key, value: Some(user) }),
                     None => {
                         if include_deleted {
-                            Some(ExportRecord {
-                                key,
-                                value: None,
-                            })
+                            Some(ExportRecord { key, value: None })
                         } else {
                             None
                         }
                     }
-                },
-            })
-            .collect()
+                }
+            }
+            // 读不到与墓碑不是一回事：整行不参与（与改造前 `collect_rows` 同一判据）
+            crate::common::RowValue::Missing => None,
+        })
+        .0
     }
 
     pub fn commit(&self) {
@@ -2089,6 +2060,68 @@ mod tests {
     /// B+ 树没有 Bitcask KeyDir 那样的独立键索引，"窗口覆盖到的那几页要反序列化"省不掉 ——
     /// 这条省的是**页数**，不是每页的解析成本。断言两半：① 窗口结果与"全量之后筛"逐条一致
     /// （界判得对，不是筛错换来快）；② 页数随窗口缩。
+    /// `scan_foreach` 提前叫停时，**不许先把整库折一遍**（M27）。
+    ///
+    /// 这条路径的文档从写下那天起就声称「不收集全库到单一大 Vec」，而实现是
+    /// `for … in collect_latest_raw_in(...)` —— 那一句会把界内每一行都先折出来，再逐条搬成
+    /// `ExportRecord`。200k 键实测因此比结果集本身还多占 ≈ 15 MB（`一次全量 scan`
+    /// 峰值 +45.5 MB / 常驻 30.7 MB）。现在走共用件 `fold_rows_streaming`：折一行交一行，
+    /// 叫停之后的键不再碰。
+    ///
+    /// 判据用**值解码次数**：B+ 树的值就住在叶子条目里，折出来那一步顺手把它解码 ——
+    /// 所以老写法是每把键一次，新写法只在真要交出去那一行才解。
+    #[test]
+    fn test_scan_foreach_stops_without_folding_the_library() {
+        const N: usize = 2000;
+        fn ruler() -> u64 {
+            crate::bplus_tree::storage::value_decodes()
+        }
+        let path = tmp_db("foreach_stop");
+        {
+            // order 64 = 默认档；页缓存 0 = 自动档（M22）
+            let mvcc = MVCC::open(&path, 64, 0);
+            for base in (0..N).step_by(2000) {
+                let end = (base + 2000).min(N);
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end)
+                    .map(|i| {
+                        (
+                            format!("k{i:05}").into_bytes(),
+                            format!("v{i}").into_bytes(),
+                        )
+                    })
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("灌第 {base} 批: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            let tx = mvcc.begin_transaction();
+            let base = ruler();
+            let mut handed = 0usize;
+            tx.scan_foreach(None, None, |rec| {
+                assert!(rec.value.is_some(), "交出来的行没有值");
+                handed += 1;
+                false // 只要第一行
+            });
+            let early = ruler() - base;
+            let base = ruler();
+            let all = tx.scan(None, None);
+            let full = ruler() - base;
+            tx.commit();
+
+            assert_eq!(handed, 1, "回调明明叫停了");
+            assert_eq!(all.len(), N, "参照量：全量 scan 要折出所有行");
+            assert!(full >= N as u64, "值解码尺子在空转（全量只解 {full} 次）");
+            assert!(
+                early <= 2,
+                "只要 1 行却解了 {early} 次值（老写法：先把全库 {N} 行折出来）"
+            );
+            eprintln!("[scan_foreach 早停] 交 1 行付 {early}，全量 {N} 行付 {full}");
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn test_windowed_scan_cost_scales_with_window_not_library() {
         const KEYS: u64 = 3000;

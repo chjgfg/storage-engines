@@ -22,8 +22,9 @@ pub use types::{
     SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use store::{
-    RowValue, VersionedStore, collect_rows, fold_lower_bound, live_record_of_logical, scan_page,
-    search_bounds, search_window, seek_prev_with,
+    RowValue, VersionedStore, collect_rows, collect_rows_as, fold_lower_bound,
+    fold_rows_streaming, live_record_of_logical, scan_page, search_bounds, search_window,
+    seek_prev_with,
 };
 pub use txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 pub use version::{decode_key, encode_key, vacuum_plan, version_key_upper_bound, VersionedKey};
@@ -49,6 +50,7 @@ pub(crate) fn tmp_test_path(prefix: &str, tag: &str, suffix: &str) -> std::path:
     ))
 }
 pub use kernel::{
-    fold_window, is_unfinished, search_page_from, visible_at, HealthFold, VacuumScheduler, WalPolicy,
+    fold_window, fold_window_emit, is_unfinished, search_page_from, visible_at, HealthFold,
+    VacuumScheduler, WalPolicy,
     WinCandidate,
 };

@@ -189,30 +189,28 @@ impl Transaction {
     ) {
         let now = now_unix_secs();
         // 界下推给折叠：窗口扫的代价必须随窗口宽度缩（页数），不是随全库页数缩
-        for (key, _ver, raw) in self.collect_latest_raw_in(false, start, end) {
-            if let Some(s) = start {
-                if key.as_slice() < s {
-                    continue;
-                }
-            }
-            if let Some(e) = end {
-                if key.as_slice() >= e {
-                    break; // key 有序，可提前停
-                }
-            }
-            let Some(bytes) = raw else { continue };
+        //
+        // ⚠️ 逐行**流式**（M27）：这条路径原先写的是 `for … in collect_latest_raw_in(...)`,
+        //    那一句会先把界内的 `(键, 版本, 存储字节)` 全攒成一个 `Vec` —— 于是本函数文档里
+        //    "不收集全库到单一大 Vec"那句是假的（200k 键实测中间那份元组头 ≈ 13 MB，与结果
+        //    `Vec` 同时活着），而且 `f` 提前叫停也省不到"折"的那一段。
+        //    `fold_rows_streaming` 才是那句文档的兑现：折一行交一行，叫停之后的键不再折。
+        crate::common::fold_rows_streaming(self, false, start, end, |key, _ver, value| {
+            let crate::common::RowValue::Value(bytes) = value else {
+                return true; // 墓碑与"读不到"都不参与（include_deleted=false）
+            };
             let m = decode_value_meta(&bytes);
             if m.is_expired_at(now) {
-                continue;
+                return true;
             }
-            let rec = ExportRecord {
+            if !f(ExportRecord {
                 key,
                 value: Some(m.user().to_vec()),
-            };
-            if !f(rec) {
-                break;
+            }) {
+                return false;
             }
-        }
+            true
+        });
     }
 
     /// 前缀流式扫描
@@ -418,19 +416,19 @@ impl Transaction {
     /// 主动清理：把「最新可见且已过期」的 key 写成 tombstone。返回清理条数。
     pub fn purge_expired(&self) -> usize {
         let now = now_unix_secs();
-        let expired_keys: Vec<Vec<u8>> = self
-            .collect_latest_raw(false)
-            .into_iter()
-            .filter_map(|(key, _ver, raw)| {
-                let raw = raw?;
-                let m = decode_value_meta(&raw);
-                if m.is_expired_at(now) {
-                    Some(key)
-                } else {
-                    None
+        // 只需要"哪几把键过期了"⇒ 逐行**流式**（M27）：原先 `collect_latest_raw(false)`
+        // 会把全库的 `(键, 版本, 字节)` 先攒成一个 `Vec`，那笔瞬时与最终要删的条数根本不成比例。
+        // ⚠️ 删除仍然必须在折叠**之后**做：折叠期间是"拿着 kv 锁走元数据"，边折边删会改到
+        //    正在走的键流（这条顺序是原实现就有的，别顺手合掉）。
+        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
+        crate::common::fold_rows_streaming(self, false, None, None, |key, _ver, value| {
+            if let crate::common::RowValue::Value(bytes) = value {
+                if decode_value_meta(&bytes).is_expired_at(now) {
+                    expired_keys.push(key);
                 }
-            })
-            .collect();
+            }
+            true
+        });
         let mut n = 0usize;
         for k in expired_keys {
             if self.delete(&k) {

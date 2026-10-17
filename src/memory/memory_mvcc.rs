@@ -458,29 +458,6 @@ impl Transaction {
         Some((version, store.get(&enc).cloned()?))
     }
 
-    /// 全部最新可见逻辑行（key 有序）= 无界版的 [`Self::collect_latest_raw_in`]。
-    pub(crate) fn collect_latest_raw(
-        &self,
-        include_deleted: bool,
-    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        self.collect_latest_raw_in(include_deleted, None, None)
-    }
-
-    /// `[start, end)` 内每个逻辑 key 的最新可见版本 —— 界**下推到 BTreeMap 的 range** 上。
-    ///
-    /// 旧形状是折完全库再由调用方逐条筛界 ⇒ 窗口再窄也要走完全表。界判在**版本键**上，
-    /// 所以 raw_key 与界之间的前缀交错的边角仍需逐条比：起点用 `continue`，终点先按
-    /// `enc ≥ encode(end,0)` 把 range 收到上界（有序迭代下后面只会更大，可以真停），
-    /// 落在界内但 raw ≥ end 的个别键再 `continue`。
-    pub(crate) fn collect_latest_raw_in(
-        &self,
-        include_deleted: bool,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Vec<(Vec<u8>, u64, Option<Vec<u8>>)> {
-        crate::common::collect_rows(self, include_deleted, start, end, None, None).0
-    }
-
     /// 取一组的值：折叠时已经把行从 map 里带出来了（内存引擎没有"另一处"），
     /// 所以凭据本身就是值，`None` 即墓碑。
     fn read_row(row: Option<Vec<u8>>) -> crate::common::RowValue {
@@ -587,21 +564,20 @@ impl Transaction {
 
     /// 导出本事务快照下每个逻辑 key 的最新可见版本（剥 TTL）
     pub fn export_latest_visible(&self, include_deleted: bool) -> Vec<ExportRecord> {
-        self.collect_latest_raw(true)
-            .into_iter()
-            .filter_map(|(key, _ver, raw)| match raw {
-                None => {
-                    if include_deleted {
-                        Some(ExportRecord { key, value: None })
-                    } else {
-                        None
-                    }
+        // 行形状在这里就定成 `ExportRecord`（M27）：原先是 `collect_latest_raw(true)` 先攒出
+        // 全库的 `(键, 版本, 字节)` 元组 `Vec`，再逐条搬进 `Vec<ExportRecord>` ⇒ 两份头结构
+        // 同时活着（200k 键实测那一段 ≈ 13 MB）。共用件本来就能自定义行形状，接上就行。
+        crate::common::collect_rows_as(self, None, None, None, None, |key, _ver, value| match value {
+            crate::common::RowValue::Tombstone => {
+                if include_deleted {
+                    Some(ExportRecord { key, value: None })
+                } else {
+                    None
                 }
-                Some(bytes) => match crate::memory::kv_ops::logical_to_user(bytes) {
-                    Some(user) => Some(ExportRecord {
-                        key,
-                        value: Some(user),
-                    }),
+            }
+            crate::common::RowValue::Value(bytes) => {
+                match crate::memory::kv_ops::logical_to_user(bytes) {
+                    Some(user) => Some(ExportRecord { key, value: Some(user) }),
                     None => {
                         if include_deleted {
                             Some(ExportRecord { key, value: None })
@@ -609,9 +585,12 @@ impl Transaction {
                             None
                         }
                     }
-                },
-            })
-            .collect()
+                }
+            }
+            // 读不到与墓碑不是一回事：整行不参与（与改造前 `collect_rows` 同一判据）
+            crate::common::RowValue::Missing => None,
+        })
+        .0
     }
 
     pub fn commit(&self) {
@@ -1118,6 +1097,64 @@ mod tests {
     /// 旧形状：`collect_latest_raw()` 折完**全库**再由调用方逐条筛界 ⇒ 10 行的窗口也要走
     /// 2000 把键（大库基线实测：窗口 scan 106.3 µs/行 vs 全量 1.1 µs/行）。
     /// 这条同时钉正确性：窗口结果必须与"全量之后筛"逐条一致，不能是筛错了才快。
+    /// `scan_foreach` 提前叫停时，**不许先把整库折一遍**（M27）。
+    ///
+    /// 这条路径的文档从写下那天起就声称「不收集全库到单一大 Vec」，而实现是
+    /// `for … in collect_latest_raw_in(...)` —— 那一句会把界内每一行都先折出来，再逐条搬成
+    /// `ExportRecord`。200k 键实测因此比结果集本身还多占 ≈ 15 MB（`一次全量 scan`
+    /// 峰值 +45.5 MB / 常驻 30.7 MB）。现在走共用件 `fold_rows_streaming`：折一行交一行，
+    /// 叫停之后的键不再碰。
+    ///
+    /// 内存引擎没有「取值」这一步（行就在手里），所以能数的是**折叠走过的键数**；
+    /// 判据同 LSM：按比例给，老写法是比例 1.0。
+    #[test]
+    fn test_scan_foreach_stops_without_folding_the_library() {
+        const N: usize = 3 * 4096 + 100;
+        fn ruler() -> u64 {
+            crate::memory::memory_mvcc::fold_keys()
+        }
+        {
+            let mvcc = MVCC::new();
+            for base in (0..N).step_by(2000) {
+                let end = (base + 2000).min(N);
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end)
+                    .map(|i| {
+                        (
+                            format!("k{i:05}").into_bytes(),
+                            format!("v{i}").into_bytes(),
+                        )
+                    })
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("灌第 {base} 批: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            let tx = mvcc.begin_transaction();
+            let base = ruler();
+            let mut handed = 0usize;
+            tx.scan_foreach(None, None, |rec| {
+                assert!(rec.value.is_some(), "交出来的行没有值");
+                handed += 1;
+                false // 只要第一行
+            });
+            let early = ruler() - base;
+            let base = ruler();
+            let all = tx.scan(None, None);
+            let full = ruler() - base;
+            tx.commit();
+
+            assert_eq!(handed, 1, "回调明明叫停了");
+            assert_eq!(all.len(), N, "参照量：全量 scan 要折出所有行");
+            assert!(
+                early * 2 <= full,
+                "只要 1 行就走了 {early} 把键，全量也才 {full} ⇒ 没提前收手"
+            );
+            eprintln!("[scan_foreach 早停] 交 1 行付 {early}，全量 {N} 行付 {full}");
+        }
+    }
+
     #[test]
     fn test_windowed_scan_cost_scales_with_window_not_library() {
         const KEYS: u64 = 2000;
