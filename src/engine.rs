@@ -2467,6 +2467,16 @@ mod tests {
             });
             line(label, "multi_get×1000", d.as_secs_f64() * 1e6 / chunk.len() as f64, "µs/键", live, peak, &format!("读到 {} 条", got.len()));
 
+            // 命中与未命中**必须分开数**：混在一个平均值里，"点查 0.86 ms" 那种症状就归不了因
+            // （M10 的教训）。这 1000 把键全是不存在的键，单价就是"查无此键"的成本。
+            let miss_chunk: Vec<Vec<u8>> = (0..1000.min(rows)).map(|i| key(rows * 8 + i)).collect();
+            let (d, live, peak, got) = timed(|| {
+                let tx = db.begin();
+                tx.multi_get(&miss_chunk)
+            });
+            let hit = got.iter().filter(|o| o.is_some()).count();
+            line(label, "multi_get×1000 全miss", d.as_secs_f64() * 1e6 / miss_chunk.len() as f64, "µs/键", live, peak, &format!("读到 {hit} 条(应为 0)"));
+
             // ---- 扫描：全量 / 1% 窗口 ----
             let (d, live, peak, scanned) = timed(|| {
                 let tx = db.begin();
@@ -2492,6 +2502,39 @@ mod tests {
             let p = pref.len().max(1);
             line(label, "prefix_scan 2B前缀", d.as_secs_f64() * 1e6 / p as f64, "µs/行", live, peak, &format!("{p} 行"));
             drop(pref);
+
+            // ---- 游标翻页：把整库一页一页翻完（长跑进程真正在用的那条路，M17） ----
+            let (d, live, peak, (pages, moved)) = timed(|| {
+                let tx = db.begin();
+                let mut cursor: Option<Vec<u8>> = None;
+                let mut pages = 0usize;
+                let mut moved = 0usize;
+                // 保险丝：页宽 500 ⇒ 正常应当走 ~rows/500 页，超两倍就是走不动了
+                while pages <= rows / 250 + 8 {
+                    let (chunk, next) = tx.scan_page(cursor.as_deref(), 500);
+                    moved += chunk.len();
+                    pages += 1;
+                    let Some(next) = next else { break };
+                    cursor = Some(next);
+                }
+                (pages, moved)
+            });
+            line(label, "scan_page 翻完整库", d.as_secs_f64() * 1e6 / pages.max(1) as f64, "µs/页", live, peak, &format!("{pages} 页 / {moved} 行（页宽 500）"));
+            assert_eq!(moved, rows, "{label}: scan_page 翻完整库必须正好交出 {rows} 行（少一行=游标走不动，多走=翻页有洞）");
+
+            // ---- 反向与定位：B+ 树只有单向 next_leaf，最容易在这两条上露形状 ----
+            let (d, live, peak, back) = timed(|| {
+                let tx = db.begin();
+                tx.seek_prev(&key(rows / 2))
+            });
+            line(label, "seek_prev 中间键", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", back.is_some()));
+
+            let (d, live, peak, rwin) = timed(|| {
+                let tx = db.begin();
+                tx.reverse_scan(Some(&lo), Some(&hi))
+            });
+            let rw = rwin.len().max(1);
+            line(label, "reverse_scan 1% 窗口", d.as_secs_f64() * 1e6 / rw as f64, "µs/行", live, peak, &format!("{rw} 行"));
 
             // ---- 管理面：分页搜索（首页 vs 深页 —— 深翻是最常见的"一次调用打满 CPU"） ----
             let page_size = 100usize;
@@ -2520,6 +2563,26 @@ mod tests {
                 tx.key_count(&key(0)[..2])
             });
             line(label, "key_count 2B前缀", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("{cnt} 键"));
+
+            // ---- TTL 往返：写 1000 个带过期时间的键，再把剩余时间读回来 ----
+            // （长跑里"会话键续期"就是这个形状；只量写不量读会把信封解析的成本藏掉）
+            let ttl_rows = 1000.min(rows);
+            let (d, live, peak, ()) = timed(|| {
+                let tx = db.begin();
+                for i in 0..ttl_rows {
+                    tx.set_with_ttl(&key(rows * 4 + i), val(i), std::time::Duration::from_secs(3600));
+                }
+                tx.commit();
+            });
+            line(label, "set_with_ttl×1000", d.as_secs_f64() * 1e6 / ttl_rows as f64, "µs/次", live, peak, "");
+            let (d, live, peak, hits) = timed(|| {
+                let tx = db.begin();
+                (0..ttl_rows)
+                    .filter(|i| tx.get_ttl(&key(rows * 4 + i)).flatten().is_some())
+                    .count()
+            });
+            line(label, "get_ttl×1000", d.as_secs_f64() * 1e6 / ttl_rows as f64, "µs/次", live, peak, &format!("{hits}/{ttl_rows} 有 TTL"));
+            assert_eq!(hits, ttl_rows, "{label}: 刚写的 TTL 必须全部读得回来（读不回来=信封在某一家被吞了）");
 
             // ---- TTL / 计数器 ----
             let (d, live, peak, ()) = timed(|| {
@@ -2554,6 +2617,10 @@ mod tests {
             let (d, live, peak, v) = timed(|| db.vacuum().unwrap());
             line(label, "vacuum() 全库", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("裁掉 {} 行", v.versions_removed));
 
+            let (d, live, peak, vr) = timed(|| db.vacuum_bounded(None, 2048).unwrap());
+            line(label, "vacuum_bounded 一片", d.as_secs_f64() * 1e6, "µs/次", live, peak,
+                 &format!("扫 {} 行、裁 {} 行（预算 2048）", vr.stats.rows_scanned, vr.stats.versions_removed));
+
             let (d, live, peak, ()) = timed(|| {
                 db.flush().unwrap();
                 let _ = db.merge();
@@ -2562,6 +2629,22 @@ mod tests {
             line(label, "flush+merge", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("磁盘 {:.1} MB", disk2 as f64 / 1e6));
 
             // ---- bulk 导入（另一条写路径：无 WAL、无冲突检测） ----
+            // ---- 物化全库的出口：`Vec` 有多大、峰值多少 MB，就是这条的意义 ----
+            // （翻页请走 scan_page；这条留在台架里就是为了把"别用它"量化出来）
+            let (d, live, peak, exp) = timed(|| db.export_latest_visible(false));
+            let en = exp.len().max(1);
+            line(label, "export 全库(物化)", d.as_secs_f64() * 1e6 / en as f64, "µs/行", live, peak, &format!("{en} 行进 Vec"));
+            drop(exp);
+
+            // ---- 跨引擎搬家：这一家 → memory（读侧 scan_page、写侧一页一事务，M17）----
+            // 期望值现问源库要（`live_keys`），因为此刻库里除了灌的 {rows} 行，还多了上面
+            // TTL/计数器那两条写进去的键 —— 拿 {rows} 当期望会假红。
+            let want = db.health().live_keys;
+            let target = open_engine(EngineKind::Memory, None).unwrap();
+            let (d, live, peak, ms) = timed(|| migrate(&*db, &*target, 1000).unwrap());
+            line(label, "migrate → memory", d.as_secs_f64() * 1e6 / rows.max(1) as f64, "µs/行", live, peak,
+                 &format!("搬 {} 行 / {} 页 / {} B", ms.rows, ms.pages, ms.bytes));
+            assert_eq!(ms.rows, want, "{label}: migrate 搬走的行数必须等于源库 live_keys（少了=游标或过滤有洞）");
             let bulk_rows = (rows / 10).max(1);
             let (d, live, peak, ()) = timed(|| {
                 let mut bulk = db.begin_bulk();
