@@ -100,9 +100,22 @@ pub struct PageManager {
     /// 做成**按页**计数而不是全局 epoch，否则一次写入就把整棵树的解析全部作废，
     /// 写多的时候缓存等于没有。
     page_writes: HashMap<PageId, u64>,
+    /// **钉住的页**：B+ 树的上层页（根 + 内部节点）。
+    ///
+    /// 为什么单独一档：换出策略再"聪明"也只保证最近用过的页留下，而全库走查（`health()` /
+    /// `scan` / `search`）与批量写会让 LRU 转好几圈 —— 实测 200k 行的库里，走查之后的随机点读
+    /// 从 45.2 µs 涨到 **58.6 µs（+30%）**，因为下降路上那几层每次都要重新读盘 + 重新解析。
+    /// 上层页数量小：35 B 键的库实测 20k 行 36 页 / 200k 行 367 页，都只占全库 **3.0%**
+    /// （≈ 叶子数 ÷ 阶数）。⚠️ 但**这个占比不是常数** —— 长键会把内部节点的扇出也压下来
+    /// （同一份五千行的库，3.3 KB 键时上层占到 **50%**），所以预算必须跟容量挂钩：
+    /// 见 [`PageManager::pin_limit`]，钉住的部分永远不超过容量的一半。
+    pinned: HashSet<u64>,
 }
 
 impl PageManager {
+    /// 钉住的上层页最多多少页（一页 4 KB ⇒ 预算 ≈ 4 MB）
+    const PIN_BUDGET_PAGES: usize = 1024;
+
     /// 某页已被写入多少次（上层解析缓存的校验凭据）
     pub fn write_count(&self, page_id: PageId) -> u64 {
         self.page_writes.get(&page_id).copied().unwrap_or(0)
@@ -111,6 +124,50 @@ impl PageManager {
     /// 页缓存容量（上层用它给"解析缓存"定同样的上限）
     pub fn cache_capacity(&self) -> usize {
         self.max_cache_pages
+    }
+
+    /// 自动档改容量用的入口：只动上限，不动内容。
+    ///
+    /// 调大不需要立刻做什么（下一次回填自然装得下）；调小也不需要主动换出 ——
+    /// 换出是在插入时按批做的，这里只把"什么时候算满"的判断改掉。
+    pub fn set_cache_capacity(&mut self, pages: usize) {
+        self.max_cache_pages = pages.max(1);
+    }
+
+    /// 钉住预算的**生效上限** = 绝对预算 与 **容量的一半** 取小。
+    ///
+    /// ⚠️ 为什么必须跟容量挂钩，而不是只钉一个绝对数：上层页占全库多少**不是常数**，
+    /// 它由"一页装得下几个键"决定 —— 实测同一份五千行的库，35 B 键时上层占 3.0%
+    /// （36 页 / 1210 页），而 900 B 键时占 **33%**（1246 页 / 3746 页：内部节点也塞不下几个
+    /// 长键 ⇒ 扇出掉到 4 以下、树深从 3 层涨到 8 层）。只按绝对数钉，碰上后者就会把整个缓存
+    /// 钉成"一动不动"，叶子一页都装不下 —— 那比不钉还糟。留一半给叶子是这条策略的底线
+    /// （守卫里 `pinned × 2 ≤ 容量` 钉的就是它）。
+    fn pin_limit(&self) -> usize {
+        Self::PIN_BUDGET_PAGES.min((self.max_cache_pages / 2).max(1))
+    }
+
+    /// 这页被钉住了吗（上层下降路上那几个节点）
+    pub fn is_pinned(&self, page_id: PageId) -> bool {
+        self.pinned.contains(&page_id.0)
+    }
+
+    /// 钉住一页，让它不参与换出。**必须在页已经在缓存里之后调用**（否则钉住的是空气）。
+    ///
+    /// 预算满了就**不再新增**（宁可不钉，也不能让"自动档"悄悄吃内存）。
+    pub fn pin(&mut self, page_id: PageId) -> bool {
+        if self.pinned.contains(&page_id.0) || !self.cache.contains_key(&page_id) {
+            return self.pinned.contains(&page_id.0);
+        }
+        if self.pinned.len() >= self.pin_limit() {
+            return false;
+        }
+        self.pinned.insert(page_id.0);
+        true
+    }
+
+    /// 当前钉住了多少页（守卫与 `tuning()` 读回用）
+    pub fn pinned_pages(&self) -> usize {
+        self.pinned.len()
     }
 }
 
@@ -249,6 +306,7 @@ impl PageManager {
             freelist_dirty: false,
             bulk_mode: false,
             page_writes: HashMap::new(),
+            pinned: HashSet::new(),
         };
 
         if file_len == 0 {
@@ -777,6 +835,10 @@ impl PageManager {
             return false;
         }
         self.cache.remove(&page_id);
+        // ⚠️ 钉住的账必须一起退：页号会被复用，一个"曾是内部节点"的页号将来可能装叶子。
+        // 漏了这一步的后果不是读错数据（解析缓存按 `page_writes` 校验，复用会 bump），
+        // 而是**针预算被死页占满** —— 上层再也钉不进去，等于悄悄退回修复前的形状。
+        self.pinned.remove(&page_id.0);
         if self.free_set.insert(page_id.0) {
             self.free_page_ids.push_back(page_id);
             self.freelist_dirty = true;
@@ -849,12 +911,17 @@ impl PageManager {
         }
     }
 
-    /// 从队首弹出仍在 cache 中的页（跳过已释放/已换出的陈旧 id）
+    /// 从队首弹出仍在 cache 中**且没被钉住**的页（跳过已释放/已换出的陈旧 id 与上层页）
     fn pop_lru_valid(&mut self) -> Option<PageId> {
         while let Some(pid) = self.lru_queue.pop_front() {
-            if self.cache.contains_key(&pid) {
-                return Some(pid);
+            if !self.cache.contains_key(&pid) {
+                continue;
             }
+            // 钉住的页不参与换出。它在队列里的这一项直接丢掉：以后它也不再是需要被挑出去的候选
+            if self.pinned.contains(&pid.0) {
+                continue;
+            }
+            return Some(pid);
         }
         None
     }

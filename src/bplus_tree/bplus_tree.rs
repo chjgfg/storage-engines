@@ -113,20 +113,49 @@ pub struct BPlusTree {
     /// 只服务只读路径（点读下降、反向找链尾）。校验靠 `PageManager::write_count` ——
     /// 写入按页计数，所以不需要在每个写点手工失效（漏一处就是读到脏节点）；页被回收再
     /// 复用时 `allocate_page` 也会 bump，不会把旧内容当成新内容。
-    /// 上限跟着 `max_cache_pages` 走：装不下就整表清空（解析缓存的意义是让点读不重解析，
-    /// 而不是再维护一个无限增长的堆）。
+    /// 上限跟着 `max_cache_pages` 走：超了就把**没钉住的**整批丢掉（解析缓存的意义是让点读
+    /// 不重解析，而不是再维护一个无限增长的堆）。⚠️ 不许退回"整表 clear"：那会把上层页的
+    /// 解析结果一起丢掉，而每一次点读都要用它们（见 [`BPlusTree::node_of`]）。
     node_cache: std::collections::HashMap<PageId, (u64, std::sync::Arc<BTreeNode>)>,
+    /// 容量是不是**自动档**（调用方传的 `max_cache_pages == 0`）
+    auto_cache: bool,
+}
+
+/// 自动档的下限：与旧的写死默认值一致 ⇒ 从"没旋钮"换到"自动档"不会让谁的工作集变小
+const AUTO_MIN_PAGES: usize = 1024;
+/// 自动档的上限（一页 4 KB ⇒ 最多 ≈ 8 MiB 常驻）。
+///
+/// 为什么必须夹住：B+ 树把整库都缓存住的常驻 ≈ 数据文件本身的大小（实测 200k 行 = 12129 页
+/// ≈ 47 MB），那已经不是"缓存一点热数据"而是"把库再复制一份到内存"。
+/// 这个基座要给单核 6 GB 的机器和 RSS ≤ 80 MB 的下游用，所以**默认只到 8 MiB，
+/// 再多是调用方的决定**（显式传 `max_cache_pages`），不是库替你做的决定。
+const AUTO_MAX_PAGES: usize = 2048;
+
+/// 自动档的容量：按库当前的**实际页数**给，夹在 [`AUTO_MIN_PAGES`] 与 [`AUTO_MAX_PAGES`] 之间。
+///
+/// 为什么按页数而不是按行数：代价的载体是页（一次点读 = 沿路每层一页），覆盖率才是决定
+/// "这次点读要不要读盘 + 重解析"的量 —— 实测同一个默认 1024 页的缓存，
+/// 20k 行（1210 页）覆盖率 84.6% ⇒ 11.9 µs/次，200k 行（12129 页）覆盖率 8.4% ⇒ 45.2 µs/次。
+fn auto_cache_pages(total_pages: u64) -> usize {
+    (total_pages as usize).clamp(AUTO_MIN_PAGES, AUTO_MAX_PAGES)
 }
 
 impl BPlusTree {
     /// 打开或创建磁盘上的 B+ 树（返回 Result，便于上层处理锁冲突等）
+    ///
+    /// `max_cache_pages == 0` = **自动档**（M22）：容量按库当前的实际页数给，夹在
+    /// [`AUTO_MIN_PAGES`] 与 [`AUTO_MAX_PAGES`] 之间，并在每次 `flush_all`（= 各家 checkpoint /
+    /// bulk 收尾都会走到）之后重新评估 —— 库是会长大的，只在 open 时定一次容量就等于
+    /// "导入完就再也没调过旋钮"。传非 0 就是显式容量，自动档完全不参与，行为与以前一致。
     pub fn try_open(
         path: impl AsRef<Path>,
         order: usize,
         max_cache_pages: usize,
     ) -> std::io::Result<Self> {
         assert!(order >= 3, "B+树阶数至少3阶");
-        let mut page_manager = PageManager::open(path, max_cache_pages)?;
+        let auto = max_cache_pages == 0;
+        let ask = if auto { AUTO_MIN_PAGES } else { max_cache_pages };
+        let mut page_manager = PageManager::open(path, ask)?;
 
         let root = if let Some(root) = page_manager.root_page_id() {
             root
@@ -144,11 +173,18 @@ impl BPlusTree {
             root_page_id
         };
 
+        // 自动档：容量按这份库现在的页数来（meta 已加载 ⇒ next_page_id 是真的）
+        if auto {
+            let cap = auto_cache_pages(page_manager.next_page_id());
+            page_manager.set_cache_capacity(cap);
+        }
+
         Ok(Self {
             page_manager,
             root,
             order,
             node_cache: std::collections::HashMap::new(),
+            auto_cache: auto,
         })
     }
 
@@ -198,6 +234,24 @@ impl BPlusTree {
     pub fn flush_all(&mut self) {
         self.page_manager.set_root_page_id(self.root);
         self.page_manager.flush_all();
+        // 自动档要在每次刷盘后重新评估：库是会长大的，只在 open 时定一次容量，
+        // 等于"导入完就再也没调过旋钮"—— 而那正是这次要修的那个洞。
+        if self.auto_cache {
+            let cap = auto_cache_pages(self.page_manager.next_page_id());
+            self.page_manager.set_cache_capacity(cap);
+        }
+    }
+
+    /// 缓存策略读数：`(生效容量, 钉住的上层页数, 是否自动档)`
+    ///
+    /// 给 `tuning()` 与守卫用 —— 自动档必须**看得见生效值**，否则"设了没生效"和
+    /// "生效了但不知道是多少"这两种情况在下游日志里长得一模一样。
+    pub fn cache_policy(&self) -> (usize, usize, bool) {
+        (
+            self.page_manager.cache_capacity(),
+            self.page_manager.pinned_pages(),
+            self.auto_cache,
+        )
     }
 
     /// 当前根页（WAL checkpoint 使用）
@@ -241,6 +295,36 @@ impl BPlusTree {
         self.page_manager.cache_capacity()
     }
 
+    /// 树的形状（**测试/台架专用**）：`(树高, 内部节点数, 叶子数, 文件里的总页数)`。
+    ///
+    /// M22 需要先知道"一次随机点读要走几层、上层页占全库多少"才能定缓存策略 ——
+    /// 上层是**结构性小**（叶子数 / order 量级）还是**跟库一起长**，决定了两件完全不同的事：
+    /// 前者该常驻（钉住，代价与库大小无关），后者才需要谈容量与覆盖率。
+    /// 走的是解析缓存，会计入 `page_reads` / `node_parses` ⇒ 台架里要在打点**之前**调它。
+    #[cfg(test)]
+    pub fn shape(&mut self) -> (u64, usize, usize, u64) {
+        fn go(t: &mut BPlusTree, id: PageId, depth: u64, st: &mut (u64, usize, usize)) {
+            st.0 = st.0.max(depth);
+            match t.node_of(id) {
+                Some(node) => match &*node {
+                    BTreeNode::Internal { keys, children } => {
+                        st.1 += 1;
+                        let _ = keys;
+                        for c in children.iter() {
+                            go(t, *c, depth + 1, st);
+                        }
+                    }
+                    BTreeNode::Leaf { .. } => st.2 += 1,
+                },
+                None => {}
+            }
+        }
+        let mut st = (0u64, 0usize, 0usize);
+        let root = self.root;
+        go(self, root, 1, &mut st);
+        (st.0, st.1, st.2, self.page_manager.next_page_id())
+    }
+
     /// 只读路径取节点：**优先用解析过的**，未命中才读页 + bincode 解析。
     ///
     /// 为什么必须有它：归因量过，B+ 树点读的 41 µs 里几乎全是 CPU —— 每次点读要走 4 个页，
@@ -257,9 +341,19 @@ impl BPlusTree {
         #[cfg(test)]
         NODE_PARSES.with(|c| c.set(c.get() + 1));
         let node = std::sync::Arc::new(bincode::deserialize::<BTreeNode>(&data).ok()?);
+        // **上层页钉住**（M22）：根与内部节点是结构性小的一小撮（实测占全库 3.0%），而每一次
+        // 点读、每一次反向游走都要用它们。不钉住时，全库走查把 LRU 转几圈就把它们挤出去 ——
+        // 实测 200k 行的库里"走查后一次随机点读"因此从 45.2 µs 涨到 58.6 µs（+30%）。
+        // 只钉 `Internal`：叶子占 97% 的页，钉叶子等于把整个库再复制一份进内存。
+        if matches!(&*node, BTreeNode::Internal { .. }) {
+            self.page_manager.pin(page_id);
+        }
         if self.node_cache.len() >= self.page_manager.cache_capacity() {
-            // 上限跟页缓存同源；超了就整表丢，宁可重解析也不无界长
-            self.node_cache.clear();
+            // 上限跟页缓存同源；超了丢**没钉住的**，留下钉住的。
+            // 以前这里是整表 `clear()`：那等于每装满 cap 个节点就把上层页的解析结果白丢一次，
+            // 而下一趟下降立刻要用它们 —— 走查之后点读变贵的那 30% 就是这笔账。
+            let pm = &self.page_manager;
+            self.node_cache.retain(|id, _| pm.is_pinned(*id));
         }
         self.node_cache.insert(page_id, (seen, node.clone()));
         Some(node)

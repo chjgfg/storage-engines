@@ -122,10 +122,19 @@ pub const ENGINE_NAMES: &[&str] = &["bitcask", "bplus_tree", "lsm_tree", "memory
 pub struct EngineConfig {
     /// B+ 树阶数（默认 64）
     pub order: usize,
-    /// B+ 树页缓存上限（页数，默认 1024）
+    /// B+ 树页缓存上限（页数）。**`0` = 自动档**（M22，也是 `Default` 给的值）。
     ///
-    /// 库的物理页超过它时，全库走查改成"装得下才缓存"，不再挤掉 OLTP 的热页；
-    /// 想让走查也全部命中，就把容量配到 ≥ 页数。
+    /// 自动档按库当前的**实际页数**给容量，夹在 `[1024, 2048]` 页之间（≈ 4 ~ 8 MiB 常驻），
+    /// 并在每次刷盘（`flush` / `checkpoint` / bulk 收尾）之后重新评估 —— 库是会长大的。
+    /// 为什么上限只有 2048 页：B+ 树缓存整个库的常驻 ≈ 数据文件本身（实测 200k 行 = 12129 页
+    /// ≈ 47 MB），那已经不是"缓存一点热数据"而是"把库再复制一份到内存"，
+    /// 那种决定该由调用方做（显式传一个数），不该由库替调用方做。
+    /// 为什么下限停在 1024：那是要改之前的写死默认值 ⇒ 换成自动档不会让任何人的工作集变小。
+    ///
+    /// 库的物理页超过容量时，全库走查改成"装得下才缓存"，不再挤掉 OLTP 的热页；
+    /// 另外根与内部节点（实测占全库 3.0%）是**钉住的**，不参与换出 —— 这两件事一起
+    /// 才让"大库 + 小缓存"的随机点读不至于每次都要重新下降。
+    /// 生效值随时能从引擎读回：`tuning()` 里的 `max_cache_pages` / `cache_pinned_pages`。
     pub max_cache_pages: usize,
     /// LSM 引擎旋钮：`None` = 用引擎自己的 MVCC 档 [`LSMTreeOptions::for_mvcc`]。
     ///
@@ -176,7 +185,10 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             order: 64,
-            max_cache_pages: 1024,
+            // 0 = 自动档（M22）：按库的页数给容量，夹在 [1024, 2048]。
+            // 空库算出来正好是 1024 ⇒ 默认档与改之前的写死值**同一个数**，
+            // 变的只是"库长大之后容量也跟着长大"。
+            max_cache_pages: 0,
             lsm: None,
             bitcask_max_file_bytes: None,
             wal_checkpoint_bytes: None,
