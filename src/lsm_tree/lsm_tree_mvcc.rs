@@ -44,7 +44,7 @@ pub use crate::common::{
 };
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
-use crate::common::vacuum_plan;
+use crate::common::vacuum_plan_group;
 use crate::common::version_key_upper_bound;
 
 /// MVCC 存储引擎（LSM 后端）
@@ -538,7 +538,14 @@ impl MVCC {
         // 最后一组也是收齐的，不用退回）；被预算截断 ⇒ 破圈时已经「看到了下一组的第一行」，
         // 所以 `cur_raw` 那一组收齐了，可以直接当游标。旧那份"窗口太窄就放大 4 倍重试"
         // 整个不需要了 —— 它存在的理由正是窗口右界可能把唯一的完整组切断。
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>> = BTreeMap::new();
+        // M36：**只攒当前这一把键的那一组**（以前是全库归组的 `BTreeMap`，每行两个 `Vec`
+        // ⇒ vacuum 自己的瞬时内存 = O(全库物理行)，600k 那档实测 +89.4 MB 那个形状）。
+        // 归并流的键序是 `raw ‖ version_be` 升序 ⇒ 同一把键的行必然连续，判完一组就地交出去。
+        let full_sweep = budget_rows == u64::MAX;
+        let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        // 只有全库轮次要把"存活行清单"交给 blob GC（有界片不碰 blob）⇒ 只在会用到时才攒
+        let mut keep_enc: Vec<Vec<u8>> = Vec::new();
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut budget_cut = false;
@@ -560,6 +567,11 @@ impl MVCC {
                     break;
                 }
                 if at_group_start {
+                    let (d, kept) = vacuum_plan_group(&mut group, xmin);
+                    to_delete.extend(d);
+                    if full_sweep {
+                        keep_enc.extend(kept.into_iter().map(|(enc, _)| enc));
+                    }
                     cur_raw = Some(vk.raw_key.clone());
                 }
                 scanned += 1;
@@ -567,16 +579,19 @@ impl MVCC {
                 if le.kind == 2 {
                     continue;
                 }
-                by_key
-                    .entry(vk.raw_key.clone())
-                    .or_default()
-                    .push((vk.version, enc.clone(), le.kind == 1, ()));
+                group.push((vk.version, enc.clone(), le.kind == 1, ()));
+            }
+        }
+        {
+            let (d, kept) = vacuum_plan_group(&mut group, xmin);
+            to_delete.extend(d);
+            if full_sweep {
+                keep_enc.extend(kept.into_iter().map(|(enc, _)| enc));
             }
         }
         let next_cursor = if budget_cut { cur_raw } else { None };
 
-        // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]
-        let (to_delete, kept) = vacuum_plan(by_key, xmin);
+        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
         let removed = to_delete.len();
 
         for enc in &to_delete {
@@ -596,7 +611,6 @@ impl MVCC {
 
             // blob 旁路的空间回收：必须在删完旧行之后、且只有全库扫完才敢做 ——
             // 「还有没有人在引用这个 blob」是个全库问题。
-            let keep_enc: Vec<Vec<u8>> = kept.into_iter().map(|(enc, _)| enc).collect();
             blob_rewritten = Some(kv.gc_blobs(&keep_enc)? > 0);
         }
 

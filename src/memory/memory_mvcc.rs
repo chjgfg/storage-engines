@@ -20,7 +20,7 @@ pub use crate::common::{
     DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
 use crate::common::{HealthFold, VacuumScheduler};
-use crate::common::vacuum_plan;
+use crate::common::vacuum_plan_group;
 use crate::common::version_key_upper_bound;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WriteSide};
 use crate::memory::mem_store::MemStore;
@@ -223,8 +223,13 @@ impl MVCC {
 
         // 分组按引用走表：判「留哪一版」只需要版本号 + 是不是墓碑，
         // 不需要把每行 value 克隆出来（旧实现是 `store.iter().collect()`）。
+        //
+        // M36：**只攒当前这一把键的那一组**，看到后继就把上一组交出去判 ⇒ 瞬时内存从
+        // O(全库物理行)（600k 档实测 +89.4 MB，比要裁的东西大两个数量级）降到
+        // O(最长那条链)。版本键按 `raw ‖ version_be` 升序到达，同一把键的行必然连续。
         let budget_rows = budget_rows.max(1);
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>> = BTreeMap::new();
+        let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut truncated = false;
@@ -238,24 +243,25 @@ impl MVCC {
             let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
             if at_group_start && scanned >= budget_rows {
                 // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）⇒ 游标就是它
+                // （`group` 正是那一组，收摊时在循环外判掉）
                 truncated = true;
                 return true;
             }
             if at_group_start {
+                let (d, _kept) = vacuum_plan_group(&mut group, xmin);
+                to_delete.extend(d);
                 cur_raw = Some(vk.raw_key.clone());
             }
             scanned += 1;
-            by_key
-                .entry(vk.raw_key.clone())
-                .or_default()
-                .push((vk.version, enc.to_vec(), val.is_none(), ()));
+            group.push((vk.version, enc.to_vec(), val.is_none(), ()));
             false
         });
+        let (d, _kept) = vacuum_plan_group(&mut group, xmin);
+        to_delete.extend(d);
         let next_cursor = if truncated { cur_raw } else { None };
         drop(store);
 
-        // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]
-        let (to_delete, _kept) = vacuum_plan(by_key, xmin);
+        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
         let removed = to_delete.len();
 
         let mut store = self.store.lock().unwrap();

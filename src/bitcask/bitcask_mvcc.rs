@@ -36,7 +36,7 @@ pub use crate::common::{
 };
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
-use crate::common::vacuum_plan;
+use crate::common::vacuum_plan_group;
 use crate::common::version_key_upper_bound;
 
 /// MVCC 存储引擎（Bitcask 后端）
@@ -486,7 +486,18 @@ impl MVCC {
         //    旧实现是两次 `kv.iter()`（每一行连 value 全部读出来），于是 vacuum 自己成了
         //    全库最重的一条路径 —— 在单核机器上「开自动回收」反而会在回收那一刻制造新事故。
         let budget_rows = budget_rows.max(1);
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>> = BTreeMap::new();
+        //
+        // M36：**只攒当前这一把键的那一组**。以前这里攒的是全库归组的
+        // `BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>>`（每行两个 `Vec`：raw_key 与 enc）
+        // ⇒ vacuum 自己的瞬时内存 = O(全库物理行)，600k 那档实测 **+89.4 MB**（下游 80 MB RSS
+        // 预算一次顶穿）。版本键按 `raw ‖ version_be` 升序到达 ⇒ 同一把键的行必然连续，
+        // 判完一组就地交出去，峰值只与**最长那条链**同阶（守卫
+        // `test_vacuum_peak_memory_scales_with_chain_not_library`）。
+        let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        // 只有全库轮次要把"存活行清单"交给 blob GC（有界片不碰 blob）⇒ 只在会用到时才攒
+        let full_sweep = budget_rows == u64::MAX;
+        let mut keep: Vec<Vec<u8>> = Vec::new();
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut truncated = false;
@@ -502,26 +513,35 @@ impl MVCC {
             let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
             if at_group_start && scanned >= budget_rows {
                 // 破在这里时 `cur_raw` 那一组已经收齐（刚看到了它的后继）⇒ 游标就是它
+                // （`group` 正是那一组，收摊时在循环外判掉）
                 truncated = true;
                 break;
             }
             if at_group_start {
+                let (d, kept) = vacuum_plan_group(&mut group, xmin);
+                to_delete.extend(d);
+                if full_sweep {
+                    keep.extend(kept.into_iter().map(|(enc, _)| enc));
+                }
                 cur_raw = Some(vk.raw_key.clone());
             }
             scanned += 1;
-            by_key
-                .entry(vk.raw_key.clone())
-                .or_default()
-                .push((vk.version, enc.clone(), loc.is_soft_tombstone(), ()));
+            group.push((vk.version, enc.clone(), loc.is_soft_tombstone(), ()));
+        }
+        let (d, kept) = vacuum_plan_group(&mut group, xmin);
+        to_delete.extend(d);
+        if full_sweep {
+            keep.extend(kept.into_iter().map(|(enc, _)| enc));
         }
         let next_cursor = if truncated { cur_raw } else { None };
 
-        // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`] ——
-        // 这条规则曾经有四份复制，是本次事故的结构性根因。
-        // 留下来的行交给 blob GC 逐个读，不再走一遍全库。
-        let (to_delete, keep) = vacuum_plan(by_key, xmin);
+        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]。
+        //
+        // ⚠️ 剩下的那笔 O(存活行) 没被这一刀覆盖：全库轮次要把保留行的 enc 收起来交给 blob GC
+        // （`keep`），而 `rewrite_in_place` 又要一次握住**全部存活大 value**。原因是
+        // `iter_meta_from` 按 `&self` 借住 KeyDir，走查途中没法再 `get_entry`（那是 `&mut self`），
+        // 所以没法"当场读完 blob 指针就丢掉这一项"。那是 blob 结构自己的事，不在这次的边界内。
         let removed = to_delete.len();
-        let keep: Vec<Vec<u8>> = keep.into_iter().map(|(enc, _)| enc).collect();
 
         for enc in &to_delete {
             let _ = kv.remove(enc);
@@ -539,7 +559,6 @@ impl MVCC {
         // - 仍有引用 → rewrite_in_place 只保留存活大 value，并更新 KeyDir 中的指针
         //
         // 只读上面 `keep` 里的行（旧实现这里又走一遍全库 iter()）。
-        let full_sweep = budget_rows == u64::MAX;
         let blob_rewritten = if !full_sweep {
             false
         } else {

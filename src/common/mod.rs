@@ -27,7 +27,9 @@ pub use store::{
     seek_prev_with,
 };
 pub use txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
-pub use version::{decode_key, encode_key, vacuum_plan, version_key_upper_bound, VersionedKey};
+pub use version::{
+    decode_key, encode_key, vacuum_plan, vacuum_plan_group, version_key_upper_bound, VersionedKey,
+};
 
 /// 测试专用的临时路径。**必须带进程内单调序号**，不能只靠时间戳。
 ///

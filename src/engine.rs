@@ -2707,6 +2707,82 @@ mod tests {
         cleanup(dirs);
     }
 
+    /// 四家的 `vacuum()` 都必须**逐组**判定，不许先把全库归组攒出来（M36）。
+    ///
+    /// 判据两条（每个引擎各核一次，失败点名是谁）：
+    /// - `vacuum_group_calls() >= 键数` —— 一把键判一次。旧形状（先把全库归组进
+    ///   `BTreeMap<Vec<u8>, Vec<…>>`、再问一次 `vacuum_plan`）在这里读出 **1** ⇒ 红
+    /// - `vacuum_group_max_rows() <= 每把键的版本数` —— 任何一次判定握住的行数不得超过一条链；
+    ///   旧形状读出的是**全库物理行** ⇒ 红
+    ///
+    /// 为什么不用 `mem_probe` 的 peak 当判据：那是**进程级**高水位，并行跑用例时别家分配的字节
+    /// 会算进来（内存那笔读数一直留在 `--test-threads=1` 的台架里，M27/M33 同口径 —— 600k 那档
+    /// 改前 **+89.4 MB** 的读数在 README）。这条守卫钉的是**结构**：不再攒全库，内存自然跟着降。
+    ///
+    /// 变异验证：把任意一家的收组改回 `BTreeMap` + 一次 `vacuum_plan` ⇒ 那一家两条都红、别家绿。
+    #[test]
+    fn all_engines_vacuum_judges_per_group_not_whole_library() {
+        const KEYS: usize = 800;
+        const VERSIONS: usize = 2;
+
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            // 自动回收会先把旧版裁掉一部分，那就不剩账了 —— 这一条要手动 vacuum
+            db.set_vacuum_auto_slice(0);
+            for _ in 0..VERSIONS {
+                let tx = db.begin();
+                for i in 0..KEYS {
+                    let k = format!("k{i:05}");
+                    assert!(
+                        tx.set(k.as_bytes(), vec![b'v'; 24]),
+                        "{name}: 第 {i} 把键写失败"
+                    );
+                }
+                tx.commit();
+            }
+            crate::common::version::reset_vacuum_group_counters();
+            let st = db.vacuum().unwrap_or_else(|e| panic!("{name}: vacuum 失败 {e}"));
+            let calls = crate::common::version::vacuum_group_calls();
+            let max_rows = crate::common::version::vacuum_group_max_rows();
+            eprintln!(
+                "[vac groups] {name}: 判定 {calls} 次 / 最大一组 {max_rows} 行 / 裁掉 {} 行、扫 {} 行",
+                st.versions_removed, st.rows_scanned
+            );
+            assert!(
+                st.rows_scanned >= (KEYS * VERSIONS) as u64,
+                "{name}: 只扫到 {} 行（应有 {} 物理行）⇒ 这个形状没被跑到",
+                st.rows_scanned,
+                KEYS * VERSIONS
+            );
+            assert!(
+                st.versions_removed > 0,
+                "{name}: 一轮什么都没裁 ⇒ 判据空转"
+            );
+            assert!(
+                calls as usize >= KEYS,
+                "{name}: vacuum 把判定折叠成了 {calls} 次（键有 {KEYS} 把）⇒ 它还是先把全库归组攒出来"
+            );
+            assert!(
+                max_rows as usize <= VERSIONS,
+                "{name}: 有一次判定握住了 {max_rows} 行（每把键只有 {VERSIONS} 版）⇒ 归组攒了不止一条链"
+            );
+            // 裁完必须还读得回最新版
+            {
+                let tx = db.begin();
+                assert_eq!(
+                    tx.get(b"k00000"),
+                    Some(vec![b'v'; 24]),
+                    "{name}: 裁完读不回最新版"
+                );
+                tx.commit();
+            }
+            drop(db);
+        }
+        cleanup(dirs);
+    }
+
     // ==================== 大库基线台架（四引擎 × 每种操作） ====================
     //
     // 前面所有守卫数的是「访问了多少块/页/盘」—— 那是**复杂度**的尺子。下游报的却是

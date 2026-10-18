@@ -29,7 +29,7 @@ pub use crate::common::{
 };
 use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
-use crate::common::vacuum_plan;
+use crate::common::vacuum_plan_group;
 use crate::common::version_key_upper_bound;
 
 /// MVCC 存储引擎
@@ -458,8 +458,13 @@ impl MVCC {
         // ① 一趟按引用的遍历。判「留哪一版」只需要三样：版本号、这行是不是墓碑、
         //    这行是不是 blob 指针 —— 全都在叶子条目手里就能读到，不必把 value 克隆出来。
         //    旧实现在这里有两趟 `kv.iter()`（每行克隆一次 value），第二趟纯粹为查 blob 引用。
+        //    M36：**只攒当前这一把键的那一组**（以前是全库归组 ⇒ vacuum 自己的瞬时内存
+        //    = O(全库物理行)，600k 档 +89.4 MB 那个形状），版本键按 `raw ‖ version_be`
+        //    升序到达 ⇒ 判完一组就地并进 `to_delete`。
         let budget_rows = budget_rows.max(1);
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, bool)>> = BTreeMap::new();
+        let mut group: Vec<(u64, Vec<u8>, bool, bool)> = Vec::new();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut has_blob_ref = false;
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut truncated = false;
@@ -475,10 +480,14 @@ impl MVCC {
             let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
             if at_group_start && scanned >= budget_rows {
                 // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）⇒ 游标就是它
+                // （`group` 正是那一组，收摊时在循环外判掉）
                 truncated = true;
                 return true;
             }
             if at_group_start {
+                let (d, kept) = vacuum_plan_group(&mut group, xmin);
+                to_delete.extend(d);
+                has_blob_ref |= kept.iter().any(|(_, refs_blob)| *refs_blob);
                 cur_raw = Some(vk.raw_key.clone());
             }
             scanned += 1;
@@ -486,20 +495,18 @@ impl MVCC {
             let refs_blob = row
                 .as_ref()
                 .is_some_and(|s| s.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB));
-            by_key
-                .entry(vk.raw_key.clone())
-                .or_default()
-                .push((vk.version, enc.to_vec(), is_tomb, refs_blob));
+            group.push((vk.version, enc.to_vec(), is_tomb, refs_blob));
             false
         });
+        let (d, kept) = vacuum_plan_group(&mut group, xmin);
+        to_delete.extend(d);
+        has_blob_ref |= kept.iter().any(|(_, refs_blob)| *refs_blob);
         let next_cursor = if truncated { cur_raw } else { None };
 
-        // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]；
+        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]；
         // 这里把「保留行是否引用 blob」当作附带信息 R 一起带出来 —— Blob GC 的判据
         // 因此仍然在同一次遍历里凑齐，不用为它再走一遍全库。
-        let (to_delete, kept) = vacuum_plan(by_key, xmin);
         let removed = to_delete.len();
-        let has_blob_ref = kept.iter().any(|(_, refs_blob)| *refs_blob);
 
         for enc in &to_delete {
             let _ = kv.delete(enc.clone());

@@ -65,6 +65,97 @@ pub fn version_key_upper_bound(end: &[u8]) -> Vec<u8> {
     b
 }
 
+// 测试专用（M36 的尺子）：vacuum 的判定**逐组发生了几次**、其中**最大的一组有几行**。
+//
+// 为什么用这两把而不是分配器计数：`mem_probe` 的 peak 是**进程级**的，并行跑用例时会被
+// 别家分配的字节污染（所以 M27/M33 的内存读数一直放在 `--test-threads=1` 的 `#[ignore]`
+// 台架里）。而"判定是逐组发生的、每组不超过一条链"这件事是**结构**事实，用 thread_local
+// 计数就能钉住：旧形状（先把全库归组进一个 `BTreeMap` 再问一次）在这里读出来是
+// `calls = 1`、`max_rows = 全库物理行` ⇒ 两条断言同时红。
+#[cfg(test)]
+thread_local! {
+    static VACUUM_GROUP_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static VACUUM_GROUP_MAX_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn vacuum_group_calls() -> u64 {
+    VACUUM_GROUP_CALLS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn vacuum_group_max_rows() -> u64 {
+    VACUUM_GROUP_MAX_ROWS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vacuum_group_counters() {
+    VACUUM_GROUP_CALLS.with(|c| c.set(0));
+    VACUUM_GROUP_MAX_ROWS.with(|c| c.set(0));
+}
+
+/// 单组（**一把逻辑键**的全部版本行）的裁判 —— [`vacuum_plan`] 就是把这份逐组调用。
+///
+/// 为什么要把这一层单独露出来：四家的 vacuum 以前都必须先把**全库**按 key 归组攒进一个
+/// `BTreeMap` 才问得动这一句 ⇒ vacuum 自己的瞬时内存 = O(全库物理行)（实测 600k 行那档
+/// **+89.4 MB**，比它要裁的东西大两个数量级，下游 80 MB RSS 预算一次就顶穿）。
+/// 而版本键是按 `raw ‖ version_be` 升序走查的 ⇒ **同一把键的行必然连续到达**，
+/// 于是调用方只需要攒住"当前这一组"，判完就地交出去 ⇒ 峰值只与**最长的那条链**同阶。
+///
+/// 规则与 [`vacuum_plan`] 完全同一条（这份实现就是它的唯一内核，不存在"两份判据"）。
+///
+/// 组是**取走**的（`std::mem::take`）⇒ 调用方那句之后手上的 `Vec` 已经空着可以接下一把键，
+/// 不需要自己再 `clear()`（四家各写一遍"判完记得清空"就是四个漏清空的機會）。
+pub fn vacuum_plan_group<V, R>(
+    group: &mut Vec<(u64, V, bool, R)>,
+    xmin: u64,
+) -> (Vec<V>, Vec<(V, R)>)
+where
+    V: Clone,
+    R: Clone,
+{
+    let mut versions = std::mem::take(group);
+    #[cfg(test)]
+    if !versions.is_empty() {
+        // 只数真判定过的那一组：空组（比如 lsm 里一整组都是 Drop 行）不算一次
+        VACUUM_GROUP_CALLS.with(|c| c.set(c.get() + 1));
+        VACUUM_GROUP_MAX_ROWS.with(|m| {
+            let n = versions.len() as u64;
+            if n > m.get() {
+                m.set(n);
+            }
+        });
+    }
+    let mut to_delete: Vec<V> = Vec::new();
+    let mut keep: Vec<(V, R)> = Vec::new();
+    versions.sort_by_key(|(v, _, _, _)| *v);
+    // 最后一个 version < xmin 的下标：它之前（更旧）的全删，它本身按墓碑规则定去留
+    let last_old = versions.iter().rposition(|(ver, _, _, _)| *ver < xmin);
+    match last_old {
+        // 整条链都在 xmin 之上：全部保留
+        None => keep.extend(versions.iter().map(|(_, row, _, extra)| (row.clone(), extra.clone()))),
+        Some(keep_old) => {
+            for i in 0..keep_old {
+                to_delete.push(versions[i].1.clone());
+            }
+            let old_is_tomb = versions[keep_old].2;
+            let has_newer = versions.iter().any(|(v, _, _, _)| *v >= xmin);
+            if old_is_tomb && !has_newer {
+                // 墓碑的终局回收：xmin 之前最终是删除且没有更新的版本 ⇒ 这一版也删掉，
+                // 否则墓碑会永久累积。注意它必须**显式进 to_delete** —— 只是"不 keep"
+                // 会让这行既不删也不留，静默躺在库里（抽出这份实现时就是这么错过的）。
+                to_delete.push(versions[keep_old].1.clone());
+            } else {
+                keep.push((versions[keep_old].1.clone(), versions[keep_old].3.clone()));
+            }
+            for i in (keep_old + 1)..versions.len() {
+                keep.push((versions[i].1.clone(), versions[i].3.clone()));
+            }
+        }
+    }
+    (to_delete, keep)
+}
+
 /// vacuum 的保留判定：给定「逻辑 key → 它的全部版本行」，算出该删哪些行、该留哪些行。
 ///
 /// 规则（四引擎必须一致，否则换引擎等于换语义）：
@@ -78,6 +169,10 @@ pub fn version_key_upper_bound(end: &[u8]) -> Vec<u8> {
 ///
 /// 泛型参数：`V` 是行标识（各引擎自己的 storage key），`R` 是引擎顺手带上的附加信息
 /// （B+ 树用它标记保留行是否引用 blob；不需要就传 `()`）。
+///
+/// ⚠️ 引擎侧的 vacuum **不该用这一份**：它要求调用方先把全库按 key 归好组 ⇒ 瞬时内存
+/// O(全库物理行)（M36 之前四家都是这么写的）。走查式的回收请用 [`vacuum_plan_group`]，
+/// 这里保留给"组本来就已经在手上了"的调用方与测试。
 pub fn vacuum_plan<V, R>(
     by_key: BTreeMap<Vec<u8>, Vec<(u64, V, bool, R)>>,
     xmin: u64,
@@ -90,31 +185,9 @@ where
     let mut keep: Vec<(V, R)> = Vec::new();
 
     for (_raw, mut versions) in by_key {
-        versions.sort_by_key(|(v, _, _, _)| *v);
-        // 最后一个 version < xmin 的下标：它之前（更旧）的全删，它本身按墓碑规则定去留
-        let last_old = versions.iter().rposition(|(ver, _, _, _)| *ver < xmin);
-        match last_old {
-            // 整条链都在 xmin 之上：全部保留
-            None => keep.extend(versions.into_iter().map(|(_, row, _, extra)| (row, extra))),
-            Some(keep_old) => {
-                for i in 0..keep_old {
-                    to_delete.push(versions[i].1.clone());
-                }
-                let old_is_tomb = versions[keep_old].2;
-                let has_newer = versions.iter().any(|(v, _, _, _)| *v >= xmin);
-                if old_is_tomb && !has_newer {
-                    // 墓碑的终局回收：xmin 之前最终是删除且没有更新的版本 ⇒ 这一版也删掉，
-                    // 否则墓碑会永久累积。注意它必须**显式进 to_delete** —— 只是"不 keep"
-                    // 会让这行既不删也不留，静默躺在库里（抽出这份实现时就是这么错过的）。
-                    to_delete.push(versions[keep_old].1.clone());
-                } else {
-                    keep.push((versions[keep_old].1.clone(), versions[keep_old].3.clone()));
-                }
-                for i in (keep_old + 1)..versions.len() {
-                    keep.push((versions[i].1.clone(), versions[i].3.clone()));
-                }
-            }
-        }
+        let (d, k) = vacuum_plan_group(&mut versions, xmin);
+        to_delete.extend(d);
+        keep.extend(k);
     }
 
     (to_delete, keep)
