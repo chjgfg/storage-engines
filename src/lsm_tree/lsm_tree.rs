@@ -13,8 +13,8 @@ use std::{
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
-    merge_latest_streaming, merge_streaming, merge_to_ssts, BlockCache, EntryValue,
-    LightEntry, SstBuilder, SstFile, StoredEntry,
+    merge_latest_streaming, merge_streaming, merge_to_ssts, vec_inputs, BlockCache, EntryValue,
+    LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry,
 };
 
 // ─── Options ─────────────────────────────────────────────────────────────────
@@ -1049,7 +1049,7 @@ impl LSMTree {
             }
         }
         let mut out = Vec::new();
-        merge_streaming(sources, |_, _| true, |k, le| out.push((k, le)));
+        merge_streaming(vec_inputs(sources), |_, _| true, |k, le| out.push((k, le)));
         out
     }
 
@@ -1647,7 +1647,11 @@ impl LSMTree {
             return Ok(());
         }
 
-        let (inputs_cur, inputs_next, old_paths) = if level == 0 {
+        // `input_files`：**拥有**本次压实的输入文件，顺序 = 源序（新→旧）。
+        // M33 起归并收的是迭代器，所以这些文件必须活到 `merge_to_ssts` 返回为止 ——
+        // 旧写法在这里就 `iter_entries()` 把它们整篇读进 `Vec` 再丢掉文件，于是瞬时内存
+        // ≈ 所有输入文件之和（实测 600k 行 61.7 MB 输入 ⇒ 物化那一步峰值 +154 MB）。
+        let (input_files, paths) = if level == 0 {
             // 全部 L0 + 与 L0 范围重叠的 L1
             let l0 = std::mem::take(&mut self.levels[0]);
             let (min_k, max_k) = span_keys(&l0);
@@ -1660,21 +1664,12 @@ impl LSMTree {
                     l1_keep.push(sst);
                 }
             }
-            let paths: Vec<_> = l0
-                .iter()
-                .chain(l1_merge.iter())
-                .map(|s| s.path.clone())
-                .collect();
-            // sources 新→旧（流式 iter 收集，避免重复编码路径）
-            let mut sources = Vec::new();
-            for sst in l0.iter().rev() {
-                sources.push(sst.iter_entries());
-            }
-            for sst in &l1_merge {
-                sources.push(sst.iter_entries());
-            }
+            let mut files: Vec<SstFile> = Vec::with_capacity(l0.len() + l1_merge.len());
+            files.extend(l0.into_iter().rev()); // L0 那个 vec 是旧→新，反转成新→旧
+            files.extend(l1_merge);
+            let paths: Vec<_> = files.iter().map(|s| s.path.clone()).collect();
             self.levels[1] = l1_keep;
-            (sources, paths, true)
+            (files, paths)
         } else {
             // 选最大的一个文件
             let cur = &mut self.levels[level];
@@ -1703,16 +1698,13 @@ impl LSMTree {
                 .chain(next_merge.iter())
                 .map(|s| s.path.clone())
                 .collect();
-            let mut sources = vec![picked.iter_entries()];
-            for sst in &next_merge {
-                sources.push(sst.iter_entries());
-            }
+            // 源序 = picked 先、下一层重叠段在后（与旧写法同序）
+            let mut files: Vec<SstFile> = Vec::with_capacity(1 + next_merge.len());
+            files.push(picked);
+            files.extend(next_merge);
             self.levels[next] = next_keep;
-            (sources, paths, true)
+            (files, paths)
         };
-
-        let _ = old_paths;
-        let paths = inputs_next;
 
         // Drop / TTL / 用户 filter；merge 每个 key 只 emit 最新一条，
         // 故多版本回收在 merge 折叠时完成（enable_snapshot_gc 主要影响读路径 pin）。
@@ -1748,8 +1740,13 @@ impl LSMTree {
         let use_mmap = self.opts.use_mmap;
         let target = self.opts.target_sst_bytes;
 
+        // 每源一路迭代器，`iter_all()` 一块一块读 ⇒ 压实期间活着的是"每源当前那一块 + 一个
+        // builder"，不再是"所有输入文件之和"（M33）。
         let mut new_files = merge_to_ssts(
-            inputs_cur,
+            input_files
+                .iter()
+                .map(|s| Box::new(s.iter_all()) as MergeInput<'_, StoredEntry>)
+                .collect(),
             &keep,
             || {
                 let id = next_id.fetch_add(1, Ordering::SeqCst);
@@ -1759,6 +1756,9 @@ impl LSMTree {
             },
             target,
         )?;
+        // 迭代器借的是 `input_files`，而下面要**删这些文件** —— Windows 上句柄还开着删不掉，
+        // 所以归并一结束就释放输入文件（旧写法"源是 Vec"顺带做到了这点，不是巧合能省的东西）。
+        drop(input_files);
         let ns = Self::dir_cache_ns(&self.dir);
         for sst in &mut new_files {
             sst.set_cache_ns(ns);
@@ -1822,9 +1822,10 @@ impl LSMTree {
     /// 过滤条件沿用**本次 compaction 的 `keep`**（TTL / Drop / 用户 filter）：同一次压实里
     /// "新写出的文件过滤过、修复出来的没过滤"会更难解释。
     ///
-    /// ⚠️ 内存：`iter_entries()` 会把段里每个文件**整篇**读进 `Vec` —— 这和常规压实是同一条账单
-    /// （`merge_to_ssts` 收的就是 `Vec<Vec<…>>`），不是这条新添的；把压实与修复都改成流式源
-    /// 是另一件事，已单独记进 README 的未修队列。
+    /// ✅ 内存：M33 起这条与常规压实**走同一条流式源**（`iter_all()` 一块一块读）。
+    /// 旧写法在这里也 `iter_entries()` 把段里每个文件整篇读进 `Vec`，与压实共用那条账单 ——
+    /// 实测 600k 行 / 8 个输入文件时那一步峰值涨 154 MB（条目本身 61.7 MB）。
+    /// 尺子见本文件 `test_compaction_repairs_level_overlap` 里那条 `merge_inputs_materialized` 断言。
     ///
     /// 被替换掉的旧文件路径追加进 `replaced`，**由调用方在 MANIFEST 记完之后**再删。
     fn repair_level_overlaps<F>(
@@ -1873,11 +1874,12 @@ impl LSMTree {
                 continue;
             }
             let old_paths: Vec<PathBuf> = run.iter().map(|s| s.path.clone()).collect();
-            let sources: Vec<Vec<(Vec<u8>, StoredEntry)>> =
-                run.iter().map(|s| s.iter_entries()).collect();
-            drop(run);
+            // M33：修复重叠与常规压实**共用同一条流式源账单**。旧写法在这里也 `iter_entries()`
+            // 整篇读进 Vec，而修复恰恰多在崩溃恢复之后跑 —— 那时正是内存最紧的时候。
             let mut merged = merge_to_ssts(
-                sources,
+                run.iter()
+                    .map(|s| Box::new(s.iter_all()) as MergeInput<'_, StoredEntry>)
+                    .collect(),
                 keep,
                 || {
                     let id = next_id.fetch_add(1, Ordering::SeqCst);
@@ -1937,7 +1939,7 @@ impl LSMTree {
                 }
             }
         }
-        merge_latest_streaming(sources, |_, _| true)
+        merge_latest_streaming(vec_inputs(sources), |_, _| true)
     }
 
     fn merge_all_at(&self, snap_seq: u64) -> Vec<(Vec<u8>, StoredEntry)> {
@@ -1972,7 +1974,7 @@ impl LSMTree {
                 );
             }
         }
-        merge_latest_streaming(sources, |_, _| true)
+        merge_latest_streaming(vec_inputs(sources), |_, _| true)
     }
 
     // ─── MANIFEST ────────────────────────────────────────────────────────────
@@ -2506,6 +2508,70 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 压实**不许把输入整篇读进内存**（M33）。
+    ///
+    /// 触发它的测量：`compaction_cost_split` 在 600k 行 / 8 个输入文件上，光"物化输入"这一步
+    /// 峰值就涨 **154 MB**（条目本身只有 61.7 MB ⇒ 多出来的是每行两个堆分配 + Vec 扩容翻倍），
+    /// 一次压实把下游 80 MB 的 RSS 预算直接吃穿。改成流式源之后这件事的计数必须是 0。
+    ///
+    /// 尺子 = `merge_inputs_materialized()`，单位是**条目数**（不是"调了几次 `iter_entries()`"：
+    /// 调一次就能搬进几万行，按次数断言会漏掉大半）。线程内计数 ⇒ 一律取差值。
+    /// ⚠️ 空转检查放在**同一行**里、且排在前面：先主动物化一个文件，证明这把尺子数得到，
+    /// 否则后面那个 `0` 完全可能只是"尺子坏了"。
+    #[test]
+    fn test_compaction_does_not_materialize_its_inputs() {
+        use crate::lsm_tree::sst::merge_inputs_materialized;
+        let dir = tmp_dir("no_materialize");
+        {
+            // mem 40 条 / L0 4 个就压：造得出"多个输入文件"这个形状
+            let mut db = LSMTree::open_with_options(&dir, 40, 4).unwrap();
+            for i in 0..400u32 {
+                db.put(
+                    format!("k{i:04}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                );
+                if i % 40 == 39 {
+                    db.flush().unwrap();
+                }
+            }
+            // ① 尺子自检：主动物化 L0 的一个文件，计数必须正好涨它的条目数
+            let probe_file = db
+                .l0_for_test()
+                .first()
+                .expect("形状没造出来：L0 是空的，后面两条断言都会空转");
+            let base = merge_inputs_materialized();
+            let n_probe = probe_file.iter_entries().len() as u64;
+            let heard = merge_inputs_materialized() - base;
+            assert_eq!(
+                heard, n_probe,
+                "这把尺子空转：主动物化了 {n_probe} 条，只数到 {heard}"
+            );
+
+            // ② 真压实：这一段不许物化任何一条输入
+            // ⚠️ 不能用 `compact_once()`：它自己看 L0 阈值，第一版就是这么空转过去的（L0 只有 2 个
+            // 文件、阈值 4 ⇒ 它一轮都不压，那条 `0` 断言就成了"什么都没做也算通过"）。
+            // `compact_l0_until(0, …)` 是"不管阈值先把 L0 压干净"，才真的走到 `compact_level`。
+            let before = db.stats_exact();
+            let m0 = merge_inputs_materialized();
+            let rounds = db.compact_l0_until(0, 8).unwrap();
+            let walked = merge_inputs_materialized() - m0;
+            let after = db.stats_exact();
+            assert!(
+                rounds >= 1 && after.l0_files < before.l0_files,
+                "这次没压实（rounds={rounds}，{before:?} → {after:?}）⇒ 上面那条 0 是空转"
+            );
+            assert_eq!(
+                walked, 0,
+                "压实把 {walked} 条输入整篇物化进了内存 ⇒ 瞬时内存又回到「所有输入文件之和」的形状\
+                 （M33：输入必须走 `MergeInput` 迭代器）"
+            );
+            // 正确性尾巴：压完仍读得到首尾两把键（流式归并没把行弄丢）
+            assert_eq!(db.get(b"k0000"), Some(b"v0".to_vec()));
+            assert_eq!(db.get(b"k0399"), Some(b"v399".to_vec()));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_overwrite_across_levels() {
         let dir = tmp_dir("ovw");
@@ -2857,9 +2923,17 @@ mod tests {
             assert_eq!(probes_before, 60, "重叠层每次点读的探文件数");
 
             // 触发一次会重写 L1 的压实
+            // M33：层内重叠修复与常规压实**共用同一条输入账单**（旧写法两边都 `iter_entries()`
+            // 整篇读进 Vec），所以这里也要有自己的尺子 —— 不是重复劳动，是两个调用点各自担责。
+            let m0 = crate::lsm_tree::sst::merge_inputs_materialized();
             db.put(b"zz".to_vec(), b"l0".to_vec());
             db.flush().unwrap();
             let rounds = db.compact_l0_until(0, 8).unwrap();
+            let walked = crate::lsm_tree::sst::merge_inputs_materialized() - m0;
+            assert_eq!(
+                walked, 0,
+                "压实/重叠修复把 {walked} 条输入整篇物化进了内存 ⇒ 又回到「所有输入文件之和」那条账（M33）"
+            );
             assert!(rounds >= 1, "压实没跑，修复也就没被调用");
 
             let l1 = &db.levels[1];

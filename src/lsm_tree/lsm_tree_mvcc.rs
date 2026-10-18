@@ -2530,31 +2530,35 @@ mod tests {
         cleanup(&path);
     }
 
-    /// 压实的耗时到底在哪一段（M30 的先量，不改语义）。
+    /// 压实的耗时与瞬时内存到底各在哪一段（M30 先量时间，M33 在同一台架上并上内存列）。
     ///
     /// 为什么要拆：`reopen_shape_probe` 只给出"13.9 s 全在 `flush` 里"，而 `flush` 里混着
     /// **三件事** —— ①把每个输入文件整篇读进 `Vec`（`iter_entries` = `iter_all().collect()`）、
     /// ②k 路归并（每步克隆键与值）、③边归并边写新 SST（`SstBuilder` 侧本来就是流式的）。
     /// "改成流式源"只治 ①，如果时间其实在 ② 或 ③，那这一刀就买错了东西。
     ///
-    /// 四段各量两次里的两次：`t_materialize` → `t_merge_write`（消费第一份物化），
-    /// 再 `t_materialize2`（页缓存已热，用来看 ① 里有多少是冷读）→ `t_merge_only`（纯归并，
-    /// sink 只计数）。⇒ **写 ≈ merge_write − merge_only**，冷读分量 ≈ materialize − materialize2。
+    /// 现在四段（M33 之后）：**① 物化输入** → **② 旧形状**（源=①那份 Vec）归并+写盘 →
+    /// **③ 新形状**（源=`iter_all()` 每源一路）归并+写盘 → **④ 纯归并不写盘**（sink 只计数）。
+    /// ⇒ 写 ≈ ② − ④；**整段旧形状 = ① + ②**，整段新形状 = ③ —— 报"省了多少内存"必须按整段比，
+    /// ⚠️ 第一版就是只比了 ② 与 ③ 两段，得出"流式反而更占内存"的反向结论（旧形的大头记在 ① 上）。
+    /// 每段之前调 `mem_probe::reset_peak()`：`peak` 是进程高水位，不压回去的话靠后的段只能报 0。
     ///
-    /// # 量出来的答案（release，600k 行 = 8 个输入文件 61 MB → 34 个输出文件 67 MB）
+    /// # 量出来的答案（release，600k 行 = 8 个输入文件 61.7 MB → 34 个输出文件 67.6 MB）
     ///
-    /// | 段 | 修前 | 修后 | 每输入行（修前 → 修后） |
-    /// |---|---|---|---|
-    /// | ① 物化输入 | 618 ms | 906 ms | 1.03 → 1.51 µs（噪声内，**不是病**） |
-    /// | ② 纯归并 | 476 ms | 765 ms | 0.79 → 1.27 µs |
-    /// | ③ 归并+写盘 | **18 018 ms** | **3 114 ms** | **30.03 → 5.19 µs** |
+    /// | 段 | M30 之前 | M30 之后（=现在） | 每输入行 | 峰值涨 |
+    /// |---|---|---|---|---|
+    /// | ① 物化输入 | 618 ms | 366.9 ms | 0.61 µs | **154.0 MB**（条目本身 61.7 MB） |
+    /// | ② 旧形状 归并+写盘 | **18 018 ms** | 1471.8 ms | 2.45 µs | 2.9 MB（叠在 ① 上） |
+    /// | ③ 新形状 流式源 | — | 1888.4 ms | 3.15 µs | **6.3 MB** |
+    /// | ④ 纯归并不写盘 | 476 ms | 307.9 ms | 0.51 µs | — |
     ///
-    /// ⇒ 病在 ③，占修前 ①+③ 的 **94%**；而 ③ 里唯一"每行都做一次、且随表长"的事是
-    /// `merge_to_ssts` 的 `if b.estimated_bytes() >= target_bytes` —— 旧实现每次调用都把当前
-    /// builder 的整表从头求和一遍（一张 2 MiB 的表 ≈19 000 行 ⇒ 每行摊到 ~30 µs，正是实测那个数）。
-    /// **我原先点名的"整篇物化"只值 0.6 s**：那是**内存**问题（瞬时 ≈ 输入条目总和），不是时间问题。
-    /// 修法就是 M19 的同一个动作：把求和改成增量账。连带效果：带 redo 的重开 14.43 s → **3.55 s**，
-    /// 而 `facade` 干净重开 30.8 ms 不变（M28 那条仍然成立）。
+    /// ⇒ **时间**的病在 ②/③，占当时 ①+③ 的 94%，而那段里唯一"每行都做一次且随表长"的事是
+    /// `merge_to_ssts` 的 `if b.estimated_bytes() >= target_bytes` —— 旧实现每次调用都把 builder
+    /// 的整表从头求和一遍（一张 2 MiB 的表 ≈19 000 行 ⇒ 每行摊 ~30 µs，正是实测那个数）。
+    /// 修法与 M19 同一个动作：改增量账。连带效果：带 redo 的重开 14.43 s → **3.55 s**。
+    /// ⇒ **内存**的病在 ①：整段旧形状 ①+② = **156.8 MB** → 新形状 ③ = **6.3 MB（省 25.0×）**，
+    /// 时间 1838.7 → 1888.4 ms（+2.7%，本机噪声带内 ⇒ 持平）。M33 收的就是这笔。
+    /// 每行摊 269 B 而条目只有 108 B ⇒ 多出来的是每行两个堆分配 + `Vec` 扩容翻倍。
     ///
     /// ```text
     /// LSM_COMPACT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture \
@@ -2564,7 +2568,9 @@ mod tests {
     #[ignore = "压实耗时拆分，手动 release 单线程跑：LSM_COMPACT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 compaction_cost_split"]
     fn compaction_cost_split() {
         use std::time::Instant;
-        use crate::lsm_tree::sst::{SstBuilder, StoredEntry, merge_streaming, merge_to_ssts};
+        use crate::lsm_tree::sst::{
+            merge_streaming, merge_to_ssts, vec_inputs, MergeInput, SstBuilder, StoredEntry,
+        };
 
         let rows: usize = std::env::var("LSM_COMPACT_ROWS")
             .ok()
@@ -2616,9 +2622,16 @@ mod tests {
         let tree = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
         let n_files = tree.l0_for_test().len();
 
+        // ── ① 物化输入（旧形状的第一步）：时间 + **这一段自己涨了多少内存** ──
+        // ⚠️ `reset_peak()` 是关键：`peak` 是进程高水位，不压回去的话这一段涨的会被前面的
+        // 灌入高峰盖住、报成 0（M27 的盲区）。基准取"当前活着的字节"，之后减它。
         let t = Instant::now();
+        let m0 = crate::mem_probe::reset_peak();
+        let live0 = crate::mem_probe::live();
         let sources: Vec<Vec<_>> = tree.l0_for_test().iter().rev().map(|s| s.iter_entries()).collect();
         let t_materialize = t.elapsed();
+        let mat_peak = crate::mem_probe::peak().saturating_sub(m0);
+        let mat_live = (crate::mem_probe::live() as i64 - live0 as i64).max(0) as u64;
         let total_rows: usize = sources.iter().map(|s| s.len()).sum();
         let bytes: usize = sources
             .iter()
@@ -2637,42 +2650,112 @@ mod tests {
             let p = out_path.join("sst").join(format!("{next_id:08}.sst"));
             SstBuilder::with_options(next_id, p, block_entries, bloom).with_bloom_bits(bits)
         };
+        // ── ② 旧形状：源 = ① 那份物化好的 Vec ──
         let t = Instant::now();
-        let written = merge_to_ssts(sources, |_: &[u8], _: &StoredEntry| true, &mut make, target).unwrap();
+        let m1 = crate::mem_probe::reset_peak();
+        let written = merge_to_ssts(
+            vec_inputs(sources),
+            |_: &[u8], _: &StoredEntry| true,
+            &mut make,
+            target,
+        )
+        .unwrap();
         let t_merge_write = t.elapsed();
+        let old_peak = crate::mem_probe::peak().saturating_sub(m1);
         let out_bytes: u64 = written.iter().map(|s| s.size_bytes).sum();
+        let n_out = written.len();
+        drop(written);
 
-        // 第二遍：再物化一次（页缓存已热）+ 纯归并（sink 只计数，不写盘）
+        // ── ③ 新形状（生产码现在走这条）：源 = 每源一路 `iter_all()` 迭代器 ──
+        // 两臂的输出必须**逐字节同口径**，否则"省了内存"可能只是"少写了东西"。
         let t = Instant::now();
-        let sources2: Vec<Vec<_>> = tree.l0_for_test().iter().rev().map(|s| s.iter_entries()).collect();
-        let t_materialize2 = t.elapsed();
+        let m2 = crate::mem_probe::reset_peak();
+        let written_stream = merge_to_ssts(
+            tree.l0_for_test()
+                .iter()
+                .rev()
+                .map(|s| Box::new(s.iter_all()) as MergeInput<'_, StoredEntry>)
+                .collect(),
+            |_: &[u8], _: &StoredEntry| true,
+            &mut make,
+            target,
+        )
+        .unwrap();
+        let t_stream = t.elapsed();
+        let new_peak = crate::mem_probe::peak().saturating_sub(m2);
+        let out_bytes_stream: u64 = written_stream.iter().map(|s| s.size_bytes).sum();
+        assert_eq!(
+            written_stream.len(),
+            n_out,
+            "流式源改变了切文件的数量（{n_out} → {}）⇒ 判据被动过了",
+            written_stream.len()
+        );
+        assert_eq!(
+            out_bytes_stream, out_bytes,
+            "两臂输出字节不同（{out_bytes} → {out_bytes_stream}）⇒ 归并结果被改动污染，不是省内存"
+        );
+        drop(written_stream);
+
+        // ④ 纯归并（sink 只计数，不写盘）：源仍走物化那份，好与 ② 直接对比"写"占多少
         let mut emitted = 0usize;
+        let sources3: Vec<Vec<_>> =
+            tree.l0_for_test().iter().rev().map(|s| s.iter_entries()).collect();
         let t = Instant::now();
-        merge_streaming(sources2, &mut |_: &[u8], _: &StoredEntry| true, |_: Vec<u8>, _| {
-            emitted += 1;
-        });
+        merge_streaming(
+            vec_inputs(sources3),
+            &mut |_: &[u8], _: &StoredEntry| true,
+            |_: Vec<u8>, _| {
+                emitted += 1;
+            },
+        );
         let t_merge_only = t.elapsed();
 
+        let mb = |b: u64| b as f64 / 1_048_576.0;
         eprintln!(
-            "  输入 {total_rows} 行 / {} MB | 输出 {} 个文件 {} MB | 纯归并交出 {emitted} 把键",
-            bytes / 1_048_576,
-            written.len(),
-            out_bytes / 1_048_576
+            "  输入 {total_rows} 行 / {:.1} MB | 输出 {n_out} 个文件 {:.1} MB | 纯归并交出 {emitted} 把键",
+            mb(bytes as u64),
+            mb(out_bytes),
         );
         eprintln!(
-            "  ① 物化输入   {:>12.1} ms（热身后 {:.1} ms）⇒ 每行 {:.3} / {:.3} µs",
+            "  ① 物化输入 {:>10.1} ms ⇒ 每行 {:.3} µs | 这一段峰值涨 {:.1} MB（条目本身 {:.1} MB、\
+             结束时仍活 {:.1} MB）⇒ 每行摊 {:.0} B",
             t_materialize.as_secs_f64() * 1e3,
-            t_materialize2.as_secs_f64() * 1e3,
             t_materialize.as_secs_f64() * 1e6 / total_rows as f64,
-            t_materialize2.as_secs_f64() * 1e6 / total_rows as f64,
+            mb(mat_peak),
+            mb(bytes as u64),
+            mb(mat_live),
+            mat_peak as f64 / total_rows.max(1) as f64,
         );
         eprintln!(
-            "  ② 纯归并     {:>12.1} ms ⇒ 每行 {:.3} µs | ③ 归并+写盘 {:>12.1} ms ⇒ 每输入行 {:.3} µs \
-             | 写这一段 ≈ {:.1} ms（占 ①+③ 的 {:.0}%）",
-            t_merge_only.as_secs_f64() * 1e3,
-            t_merge_only.as_secs_f64() * 1e6 / total_rows as f64,
+            "  ② 旧形状 归并+写盘 {:>10.1} ms ⇒ 每输入行 {:.3} µs | 这一段峰值涨 {:.1} MB\
+             （源=①那份 Vec ⇒ 输入的 154 MB 已记在 ① 上）",
             t_merge_write.as_secs_f64() * 1e3,
             t_merge_write.as_secs_f64() * 1e6 / total_rows as f64,
+            mb(old_peak),
+        );
+        eprintln!(
+            "  ③ 新形状 流式源     {:>10.1} ms ⇒ 每输入行 {:.3} µs | 峰值涨 {:.1} MB",
+            t_stream.as_secs_f64() * 1e3,
+            t_stream.as_secs_f64() * 1e6 / total_rows as f64,
+            mb(new_peak),
+        );
+        // ⚠️ 报"省了多少"必须按**整条操作**比，不能拿 ② 与 ③ 两段各截一段比 ——
+        // 旧形状的大头（物化那 154 MB）在 ① 段，② 只是叠在它上面多涨的 2.9 MB。
+        // 只比 ② vs ③ 会得到"新形状反而更占内存"的错误结论（第一版这句就印错了）。
+        let old_total = mat_peak + old_peak;
+        eprintln!(
+            "  ⇒ 整段瞬时内存：旧形状 ①+② = {:.1} MB → 新形状 ③ = {:.1} MB（省 {:.1}×）\
+             | 整段时间：旧 ①+② = {:.1} ms → 新 ③ = {:.1} ms",
+            mb(old_total),
+            mb(new_peak),
+            if new_peak > 0 { old_total as f64 / new_peak as f64 } else { 0.0 },
+            (t_materialize.as_secs_f64() + t_merge_write.as_secs_f64()) * 1e3,
+            t_stream.as_secs_f64() * 1e3,
+        );
+        eprintln!(
+            "  ④ 纯归并不写盘 {:>10.1} ms ⇒ 每行 {:.3} µs | 写这一段 ≈ {:.1} ms（占 ①+② 的 {:.0}%）",
+            t_merge_only.as_secs_f64() * 1e3,
+            t_merge_only.as_secs_f64() * 1e6 / total_rows as f64,
             (t_merge_write.as_secs_f64() - t_merge_only.as_secs_f64()) * 1e3,
             (t_merge_write.as_secs_f64() - t_merge_only.as_secs_f64())
                 * 100.0
@@ -2680,7 +2763,6 @@ mod tests {
         );
         eprintln!("  文件数={n_files}（压实输入个数）| 输出目标 {target} B/文件");
         drop(tree);
-        drop(written);
         cleanup(&dir);
         cleanup(&out_dir);
     }
@@ -3348,9 +3430,11 @@ mod tests {
     ///   （9.8 ms vs 6.4 ms，都不压实）。
     /// - `[facade]`（走修后的门面）= **13.3 ms**。同档修前的台架读数是 17.5~19.8 s（跨轮噪声 1.3×，
     ///   只当量级看）；因果凭据取上面那对**同轮**数字 + 层文件数不动。
-    /// - ⚠️ **没修完的部分**：`no_bulk` 那条（有 redo 的崩溃恢复）仍然 14.4 s，其中 flush 13.7 s ——
-    ///   因为 redo 落了盘就必须 compact，而压实的输入仍是整篇物化（`merge_to_ssts` 收
-    ///   `Vec<Vec<(键, 条目)>>`、`SstFile::iter_entries()` 一篇读全文件）。这笔挂在未修队列。
+    /// - ✅ 当时"没修完的部分"：`no_bulk` 那条（有 redo 的崩溃恢复）仍然 14.4 s，其中 flush 13.7 s ——
+    ///   因为 redo 落了盘就必须 compact。**这笔后来分两次收掉**：M30 查到时间元凶是
+    ///   `SstBuilder::estimated_bytes()` 每交一行重求和整表（同档 14.43 s → **3.55 s**），
+    ///   M33 把剩下的"输入整篇物化"（内存账，峰值 156.8 MB）改成流式源（→ 6.3 MB）。
+    ///   下面 `compaction_cost_split` 的注释里有两笔的完整拆分。
     ///
     /// 略去的写：`set_with_ttl×1000` / `incr×1000`（各 1000 行 ≈ 0.2 MB WAL，跟 60 万行那串比是零头）。
     ///
@@ -3590,7 +3674,8 @@ mod tests {
         probe_open("cond_flush", &d_cond, false);
 
         // 臂 4：不跑 bulk 的另一份 shape（WAL 里有 6 万条待重放）⇒ 条件为真，仍然会 flush，
-        // 于是这条把**剩下那笔没修的账**（压实的输入整篇物化）单独暴露出来
+        // 于是这条把**有 redo 那条路径的整笔代价**单独暴露出来（当年挂的是"输入整篇物化"，
+        // 时间那一半 M30 收掉、内存那一半 M33 收掉；留着这条臂是为了看两笔收完之后还剩多少）
         let d_nobulk = tmp_db("reopen_probe_nobulk");
         build_shape(&d_nobulk, rows, false);
         probe_open("no_bulk(有 redo)", &d_nobulk, false);

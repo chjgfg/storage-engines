@@ -158,6 +158,29 @@ pub(crate) fn light_visits() -> u64 {
     LIGHT_VISITS.with(|c| c.get())
 }
 
+// 测试专用：有多少条目被 `SstFile::iter_entries()` **整篇物化**进内存（M33）。
+//
+// 为什么还要一把计数尺：改流式源之后"没有整篇读进来"这件事必须能被断言。只看输出正确性
+// 永远抓不到"照样先 collect 再归并"的退化版；只看内存又必须单线程跑（分配计数是进程级的，
+// 并行用例会互相抬高峰值 —— M27 就是栽在这里）。这条计数把"整篇读进 Vec"直接数出来。
+// ⚠️ 单位 = **条目数**，不是"调了几次 `iter_entries()`"：要抓的是"搬进内存多少行"。
+// 与 `note_light_visit` 同为**线程内**计数 ⇒ 断言一律取差值。
+#[cfg(test)]
+thread_local! {
+    static MERGE_INPUTS_MATERIALIZED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_merge_input_materialized(n: u64) {
+    MERGE_INPUTS_MATERIALIZED.with(|c| c.set(c.get() + n));
+}
+
+/// 当前线程被整篇物化进内存的条目数（测试探针用）
+#[cfg(test)]
+pub(crate) fn merge_inputs_materialized() -> u64 {
+    MERGE_INPUTS_MATERIALIZED.with(|c| c.get())
+}
+
 // 测试专用：一次点读在 SST 里**比较过多少个条目键**，以及探过多少个 SST 文件。
 //
 // 为什么必须分开数：bloom 通过之后，取那一行有两条路 —— 稀疏索引二分 + 定位块（`find_block`），
@@ -860,8 +883,17 @@ impl SstFile {
         }
     }
 
+    /// 把**整个文件**读进一个 `Vec`。
+    ///
+    /// ⚠️ 只有"文件本来就在内存里（v1 / 小文件）"或"调用方确实要随机访问这份 `Vec`"时该用它。
+    /// **压实与层内重叠修复的输入不许用它**（M33）：那些路径现在收 `MergeInput`（一路一个
+    /// 迭代器），用这条会把瞬时内存推到"所有输入文件之和"—— 实测 600k 行 61.7 MB 的输入
+    /// 在这一步峰值涨到 **154 MB**。尺子是 `merge_inputs_materialized()`（测试专用）。
     pub fn iter_entries(&self) -> Vec<(Vec<u8>, StoredEntry)> {
-        self.iter_all().collect()
+        let v: Vec<(Vec<u8>, StoredEntry)> = self.iter_all().collect();
+        #[cfg(test)]
+        note_merge_input_materialized(v.len() as u64);
+        v
     }
 
     pub fn for_each_entry<F>(&self, mut f: F) -> std::io::Result<()>
@@ -1624,7 +1656,32 @@ impl LightEntry {
 /// 同一个判据 ⇒ **折叠的答案 == 逐把点查的答案**。正常形状里两者本来就一致（后建的 L0 文件
 /// 只会装更晚的 seq、内存表比任何已落盘的都新），所以这次改动对既有路径是**语义不变**；
 /// 变的是重叠/崩溃恢复那两种以前会给出错误答案的形状。
-pub fn merge_streaming<T, F, K>(sources: Vec<Vec<(Vec<u8>, T)>>, mut keep: K, mut emit: F)
+/// 归并的一路输入：**一个按键升序的迭代器**（M33）。
+///
+/// 为什么不是 `Vec<(键, 条目)>`：上一版的签名逼着每个调用点先把**整个输入文件**读进内存
+/// （`iter_entries()` = `iter_all().collect()`），于是一次压实的瞬时内存 ≈ 所有输入文件之和 ——
+/// 实测 600k 行 / 61.7 MB 的输入，物化那一步峰值涨到 **154 MB**（每行摊 269 B，而条目本身
+/// 只有 108 B：多出来的是每行两个堆分配 + `Vec` 扩容翻倍），下游那台 1 核 6 GB 的机器
+/// 给的 RSS 预算是 80 MB ⇒ 一次压实自己就把预算吃穿了。
+/// 改成一路一个迭代器之后，同一轮压实只需要"每源当前那一块 + 一个 builder"。
+///
+/// 用 `Box<dyn>` 而不是泛型参数：源的形状本来就是混合的（内存表切出来是 `Vec`、
+/// SST 是 `SstEntryIter`、读路径还带 `filter`），泛型要么要求同构要么逼每个调用点写类型名；
+/// 而"一路一个盒子"的开销 = 输入文件数（个位数到几十），相比每行的克隆可以忽略。
+pub type MergeInput<'a, T> = Box<dyn Iterator<Item = (Vec<u8>, T)> + 'a>;
+
+/// 把"本来就物化在内存里"的源接到 `MergeInput` 上（M33）。
+///
+/// 内存表切片（`mem_range_at` / `range_at` 返回的就是 `Vec`）走这条 —— **只是换个类型**，
+/// 不复制条目。要避开的物化是 `SstFile::iter_entries()`：那是把磁盘上的整个文件读进 `Vec`，
+/// 而压实/修复的输入恰好是磁盘文件。
+pub fn vec_inputs<T: 'static>(srcs: Vec<Vec<(Vec<u8>, T)>>) -> Vec<MergeInput<'static, T>> {
+    srcs.into_iter()
+        .map(|s| Box::new(s.into_iter()) as MergeInput<T>)
+        .collect()
+}
+
+pub fn merge_streaming<T, F, K>(sources: Vec<MergeInput<'_, T>>, mut keep: K, mut emit: F)
 where
     T: MergeSeq,
     F: FnMut(Vec<u8>, T),
@@ -1634,7 +1691,6 @@ where
         key: Vec<u8>,
         se: T,
         src: usize,
-        idx: usize,
     }
     impl<T: MergeSeq> Ord for Node<T> {
         fn cmp(&self, other: &Self) -> CmpOrdering {
@@ -1660,51 +1716,53 @@ where
     }
     impl<T: MergeSeq> Eq for Node<T> {}
 
+    // 每源一个 `Peekable`：堆里的 Node 是该源**当前头部的一份克隆**（还没消费掉）。
+    // 所以推进节奏必须是"弹出 Node → `next()` 消费那个头部 → 再 `peek()` 推下一个"——
+    // 旧写法靠索引读 `Vec`，索引本身就是游标，改成迭代器后这一步要显式做。
+    let mut srcs: Vec<std::iter::Peekable<MergeInput<T>>> =
+        sources.into_iter().map(|s| s.peekable()).collect();
     let mut heap = BinaryHeap::new();
-    for (s, src) in sources.iter().enumerate() {
-        if let Some((k, se)) = src.first() {
+    for s in 0..srcs.len() {
+        if let Some((k, se)) = srcs[s].peek() {
             heap.push(Node {
                 key: k.clone(),
                 se: se.clone(),
                 src: s,
-                idx: 0,
             });
         }
     }
+    // 不捕获任何变量：源与堆都当参数传进来。写成闭包捕获 `srcs` 会把这vec 长期借住，
+    // 主循环里再 `srcs[..].next()` 就是第二次可变借用，编译不过。
+    let advance = |srcs: &mut [std::iter::Peekable<MergeInput<T>>],
+                   heap: &mut BinaryHeap<Node<T>>,
+                   s: usize| {
+        srcs[s].next();
+        if let Some((k, se)) = srcs[s].peek() {
+            heap.push(Node {
+                key: k.clone(),
+                se: se.clone(),
+                src: s,
+            });
+        }
+    };
     let mut last_key: Option<Vec<u8>> = None;
     while let Some(n) = heap.pop() {
-        let push_next = |heap: &mut BinaryHeap<Node<T>>,
-                         sources: &[Vec<(Vec<u8>, T)>],
-                         src: usize,
-                         idx: usize| {
-            let next_idx = idx + 1;
-            if let Some(s) = sources.get(src) {
-                if next_idx < s.len() {
-                    heap.push(Node {
-                        key: s[next_idx].0.clone(),
-                        se: s[next_idx].1.clone(),
-                        src,
-                        idx: next_idx,
-                    });
-                }
-            }
-        };
-        push_next(&mut heap, &sources, n.src, n.idx);
+        advance(&mut srcs, &mut heap, n.src);
 
         if last_key.as_ref().map(|k| k == &n.key).unwrap_or(false) {
             continue;
         }
 
         // 收集所有同 key 条目，选最优：**seq 大者赢**；seq 相同才回到"源序小者赢"。
-        let key = n.key.clone();
+        let key = n.key;
         let mut best_src = n.src;
-        let mut best = n.se.clone();
+        let mut best = n.se;
         while heap.peek().map(|p| p.key == key).unwrap_or(false) {
             let m = heap.pop().unwrap();
-            push_next(&mut heap, &sources, m.src, m.idx);
+            advance(&mut srcs, &mut heap, m.src);
             if m.se.seq() > best.seq() || (m.se.seq() == best.seq() && m.src < best_src) {
                 best_src = m.src;
-                best = m.se.clone();
+                best = m.se;
             }
         }
 
@@ -1717,7 +1775,7 @@ where
 
 /// 兼容：归并到 Vec
 pub fn merge_latest_streaming<F>(
-    sources: Vec<Vec<(Vec<u8>, StoredEntry)>>,
+    sources: Vec<MergeInput<'_, StoredEntry>>,
     mut keep: F,
 ) -> Vec<(Vec<u8>, StoredEntry)>
 where
@@ -1728,17 +1786,18 @@ where
     out
 }
 
+/// `Vec<Vec<…>>` 版的便捷入口（内存表切片、以及测试用）
 pub fn merge_latest(
     sources: Vec<Vec<(Vec<u8>, StoredEntry)>>,
 ) -> Vec<(Vec<u8>, StoredEntry)> {
-    merge_latest_streaming(sources, |_, _| true)
+    merge_latest_streaming(vec_inputs(sources), |_, _| true)
 }
 
 
 /// **真流式**归并写入多个 SST：边 merge 边 `add`，达到 `target_bytes` 就 `finish` 落盘，
 /// 不先物化全量 `Vec`（单 builder 缓冲不超过约一个 SST）。
 pub fn merge_to_ssts<F>(
-    sources: Vec<Vec<(Vec<u8>, StoredEntry)>>,
+    sources: Vec<MergeInput<'_, StoredEntry>>,
     mut keep: F,
     mut new_builder: impl FnMut() -> SstBuilder,
     target_bytes: usize,
@@ -1885,7 +1944,7 @@ mod tests {
         let mut id = 0u64;
         let s0 = builder_size_walks();
         // target 给 64 KiB ⇒ 6000 行该切出好几个文件（"每行问一次判定"这一步真的被走到）
-        let files = merge_to_ssts(sources, |_, _| true, || {
+        let files = merge_to_ssts(vec_inputs(sources), |_, _| true, || {
             id += 1;
             SstBuilder::with_options(id, tmp(&format!("est_merge_{id}")), 64, false)
         }, 64 * 1024)

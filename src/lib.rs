@@ -37,3 +37,61 @@ pub use engine::{
 /// LSM 的旋钮集：`EngineConfig::lsm` 收的就是这个类型，所以在根上直接给个名字，
 /// 免得下游为了配一个缓存容量还得写全 `lsm_tree::` 路径（那正是"绕开门面自己拼"的起点）。
 pub use lsm_tree::LSMTreeOptions;
+
+/// 测试专用：记账分配器 + 峰值水位线。`#[cfg(test)]` ⇒ 对 crate 使用者零成本。
+///
+/// 原来这份埋在 `engine::tests` 里，只有门面台架用得到。M33 要量的是**存储层内部**一次压实的
+/// 瞬时内存，所以提到 crate 根，两家共用一把尺子 —— 一个 crate 只能有一个 `#[global_allocator]`，
+/// 在 lsm 那边再抄一份是直接编译失败，不是"多测一遍"。
+///
+/// `reset_peak()` 是这次新增的那一格：`peak` 是**进程高水位**，同一轮里靠后的操作永远报 `+0`
+/// （M27 记下的度量盲区，当时写的是"要拆得做隔离台架"）。把水位线在一段操作开始前压回
+/// "当前活着的字节"，那段自己涨了多少才量得出来。
+#[cfg(test)]
+pub(crate) mod mem_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static LIVE: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Tracking;
+
+    unsafe impl GlobalAlloc for Tracking {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            // SAFETY: 委托给 System，契约由调用方（Rust 运行时）保证
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                let now = LIVE.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
+                PEAK.fetch_max(now, Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            LIVE.fetch_sub(l.size() as u64, Relaxed);
+            // SAFETY: 指针与布局由调用方按 GlobalAlloc 契约提供
+            unsafe { System.dealloc(p, l) };
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Tracking = Tracking;
+
+    /// 此刻还活着的堆字节
+    pub(crate) fn live() -> u64 {
+        LIVE.load(Relaxed)
+    }
+
+    /// 开机到此刻的高水位
+    pub(crate) fn peak() -> u64 {
+        PEAK.load(Relaxed)
+    }
+
+    /// 把高水位压回"当前活着的字节"，并返回那个基准值
+    /// ⇒ 之后 `peak() - 基准` 就是**这一段操作**的瞬时增量（不会被前面的高点压成 0）
+    pub(crate) fn reset_peak() -> u64 {
+        let l = LIVE.load(Relaxed);
+        PEAK.store(l, Relaxed);
+        l
+    }
+}

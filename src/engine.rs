@@ -2719,52 +2719,16 @@ mod tests {
     //   SCALE_ROWS=200000 cargo test --release --lib -- --ignored --nocapture \
     //       --test-threads=1 scale_baseline_all_engines
     // `--test-threads=1` 是必须的：内存计数是进程级的，并行会把别家用例的分配算进来。
-
-    /// 记账分配器：只统计申请/释放的字节数。`#[cfg(test)]` ⇒ 对 crate 使用者零成本。
-    mod mem_probe {
-        use std::alloc::{GlobalAlloc, Layout, System};
-        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-        static LIVE: AtomicU64 = AtomicU64::new(0);
-        static PEAK: AtomicU64 = AtomicU64::new(0);
-
-        pub struct Tracking;
-
-        unsafe impl GlobalAlloc for Tracking {
-            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-                // SAFETY: 委托给 System，契约由调用方（Rust 运行时）保证
-                let p = unsafe { System.alloc(l) };
-                if !p.is_null() {
-                    let now = LIVE.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
-                    PEAK.fetch_max(now, Relaxed);
-                }
-                p
-            }
-            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-                LIVE.fetch_sub(l.size() as u64, Relaxed);
-                // SAFETY: 指针与布局由调用方按 GlobalAlloc 契约提供
-                unsafe { System.dealloc(p, l) };
-            }
-        }
-
-        #[global_allocator]
-        static ALLOC: Tracking = Tracking;
-
-        pub fn live() -> u64 {
-            LIVE.load(Relaxed)
-        }
-        pub fn peak() -> u64 {
-            PEAK.load(Relaxed)
-        }
-    }
+    // 记账分配器本身在 crate 根的 `crate::mem_probe`（M33 提到根上：一个 crate 只能有一个
+    // `#[global_allocator]`，而 LSM 的压实台架要用同一把尺子，不能在 lsm 那边再抄一份）。
 
     /// 跑一次操作，返回 (墙钟, 常驻字节增量, 期间峰值字节增量, 操作返回值)
     fn timed<T>(f: impl FnOnce() -> T) -> (std::time::Duration, i64, u64, T) {
-        let (l0, p0) = (mem_probe::live() as i64, mem_probe::peak());
+        let (l0, p0) = (crate::mem_probe::live() as i64, crate::mem_probe::peak());
         let t = std::time::Instant::now();
         let out = f();
         let d = t.elapsed();
-        let (l1, p1) = (mem_probe::live() as i64, mem_probe::peak());
+        let (l1, p1) = (crate::mem_probe::live() as i64, crate::mem_probe::peak());
         (d, l1 - l0, p1.saturating_sub(p0), out)
     }
 
