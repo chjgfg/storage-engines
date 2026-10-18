@@ -261,6 +261,11 @@ impl MVCC {
             }
         };
 
+        // 这一家**保持无条件**：`Bitcask::flush` = 写缓冲空就直接返回 + 一次 fsync，是有界工作。
+        // LSM 那一档在 M28 改成了「有 redo 才 flush」，因为它的 `flush()` 末尾挂着无界的
+        // `maybe_compact()` —— 600k 实测那次悬崖 13.9 s 全花在那儿。若将来这里的 flush 长出
+        // 随库涨的活（文件滚动、合并），照 `test_open_does_not_compact_when_nothing_to_redo`
+        // 那把尺子（层文件数不动）改，别在这里加一条只会空转的断言。
         tree.flush()?;
         // 同样要「先截断再写 Checkpoint」，否则这次 open 留下的起点信息会被截断抹掉，
         // 下次 open 只能再全库扫一遍（首次打开的库尤其需要这条快路）。

@@ -177,6 +177,9 @@ impl MVCC {
 
         // 把 next_version 写入 meta，下次干净 open 可跳过全树扫描
         tree.set_next_version(start_ver);
+        // **必须无条件 flush**：上面那句 `set_next_version` 只改了内存里的页，是这次 flush
+        // 把它落到 meta 页 —— 与 redo 是否为空无关。所以 LSM 在 M28 上的那条「有 redo 才
+        // flush」在这里不适用（那边的 flush 在空 redo 时只剩一次 fsync 外加无界压实）。
         tree.flush_all();
         let root = tree.root_page_id();
         let next_page = tree.next_page_id();
