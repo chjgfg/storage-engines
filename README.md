@@ -6,8 +6,8 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 287 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M28**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 288 个单元测试 + 4 个集成测试
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M29**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -18,15 +18,15 @@
 (发布于 2026-10-15,未 yank)。**这一版已经包含**七条"随 uptime 恶化"通道的修复与 M9 的门面
 改造(`KvEngine: Send + Sync`、类型化选型、`EngineName`)⇒ 版本号依赖就能拿到。
 
-但 0.4.0 那个发布件**不含 10-16 之后的 M10–M28**:LSM 点查的常驻文件句柄与稀疏索引二分
+但 0.4.0 那个发布件**不含 10-16 之后的 M10–M29**:LSM 点查的常驻文件句柄与稀疏索引二分
 (下游实测单次点查 0.86 ms 那条就是它)、四引擎窗口/前缀 scan 的界下推、bitcask 懒分配写缓冲、
 B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`、四引擎
 事务内核合成一份、`migrate` + `scan_page`、LSM 灌行 O(N²)、`seek_prev` 整段物化、游标未下推、
-B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实。
-磁盘格式这十九批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
+B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实、有界回收一片改惰性归并。
+磁盘格式这二十批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M28
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M29
 storage-engines = { path = "../storage-engines" }
 
 # (b) 走远端:git 依赖(gitee 与 github 内容一致)
@@ -36,7 +36,7 @@ storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branc
 storage-engines = "0.4"
 ```
 
-`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M28 又想要版本号依赖,
+`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M29 又想要版本号依赖,
 只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
 MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
@@ -589,9 +589,9 @@ loop {
 
 | 已收成一份(`src/common/`) | 必须每引擎一份 |
 |---|---|
-| `version.rs`:版本键编解码 + vacuum「留哪一版」判定 | 遍历原语:`iter_meta_from` / `scan_entries_break_from` / `scan_latest_light_window` / `scan_entries_from` —— KeyDir、叶子链、SST 分层、BTreeMap 根本不是一种东西 |
+| `version.rs`:版本键编解码 + vacuum「留哪一版」判定 | 遍历原语:`iter_meta_from` / `scan_entries_break_from` / `light_iter_range` / `scan_entries_from` —— KeyDir、叶子链、SST 分层、BTreeMap 根本不是一种东西 |
 | `kernel.rs`:可见性判据 `visible_at`、`HealthFold`、`VacuumScheduler`(含"取账不能 swap")、`is_unfinished`、**`fold_window`**(窗口折叠驱动)、**`search_page_from`**(分页核) |
-| **`store.rs`(M18a):`VersionedStore` trait + `collect_rows` + `search_window`** —— "按 enc 升序折出每把 key 的胜出行、界内过滤、取值、剥壳、窗口化"从此只有一份。**M20 又添两句**:`seek_prev_with`(反向逐步的循环 + 按组退界)与 `live_record_of_logical`(单键"活着吗"的判定,与 `scan` 同一份口径) | 有界遍历的**早停与起点**:谁能反向走、谁只有单向 `next_leaf`、谁的窗口要按源封顶。**反向一步**同一家一个样子:mem `range_back` / bitcask `range_meta_back`(只读 KeyDir,不碰 value)/ bplus `find_back`(跨叶有进度守卫)/ lsm `find_back`(逐源取最大) |
+| **`store.rs`(M18a):`VersionedStore` trait + `collect_rows` + `search_window`** —— "按 enc 升序折出每把 key 的胜出行、界内过滤、取值、剥壳、窗口化"从此只有一份。**M20 又添两句**:`seek_prev_with`(反向逐步的循环 + 按组退界)与 `live_record_of_logical`(单键"活着吗"的判定,与 `scan` 同一份口径) | 有界遍历的**早停与起点**:谁能反向走、谁只有单向 `next_leaf`、谁的早停停在堆顶而不是源尾。**反向一步**同一家一个样子:mem `range_back` / bitcask `range_meta_back`(只读 KeyDir,不碰 value)/ bplus `find_back`(跨叶有进度守卫)/ lsm `find_back`(逐源取最大) |
 | `types.rs`:`MvccHealth` / `VacuumStats` / `VacuumRound` / `DurabilityProfile` | 各自的守卫测试:同一条通道在不同引擎的**量尺不同**(读盘次数 / value 解码次数 / 物化次数 / 克隆次数),拿一把尺量不到另外三家 |
 | **`txn.rs`(M18b~M18e):`TxnCore` + `WriteSide` + `WalTail`** —— begin 的版本号与活跃快照登记、**整条写序列**(冲突判定 → 值编码 → 页容量判定 → WAL Write → 落行 → 写集登记；M25 把"WAL Begin"从这条序列里删了，七步)、`commit` 销账 + 回收记账、`rollback` 按写集撤销、批量写的**部分撤销**、bulk 会话的版本与收尾幂等、**写集本身(M24:`Registry` 的值类型是 `HashSet`)** | 写路径上"这一行的字节去哪、WAL 记录怎么排、大值走不走旁路、装不装得下一页" —— 那些是 `WriteSide` 的槽(有 WAL / blob / 页容量的人家只实现自己那几条,其余走默认实现 = 不做也不失败) |
 | `VersionedStore` 的**两个方法**:`scan_candidates`(我这家的键怎么折)与 `materialize`(一组的字节在哪儿 —— KeyDir 在日志另一处、B+ 树在叶子里、LSM 要跨源点查、内存就在同一个 map)。**三态** `RowValue{Value,Tombstone,Missing}` 是刻意的:折叠侧必须分得开"读不到"与"墓碑", 合成 `Option` 就会把 lsm 那行"视图里有、值里没"的跳过语义改掉 |
@@ -704,7 +704,7 @@ lsm 灌行 20.7 / 20.6 / 23.5（记 14.5）⇒ 本机（`D:` 是 5400 转机械�
 | **lsm 再冷重开（µs）** | 10 237.3 | 10 296.5 | **17 487 030.8** | **56.9×** | ✅ **已修(M28)**：同一台架修后复跑 **9 106.7 µs**、重开常驻 12.1 → **1.9 MB**（跨轮数，只当量级；因果凭据取下面那对**同轮**剖面 A/B 1668× + 层文件数不动） |
 | bplus multi_get / 随机点读（µs/键·次） | 5.9 / 9.0 | 42.5 / 39.7 | 66.9 / 48.7 | 11.3× / 5.4× | ⚠️ 未修。M22 治的是"页命中"，这条连**全 miss** 都涨 3.5× ⇒ 贵在定位/页解码本身 |
 | lsm 随机点读 / multi_get（µs/次·键） | 4.7 / 4.1 | 48.8 / 42.9 | 76.5 / 71.2 | 16.3× / 17.4× | ⚠️ M23 说过的那条上限：块缓存自动档封顶 1024 块，600k 的块数早超 ⇒ 覆盖率随库缩。价签已知，要不要放大是调用方决定 |
-| **lsm vacuum_bounded 一片（µs/次）** | 2 716.3 | 10 277.0 | 30 090.7（复跑 15 676.8） | **5.8~11×** | ⚠️ 未修，**且推翻本 README 早前那句"平——有界回收这条是干净的"**：那判断只做了 20k↔200k 两档。那片只扫 2046 行、裁 0 行 ⇒ 14.7 µs/行，是同档全量 scan（4.9 µs/行）的 3 倍 |
+| **lsm vacuum_bounded 一片（µs/次）** | 2 716.3 | 10 277.0 | 30 090.7（复跑 15 676.8） | **5.8~11×** | ✅ **已修(M29)**：修后 600k = **4 044.7 µs** ⇒ 对 20k 的 2 716.3 只剩 **1.49×**（底噪内，"一片与库大小无关"重新成立，但这回是三档 + 一条计数守卫凭的）。机制：旧窗口是「**每个源各取满 `预算` 行**再归并」⇒ 取到的行数 = `源数 × 预算`，而文件数 ∝ 库大小 |
 
 `lsm 再冷重开` 是这一轮唯一"原始倍数 >1000×"的数，所以单独剖了一次（新台架 `reopen_shape_probe`，
 `#[ignore]`，**同一轮里给「open 里的 flush 无条件 vs 有条件」两份数**，所以不用跨构建比墙钟）：
@@ -736,6 +736,33 @@ lsm 灌行 20.7 / 20.6 / 23.5（记 14.5）⇒ 本机（`D:` 是 5400 转机械�
   两家的 open 里都没有无界工作，所以那两处保持无条件，各自在代码里写明了"若将来长出随库涨的活，
   照哪把尺子改"。
 
+`vacuum_bounded 一片`（M29，同轮第二刀）的归因走的是**计数尺而不是墙钟**（新台架
+`vacuum_slice_fold_attribution`，把 SST 文件数当自变量、其余不动）：
+
+| 源数（= SST 文件数 + memtable） | 一片交出 | 一片折过的编码键 | 折/交 |
+|---|---|---|---|
+| 3 | 2048 行 | 6096 | 3.0× |
+| 9 | 2048 行 | 18384 | 9.0× |
+| 25 | 2048 行 | 22000 | **10.7×（已等于整库）** |
+| 修后 25 / 49 | 2048 行 | **2049 / 2051** | **1.0×** |
+
+- 机制就一句话：旧的窗口实现是「**每个源各取满 `预算` 行**再归并」，所以一片的代价 =
+  `源数 × 预算`；而 SST 文件数 ∝ 库大小 ⇒ "有界的一片"每行 14.7 µs，比"无界的全库"（4.9 µs/行）
+  还贵 3 倍。**24 个文件那档最直白：每个文件只有 834 行，"取满 2048"= 把整篇读完。**
+- 改法：`vacuum_bounded` 改走既有的惰性 k 路归并 `light_iter_range`，凑够预算当场收手。
+  代价从 `源数 × 预算` 变成 `预算`。守卫 `test_vacuum_slice_walks_only_its_budget` 钉这个比值
+  （`折 ≤ 预算×2` **且** `交出 ≥ 预算×7/8` —— 后一条专门防"只走了三行也算过"的空转）。
+  变异证红：把那句 `break` 拆掉 ⇒ `交出 16000 行 / 折过 16000 把键`。
+- ⚠️ 连带删掉一套**补偿**：旧实现里"窗口太窄就放大 4 倍重试"存在的唯一理由，是窗口右界可能
+  把唯一那组版本链切成半条；惰性流只在组边界收手（收手条件就是"看到了后继组的第一行"），
+  那个情形结构上不存在了。**改的是代价，不是判据**：`vacuum_bounded_is_bounded_and_ends_where_vacuum_does`
+  与四家各自的 `test_vacuum_bounded_slices_and_converges` 一字未动地过了。
+- ⚠️ 造形状踩到的坑（值得记）：想让"文件多"，只关 `l0_compact_threshold` 和
+  `max_compactions_per_flush` **不够** —— 写路径还有一档 `maybe_stall_on_l0`，L0 到
+  `l0_slowdown_trigger`（MVCC 档 = 12）会**绕过那两个旋钮**直接 `compact_level(0)`；第一版台架
+  就是在第 13 个文件处把 12 个合成了 2 个，而且因为门面 `flush` 是 `let _ = ...`（吞错），
+  它一开始是**静默**失效的。
+
 ### 补测的操作（台架补到 31 项/引擎，20k 与 200k 同构建对照）
 
 新加进去的是**之前没量过的功能**，不是重复旧项：`multi_get` 全未命中的单价、`scan_page` 翻完整库、
@@ -752,7 +779,7 @@ lsm 灌行 20.7 / 20.6 / 23.5（记 14.5）⇒ 本机（`D:` 是 5400 转机械�
 | `migrate`（µs/行） bitcask / lsm / memory | 15.1 / 61.2 / 20.5 | 27.2→**10.6** / 167.1→**13.6** / 27.5→**8.0** | 改后 0.70× / 0.22× / 0.39× | ✅ 同上 |
 | `multi_get` **全未命中**（µs/键） bitcask / lsm | 0.7 / 0.8 | 0.9 / 0.5 | ≈1× | **命中与未命中差 10~100 倍**：未命中几乎免费，命中的钱在"定位并读出值" |
 | `multi_get` 命中（µs/键） bplus / lsm | 24.9 / 16.8 | 65.1 / 58.4 | 2.6× / 3.5× | 覆盖率与 SST 分散度（与点读同源） |
-| `vacuum_bounded` 一片 2048 行（µs/次） 四家 | 2 809~8 603 | 3 536~9 299 | ≈1× | ~~**平 —— 有界回收这条是干净的**（长跑该用它的依据）~~ ⚠️ **2026-10-18 三档复测推翻，见上面"三档复测"那节**：bplus / bitcask / memory 三家仍然 ≈1×，**lsm 到 600k 涨到 15.7~30.1 ms（5.8~11×）**。原判断只做了 20k↔200k 两档 —— 两档比不出阈值 |
+| `vacuum_bounded` 一片 2048 行（µs/次） 四家 | 2 809~8 603 | 3 536~9 299 | ≈1× | ~~**平 —— 有界回收这条是干净的**（长跑该用它的依据）~~ ⚠️ **2026-10-18 三档复测推翻，见上面"三档复测"那节**：bplus / bitcask / memory 三家仍然 ≈1×，**lsm 到 600k 涨到 15.7~30.1 ms（5.8~11×）**。原判断只做了 20k↔200k 两档 —— 两档比不出阈值。**已修(M29)**：600k 复跑 4 044.7 µs ⇒ 对 20k 只剩 1.49×，那句依据重新成立，但这回是三档 + 计数守卫凭的 |
 | `set_with_ttl` / `get_ttl`（µs/次） 四家 | 6.3~107 / 2.0~11.4 | 17.0~94.5 / 2.0~13.3 | ≈1× | 平；TTL 往返 1000/1000 读得回（断言就在台架里） |
 | `export` 全库（µs/行） 四家 | 2.5~7.0 | 3.1~5.3 | ≈1× | 单价平，但**常驻 33 MB @200k**（物化） ⇒ 大库别用它 |
 
@@ -781,6 +808,10 @@ LSM_FILL_ROWS=200000 LSM_FILL_CHUNK=20000 cargo test --release --lib -- --ignore
 # 同一轮里给「flush 无条件 vs 有条件」两份数 ⇒ 不用跨构建比墙钟
 REOPEN_PROBE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture \
     --test-threads=1 reopen_shape_probe
+# M29 的一片读放大：把 SST 文件数当自变量，数一片真的折过多少把编码键
+# （计数与构建档位无关，debug 也能量 —— 墙钟才是 release 的活）
+LSM_VAC_ROWS=20000 LSM_VAC_FILES=24 cargo test --release --lib -- --ignored --nocapture \
+    --test-threads=1 vacuum_slice_fold_attribution
 ```
 
 ### WAL 与崩溃恢复
@@ -1069,10 +1100,15 @@ data.db.lock       单写者锁(内含 pid)
   ⚠️ bitcask / bplus 两家 open 里那两处 flush **故意没跟着改**:量下来它们的 flush 是有界的
   (一次 fsync / 顺带把 `next_version` 落 meta 页),给它们加条件既没有可证的收益、也造不出
   不空转的断言 —— 两处的代码注释里写明了"若将来长出随库涨的活,照哪把尺子改"。
-- ⚠️ **`vacuum_bounded` 一片的每行单价随库涨(M29,未修)**:600k 档那片扫 2046 行、裁 0 行却花
-  15.7~30.1 ms ⇒ **14.7 µs/行**,是同档全量 scan(4.9 µs/行)的 3 倍,而 README 早前那句
-  "有界回收这条是干净的(长跑该用它的依据)"就是被它推翻的。判据待定的一段:先用 `light_visits`
-  数一片**折过多少把编码键** —— 远大于 2046 ⇒ 游标没下推;差不多 ⇒ 每片有 O(文件数) 的固定开销。
+- ~~**`vacuum_bounded` 一片的每行单价随库涨(M29,未修)**~~ **已修(M29)**:600k 档那片扫 2046 行、
+  裁 0 行却花 15.7~30.1 ms ⇒ **14.7 µs/行**,是同档全量 scan(4.9 µs/行)的 3 倍,而 README 早前那句
+  "有界回收这条是干净的(长跑该用它的依据)"就是被它推翻的。归因用计数尺(`light_visits` 数一片
+  **折过多少把编码键**):答案是"折得比交出多得多",但不是游标没下推 —— 是**每个源各取满 `预算` 行**
+  再归并(3 源折 6096、9 源 18384、24 源 22000 = 整库),而源数 ∝ 库大小。改走惰性 `light_iter_range`
+  后 600k 那片 **4 044.7 µs**(对 20k 只剩 1.49×,底噪内)、折/交 = 2049/2048 = **1.0×**。
+  ⚠️ 连带删掉了旧实现里"窗口太窄就放大 4 倍重试"那套补偿(惰性流不会切在半组上,那个情形结构上
+  不存在),以及 `scan_latest_light_window` / `light_view_break_from` 两个 pub 入口 —— **对 0.4.0 是
+  破坏性变更**,已在 CHANGELOG 列出。
 - **压实与修复的输入是整篇物化**:`merge_to_ssts` 收的是 `Vec<Vec<(键, 条目)>>`,而
   `SstFile::iter_entries()` 把一个文件全读进内存 ⇒ 一次压实的瞬时内存 ≈ **所有输入文件的条目总和**
   (不是"约一个 SST")。`SstBuilder` 侧确实是流式的,`sst.rs` 那句注释只写对了一半。修复重叠共用
@@ -1307,7 +1343,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:287 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:288 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

@@ -470,11 +470,18 @@ impl MVCC {
     /// - 每个逻辑 key：只保留「最后一个 version < xmin」+ 全部 version >= xmin
     /// - 若 xmin 之前最终是 tombstone 且无更新版本 → 整 key 删除
     ///
-    /// 遍历用 [`LSMTree::scan_latest_light_window`]（每源封顶的窗口式归并），所以一轮的
-    /// 代价与库总量无关。`kind == 2`（`EntryValue::Drop`，已被硬删的行）整行不参与，
-    /// 语义与 `iter()` 一致；`Put(None)` 才是「逻辑删除行」。**最后一组只在看到后继组的
-    /// 第一行之后才算收齐**，没收齐的那一组本轮不裁（版本区间的穿插可能把它切断），
-    /// 留给下一轮从同一个游标重读。
+    /// 遍历用 [`LSMTree::light_iter_range`]（惰性 k 路归并，**凑够预算就当场收手**），
+    /// 所以一轮的代价与库总量无关 —— M29 之前这里走的是 `scan_latest_light_window`
+    /// （**每个源各取满 `预算` 行**再归并），代价 = `源数 × 预算`，于是"一片"的每行单价
+    /// 随 SST 文件数涨、也就是随库涨（600k 实测 5.8~11×，凭据见
+    /// [`vacuum_slice_fold_attribution`] 与守卫 `test_vacuum_slice_walks_only_its_budget`）。
+    /// `kind == 2`（`EntryValue::Drop`，已被硬删的行）整行不参与，语义与 `iter()` 一致；
+    /// `Put(None)` 才是「逻辑删除行」。
+    ///
+    /// **游标只在组边界上落**：收手的条件是"看到了后继组的第一行"，所以被当游标的那一组
+    /// 一定已经收齐；自然走到库尾时最后一组同样收齐。旧窗口实现还要额外防"右界把最后一组
+    /// 切成半条链"（那个 `boundary` 与"放大 4 倍重试"的循环都是为它存在的），惰性流从结构上
+    /// 不会切在半组上，所以那套补偿一并删掉了。
     ///
     /// `set_mvcc_xmin_filter` 只在**全库轮次**（`budget_rows == u64::MAX`）下发：它影响
     /// compact 丢哪些旧墓碑，语义是「全库已按这个 xmin 裁过」。
@@ -503,33 +510,33 @@ impl MVCC {
 
         let mut kv = self.kv.lock().unwrap();
 
-        // 分组走 M3a 为折叠引入的轻量视图：判「留哪一版」只需要版本号 + 是不是墓碑。
+        // 分组走 M3a 为轻量视图：判「留哪一版」只需要版本号 + 是不是墓碑。
         // 旧实现用 `kv.iter()`，而它会先把**每个源整个 collect() 进内存（连 value）**
         // ⇒ 一次 vacuum 的峰值内存约等于整个库。
         let budget_rows = budget_rows.max(1);
-        let mut cap = if budget_rows >= (usize::MAX as u64) {
-            usize::MAX
-        } else {
-            budget_rows as usize
-        };
-        // 版本键 = raw_key ‖ 8 字节大端 ⇒ 组宽度 8；窗口只在组边界收手
-        const VERSION_SUFFIX: usize = 8;
 
-        // 窗口右界只保证「窗口里 ≥2 组」，而 `after` 之前那几组会被过滤掉 —— 极端情况下
-        // 过滤后只剩一组、且正是被右界切断的那组，本轮就一个能裁的完整组都没有。
-        // 这时把窗口放大 4 倍重试（几何 ⇒ 总代价仍是最终窗口的常数倍），最坏退化成一轮
-        // 读完剩余全库；不重试就会原地打转（游标退回 `after`，下一轮读到一模一样的窗口）。
-        let (by_key, scanned, next_cursor) = loop {
-            let (rows, boundary) =
-                kv.scan_latest_light_window(after, u64::MAX, cap, VERSION_SUFFIX);
-
-            let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>> = BTreeMap::new();
-            let mut scanned = 0u64;
-            let mut cur_raw: Option<Vec<u8>> = None;
-            let mut last_done_raw: Option<Vec<u8>> = None;
-            let mut budget_cut = false;
-            for (enc, le) in &rows {
-                let Some(vk) = decode_key(enc) else {
+        // ⚠️ 这里必须用**惰性**归并（`light_iter_range`），不能用旧的
+        // `scan_latest_light_window`：那个是「每个源各取 `budget` 行再归并」，所以一片取到的
+        // 行数是 `源数 × 预算`（2026-10-18 台架实测：24 个 SST 时一片交出 2048 行却取了
+        // 22000 行；48 个文件时干脆等于整库），一片的每行单价因此**随 SST 文件数涨 = 随库涨**，
+        // 600k 档那一片 14.7 µs/行就是这么来的（同档全量 scan 才 4.9 µs/行）。
+        // 惰性那条每源只先取一行定堆顶，后面的行只有真被合并用到才取 ⇒ 代价 = 走到的行数。
+        //
+        // 游标语义跟着变简单了：自然走到库尾 ⇒ `next_cursor = None`（这一轮就是最后一片，
+        // 最后一组也是收齐的，不用退回）；被预算截断 ⇒ 破圈时已经「看到了下一组的第一行」，
+        // 所以 `cur_raw` 那一组收齐了，可以直接当游标。旧那份"窗口太窄就放大 4 倍重试"
+        // 整个不需要了 —— 它存在的理由正是窗口右界可能把唯一的完整组切断。
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>> = BTreeMap::new();
+        let mut scanned = 0u64;
+        let mut cur_raw: Option<Vec<u8>> = None;
+        let mut budget_cut = false;
+        {
+            let mut it = kv.light_iter_range(after, None, u64::MAX);
+            while let Some((enc, le)) = it.next() {
+                // 尺子：这片真的折过多少把编码键（与 M27 那四家守卫同一把）
+                #[cfg(test)]
+                crate::lsm_tree::sst::note_light_visit();
+                let Some(vk) = decode_key(&enc) else {
                     continue;
                 };
                 if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
@@ -537,12 +544,11 @@ impl MVCC {
                 }
                 let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
                 if at_group_start && scanned >= budget_rows {
-                    // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）
                     budget_cut = true;
                     break;
                 }
                 if at_group_start {
-                    last_done_raw = cur_raw.replace(vk.raw_key.clone());
+                    cur_raw = Some(vk.raw_key.clone());
                 }
                 scanned += 1;
                 // Drop 行也参与「换组」的判定（它照样推进键序），只是不作为裁剪候选
@@ -554,35 +560,8 @@ impl MVCC {
                     .or_default()
                     .push((vk.version, enc.clone(), le.kind == 1, ()));
             }
-            // 窗口被定界 或 预算截断 ⇒ 后面还有没看完的行
-            let truncated = boundary.is_some() || budget_cut;
-            // 两种截法对「最后一组收齐没有」的答案不一样：
-            // - 预算截断：是「看到了下一组的第一行」才破的圈 ⇒ `cur_raw` 那一组已经收齐，
-            //   可以裁，游标就是它。
-            // - 窗口定界：循环自然结束 ⇒ `cur_raw` 这一组可能被右界切断，本轮不裁，
-            //   游标退回上一个收齐的组。
-            let (cursor, open_group) = if budget_cut {
-                (cur_raw.clone(), None)
-            } else if boundary.is_some() {
-                (last_done_raw.clone(), cur_raw.clone())
-            } else {
-                (None, None)
-            };
-            if let Some(open) = open_group {
-                by_key.remove(&open);
-            }
-            let next_cursor = if truncated { cursor } else { None };
-
-            // 一轮什么都没裁、又还没到库尾 ⇒ 窗口太窄，放大重试（见上面注释）
-            if next_cursor.is_none() && truncated && by_key.is_empty() {
-                if cap >= usize::MAX / 4 {
-                    break (by_key, scanned, None);
-                }
-                cap = cap.saturating_mul(4).max(1);
-                continue;
-            }
-            break (by_key, scanned, next_cursor);
-        };
+        }
+        let next_cursor = if budget_cut { cur_raw } else { None };
 
         // 「留哪一版」是四引擎共用的判定，实现在 [`crate::common::vacuum_plan`]
         let (to_delete, kept) = vacuum_plan(by_key, xmin);
@@ -1885,6 +1864,131 @@ mod tests {
         cleanup(&path);
     }
 
+    /// 一片有界回收的**读放大**归因（M29）。
+    ///
+    /// 触发它的测量：2026-10-18 三档基线里 `lsm vacuum_bounded 一片`（预算 2048）=
+    /// 2 716.3 / 10 277.0 / 30 090.7 µs（600k 复跑 15 676.8）⇒ 每行单价随库涨 **5.8~11×**，
+    /// 而 README 那句"平 —— 有界回收这条是干净的（长跑该用它的依据）"就是这么被推翻的。
+    /// 那一片只交 2046 行、裁 0 行 ⇒ 14.7 µs/行，是同档 `一次全量 scan`（4.9 µs/行）的 3 倍。
+    ///
+    /// 尺子是 `light_visits`（这片真的折过多少把编码键）—— **计数与构建档位无关，debug 就能跑**，
+    /// 所以这条不占 release 台架的时间。旧写法（每源各取满 `预算` 行再归并）在这里报的是
+    /// `源数 × 预算`：24 个 SST 时交出 2048 行、折 22000 把键；换成惰性归并后折/交 ≈ 1。
+    ///
+    /// ```text
+    /// LSM_VAC_ROWS=200000 cargo test --lib -- --ignored --nocapture --test-threads=1 vacuum_slice_fold_attribution
+    /// ```
+    #[test]
+    #[ignore = "一片读放大归因，单线程跑：LSM_VAC_ROWS=200000 cargo test --lib -- --ignored --nocapture --test-threads=1 vacuum_slice_fold_attribution"]
+    fn vacuum_slice_fold_attribution() {
+        use std::time::Instant;
+
+        let rows: usize = std::env::var("LSM_VAC_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+        // 源数（= SST 文件数）是自变量：默认把文件数顶到 24，压实整个关掉免得被合回去。
+        // ⚠️ 为什么用"多次 flush"而不是"调小 target_sst_bytes"：那个旋钮只在**压实输出**时
+        // 切文件，`flush_mem` 一次只写一个文件 —— 第一版就是照旋钮调的，量出来永远 1 个文件。
+        let files: usize = std::env::var("LSM_VAC_FILES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<24}\",\"v\":1}}", i).into_bytes()
+        }
+        const BUDGET: u64 = 2048;
+
+        let path = tmp_db("vac_slice");
+        {
+            let mut opts = LSMTreeOptions::for_mvcc();
+            opts.l0_compact_threshold = usize::MAX / 4;
+            opts.max_compactions_per_flush = 0;
+            // 写路径自己有一档 L0 背压：`maybe_stall_on_l0` 在 L0 ≥ `l0_slowdown_trigger`
+            // (MVCC 档 = 12) 时**直接** `compact_level(0)`，绕开上面两个旋钮 —— 第一版台架
+            // 就是在第 13 个文件处被它把 12 个文件合成了 2 个，"源数"这个自变量当场失效。
+            opts.l0_slowdown_trigger = usize::MAX / 8;
+            opts.l0_stop_trigger = usize::MAX / 8;
+            let mvcc = MVCC::try_open_with(&path, Some(opts)).unwrap();
+            // 每个文件写 `per` 行，写完立刻 flush ⇒ 一个文件（`flush_mem` 一次只写一个 SST）。
+            // 这样"源数"就是这条台架唯一在动的自变量。
+            let per = (rows + files - 1) / files;
+            for f in 0..files {
+                let lo = f * per;
+                let hi = (lo + per).min(rows);
+                if lo >= hi {
+                    break;
+                }
+                for base in (lo..hi).step_by(1000) {
+                    let end = (base + 1000).min(hi);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), val(i))).collect();
+                    let tx = mvcc.begin_transaction();
+                    if let Err(bad) = tx.batch_set(&items) {
+                        panic!("灌第 {base} 批冲突: {}", String::from_utf8_lossy(&bad));
+                    }
+                    tx.commit();
+                }
+                mvcc.flush();
+                // ⚠️ 门面那个 `MVCC::flush` 是 `let _ = ...`（吞错的），台架必须直接问树要结果，
+                // 否则"文件数没长上去"这种形状失败会静默变成一条空转的读数。
+                let s = mvcc.kv.lock().unwrap().stats();
+                assert_eq!(s.total_sst, f + 1, "第 {} 次 flush 后该有 {} 个文件", f, f + 1);
+            }
+            // 更新 10% 的键：制造版本链，vacuum 才有得裁（形状照门面台架）
+            let updates = (rows / 10).max(1);
+            for base in (0..updates).step_by(500) {
+                let end = (base + 500).min(updates);
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    (base..end).map(|i| (key(i), val(i + rows))).collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("更新第 {base} 批冲突: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            let st = mvcc.kv.lock().unwrap().stats();
+            eprintln!(
+                "=== 一片读放大 rows={rows} 预算={BUDGET} | sst {} 个 / {} MB | mem_entries {} ===",
+                st.total_sst,
+                st.level_bytes.iter().sum::<u64>() / 1_048_576,
+                st.mem_entries
+            );
+
+            let mut last_cursor: Option<Vec<u8>> = None;
+            for which in ["第1片", "第2片"] {
+                let base = crate::lsm_tree::sst::light_visits();
+                let t = Instant::now();
+                let r = mvcc.vacuum_bounded(last_cursor.as_deref(), BUDGET).unwrap();
+                let d = t.elapsed();
+                let walked = crate::lsm_tree::sst::light_visits() - base;
+                let scanned = r.stats.rows_scanned;
+                eprintln!(
+                    "  {which}: 交出 {scanned} 行 / 裁 {} 行 | 折过 {walked} 把编码键 | 折/交 = {:.1}× \
+                     | 源数 {} | {:.1} µs | 每行 {:.2} µs",
+                    r.stats.versions_removed,
+                    if scanned == 0 {
+                        0.0
+                    } else {
+                        walked as f64 / scanned as f64
+                    },
+                    st.total_sst + 1,
+                    d.as_secs_f64() * 1e6,
+                    if scanned == 0 {
+                        0.0
+                    } else {
+                        d.as_secs_f64() * 1e6 / scanned as f64
+                    },
+                );
+                last_cursor = r.next_cursor;
+            }
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn test_wal_undo_uncommitted() {
         let path = tmp_db("undo");
@@ -2210,11 +2314,12 @@ mod tests {
 
     /// 有界回收：每轮只碰一小段，多轮跑完必须和一次全库 vacuum 得到**同样**的结果。
     ///
-    /// LSM 的切片比另外三家麻烦：一扇窗口要横跨 memtable 和若干 SST，而**只有每个源都
-    /// 读满了这段窗口**，归并结果才敢在窗口尾截断。所以这里中途 `flush()` 一次，
-    /// 让版本行同时分布在 memtable 和 SST 里，逼这条路径真的被走到。
-    /// 键里放了前缀嵌套的 `k1` / `k1x`：版本键 `raw ‖ 8B` 下两把 key 的区间会互相穿插，
-    /// 这是窗口右界最容易切在组中间的情形。
+    /// LSM 的切片比另外三家麻烦：一扇窗口要横跨 memtable 和若干 SST，而版本键
+    /// `raw ‖ 8B` 下**同一把逻辑 key 的各版本会散在不同源里**，所以"留哪一版"必须在
+    /// 整组收齐之后才敢判。这里中途 `flush()` 一次，让版本行同时分布在 memtable 和 SST 里，
+    /// 逼这条跨源归并的路径真的被走到。
+    /// 键里放了前缀嵌套的 `k1` / `k1x`：两把 key 的区间会互相穿插，这是游标最容易切在
+    /// 组中间的情形。
     #[test]
     fn test_vacuum_bounded_slices_and_converges() {
         const CHAIN: u64 = 120;
@@ -2284,6 +2389,87 @@ mod tests {
                 assert_eq!(tx.get(k), Some(format!("v{}", CHAIN - 1).into_bytes()));
             }
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// 一片有界回收**只许走它预算那么多行**（M29）。
+    ///
+    /// 触发它的测量：三档基线里 `lsm vacuum_bounded 一片`（预算 2048）= 2 716.3 / 10 277.0 /
+    /// 30 090.7 µs ⇒ **每行单价随库涨 5.8~11×**，而 README 那句"平 —— 有界回收这条是干净的
+    /// （长跑该用它的依据）"就是这么被推翻的。归因台架 [`vacuum_slice_fold_attribution`]
+    /// 给出机制：旧写法走 `scan_latest_light_window` —— **每个源各取满 `预算` 行再归并**，
+    /// 于是取到的行数是 `源数 × 预算`（24 个 SST 时交出 2048 行、折 22000 把键；48 个文件时
+    /// 直接等于整库），而 SST 文件数 ∝ 库大小 ⇒ 单价随库涨。
+    ///
+    /// 尺子 = `light_visits`（这片交到我手里多少把编码键）。两条断言配对才不空转：
+    /// **折过的 ≤ 预算 × 2**，而**交出的行数必须接近预算**（不然"只走了三行"也能过）。
+    /// 源数是这里的自变量：形状造到 17 个源 ⇒ 老写法该折 17× 预算 ⇒ 必红。
+    #[test]
+    fn test_vacuum_slice_walks_only_its_budget() {
+        const ROWS: usize = 8_000;
+        const FILES: usize = 16;
+        const BUDGET: u64 = 512;
+
+        let path = tmp_db("vac_budget");
+        let mut opts = LSMTreeOptions::for_mvcc();
+        // 压实与 L0 背压整个关掉：这条要的是"文件多"这个形状。⚠️ 只关 `l0_compact_threshold`
+        // 和 `max_compactions_per_flush` 不够 —— 写路径还有一档 `maybe_stall_on_l0`，
+        // L0 到 `l0_slowdown_trigger`(MVCC 档 = 12) 会**绕过那两个旋钮**直接 compact_level(0)。
+        opts.l0_compact_threshold = usize::MAX / 4;
+        opts.max_compactions_per_flush = 0;
+        opts.l0_slowdown_trigger = usize::MAX / 8;
+        opts.l0_stop_trigger = usize::MAX / 8;
+        {
+            let mvcc = MVCC::try_open_with(&path, Some(opts)).unwrap();
+            let per = ROWS / FILES;
+            for f in 0..FILES {
+                let lo = f * per;
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (lo..lo + per)
+                    .map(|i| (format!("k{i:05}").into_bytes(), format!("v{i}").into_bytes()))
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("灌第 {f} 片冲突: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+                mvcc.flush();
+                // 门面那个 `flush` 是 `let _ = ...`（吞错的），形状没造出来必须当场炸
+                let s = mvcc.kv.lock().unwrap().stats();
+                assert_eq!(s.total_sst, f + 1, "第 {f} 次 flush 没落出一个文件，形状没造出来");
+            }
+            // 第二版：让每把键都有两条版本行（vacuum 有得裁，也保证折的是"版本行"而不是"键"）
+            for base in (0..ROWS).step_by(2000) {
+                let end = (base + 2000).min(ROWS);
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end)
+                    .map(|i| (format!("k{i:05}").into_bytes(), format!("w{i}").into_bytes()))
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("更新第 {base} 批冲突: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+
+            let before = crate::lsm_tree::sst::light_visits();
+            let r = mvcc.vacuum_bounded(None, BUDGET).unwrap();
+            let walked = crate::lsm_tree::sst::light_visits() - before;
+            eprintln!(
+                "一片: 交出 {} 行 / 折过 {walked} 把键 / 裁 {} 行 / 源数 {}",
+                r.stats.rows_scanned, r.stats.versions_removed, FILES + 1
+            );
+            assert!(
+                r.stats.rows_scanned >= BUDGET - BUDGET / 8,
+                "预算 {BUDGET} 行的一片只交了 {} 行 ⇒ 上面那条比值断言会空转（形状或游标有问题）",
+                r.stats.rows_scanned
+            );
+            assert!(
+                walked <= BUDGET * 2,
+                "预算 {BUDGET} 行的一片折了 {walked} 把编码键（源数 {}）⇒ 又回到「每源各取满预算」，\
+                 一片的代价就跟着 SST 文件数涨",
+                FILES + 1
+            );
+            assert!(r.next_cursor.is_some(), "库里还有 {} 行没走完，游标不该是 None", ROWS * 2);
         }
         cleanup(&path);
     }

@@ -731,10 +731,13 @@ impl SstFile {
     /// `[from, to)` 内的轻量视图：**起点靠稀疏索引定位，键一旦越过上界就收手**，
     /// 后面的块一篇都不读。
     ///
-    /// 存在的理由和 [`Self::light_view_break_from`] 同源但目的不同：那个按「行数预算」
-    /// 切给有界回收用，这个按**键的区间**切给窗口/前缀查询用。`light_view` 是把整个文件
-    /// 读完再筛，于是 10 行的窗口要付整文件的块读代价（大库基线实测：LSM 窗口 scan
-    /// 405 µs/行 vs 全量 scan 4.0 µs/行）。折叠规则与 `light_view` 完全一致。
+    /// 存在的理由是：`light_view` 是把整个文件读完再筛，于是 10 行的窗口要付整文件的块读代价
+    /// （大库基线实测：LSM 窗口 scan 405 µs/行 vs 全量 scan 4.0 µs/行）。折叠规则与
+    /// `light_view` 完全一致。
+    ///
+    /// ⚠️ M29 之前这里还有一位 `light_view_break_from`：按「行数预算」切给有界回收用。
+    /// 它已删除 —— 有界回收改走本函数（按**键的区间**切，代价与文件里的行数无关），
+    /// 而"每源各取满预算"那种切法正是 M29 那条单价随库涨的根因。
     /// **惰性**的轻量视图：一次只往前拉一条，块是一块一块读的。
     ///
     /// 为什么要有它（M15b）：[`Self::light_view_range`] 先把整篇范围 `Vec` 化才交给归并，
@@ -844,104 +847,6 @@ impl SstFile {
             }
         }
         out
-    }
-
-    /// 从 `from`（**含**）起取轻量条目，**够 `max_rows` 行就准备收手，但一定把当前这一组读完
-    /// 才停**；返回 `(条目, 是否被截断)`，`truncated = true` 表示本文件在后面还有行。
-    ///
-    /// 起点靠稀疏索引下降到所在块，**之前的块一篇都不读**。
-    ///
-    /// 为什么要「按组收手」而不是按行：组 = 去掉尾部 `group_suffix` 字节后的键，也就是
-    /// MVCC 的版本链（`raw_key ‖ version`）。半组交给上层等于让上层无法判断「留哪一版」，
-    /// 所以预算只能在组边界生效 —— 一行的偏差就是一条链的长度，这是有界回收明确接受的代价。
-    /// `group_suffix = 0` 时每个键自成一界，等同于纯按行封顶。
-    ///
-    /// 有界回收还需要它：跨源归并只有「每个源都读满了这个窗口」时才能安全定出截断点，
-    /// 所以窗口必须先按源封顶，而不是按归并结果封顶。
-    pub fn light_view_break_from(
-        &self,
-        from: Option<&[u8]>,
-        snap_seq: u64,
-        max_rows: usize,
-        group_suffix: usize,
-    ) -> (Vec<(Vec<u8>, LightEntry)>, bool) {
-        let mut out: Vec<(Vec<u8>, LightEntry)> = Vec::new();
-        // 折叠规则与 light_view 一致；写成局部函数而不是闭包，调用方才能在外面读 out.len()
-        fn feed(
-            out: &mut Vec<(Vec<u8>, LightEntry)>,
-            k: &[u8],
-            se: &StoredEntry,
-            snap_seq: u64,
-        ) {
-            if !se.visible_at(snap_seq) {
-                return;
-            }
-            let le = LightEntry::of(se);
-            match out.last_mut() {
-                Some((pk, p)) if pk.as_slice() == k => {
-                    if le.seq >= p.seq {
-                        *p = le;
-                    }
-                }
-                _ => out.push((k.to_vec(), le)),
-            }
-        }
-
-        // 预算已满且下一条换了组 → 就地收手
-        let mut over_budget = false;
-
-        if let Some(all) = &self.entries_cache {
-            // v1 文件整份在内存里，没有索引：二分定位起点后顺序取
-            let start = match from {
-                Some(f) => all.partition_point(|(k, _)| k.as_slice() < f),
-                None => 0,
-            };
-            for (k, se) in &all[start..] {
-                if over_budget && !out.last().is_some_and(|(pk, _)| same_group(pk, k, group_suffix))
-                {
-                    return (out, true);
-                }
-                feed(&mut out, k, se, snap_seq);
-                if out.len() >= max_rows {
-                    over_budget = true;
-                }
-            }
-            return (out, false);
-        }
-
-        let start_block = match from {
-            Some(f) => match self.find_block(f) {
-                Some(i) => i,
-                // 比本文件最小键还小 ⇒ 从第 0 块起
-                None => 0,
-            },
-            None => 0,
-        };
-        for i in start_block..self.index.len() {
-            match self.load_block(i) {
-                Ok(b) => {
-                    for (k, se) in &b.entries {
-                        if let Some(f) = from {
-                            if k.as_slice() < f {
-                                continue;
-                            }
-                        }
-                        if over_budget
-                            && !out.last().is_some_and(|(pk, _)| same_group(pk, k, group_suffix))
-                        {
-                            return (out, true);
-                        }
-                        feed(&mut out, k, se, snap_seq);
-                        if out.len() >= max_rows {
-                            over_budget = true;
-                        }
-                    }
-                }
-                // 与 iter_all 一致：坏块即止
-                Err(_) => break,
-            }
-        }
-        (out, false)
     }
 
     /// 流式迭代全部 entry（按磁盘顺序）
@@ -1640,19 +1545,6 @@ impl MergeSeq for StoredEntry {
     fn seq(&self) -> u64 {
         self.seq
     }
-}
-
-/// 判断两个键是否属于同一「组」：组 = 去掉尾部 `suffix` 字节后的键。
-///
-/// MVCC 层用 `raw_key ‖ version(8 字节大端)` 做版本键，所以 `suffix = 8` 时一组就是
-/// 一把逻辑 key 的整条版本链。有界遍历必须只在组边界收手（半条链交给上层没法判
-/// 「留哪一版」），而 SST 这层本身不认识 MVCC，所以组的宽度由调用方给。
-/// `suffix = 0` ⇒ 每个键自成一界。
-pub(crate) fn same_group(a: &[u8], b: &[u8], suffix: usize) -> bool {
-    if a.len() < suffix || b.len() < suffix {
-        return a == b;
-    }
-    a[..a.len() - suffix] == b[..b.len() - suffix]
 }
 
 /// 轻量归并项：**只有 seq 与种类字节，不带 value 字节**。
