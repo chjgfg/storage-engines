@@ -438,7 +438,10 @@ impl LSMTree {
     }
 
     /// SST 里需要缓存槽位的块总数（v1 文件记 0，见 [`SstFile::blocks`]）
-    fn sst_block_count(&self) -> usize {
+    ///
+    /// 公开它是为了让调用方能算**覆盖率**：`tuning()` 里的 `block_cache_capacity` 是分子，
+    /// 这个数是分母（M32）。只看生效容量的人分不清"顶已经撞上了"和"库本来就小"。
+    pub fn sst_block_count(&self) -> usize {
         self.levels.iter().flatten().map(|s| s.blocks()).sum()
     }
 
@@ -466,6 +469,17 @@ impl LSMTree {
             self.sst_block_count().clamp(floor, ceil)
         };
         self.block_cache.lock().unwrap().set_capacity(target);
+    }
+
+    /// 把块缓存自动档的上限改成 `blocks`，并**就地**重估容量（`usize::MAX` = 不设顶）。
+    ///
+    /// 为什么要有这条：默认的 1024 块 ≈ 7.1 MB 是**预算**，而库里块数远大于它时覆盖率就掉下来
+    /// —— 实测 40000 键（2681 块）装不下、600k 键更明显，每次点读多付一次未命中（≈54~94 µs 的
+    /// 随机读价）。抬顶等于"把库往 RAM 里复制"，这个决定归调用方，不归库默认。
+    /// `0` 仍是"关自动档"（生效值 = 配置值），语义与 [`LSMTreeOptions::block_cache_auto_max`] 一致。
+    pub fn set_block_cache_auto_max(&mut self, blocks: usize) {
+        self.opts.block_cache_auto_max = blocks;
+        self.reevaluate_cache_capacity();
     }
 
     /// 热更新部分 option（阈值 / compact 触发 / bloom 新文件 / fsync 策略等）。
@@ -1142,6 +1156,12 @@ impl LSMTree {
     #[cfg(test)]
     pub(crate) fn sst_blocks_for_test(&self) -> usize {
         self.sst_block_count()
+    }
+
+    /// 测试专用：块缓存里**当前真的住着几块**（M32 用它证明"抬容量不重建缓存"）
+    #[cfg(test)]
+    pub(crate) fn cached_blocks_for_test(&self) -> usize {
+        self.block_cache.lock().unwrap().len()
     }
 
     /// 测试专用：第 0 层的文件句柄（M30 的耗时拆分要从这里取压实输入）

@@ -98,7 +98,7 @@ pub(crate) fn crc32_bytewise(data: &[u8]) -> u32 {
     !crc
 }
 
-// 测试专用尺子：本线程调过多少次 `DiskFile::len()`（= 一次 `File::metadata()` 系统调用）。
+// 测试专用尺子①：本线程调过多少次 `DiskFile::len()`（= 一次 `File::metadata()` 系统调用）。
 //
 // M31 的凭据就挂在这上面：`read_page` 原先每次读都问一遍文件长度，只为判断"这页在不在 EOF
 // 之外"，而本机裸测这一次问价 **6.2~8.9 µs**，整次定位读也才 15~17 µs ⇒ 四到五成花在一句
@@ -112,6 +112,25 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn len_calls() -> u64 {
     LEN_CALLS.with(|c| c.get())
+}
+
+// 测试专用尺子②：本线程**真的落盘读了几页**（M32）。
+//
+// 为什么"全驻留"只能在磁盘这一层判：页缓存的命中数回答的是"有没有走到页缓存"，而
+// `BPlusTree::node_of` 在**上一层**还有一份解析结果缓存 —— 那份命中时连页缓存都不问，
+// 所以"页缓存零未命中"并不等于"没读盘"（结构上可能是两份尺子读数差很多）。实测这个形状里
+// 两者恰好相等（一轮点读落盘 1621 = 页缓存未命中 1621，因为未命中必然落盘），但判据要选
+// 那个**不会说谎**的层：抬到不设顶之后一轮随机点读的磁盘读次数 = 0，才是"库住进内存了"。
+// 守卫见 `test_cache_auto_max_is_raisable_and_misses_go_to_zero`。
+#[cfg(test)]
+thread_local! {
+    static DISK_PAGE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 本线程落盘读过的页数（每次 `DiskFile::read_page` 记一次；它在最底层，无从命中/未命中之分）
+#[cfg(test)]
+pub(crate) fn disk_page_reads() -> u64 {
+    DISK_PAGE_READS.with(|c| c.get())
 }
 
 // ─── DiskFile ───────────────────────────────────────────────────────────────
@@ -219,6 +238,8 @@ impl DiskFile {
     /// 语义一字未动，少的是一次系统调用；这条由 `test_read_page_does_not_ask_file_length`
     /// 与 `test_read_page_tail_shapes_match_the_old_length_guarded_form` 两头守着。
     pub fn read_page(&mut self, page_index: u64) -> std::io::Result<Vec<u8>> {
+        #[cfg(test)]
+        DISK_PAGE_READS.with(|c| c.set(c.get() + 1));
         let size = self.page_size()?;
         let offset = page_index * size as u64;
         let mut buf = vec![0u8; size];

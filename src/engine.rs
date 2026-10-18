@@ -179,6 +179,12 @@ pub struct EngineConfig {
     pub wal_checkpoint_bytes: Option<u64>,
     /// 自动回收的切片宽度（版本行数）；`None` = 默认 16 Ki 行，`Some(0)` = 关闭自动回收。
     pub vacuum_auto_slice_rows: Option<u64>,
+    /// 缓存自动档的上限（单位 = 该引擎自己的缓存槽位：bplus 是 4 KiB 页、lsm 是 SST 块）。
+    /// `None` = 用各家默认（bplus 2048 页 ≈ 8 MiB / lsm 1024 块 ≈ 7.1 MB）；
+    /// `Some(usize::MAX)` = 不设顶，等于"自动档跟着库长"，代价是把库复制进 RAM。
+    /// 只有 `bplus` / `lsm` 有这个概念，给另外两家会在**打开时就失败**（不静默忽略）。
+    /// 读回与覆盖率分母见 [`KvEngine::tuning`]。
+    pub cache_auto_max: Option<usize>,
 }
 
 impl Default for EngineConfig {
@@ -193,6 +199,7 @@ impl Default for EngineConfig {
             bitcask_max_file_bytes: None,
             wal_checkpoint_bytes: None,
             vacuum_auto_slice_rows: None,
+            cache_auto_max: None,
         }
     }
 }
@@ -409,6 +416,26 @@ pub trait KvEngine: Send + Sync {
 
     /// 读回 WAL 自动 checkpoint 阈值；`memory` 同理会返回 [`EngineError::Unsupported`]。
     fn wal_checkpoint_limit(&self) -> Result<u64>;
+
+    /// 把**缓存自动档的上限**改成 `n` 个缓存单元（`bplus` = 4 KiB 页，`lsm` = SST 数据块）。
+    ///
+    /// 为什么单位是"该引擎自己的槽位数"而不是字节数：自动档本来就是按槽数长出来的
+    /// （`clamp(库的槽数, 地板, 上限)`），换成字节只会多一层换算与另一种四舍五入；
+    /// 想知道自己买到了多少常驻，用 `tuning()` 给的分子/分母自己乘（价签在 README 里）。
+    ///
+    /// - `usize::MAX` = **不设顶** ⇒ 自动档等于"跟着库长"，代价是把库往 RAM 里复制一份
+    ///   （bplus 实测 200k 行 12 129 页 ≈ 47 MB、lsm 600k 档块全驻留 ≈ 18.7 MB）—— 那是调用方的决定。
+    /// - `0`：`lsm` 表示**关掉**自动档（生效值回到 `block_cache_blocks` 配置值）；
+    ///   `bplus` 的下限是 1024 页，所以给它 0 等于"保持默认下限"，不是关缓存。
+    /// - `bitcask` / `memory` 没有这个旋钮（前者靠 OS page cache，后者根本没有盘）
+    ///   ⇒ [`EngineError::Unsupported`]，不会静默"设置成功"。
+    ///
+    /// 改容量是**就地改上限，不重建缓存**：重建 = 调一次旋钮就把已经焐热的页/块全丢掉
+    /// （M23 踩过，守卫按"住着几页/几块，抬前抬后同一个数"钉住）。
+    fn set_cache_auto_max(&self, n: usize) -> Result<()>;
+
+    /// 读回当前的自动档上限；语义同上，两家之外返回 [`EngineError::Unsupported`]。
+    fn cache_auto_max(&self) -> Result<usize>;
 
     /// 落盘数据（内存引擎为 no-op）
     fn flush(&self) -> Result<()>;
@@ -645,6 +672,11 @@ pub fn open_engine_with<N: EngineName>(
     if let Some(bytes) = config.wal_checkpoint_bytes {
         db.set_wal_checkpoint_limit(bytes)?;
     }
+    if let Some(n) = config.cache_auto_max {
+        // 用 `?` 是有意的：给 memory/bitcask 配了这个旋钮要当场失败，
+        // 不能让下游以为"我配过了"（同一个理由见上面 wal_checkpoint_bytes 那段）。
+        db.set_cache_auto_max(n)?;
+    }
     if let Some(rows) = config.vacuum_auto_slice_rows {
         db.set_vacuum_auto_slice(rows);
     }
@@ -686,6 +718,7 @@ macro_rules! impl_engine {
         durable: $durable:tt,
         wal: $wal:tt,
         merge: $merge:tt,
+        cache: $cache:tt,
     ) => {
         struct $engine {
             inner: $mvcc,
@@ -747,6 +780,7 @@ macro_rules! impl_engine {
             impl_engine!(@durable $durable);
             impl_engine!(@wal $wal);
             impl_engine!(@merge $merge);
+            impl_engine!(@cache_max $cache);
 
             fn tuning(&self) -> EngineTuning {
                 self.inner.tuning()
@@ -1010,6 +1044,34 @@ macro_rules! impl_engine {
         }
     };
 
+    // ---- 缓存自动档上限分支（M32）----
+    (@cache_max yes) => {
+        fn set_cache_auto_max(&self, n: usize) -> Result<()> {
+            self.inner.set_cache_auto_max(n);
+            Ok(())
+        }
+
+        fn cache_auto_max(&self) -> Result<usize> {
+            Ok(self.inner.cache_auto_max())
+        }
+    };
+    // 没有"缓存槽数"这个概念的引擎：明说 unsupported，别回"设置成功"
+    (@cache_max no) => {
+        fn set_cache_auto_max(&self, _n: usize) -> Result<()> {
+            Err(EngineError::Unsupported {
+                engine: self.name(),
+                op: "cache auto max",
+            })
+        }
+
+        fn cache_auto_max(&self) -> Result<usize> {
+            Err(EngineError::Unsupported {
+                engine: self.name(),
+                op: "cache auto max",
+            })
+        }
+    };
+
     // ---- merge 分支 ----
     (@merge yes) => {
         fn merge(&self) -> Result<()> {
@@ -1034,6 +1096,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: yes,
+    cache: no,
 }
 
 impl_engine! {
@@ -1049,6 +1112,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: no,
+    cache: yes,
 }
 
 impl_engine! {
@@ -1064,6 +1128,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: no,
+    cache: yes,
 }
 
 impl_engine! {
@@ -1079,6 +1144,7 @@ impl_engine! {
     durable: no,
     wal: no,
     merge: no,
+    cache: no,
 }
 
 // 只有 bitcask 支持 merge：宏生成的 impl 用了 trait 的默认实现（返回
@@ -2293,6 +2359,111 @@ mod tests {
         );
         let mem_default = open_engine("memory", None).expect("默认档 memory");
         assert_eq!(mem_default.vacuum_auto_slice(), 16 * 1024, "四引擎默认切片同一个值");
+
+        cleanup(dirs.into_iter().map(Some).collect());
+    }
+
+    /// 缓存自动档的**顶**这颗旋钮：两家里调得动、另外两家当场说不行（M32 的门面侧守卫）。
+    ///
+    /// 为什么门面层还要一条：`set_cache_auto_max` / `cache_auto_max` 走的是 `impl_engine!` 的
+    /// `@cache_max yes/no` 分支 —— **分支标错不会编译失败**（把 bitcask 也写成 `yes` 只会让它
+    /// 转发给一个没有这个方法的名字… 而写成 `no`/`yes` 的错配更隐蔽：调用拿到 `Ok(())`，
+    /// 其实没人听）。下游要的是"要么真抬得动，要么明确说抬不动"，所以两条路（热调 / 带配置打开）
+    /// 都要过一遍。
+    ///
+    /// 覆盖率效应（抬顶之后落盘读归零）**不在这里量**：那是各家自己的账，守卫是
+    /// bplus `test_cache_auto_max_is_raisable_and_misses_go_to_zero` 与
+    /// lsm `test_block_cache_auto_max_is_raisable_and_coverage_is_readable`。
+    #[test]
+    fn cache_auto_max_knob_routes_to_two_engines_and_is_refused_by_the_other_two() {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        // ---- 能调的两家：默认顶读得回来，压/抬之后读回来的是新值，tuning 里连着分母 ----
+        for (name, default_ceil) in [("bplus_tree", 2048usize), ("lsm_tree", 1024)] {
+            let dir = tmp_dir(&format!("cache_max_{name}"));
+            dirs.push(dir.clone());
+            let db = open_engine(name, Some(&dir)).expect("默认档");
+            assert_eq!(db.cache_auto_max().unwrap(), default_ceil, "{name}: 默认顶要读得回来");
+
+            db.set_cache_auto_max(default_ceil / 2).expect("压顶不该报错");
+            assert_eq!(
+                db.cache_auto_max().unwrap(),
+                default_ceil / 2,
+                "{name}: 压顶没落到引擎里"
+            );
+
+            db.set_cache_auto_max(usize::MAX).expect("抬顶不该报错");
+            assert_eq!(
+                db.cache_auto_max().unwrap(),
+                usize::MAX,
+                "{name}: 抬顶没落到引擎里"
+            );
+
+            // 顶与分母必须同时在清单里：只给"生效容量"没人能判断这是撞顶还是库就这么小
+            let t = db.tuning();
+            let (ceil_key, denom_key) = if name == "bplus_tree" {
+                ("page_cache_auto_max", "total_pages")
+            } else {
+                ("block_cache_auto_max", "sst_blocks")
+            };
+            assert_eq!(t.get(ceil_key), Some(usize::MAX.to_string().as_str()), "{t}");
+            assert!(t.get(denom_key).is_some(), "{t}: 缺分母 ⇒ 报不出覆盖率");
+        }
+
+        // ---- `EngineConfig.cache_auto_max` 那条路：打开时就带上顶 ----
+        for (name, ceil) in [("bplus_tree", 4096usize), ("lsm_tree", 3000)] {
+            let dir = tmp_dir(&format!("cache_max_cfg_{name}"));
+            dirs.push(dir.clone());
+            let db = open_engine_with(
+                name,
+                Some(&dir),
+                &EngineConfig {
+                    cache_auto_max: Some(ceil),
+                    ..Default::default()
+                },
+            )
+            .expect("带顶打开");
+            assert_eq!(db.cache_auto_max().unwrap(), ceil, "{name}: 配置里的顶没进引擎");
+        }
+
+        // ---- 没有"缓存槽数"这个概念的两家：热调与带配置打开都要**当场失败** ----
+        for name in ["bitcask", "memory"] {
+            let dir = tmp_dir(&format!("cache_max_bad_{name}"));
+            dirs.push(dir.clone());
+            let db = open_engine(name, Some(&dir)).expect("默认档");
+            let e = db
+                .set_cache_auto_max(4096)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: 抬顶要报错，不能静默返回成功"));
+            assert!(
+                matches!(e, EngineError::Unsupported { engine, op }
+                    if engine == name && op == "cache auto max"),
+                "错误要指到具体的引擎与操作：{e}"
+            );
+            assert!(
+                matches!(db.cache_auto_max(), Err(EngineError::Unsupported { .. })),
+                "{name}: 读顶也要报同一个错"
+            );
+            drop(db); // 同一个目录还要再开一次：锁要放开
+
+            // 带配置打开也不能静默忽略（"以为设了顶、其实跑的是默认档"就是这个洞的形状）
+            let cfg_dir = tmp_dir(&format!("cache_max_cfg_bad_{name}"));
+            dirs.push(cfg_dir.clone());
+            let bad = open_engine_with(
+                name,
+                Some(&cfg_dir),
+                &EngineConfig {
+                    cache_auto_max: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{name}: 带 cache_auto_max 打开要失败，不能静默忽略"));
+            assert!(
+                matches!(bad, EngineError::Unsupported { .. }),
+                "{name}: 要的是 Unsupported，实际 {bad}"
+            );
+        }
 
         cleanup(dirs.into_iter().map(Some).collect());
     }

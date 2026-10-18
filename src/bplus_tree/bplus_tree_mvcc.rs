@@ -317,6 +317,15 @@ impl MVCC {
         self.kv.lock().unwrap().cache_policy()
     }
 
+    /// 页缓存自动档的上限（`usize::MAX` = 不设顶，见 [`BPlusTree::set_cache_auto_max`]）。
+    pub fn set_cache_auto_max(&self, pages: usize) {
+        self.kv.lock().unwrap().set_cache_auto_max(pages);
+    }
+
+    pub fn cache_auto_max(&self) -> usize {
+        self.kv.lock().unwrap().cache_auto_max()
+    }
+
     /// 本引擎能被调的东西 —— 清单在这里，不在门面。
     pub fn tuning(&self) -> EngineTuning {
         let mut t = EngineTuning::default();
@@ -327,6 +336,12 @@ impl MVCC {
         t.push("max_cache_pages", cap);
         t.push("cache_pinned_pages", pinned);
         t.push("cache_auto", if auto { 1 } else { 0 });
+        // 自动档的顶与分母（M32）：只有 (生效容量, 总页数) 同时给出来，调用方才知道
+        // "覆盖率 5.6%" 这件事，也才知道抬顶要付出多少常驻
+        let tree = self.kv.lock().unwrap();
+        t.push("page_cache_auto_max", tree.cache_auto_max());
+        t.push("total_pages", tree.next_page_id() as usize);
+        drop(tree);
         t
     }
 
@@ -2410,6 +2425,163 @@ mod tests {
             let (cap, _, auto) = mvcc.cache_policy();
             assert!(!auto, "显式传了数就不该是自动档");
             assert_eq!(cap, 512, "显式容量被自动档覆盖了：生效 {cap}");
+        }
+        cleanup(&path);
+    }
+
+    /// 自动档的**上限可以抬**，抬了要真的一个字节都不再读盘，而且**不重建缓存**（M32）。
+    ///
+    /// 为什么单独一条：`test_cache_capacity_follows_the_library` 钉的是"容量跟着库长、到 2048 封顶"，
+    /// 但 2048 这个顶在 600k 行的库上只剩 5.6% 覆盖率 ⇒ 每次点读都要付一次读盘 + 重解析（M31 量过：
+    /// 页/次 = 1.03）。顶是**预算**不是正确性，所以"要不要把库复制进 RAM"得调用方点名 ——
+    /// 而"能点名"这件事本身需要一条守卫，否则它只是一个写在注释里的承诺。
+    ///
+    /// 判据全部用计数，量在**磁盘那一层**（`common::disk::disk_page_reads`）：那才是"全驻留"的定义。
+    /// 实测这份 1300 把长键（≈ 2606 页）的库 ——
+    /// 冷启一趟落盘 2605 次 ｜ 默认顶 2048 焐热一趟后再走仍落盘 **1621** 次（顶真的绑住了）｜
+    /// 抬到不设顶 ⇒ 容量 2606 = 页数，焐热一趟后再走落盘 **0** 次、页缓存未命中 **0** 次，
+    /// 而住着 1986 页、抬前抬后**同一个数**（没重建）。
+    /// ⚠️ 两个当时想错的地方，都改在这里而不是删掉：
+    /// - 原本打算"压到下限 1024 再抬"，理由是"默认顶装得下这个形状"。**错**：默认顶下焐热一趟
+    ///   仍有 1621 次落盘 —— 钉住的上层页预算是容量的一半（`min(1024, cap/2)` = 1024 页），
+    ///   住的 1986 页里 1024 页是上层，留给 1300 片叶子的只有 962 个槽。所以根本不需要主动压顶
+    ///   —— 少跑两趟，形状自己的证据反而更硬。
+    /// - 原本怀疑"`page_reads` 数不到东西是因为 `node_cache` 在页缓存之上把点读全吸收了"。
+    ///   实测**落盘数 = 页缓存未命中数**（1621 = 1621），页缓存这一层的尺子一直是准的；真正
+    ///   让那条守卫"卡死不动"的是另一件事 —— 见上面 `resident` 那段：同一条语句里锁两次
+    ///   同一把 `Mutex` = 自死锁，进程 CPU 冻住、一行都不打印，看起来像"读路径慢了几十倍"。
+    /// 变异对照（都真跑过，红的位置就是它该管的那件事）：
+    /// - A「只记值、不落到生效容量」⇒ 本条红在 `cap1 == total`（实测 left 2048 / right 2606），
+    ///   LSM 同一条变异红在 `cap_after == blocks`（left 8 / right 26）。⚠️ 这时**门面那条守卫
+    ///   仍然绿** —— 它只核对"读回来的值"，效应必须留在引擎里，这就是"每一层都要有自己的守卫"。
+    /// - B「把改容量写成重建缓存」⇒ 本条红在"住着几页"（left 0 / right 1986），
+    ///   LSM 红在 `0 / 8`。
+    #[test]
+    fn test_cache_auto_max_is_raisable_and_misses_go_to_zero() {
+        use crate::bplus_tree::page::cache_misses;
+        use crate::common::disk::disk_page_reads;
+        const ROWS: usize = 1300; // 长键形状：一把键 ≈ 3.3 KB ⇒ 一页一条 ⇒ 页数跟着行数长
+        let path = tmp_db("cache_raise");
+        {
+            let mvcc = MVCC::open(&path, 64, 0);
+            let pad = vec![b'k'; 3300];
+            let keys: Vec<Vec<u8>> = (0..ROWS)
+                .map(|i| {
+                    let mut key = format!("k{i:06}_").into_bytes();
+                    key.extend_from_slice(&pad);
+                    key
+                })
+                .collect();
+            for key in &keys {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key, b"v".to_vec()), "灌一把键失败");
+                tx.commit();
+            }
+            mvcc.flush();
+
+            let total = mvcc.kv.lock().unwrap().next_page_id() as usize;
+            let (cap0, _, auto) = mvcc.cache_policy();
+            assert!(auto, "传 0 就该是自动档");
+            assert!(
+                total > 2048,
+                "形状没造出来：{total} 页没超过默认上限 2048 ⇒ 顶根本没绑住，后面全是空转"
+            );
+            assert_eq!(cap0, 2048, "封顶时生效容量必须是 2048，实际 {cap0}");
+            assert_eq!(mvcc.cache_auto_max(), 2048, "上限本身要读得回来");
+
+            let mut order: Vec<usize> = (0..ROWS).collect();
+            let mut s = 0x853c_49e6_77b9_5b3eu64;
+            for i in (1..order.len()).rev() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (s >> 33) as usize % (i + 1);
+                order.swap(i, j);
+            }
+            // 一趟随机点读，返回（这一趟落盘读了一几页, 页缓存未命中几次）
+            let read_pass = |mvcc: &MVCC| -> (u64, u64) {
+                let tx = mvcc.begin_transaction();
+                let d0 = disk_page_reads();
+                let m0 = cache_misses();
+                for &i in &order {
+                    assert_eq!(tx.get(&keys[i]), Some(b"v".to_vec()), "读第 {i} 把键不对");
+                }
+                drop(tx);
+                (disk_page_reads() - d0, cache_misses() - m0)
+            };
+            // 缓存里"住着几页 / 钉住几页"要一次锁取两个数。
+            // ⚠️ 不能写成 `mvcc.kv.lock().unwrap().a()` 和 `mvcc.kv.lock().unwrap().b()` 放在
+            // **同一条语句**的两个参数里：临时量（第一个 MutexGuard）要到语句结束才释放，第二次
+            // `lock()` 就是自死锁 —— `std::sync::Mutex` 不可重入，单线程直接冻住（CPU 不涨、
+            // 什么都不打印）。这条守卫就是这么"卡死"过一次，三个现象全部指向错的地方。
+            let resident = |mvcc: &MVCC| -> (usize, usize) {
+                let tree = mvcc.kv.lock().unwrap();
+                (tree.cached_pages_for_test(), tree.cache_policy().1)
+            };
+
+            // ⚠️ 必须**冷重开**再量：写阶段会把摸过的页连同解析结果留在 `node_cache` 里，
+            // 不重开量的就不是生产形状。重开之后两个缓存都是空的。
+            drop(mvcc);
+            let mvcc = MVCC::open(&path, 64, 0);
+
+            // 尺子自己先被证明数得到：冷启动第一趟不可能一个字节都不读盘
+            let (cold, cold_miss) = read_pass(&mvcc);
+            assert!(
+                cold > 0,
+                "这把尺子没数到落盘读 ⇒ 空转（冷重开后第一趟读 {ROWS} 把键却要 0 次落盘，不可能）"
+            );
+
+            // ① 默认顶 2048：焐热一趟之后**仍然要落盘** —— 这就是病灶本身（顶是预算，
+            //    工作集一旦超过它，每次点读都在付"读页 + 重解析"），也是 600k 行上看到 5.6% 覆盖率的形状
+            let (warm_default, warm_default_miss) = read_pass(&mvcc);
+            assert!(
+                warm_default > 0,
+                "容量 2048 / 全库 {total} 页，焐热一趟后一轮点读零落盘 ⇒ 这个顶根本没绑住，\
+                 后面「抬顶」的对照就是空转（形状变了要重挑 ROWS/键长）"
+            );
+
+            // ② 抬到不设顶：容量贴到总页数；且**不重建**（住着几页，抬完还住着几页）
+            let (resident_before, pinned) = resident(&mvcc);
+            assert!(resident_before > 0, "焐过一轮后缓存是空的 ⇒ 下面那条「没重建」会空转");
+            mvcc.set_cache_auto_max(usize::MAX);
+            let (cap1, _, _) = mvcc.cache_policy();
+            assert_eq!(
+                cap1, total,
+                "抬到不设顶 ⇒ 容量必须贴到总页数 {total}，实际 {cap1}"
+            );
+            assert_eq!(mvcc.cache_auto_max(), usize::MAX, "抬上去的上限要读得回来");
+            let (resident_after, _) = resident(&mvcc);
+            assert_eq!(
+                resident_after, resident_before,
+                "抬容量把缓存从 {resident_before} 页变成 {resident_after} 页 ⇒ 走回了「重建缓存」"
+            );
+
+            // ③ 新容量下焐热一趟，第二趟必须**一次盘都不读** —— 否则"抬上来的容量"是假的
+            let _ = read_pass(&mvcc);
+            let (raised_reads, raised_miss) = read_pass(&mvcc);
+            assert_eq!(
+                raised_reads, 0,
+                "容量已经 = 页数 {total}，第二趟随机点读仍落盘 {raised_reads} 次 ⇒ 抬上来的容量没生效"
+            );
+            assert_eq!(
+                raised_miss, 0,
+                "容量 = 页数 {total} 时第二趟仍有 {raised_miss} 次页缓存未命中 ⇒ 抬上来的容量没生效"
+            );
+            let t = mvcc.tuning();
+            assert_eq!(
+                t.get("total_pages"),
+                Some(total.to_string().as_str()),
+                "分母要看得见，否则调用方算不出覆盖率：{t}"
+            );
+            assert_eq!(
+                t.get("max_cache_pages"),
+                Some(total.to_string().as_str()),
+                "tuning 里的生效容量必须与 cache_policy 一致：{t}"
+            );
+            eprintln!(
+                "[压顶→抬顶] 页数 {total}：冷启落盘 {cold}（缺 {cold_miss}）| 默认顶 2048 焐热后落盘 \
+                 {warm_default}（缺 {warm_default_miss}）| 抬到不设顶后容量 {cap1}，焐热一趟再走一趟落盘 \
+                 {raised_reads}（缺 {raised_miss}）；住着 {resident_before} → {resident_after} 页\
+                 （钉住 {pinned}，没重建）"
+            );
         }
         cleanup(&path);
     }

@@ -375,6 +375,8 @@ impl MVCC {
         t.push("block_cache_auto_max", o.block_cache_auto_max);
         // 生效值，不是配置值：自动档下 `block_cache_blocks` 只是地板
         t.push("block_cache_capacity", kv.block_cache_capacity());
+        // 分母（M32）：没有它，调用方看见"容量 1024"分不清是"顶撞上了"还是"库就这么点块"
+        t.push("sst_blocks", kv.sst_block_count());
         drop(kv);
         t.push("use_mmap", o.use_mmap);
         t.push("l0_compact_threshold", o.l0_compact_threshold);
@@ -383,6 +385,16 @@ impl MVCC {
         t.push("target_sst_bytes", o.target_sst_bytes);
         t.push("blob_threshold", o.blob_threshold);
         t
+    }
+
+    /// 块缓存自动档的上限（`0` = 关自动档，`usize::MAX` = 不设顶）。见
+    /// [`LSMTree::set_block_cache_auto_max`]。
+    pub fn set_cache_auto_max(&self, blocks: usize) {
+        self.kv.lock().unwrap().set_block_cache_auto_max(blocks);
+    }
+
+    pub fn cache_auto_max(&self) -> usize {
+        self.kv.lock().unwrap().options().block_cache_auto_max
     }
 
     pub fn checkpoint(&self) {
@@ -1377,6 +1389,131 @@ mod tests {
             let t = mvcc.tuning();
             assert_eq!(t.get("block_cache_auto_max"), Some("0"), "{t}");
             assert_eq!(t.get("block_cache_capacity"), Some("4"), "{t}");
+        }
+        cleanup(&path);
+    }
+
+    /// 天花板本身可以抬，而且**分母要看得见**（M32）。
+    ///
+    /// 为什么单独一条：`for_mvcc` 的默认上限 1024 块 ≈ 7.1 MB 是**预算**，可 600k 键那档的块数
+    /// 远不止 1024 ⇒ 覆盖率掉下来，每次点读多付一次随机读（实测 ≈54~94 µs）。默认值不该替调用方
+    /// 决定"要不要把库复制进 RAM"，但**要能让他决定**：`set_cache_auto_max(usize::MAX)` = 不设顶。
+    ///
+    /// 钉四件事：⓪ 封顶时**焐热一趟之后仍然缺块**（26 块 / 容量 8 实测一轮缺 26 —— 冷启第一趟
+    /// 谁都要缺，拿它当"顶绑住了"的证据等于什么都没证，与 bplus 那条守卫同一个口径）
+    /// ① 抬顶之后容量 = 实际块数（不是"配了没生效"）② `tuning()` 同时给出分子
+    /// (`block_cache_capacity`) 与分母 (`sst_blocks`)，否则运维看到 1024 分不清"撞上顶"还是"库就这么小"
+    /// ③ 抬顶**不重建缓存** ⇒ 之前焐热的块还在（M23 的教训：自动档自己清自己的缓存）。
+    ///
+    /// 变异对照（与 bplus 那两条一起跑的）：A「只记值、不重估容量」⇒ 红在 ① 的
+    /// `cap_after == blocks`（left 8 / right 26）；B「重建缓存」⇒ 红在 ③ 的"住着几块"
+    /// （left 0 / right 8）。两条都**不会**被门面的 `cache_auto_max_knob_…` 抓到，效应归引擎。
+    #[test]
+    fn test_block_cache_auto_max_is_raisable_and_coverage_is_readable() {
+        const BLOCK_ENTRIES: usize = 8;
+        const FLOOR: usize = 4;
+        // 200 把键、每块 8 条 ⇒ ≈26 块。顶给 8（不是 16）才够"被明显甩开"——
+        // 形状没造出来的守卫等于没写。
+        const CEIL: usize = 8;
+        let path = tmp_db("cache_auto_raise");
+        let keys: Vec<Vec<u8>> = (0..200).map(|i| format!("k{i:04}").into_bytes()).collect();
+        let opts = LSMTreeOptions {
+            sst_block_entries: BLOCK_ENTRIES,
+            block_cache_blocks: FLOOR,
+            block_cache_auto_max: CEIL,
+            ..LSMTreeOptions::for_mvcc()
+        };
+        {
+            let mvcc = MVCC::try_open_with(&path, Some(opts)).unwrap();
+            for base in (0..200).step_by(20) {
+                let end = (base + 20).min(200);
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end)
+                    .map(|i| (keys[i].clone(), format!("v{i}").into_bytes()))
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("batch_set 冲突: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+                mvcc.flush();
+            }
+            let shape = || {
+                let kv = mvcc.kv.lock().unwrap();
+                (kv.sst_blocks_for_test(), kv.block_cache_capacity())
+            };
+            let (blocks, cap) = shape();
+            assert!(
+                blocks > CEIL * 2,
+                "形状没造出来：{blocks} 块没把天花板 {CEIL} 甩开"
+            );
+            assert_eq!(cap, CEIL, "抬顶之前容量必须封顶（块数 {blocks}，实测 {cap}）");
+
+            // 先在封顶的状态下焐热：容量 8 而库有 26 块 ⇒ 缓存里住着东西，但装不下全部
+            let tx = mvcc.begin_transaction();
+            for k in &keys {
+                assert!(tx.get(k).is_some(), "读 {} 落空", String::from_utf8_lossy(k));
+            }
+            // ⚠️ 焐热一趟**之后**再量缺页：冷启第一趟谁都要缺，拿它当"顶绑住了"的证据等于什么都没证
+            let capped0 = crate::lsm_tree::sst::block_misses();
+            for k in &keys {
+                assert!(tx.get(k).is_some());
+            }
+            let capped_misses = crate::lsm_tree::sst::block_misses() - capped0;
+            drop(tx);
+            assert!(
+                capped_misses > 0,
+                "容量 {cap} / 全库 {blocks} 块，焐热后第二趟一次都不缺 ⇒ 这个顶没绑住，后面全是空转"
+            );
+            let resident_before = mvcc.kv.lock().unwrap().cached_blocks_for_test();
+            assert!(
+                resident_before > 0,
+                "形状没造出来：焐过一轮之后缓存里一块都没有 ⇒ 下面那条「没重建」的断言会空转"
+            );
+
+            mvcc.set_cache_auto_max(usize::MAX);
+            let (blocks2, cap_after) = shape();
+            assert_eq!(blocks2, blocks, "抬顶不该改动库的形状");
+            assert_eq!(
+                cap_after, blocks,
+                "顶抬到不设限 ⇒ 容量必须等于实际块数（块数 {blocks}，实测 {cap_after}）"
+            );
+            assert_eq!(mvcc.cache_auto_max(), usize::MAX, "上限要能读回来");
+            // M23 的纪律：**改容量是就地改上限，不许重建**（重建 = 调一次旋钮就把焐热的块全丢掉）
+            let resident_after = mvcc.kv.lock().unwrap().cached_blocks_for_test();
+            assert_eq!(
+                resident_after, resident_before,
+                "抬顶把缓存从 {resident_before} 块变成 {resident_after} 块 ⇒ 又走回「重建缓存」那条路"
+            );
+
+            // 再跑两趟：第一趟把新容量填满，第二趟才该 0 未命中。
+            // ⚠️ 别在抬顶后**立刻**要求 0 未命中：封顶那会儿只装得下 8/26 块，缺的那 18 块是
+            //   应有账（第一版这条就是写出假红来的地方）。
+            let tx = mvcc.begin_transaction();
+            for k in &keys {
+                assert!(tx.get(k).is_some());
+            }
+            let m0 = crate::lsm_tree::sst::block_misses();
+            for k in &keys {
+                assert!(tx.get(k).is_some());
+            }
+            let misses = crate::lsm_tree::sst::block_misses() - m0;
+            drop(tx);
+            assert_eq!(
+                misses, 0,
+                "容量 = 块数 {blocks} 之后第二趟仍缺 {misses} 块 ⇒ 抬上来的容量没真的生效"
+            );
+
+            let t = mvcc.tuning();
+            assert_eq!(
+                t.get("sst_blocks"),
+                Some(blocks.to_string().as_str()),
+                "分母必须看得见，否则运维算不出覆盖率：{t}"
+            );
+            assert_eq!(t.get("block_cache_capacity"), Some(blocks.to_string().as_str()), "{t}");
+            eprintln!(
+                "[抬顶] 块数 {blocks}：封顶 {cap} 时一轮缺 {capped_misses} 块 ⇒ 抬到不设顶后容量 \
+                 {cap_after}，重读未命中 {misses}"
+            );
         }
         cleanup(&path);
     }

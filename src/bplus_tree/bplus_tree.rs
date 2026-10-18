@@ -140,6 +140,12 @@ pub struct BPlusTree {
     node_cache: std::collections::HashMap<PageId, (u64, std::sync::Arc<BTreeNode>)>,
     /// 容量是不是**自动档**（调用方传的 `max_cache_pages == 0`）
     auto_cache: bool,
+    /// 自动档的**上限**，初值 = [`AUTO_MAX_PAGES`]；M32 让它可改。
+    ///
+    /// 为什么要能改：上限是**预算**不是正确性，而"默认 2048 页 ≈ 8 MiB"这一档在 600k 行的库上
+    /// 只剩 5.6% 覆盖率 ⇒ 每次点读都付一次未命中。调用方要么认这个预算、要么自己把顶抬起来
+    /// （抬到 ≥ 总页数 = 把库复制进 RAM，价签在 README 里写着），但那个决定不该由库替他做。
+    auto_max_pages: usize,
 }
 
 /// 自动档的下限：与旧的写死默认值一致 ⇒ 从"没旋钮"换到"自动档"不会让谁的工作集变小
@@ -157,8 +163,8 @@ const AUTO_MAX_PAGES: usize = 2048;
 /// 为什么按页数而不是按行数：代价的载体是页（一次点读 = 沿路每层一页），覆盖率才是决定
 /// "这次点读要不要读盘 + 重解析"的量 —— 实测同一个默认 1024 页的缓存，
 /// 20k 行（1210 页）覆盖率 84.6% ⇒ 11.9 µs/次，200k 行（12129 页）覆盖率 8.4% ⇒ 45.2 µs/次。
-fn auto_cache_pages(total_pages: u64) -> usize {
-    (total_pages as usize).clamp(AUTO_MIN_PAGES, AUTO_MAX_PAGES)
+fn auto_cache_pages(total_pages: u64, max_pages: usize) -> usize {
+    (total_pages as usize).clamp(AUTO_MIN_PAGES, max_pages.max(AUTO_MIN_PAGES))
 }
 
 impl BPlusTree {
@@ -196,7 +202,7 @@ impl BPlusTree {
 
         // 自动档：容量按这份库现在的页数来（meta 已加载 ⇒ next_page_id 是真的）
         if auto {
-            let cap = auto_cache_pages(page_manager.next_page_id());
+            let cap = auto_cache_pages(page_manager.next_page_id(), AUTO_MAX_PAGES);
             page_manager.set_cache_capacity(cap);
         }
 
@@ -206,6 +212,7 @@ impl BPlusTree {
             order,
             node_cache: std::collections::HashMap::new(),
             auto_cache: auto,
+            auto_max_pages: AUTO_MAX_PAGES,
         })
     }
 
@@ -258,7 +265,7 @@ impl BPlusTree {
         // 自动档要在每次刷盘后重新评估：库是会长大的，只在 open 时定一次容量，
         // 等于"导入完就再也没调过旋钮"—— 而那正是这次要修的那个洞。
         if self.auto_cache {
-            let cap = auto_cache_pages(self.page_manager.next_page_id());
+            let cap = auto_cache_pages(self.page_manager.next_page_id(), self.auto_max_pages);
             self.page_manager.set_cache_capacity(cap);
         }
     }
@@ -267,12 +274,37 @@ impl BPlusTree {
     ///
     /// 给 `tuning()` 与守卫用 —— 自动档必须**看得见生效值**，否则"设了没生效"和
     /// "生效了但不知道是多少"这两种情况在下游日志里长得一模一样。
+    /// 把自动档的上限改成 `pages`（**就地改容量**，不重建缓存）。
+    ///
+    /// `usize::MAX` = 不设顶 ⇒ 自动档就等于"跟着库长"（代价：常驻 ≈ 数据文件本身）。
+    /// 只在自动档下有意义：调用方显式给了 `max_cache_pages != 0` 时，本来就没有顶可言。
+    /// ⚠️ 与 M23 同一条纪律：**改容量不许重建缓存**，否则"把旋钮调大"这个动作会先把已经
+    /// 焐热的页全丢掉，自动档就变成"每次重估都自己清一次缓存"。
+    pub fn set_cache_auto_max(&mut self, pages: usize) {
+        self.auto_max_pages = pages.max(AUTO_MIN_PAGES);
+        if self.auto_cache {
+            let cap = auto_cache_pages(self.page_manager.next_page_id(), self.auto_max_pages);
+            self.page_manager.set_cache_capacity(cap);
+        }
+    }
+
+    /// 当前自动档上限（非自动档时它也返回，但不起作用 —— 与 `cache_policy()` 的口径一致）
+    pub fn cache_auto_max(&self) -> usize {
+        self.auto_max_pages
+    }
+
     pub fn cache_policy(&self) -> (usize, usize, bool) {
         (
             self.page_manager.cache_capacity(),
             self.page_manager.pinned_pages(),
             self.auto_cache,
         )
+    }
+
+    /// 测试专用：页缓存里**当前真的住着几页**（M32 用它证明"抬容量不重建缓存"）
+    #[cfg(test)]
+    pub(crate) fn cached_pages_for_test(&self) -> usize {
+        self.page_manager.stats().cache_pages
     }
 
     /// 当前根页（WAL checkpoint 使用）
