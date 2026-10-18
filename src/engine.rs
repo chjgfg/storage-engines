@@ -2799,13 +2799,19 @@ mod tests {
     // `#[global_allocator]`，而 LSM 的压实台架要用同一把尺子，不能在 lsm 那边再抄一份）。
 
     /// 跑一次操作，返回 (墙钟, 常驻字节增量, 期间峰值字节增量, 操作返回值)
+    ///
+    /// 峰值**先把高水位压回"当前活着的字节"再量**：`peak` 是进程级单调高水位，只增不减 ⇒
+    /// 直接取 `peak() - peak()` 之前那个高点的话，**排在后面的操作只会报 +0.0 MB**，哪怕它
+    /// 自己瞬时涨了 50 MB（M33 记过这个盲区，M36 又踩了一遍：那一轮 lsm/bplus/memory 三家
+    /// 的 `vacuum()` 峰值读数全是 0，等于没量）。压回去之后 `peak − 基准` 才是**这一段**的瞬时增量。
     fn timed<T>(f: impl FnOnce() -> T) -> (std::time::Duration, i64, u64, T) {
-        let (l0, p0) = (crate::mem_probe::live() as i64, crate::mem_probe::peak());
+        let base = crate::mem_probe::reset_peak();
+        let l0 = crate::mem_probe::live() as i64;
         let t = std::time::Instant::now();
         let out = f();
         let d = t.elapsed();
-        let (l1, p1) = (crate::mem_probe::live() as i64, crate::mem_probe::peak());
-        (d, l1 - l0, p1.saturating_sub(p0), out)
+        let l1 = crate::mem_probe::live() as i64;
+        (d, l1 - l0, crate::mem_probe::peak().saturating_sub(base), out)
     }
 
     /// 目录（或文件）总字节
