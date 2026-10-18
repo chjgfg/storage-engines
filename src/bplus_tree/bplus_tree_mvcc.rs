@@ -2711,6 +2711,192 @@ mod tests {
         cleanup(&path);
     }
 
+    /// bplus 写路径的每行 / 每事务各花在哪（M34 的先量，`#[ignore]`）。
+    ///
+    /// 触发它的测量：三档基线 600k 档 `bplus 灌 600000 行(事务)` = **114.2 µs/行**，同一形状
+    /// bitcask 16.3、lsm 25.2、memory 4.3 ⇒ 贵 **7~26 倍**；而 20k→600k 只有 1.49×
+    /// （**线性但绝对值贵**）⇒ 不是复杂度，是每行 / 每事务的固定开销。
+    /// `commit_with_options` 默认不刷页（`flush_pages = false`），所以嫌疑集中在逐行 `insert`。
+    ///
+    /// 五臂各自一份新库（同一批键形状：键 40 B / 值 47 B，与门面大库台架同一形状）：
+    /// - **A** 裸 `insert_or_shout`（不经 MVCC、不经 WAL）⇒ 纯树 + 页缓存那份账
+    /// - **E** 与 A 完全同形，只多一句 `set_cache_auto_max(usize::MAX)` ⇒ **A/B/C 里哪一笔是
+    ///   "缓存顶不住 ⇒ 脏页换出（双写 + fsync）"，看 `E − A`**（页数超过顶的那些档才有差值）
+    /// - **B** 事务内 `set_raw` ×N **不 commit** ⇒ 再加版本键编码 + 逻辑值编码 + WAL 追加
+    /// - **C** 完整 begin / set×1000 / commit ⇒ 就是台架那一格
+    /// - **D** 空事务 begin/commit ×(N/1000) ⇒ 每事务的固定开销（WAL fsync、阈值判断）
+    ///
+    /// 判读（只看差值，绝对墙钟在本机不作因果凭据）：`B − A` = MVCC/WAL 追加的每行账；
+    /// `C − B` = 每事务固定摊到每行的部分；`D × (N/1000)` 应当与 `C − B` 对得上，
+    /// 对不上就说明 commit 之外还有别的事在按行收费。
+    /// 每臂还带六把计数尺（解析/页读/缺页/清扫/换出/刷脏，都是"次/行"）——
+    /// µs 只能看趋势，**"钱在哪一层"要靠次数定案**：第一版就是靠"解析 0 次/行"才发现
+    /// 写侧下降当时完全绕过解析缓存，那把尺子数不到它。
+    ///
+    /// ```text
+    /// BPLUS_WRITE_ROWS=200000 cargo test --release --lib -- --ignored --nocapture \
+    ///     --test-threads=1 bplus_write_cost_attribution
+    /// ```
+    #[test]
+    #[ignore = "写路径归因，手动 release 单线程跑：BPLUS_WRITE_ROWS=200000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 bplus_write_cost_attribution"]
+    fn bplus_write_cost_attribution() {
+        use std::time::Instant;
+        let rows: usize = std::env::var("BPLUS_WRITE_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+        let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / rows as f64;
+        let txns = (rows / 1000).max(1);
+        // 计数尺：µs 在本机只能看趋势，"钱在哪一层"要靠次数定案
+        let probe = || {
+            (
+                crate::bplus_tree::bplus_tree::node_parses(),
+                crate::bplus_tree::page::page_reads(),
+                crate::bplus_tree::page::cache_misses(),
+                crate::bplus_tree::bplus_tree::node_cache_sweeps(),
+                crate::bplus_tree::page::page_evictions(),
+                crate::bplus_tree::page::batch_flushed_pages(),
+            )
+        };
+        let mut per = Vec::new();
+
+        // A 裸 insert（不经 MVCC / 不经 WAL）
+        let dir_a = tmp_db("w_attrib_raw");
+        let t_a = {
+            let mvcc = MVCC::open(&dir_a, 64, 0);
+            let p0 = probe();
+            let t = Instant::now();
+            {
+                let mut kv = mvcc.kv.lock().unwrap();
+                for i in 0..rows {
+                    insert_or_shout(
+                        &mut kv,
+                        encode_key(&key(i), i as u64 + 1),
+                        RowId(Some(val(i))),
+                        "归因 A",
+                    );
+                }
+            }
+            let d = t.elapsed();
+            let p1 = probe();
+            per.push(("A 裸 insert", p1.0 - p0.0, p1.1 - p0.1, p1.2 - p0.2, p1.3 - p0.3, p1.4 - p0.4, p1.5 - p0.5));
+            d
+        };
+
+        // E 与 A 同一形状，但先把页缓存的顶**抬到不设顶**（M32 那个旋钮）
+        // ⇒ `E − A` = "缓存顶不住 ⇒ 脏页换出 + 双写 + fsync" 这一笔的价签
+        let dir_e = tmp_db("w_attrib_raised");
+        let t_e = {
+            let mvcc = MVCC::open(&dir_e, 64, 0);
+            let p0 = probe();
+            let t = Instant::now();
+            {
+                let mut kv = mvcc.kv.lock().unwrap();
+                kv.set_cache_auto_max(usize::MAX);
+                for i in 0..rows {
+                    insert_or_shout(
+                        &mut kv,
+                        encode_key(&key(i), i as u64 + 1),
+                        RowId(Some(val(i))),
+                        "归因 E",
+                    );
+                }
+            }
+            let d = t.elapsed();
+            let p1 = probe();
+            per.push(("E 抬顶裸 insert", p1.0 - p0.0, p1.1 - p0.1, p1.2 - p0.2, p1.3 - p0.3, p1.4 - p0.4, p1.5 - p0.5));
+            d
+        };
+
+        // B 事务内写，不 commit（回滚排在计时之外）
+        let dir_b = tmp_db("w_attrib_txn");
+        let t_b = {
+            let mvcc = MVCC::open(&dir_b, 64, 0);
+            let tx = mvcc.begin_transaction();
+            let p0 = probe();
+            let t = Instant::now();
+            for i in 0..rows {
+                assert!(tx.set_raw(&key(i), val(i)), "第 {i} 行被拒收");
+            }
+            let d = t.elapsed();
+            let p1 = probe();
+            per.push(("B 写不提交", p1.0 - p0.0, p1.1 - p0.1, p1.2 - p0.2, p1.3 - p0.3, p1.4 - p0.4, p1.5 - p0.5));
+            drop(tx);
+            d
+        };
+
+        // C 完整事务（每 1000 行一事务）= 台架那一格
+        let dir_c = tmp_db("w_attrib_full");
+        let t_c = {
+            let mvcc = MVCC::open(&dir_c, 64, 0);
+            let p0 = probe();
+            let t = Instant::now();
+            for base in (0..rows).step_by(1000) {
+                let end = (base + 1000).min(rows);
+                let tx = mvcc.begin_transaction();
+                for i in base..end {
+                    assert!(tx.set_raw(&key(i), val(i)), "第 {i} 行被拒收");
+                }
+                tx.commit();
+            }
+            let d = t.elapsed();
+            let p1 = probe();
+            per.push(("C 完整事务", p1.0 - p0.0, p1.1 - p0.1, p1.2 - p0.2, p1.3 - p0.3, p1.4 - p0.4, p1.5 - p0.5));
+            d
+        };
+
+        // D 空事务：每事务的固定开销
+        let dir_d = tmp_db("w_attrib_empty");
+        let t_d = {
+            let mvcc = MVCC::open(&dir_d, 64, 0);
+            let t = Instant::now();
+            for _ in 0..txns {
+                let tx = mvcc.begin_transaction();
+                tx.commit();
+            }
+            t.elapsed()
+        };
+
+        let per_txn_empty = t_d.as_secs_f64() * 1e6 / txns as f64;
+        println!(
+            "=== bplus 写路径归因 rows={rows} 事务数={txns}（µs/行，同一份构建）===\n  \
+             A 裸 insert {a:>8.1} | E 抬顶裸 insert {e:>8.1}（E−A = {ea:>6.1} ⇒ 换出+双写+fsync 那一笔）| \
+             B 事务内写不提交 {b:>8.1}（B−A = {ba:>6.1}）| \
+             C 完整事务 {c:>8.1}（C−B = {cb:>6.1}）\n  \
+             D 空事务 {d:>8.1} µs/事务 ⇒ 摊到每行 {dp:>6.3} µs | C 实测每事务 {cpt:>9.1} ms",
+            a = us(t_a),
+            e = us(t_e),
+            ea = us(t_e) - us(t_a),
+            b = us(t_b),
+            ba = us(t_b) - us(t_a),
+            c = us(t_c),
+            cb = us(t_c) - us(t_b),
+            d = per_txn_empty,
+            dp = per_txn_empty / 1000.0,
+            cpt = t_c.as_secs_f64() * 1e3 / txns as f64,
+        );
+        for (name, parses, reads, misses, sweeps, evictions, flushed) in &per {
+            println!(
+                "  {name:<16} 每行：解析 {:>6.2} 页读 {:>6.2} 缺 {:>6.2} 换出 {:>6.2} 刷脏 {:>6.2} | 解析缓存整表清扫 {} 次",
+                *parses as f64 / rows as f64,
+                *reads as f64 / rows as f64,
+                *misses as f64 / rows as f64,
+                *evictions as f64 / rows as f64,
+                *flushed as f64 / rows as f64,
+                sweeps,
+            );
+        }
+        for d in [dir_a, dir_e, dir_b, dir_c, dir_d] {
+            cleanup(&d);
+        }
+    }
+
     /// 一次"未命中"的单价拆开裸测（M31 的归因，`#[ignore]`）。
     ///
     /// 为什么还要再拆一层：`bplus_read_cost_attribution` 已经证明**一次随机点读只缺 ~1 页**

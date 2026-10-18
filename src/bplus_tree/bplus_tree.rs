@@ -52,6 +52,34 @@ pub(crate) fn node_cache_visited() -> u64 {
     NODE_CACHE_VISITED.with(|c| c.get())
 }
 
+// 测试专用：下降**定位了几次**、这几次一共**比较了几把分隔键**（M34 的尺子）。
+//
+// 为什么要单独数：`child_index` 从线性 `position` 换成二分之后，省下的是"每层看多少把键"，
+// 这件事在 µs 上会被本机跨构建漂移（1.3~1.9×）盖住，但它是个**纯计数**的事实 ——
+// 顺序灌行时目标永远是最后一个子 ⇒ 线性扫必然走满整页键数，二分只走 log2(扇出)。
+// 数法是把计数器放在真正的比较回调里，所以量的是"实际发生的比较"，不是公式估算。
+#[cfg(test)]
+thread_local! {
+    static DESCENT_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DESCENT_KEY_COMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DESCENT_MAX_COMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn descent_lookups() -> u64 {
+    DESCENT_LOOKUPS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn descent_key_comps() -> u64 {
+    DESCENT_KEY_COMPS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn descent_max_comps() -> u64 {
+    DESCENT_MAX_COMPS.with(|c| c.get())
+}
+
 /// 行ID：指向数据在磁盘/内存中的位置
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 // pub struct RowId(pub u64);
@@ -337,6 +365,71 @@ impl BPlusTree {
     }
 }
 
+/// 字节账的常量：全进程量一次，之后每条只两次加法（M34）。
+///
+/// 为什么可以只量一次：bincode 用定宽整数编码，`Vec<u8>` = 「长度前缀 + 原样字节」、
+/// `Option<T>` = 「判别 + 有值时再接一个 T」⇒ 一个节点的字节对「每条的键长、值长」是**线性**的，
+/// 于是"逐条问 bincode"退化成"逐条做两次加法"。逐条问一次要做两次 `serialized_size`，
+/// 而插一条要问整页 —— 这正是 M34 在写路径上量出来的那一刀。
+/// 为什么常量还是探针量出来、不写死数字：编码宽度是 bincode 版本与配置的事，写错一次就是
+/// "按错的尺寸写坏一页"。探针与真实序列化的逐档对拍由
+/// `test_reorg_size_formula_matches_bincode` 钉住。
+#[derive(Clone, Copy)]
+struct SizeConsts {
+    /// 只有 `next_leaf`（条目为空）的叶子
+    leaf_base_none: i64,
+    /// 同上但 `next_leaf` 是 `Some`（`Option` 的判别 + 定宽 `PageId`）
+    leaf_base_some: i64,
+    /// 空内部节点（无键无子）
+    internal_base: i64,
+    /// 一个子节点占的字节（定宽 `PageId` ⇒ 可乘）
+    internal_child: i64,
+    /// 一条叶子条目：空键 + `RowId(None)`
+    entry_base: i64,
+    /// `RowId` 从 `None` 变 `Some(空值)` 多出来的字节
+    entry_some: i64,
+    /// 一把空键占的字节（= `Vec<u8>` 的长度前缀）
+    key_unit: i64,
+}
+
+impl SizeConsts {
+    fn measure() -> SizeConsts {
+        let size = |n: &BTreeNode| bincode::serialized_size(n).unwrap_or(u64::MAX) as i64;
+        let leaf = |next_leaf: Option<PageId>| {
+            size(&BTreeNode::Leaf {
+                entries: Vec::new(),
+                next_leaf,
+            })
+        };
+        let empty_internal = size(&BTreeNode::Internal {
+            keys: Vec::new(),
+            children: Vec::new(),
+        });
+        let one_child = size(&BTreeNode::Internal {
+            keys: Vec::new(),
+            children: vec![PageId(1)],
+        });
+        let empty_entry = bincode::serialized_size(&(Vec::<u8>::new(), RowId(None)))
+            .unwrap_or(u64::MAX) as i64;
+        let null_entry = bincode::serialized_size(&(Vec::<u8>::new(), RowId(Some(Vec::new()))))
+            .unwrap_or(u64::MAX) as i64;
+        SizeConsts {
+            leaf_base_none: leaf(None),
+            leaf_base_some: leaf(Some(PageId(0))),
+            internal_base: empty_internal,
+            internal_child: one_child - empty_internal,
+            entry_base: empty_entry,
+            entry_some: null_entry - empty_entry,
+            key_unit: bincode::serialized_size(&Vec::<u8>::new()).unwrap_or(u64::MAX) as i64,
+        }
+    }
+}
+
+fn size_consts() -> &'static SizeConsts {
+    static CONSTS: std::sync::OnceLock<SizeConsts> = std::sync::OnceLock::new();
+    CONSTS.get_or_init(SizeConsts::measure)
+}
+
 impl BPlusTree {
     /// 当前生效的阶数（门面读回用：证明"设进去的值真到了引擎里"）
     pub fn order(&self) -> usize {
@@ -383,6 +476,10 @@ impl BPlusTree {
     /// 为什么必须有它：归因量过，B+ 树点读的 41 µs 里几乎全是 CPU —— 每次点读要走 4 个页，
     /// 每个页都要 4 KB 拷贝 + 解析整节点（34~64 条 ⇒ 上百次堆分配）；缓存开大也没用。
     /// 校验凭 `PageManager::write_count` 按页做，所以写点不需要手工失效。
+    ///
+    /// M34 之后**写路径的下降也走它**（`insert_recursive`/`update_recursive`/`read_node`）：
+    /// 以前写一侧是裸 `read_page` + 解析 ⇒ 每行把整条路径重解析一遍（实测 2.94 页读/行、
+    /// 3 次整节点解析/行，而这把尺子当时根本数不到它们 —— 解析计数只挂在 `node_of` 上）。
     fn node_of(&mut self, page_id: PageId) -> Option<std::sync::Arc<BTreeNode>> {
         let seen = self.page_manager.write_count(page_id);
         if let Some((at, node)) = self.node_cache.get(&page_id) {
@@ -394,6 +491,19 @@ impl BPlusTree {
         #[cfg(test)]
         NODE_PARSES.with(|c| c.set(c.get() + 1));
         let node = std::sync::Arc::new(bincode::deserialize::<BTreeNode>(&data).ok()?);
+        self.memoize_node(page_id, seen, node)
+    }
+
+    /// 把一份节点内容放进解析缓存，顺带执行两条纪律：上层页钉住、超上限丢没钉住的。
+    ///
+    /// `seen` 必须是**这次放进去的内容所对应的那次写**的 `write_count` —— `node_of` 拿它判陈旧。
+    /// 两条来路都满足：`node_of` 读页之后、`insert` 写完页之后（见 [`Self::cache_written`]）。
+    fn memoize_node(
+        &mut self,
+        page_id: PageId,
+        seen: u64,
+        node: std::sync::Arc<BTreeNode>,
+    ) -> Option<std::sync::Arc<BTreeNode>> {
         // **上层页钉住**（M22）：根与内部节点是结构性小的一小撮（实测占全库 3.0%），而每一次
         // 点读、每一次反向游走都要用它们。不钉住时，全库走查把 LRU 转几圈就把它们挤出去 ——
         // 实测 200k 行的库里"走查后一次随机点读"因此从 45.2 µs 涨到 58.6 µs（+30%）。
@@ -417,6 +527,53 @@ impl BPlusTree {
         Some(node)
     }
 
+    /// 刚落盘的页**直接回填**解析缓存。
+    ///
+    /// 为什么这是免费的：写入的内容此刻就在调用方手上（`insert` 那条 `Vec<(PageId, BTreeNode)>`），
+    /// 搬进 `Arc` 只要一次 `Arc` 分配 —— 不回填的话下一条行的下降要把这 4 KB 重新拷出来、
+    /// 再把整节点解析一遍（上百次小堆分配）。实测顺序灌行每行 3 次整节点解析，其中 2 次
+    /// （根 + 中间层）本来就几乎没变，另 1 次（叶子）是上一条自己写脏的。
+    ///
+    /// `write_page` 只在**写成功**之后才该回填：写失败时页内容还是旧的，缓存里放新内容
+    /// 就是让下一次下降读到盘上并没有的东西。
+    fn cache_written(&mut self, page_id: PageId, node: BTreeNode) {
+        let seen = self.page_manager.write_count(page_id);
+        self.memoize_node(page_id, seen, std::sync::Arc::new(node));
+    }
+
+    /// 内部节点里该走哪个子：第一把**严格大于** `key` 的键的下标（键相等要走右边 —— 分隔键
+    /// 本身归左半，`key == keys[i]` 时目标在 `i` 右边）。
+    ///
+    /// 为什么二分而不是 `position` 线性扫：顺序灌行时目标**永远是最后一个子**，线性扫每层
+    /// 都要把整页分隔键走一遍 ⇒ 下降的代价从 O(log 扇出) 变成 O(扇出)。M34 量写路径单价时
+    /// 这条是读、写两侧的公共开销（点读、`latest_version`、插入、删除、反向定位都走它）。
+    fn child_index(keys: &[Key], key: &Key) -> usize {
+        #[cfg(test)]
+        let mut comps = 0u64;
+        let one = |k: &Key| {
+            #[cfg(test)]
+            {
+                comps += 1;
+            }
+            k.as_slice().cmp(key.as_slice())
+        };
+        let idx = match keys.binary_search_by(one) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        #[cfg(test)]
+        {
+            DESCENT_LOOKUPS.with(|c| c.set(c.get() + 1));
+            DESCENT_KEY_COMPS.with(|c| c.set(c.get() + comps));
+            DESCENT_MAX_COMPS.with(|m| {
+                if comps > m.get() {
+                    m.set(comps);
+                }
+            });
+        }
+        idx
+    }
+
     /// 节点序列化后能不能装进一页。
     ///
     /// **只能问序列化结果，不能问条数**：条目是变长的（键可达几十字节、RowId 带 flag 与
@@ -430,38 +587,41 @@ impl BPlusTree {
         }
     }
 
-    /// 一条条目在序列化结果里占多少字节。
-    ///
-    /// bincode 把 `Vec<T>` 编成「长度 + 逐条」⇒「空 vec 的字节」减掉之后每条**可加**，
-    /// 所以「节点字节 = 空节点字节 + Σ 每条字节」是精确值而不是估算（由
-    /// `test_reorg_size_formula_matches_bincode` 逐档与真实序列化对拍钉住）。
-    /// 为什么不直接 `serialized_size(&候选节点)` 逐档试：那要克隆上百条 `(Vec<u8>, RowId)`，
-    /// 一次删除重探十几档 ⇒ 4000 次删除就是几百万次堆分配，**量尺自己变成瓶颈**。
-    /// 为什么不让手算常量代替：`RowId` 是 `Option<Vec<u8>>`，键与值都变长，常量错一次
-    /// 就是"按错的尺寸写坏一页"。
-    fn vec_item_bytes<T: serde::Serialize>(item: &T) -> usize {
-        let empty = bincode::serialized_size(&Vec::<T>::new()).unwrap_or(0) as i64;
-        let one = bincode::serialized_size(&[item][..]).unwrap_or(0) as i64;
-        (one - empty).max(0) as usize
+    /// 一条叶子条目在序列化结果里占多少字节 —— 常量见 [`SizeConsts`]，O(1) 且**精确**。
+    fn entry_bytes(item: &(Key, RowId)) -> i64 {
+        let RowId(row) = &item.1;
+        Self::entry_bytes_borrowed(&item.0, row)
+    }
+
+    /// 同上，但接**借用**：`row_fits` 是每条写都要问的一句，不能为量一次尺寸先把键与值各克隆
+    /// 一份（那是事务路径上每行两次堆分配，只为了算一个数）。
+    fn entry_bytes_borrowed(key: &[u8], row: &Option<Vec<u8>>) -> i64 {
+        let c = size_consts();
+        let mut n = c.entry_base + key.len() as i64;
+        if let Some(v) = row {
+            n += c.entry_some + v.len() as i64;
+        }
+        n
+    }
+
+    /// 一把键（内部节点的分隔键）占多少字节
+    fn key_bytes(item: &Key) -> i64 {
+        size_consts().key_unit + item.len() as i64
     }
 
     /// 只有 `next_leaf` 的叶子（条目为空）序列化后的字节数
     fn leaf_base(next_leaf: Option<PageId>) -> i64 {
-        let probe = BTreeNode::Leaf {
-            entries: Vec::new(),
-            next_leaf,
-        };
-        bincode::serialized_size(&probe).unwrap_or(i64::MAX as u64) as i64
+        if next_leaf.is_some() {
+            size_consts().leaf_base_some
+        } else {
+            size_consts().leaf_base_none
+        }
     }
 
     /// 空内部节点（无键无子）的字节数，与「一个子节点占的字节」——子节点是定宽 `PageId`，
     /// 所以键数与子节点数可以分开加（同样由对拍测试钉住）
     fn internal_base() -> i64 {
-        let probe = BTreeNode::Internal {
-            keys: Vec::new(),
-            children: Vec::new(),
-        };
-        bincode::serialized_size(&probe).unwrap_or(i64::MAX as u64) as i64
+        size_consts().internal_base
     }
 
     /// 两半**都装得下**的分界区间 `(lo, hi)`；`None` = 没有任何合法分界 ⇒ 调用方一字都不能写。
@@ -501,28 +661,22 @@ impl BPlusTree {
     /// 一批叶子条目 + `next_leaf` 序列化后的**精确**字节数（可加性见 `fitting_split` 的注释）
     fn leaf_total_bytes(entries: &[(Key, RowId)], next_leaf: Option<PageId>) -> i64 {
         Self::leaf_base(next_leaf)
-            + entries
-                .iter()
-                .map(|e| Self::vec_item_bytes(e) as i64)
-                .sum::<i64>()
+            + entries.iter().map(Self::entry_bytes).sum::<i64>()
     }
 
     /// 内部节点的精确字节数：键是变长的、子节点是定宽 `PageId` ⇒ 两项分开加
     fn internal_total_bytes(keys: &[Key], child_count: usize) -> i64 {
         Self::internal_base()
-            + keys
-                .iter()
-                .map(|k| Self::vec_item_bytes(k) as i64)
-                .sum::<i64>()
+            + keys.iter().map(Self::key_bytes).sum::<i64>()
             + child_count as i64 * Self::internal_child_unit()
     }
 
     /// 前缀字节表：`pre[i]` = 前 i 条的字节和 ⇒ 任意半页的字节 O(1) 拿到
-    fn prefix_bytes(per: &[i64]) -> Vec<i64> {
-        let mut pre = Vec::with_capacity(per.len() + 1);
+    fn prefix_bytes<T>(items: &[T], size: fn(&T) -> i64) -> Vec<i64> {
+        let mut pre = Vec::with_capacity(items.len() + 1);
         pre.push(0i64);
-        for b in per {
-            pre.push(pre.last().unwrap() + b);
+        for it in items {
+            pre.push(pre.last().unwrap() + size(it));
         }
         pre
     }
@@ -538,8 +692,7 @@ impl BPlusTree {
         order: usize,
     ) -> Option<usize> {
         let n = entries.len();
-        let per: Vec<i64> = entries.iter().map(|e| Self::vec_item_bytes(e) as i64).collect();
-        let pre = Self::prefix_bytes(&per);
+        let pre = Self::prefix_bytes(entries, Self::entry_bytes);
         // 左半的下一叶是"某个 Some"，与具体页号无关（PageId 定宽）
         let base_left = Self::leaf_base(Some(PageId(0)));
         let base_right = Self::leaf_base(next_leaf);
@@ -555,8 +708,7 @@ impl BPlusTree {
     /// 内部节点的分裂点（上提键的下标 `k`：左半拿 `keys[..k]`，右半拿 `keys[k+1..]`）
     fn internal_split_point(keys: &[Key], order: usize) -> Option<usize> {
         let n = keys.len();
-        let per: Vec<i64> = keys.iter().map(|k| Self::vec_item_bytes(k) as i64).collect();
-        let pre = Self::prefix_bytes(&per);
+        let pre = Self::prefix_bytes(keys, Self::key_bytes);
         let base = Self::internal_base();
         let cu = Self::internal_child_unit();
         // 左半 k 把键 + k+1 个子；右半 n-k-1 把键 + n-k 个子
@@ -572,11 +724,7 @@ impl BPlusTree {
     }
 
     fn internal_child_unit() -> i64 {
-        let one = BTreeNode::Internal {
-            keys: Vec::new(),
-            children: vec![PageId(1)],
-        };
-        bincode::serialized_size(&one).unwrap_or(0) as i64 - Self::internal_base()
+        size_consts().internal_child
     }
 
     /// 这一行**住得住一页吗** —— 给上层在动 WAL 之前先问一句。
@@ -584,9 +732,13 @@ impl BPlusTree {
     /// 为什么要有这个谓词而不是等 `insert` 返回 `false`：事务层是「先 append WAL、再写树」，
     /// 树拒收之后 WAL 里就留下一条"提交了但这行不存在"的记录，恢复时按它重放只会再拒一次，
     /// 表现成"WAL 说有、树里查无此键"。所以拒绝必须发生在写 WAL **之前**。
-    /// 判据与分裂用的是同一套字节账（`leaf_total_bytes`），不留两边不一致。
+    /// 判据与分裂用的是同一套字节账（`leaf_base` + `entry_bytes_borrowed`，与 `leaf_total_bytes`
+    /// 逐项相同），不留两边不一致。
+    ///
+    /// 为什么不走 `leaf_total_bytes(&[(key.to_vec(), RowId(row.clone()))])`：那是每条写都要问
+    /// 的一句，为了算一个数先把键与值各克隆一份 —— 事务路径上每行两次堆分配白花在量尺上。
     pub fn row_fits(&self, key: &[u8], row: &Option<Vec<u8>>) -> bool {
-        Self::leaf_total_bytes(&[(key.to_vec(), RowId(row.clone()))], None) <= MAX_PAYLOAD as i64
+        Self::leaf_base(None) + Self::entry_bytes_borrowed(key, row) <= MAX_PAYLOAD as i64
     }
 
     /// 插入一行。返回 `false` = **这一行没进去**，只有一种成因：这一条比一整页还大，
@@ -606,10 +758,13 @@ impl BPlusTree {
             SPLIT_DROPS.with(|c| c.set(c.get() + 1));
             return false;
         }
-        for (page_id, node) in &step.writes {
+        for (page_id, node) in step.writes {
             // 到这里的每个节点都逐档量过字节 ⇒ 写失败只剩「磁盘坏了」这一种解释
-            let data = bincode::serialize(node).expect("serialize node");
-            self.page_manager.write_page(*page_id, &data);
+            let data = bincode::serialize(&node).expect("serialize node");
+            if self.page_manager.write_page(page_id, &data) {
+                // 写成功才回填：内容与盘上不一致时，缓存里的旧那份比没有那份更坏
+                self.cache_written(page_id, node);
+            }
         }
         if let Some((promote_key, new_page)) = step.promote {
             let new_root_page_id = self.page_manager.allocate_page();
@@ -618,7 +773,9 @@ impl BPlusTree {
                 children: vec![self.root, new_page],
             };
             let root_data = bincode::serialize(&new_root).expect("serialize new root");
-            self.page_manager.write_page(new_root_page_id, &root_data);
+            if self.page_manager.write_page(new_root_page_id, &root_data) {
+                self.cache_written(new_root_page_id, new_root);
+            }
             self.set_root(new_root_page_id);
         }
         true
@@ -627,16 +784,23 @@ impl BPlusTree {
     /// 一趟下降：返回「还没落盘的一串（页号, 内容）」与要不要往上升一层。
     /// `landed = false` 时 `writes` 必为空，`alloc` 继续往上传，由 [`Self::insert`] 统一回收。
     fn insert_recursive(&mut self, node_page_id: PageId, key: Key, row_id: RowId) -> InsertStep {
-        let node_data = self.page_manager.read_page(node_page_id).unwrap();
-        let node: BTreeNode = bincode::deserialize(&node_data).unwrap();
+        // 下降走解析缓存（M34），并且**只有真要改这一层时才克隆键/子数组**：
+        // 顺序灌行时内部节点 40 次里只有 1 次真的变（下面分裂了），另外 39 次连一次堆分配都不必花。
+        //
+        // ⚠️ 这里必须是 `expect` 不能是"当失败处理"：`insert` 返回 `false` 的含义被上层读成
+        // "这一行装不下"（`row_fits` 已经过了 ⇒ WAL 也已经写了）⇒ 页读不出来却回一句 false，
+        // 盘上就留下一条"提交了但树里没有"的记录，正是 `row_fits` 注释里要避免的那个形状。
+        let node = self.node_of(node_page_id).expect("下降取节点");
         let order = self.order;
         let cap = MAX_PAYLOAD as i64;
 
-        match node {
+        match &*node {
             BTreeNode::Leaf {
-                mut entries,
+                entries,
                 next_leaf,
             } => {
+                let next_leaf = *next_leaf;
+                let mut entries = entries.clone();
                 match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
                     Ok(idx) => entries[idx].1 = row_id,
                     Err(idx) => entries.insert(idx, (key, row_id)),
@@ -671,11 +835,8 @@ impl BPlusTree {
                     alloc: vec![new_page],
                 }
             }
-            BTreeNode::Internal {
-                mut keys,
-                mut children,
-            } => {
-                let child_idx = keys.iter().position(|k| key < *k).unwrap_or(keys.len());
+            BTreeNode::Internal { keys, children } => {
+                let child_idx = Self::child_index(keys, &key);
                 let child_page_id = children[child_idx];
                 let child = self.insert_recursive(child_page_id, key, row_id);
                 if !child.landed {
@@ -684,6 +845,8 @@ impl BPlusTree {
                 let Some((promote_key, new_page)) = child.promote else {
                     return child; // 下面没分裂 ⇒ 孩子那条写入原样上交
                 };
+                // 走到这里才需要 owned 副本（这一层要插一把上提键、挂一个新子）
+                let (mut keys, mut children) = (keys.clone(), children.clone());
                 keys.insert(child_idx, promote_key);
                 children.insert(child_idx + 1, new_page);
                 if keys.len() < order && Self::internal_total_bytes(&keys, children.len()) <= cap {
@@ -747,10 +910,7 @@ impl BPlusTree {
                 .ok()
                 .map(|idx| entries[idx].1.clone()),
             BTreeNode::Internal { keys, children } => {
-                let child_idx = keys
-                    .iter()
-                    .position(|k| key < k.clone())
-                    .unwrap_or(keys.len());
+                let child_idx = Self::child_index(keys, &key);
                 let next = children[child_idx];
                 self.get_recursive(next, key)
             }
@@ -781,10 +941,7 @@ impl BPlusTree {
             }
             BTreeNode::Internal { keys, children } => {
                 // 找到子节点
-                let child_idx = keys
-                    .iter()
-                    .position(|k| key < k.clone())
-                    .unwrap_or(keys.len());
+                let child_idx = Self::child_index(keys, &key);
                 let child_page_id = children[child_idx];
                 // 递归更新子节点
                 self.update_recursive(child_page_id, key, new_row_id)
@@ -811,6 +968,13 @@ impl BPlusTree {
     }
 
     fn read_node(&mut self, page_id: PageId) -> BTreeNode {
+        // M34 试过把这里改成走 `node_of`（解析缓存），**复测把它退回来了**：600k 档
+        // `vacuum()` 全库 12.27 s → **15.12 s**，而同一天没被碰过的 bitcask 那条从 5.79 s 变成
+        // 4.52 s（噪声朝反方向）⇒ 比值 2.12× → 3.34× 是这一处带来的。
+        // 为什么删除/重组那条路和插入不同：它是**走查** —— 每页基本只碰一次，回填解析缓存换不到
+        // 下一次命中，只多付了 `Arc` 分配、HashMap 插入、`pin` 检查与装满之后的整表 `retain`
+        // （和 [`crate::bplus_tree::page::PageManager::read_page_for_walk`] 当年"装得下才回填"
+        // 是同一个理由）。插入那条路的页会被连续几百行反复用到，所以它值得（见 `insert_recursive`）。
         let data = self.page_manager.read_page(page_id).expect("read page");
         bincode::deserialize(&data).expect("deserialize node")
     }
@@ -1004,18 +1168,14 @@ impl BPlusTree {
         let tail = right_next;
         let mut union = left_entries;
         union.extend(right_entries);
-        // 逐条问 bincode：`RowId` 是 `Option<Vec<u8>>`（变长），手算常量错一次就是写坏页
-        let per: Vec<i64> = union.iter().map(|e| Self::vec_item_bytes(e) as i64).collect();
+        // 每条的字节由探针常量导出（`RowId` 是 `Option<Vec<u8>>` ⇒ 变长，手算硬编码错一次就是
+        // 写坏页，所以常量本身是量出来的，并由逐档对拍钉住）
         let cap = MAX_PAYLOAD as i64;
         // 左半页的下一叶就是右半页，右半页接原本右页的下一叶 ⇒ 两个 base 分开算
         let base_left = Self::leaf_base(Some(right_page));
         let base_right = Self::leaf_base(tail);
         // 前缀和：`prefix[i]` = 前 i 条的字节和 ⇒ 任意半页的字节都是 O(1) 拿到
-        let mut prefix = Vec::with_capacity(union.len() + 1);
-        prefix.push(0i64);
-        for b in &per {
-            prefix.push(prefix.last().unwrap() + b);
-        }
+        let prefix = Self::prefix_bytes(&union, Self::entry_bytes);
         let left_bytes = |i: usize| -> i64 { base_left + prefix[i] };
         let right_bytes = |i: usize| -> i64 { base_right + (prefix[union.len()] - prefix[i]) };
 
@@ -1196,16 +1356,13 @@ impl BPlusTree {
         let base = Self::internal_base();
         let cu = Self::internal_child_unit();
         let cap = MAX_PAYLOAD as i64;
-        let per: Vec<i64> = union_keys
-            .iter()
-            .map(|k| Self::vec_item_bytes(k) as i64)
-            .collect();
         let n = union_keys.len();
+        let pre = Self::prefix_bytes(&union_keys, Self::key_bytes);
         // 左半拿 keys[..i] + children[..i+1]，右半拿 keys[i+1..] + children[i+1..]
         // （keys[i] 本身提回父当分隔键 ⇒ 不进任何一半）
-        let left_bytes = |i: usize| -> i64 { base + per[..i].iter().sum::<i64>() + (i as i64 + 1) * cu };
+        let left_bytes = |i: usize| -> i64 { base + pre[i] + (i as i64 + 1) * cu };
         let right_bytes = |i: usize| -> i64 {
-            base + per[i + 1..].iter().sum::<i64>() + (n as i64 - i as i64) * cu
+            base + (pre[n] - pre[i + 1]) + (n as i64 - i as i64) * cu
         };
 
         // ① union 整个装得下一页 ⇒ 真合并（父丢一把键与一个子节点，右页释放）
@@ -1379,7 +1536,7 @@ impl BPlusTree {
                 true
             }
             BTreeNode::Internal { keys, children } => {
-                let child_idx = keys.iter().position(|k| key < *k).unwrap_or(keys.len());
+                let child_idx = Self::child_index(&keys, &key);
                 let child_page_id = children[child_idx];
                 let deleted = self.delete_recursive(child_page_id, key, Some(node_page_id));
                 if !deleted {
@@ -1551,10 +1708,7 @@ impl BPlusTree {
         match &*node {
             BTreeNode::Leaf { .. } => Some(node_page_id),
             BTreeNode::Internal { keys, children } => {
-                let child_idx = keys
-                    .iter()
-                    .position(|k| key < k.clone())
-                    .unwrap_or(keys.len());
+                let child_idx = Self::child_index(keys, &key);
                 let next = children[child_idx];
                 self.find_leaf_for_key(next, key)
             }
@@ -1951,6 +2105,8 @@ mod tests {
     ///
     /// 为什么单开一条：公式偏了，落盘前的 `node_fits` 只会让它退回
     /// "什么都不动" ⇒ 数据一条不丢、测试全绿，但优化**静默地没发生**。这种失败只有对拍抓得到。
+    /// M34 把"逐条问 bincode"换成"逐条两次加法 + 一组探针常量" ⇒ 对拍必须额外覆盖
+    /// **同一页里键长不一、`RowId` 有 `None` 有 `Some`** 的形状 —— 线性假设只在这些地方会破。
     #[test]
     fn test_reorg_size_formula_matches_bincode() {
         fn item(i: usize, pad: usize) -> (Key, RowId) {
@@ -1968,10 +2124,7 @@ mod tests {
                 };
                 let real = bincode::serialize(&node).unwrap().len() as i64;
                 let formula = BPlusTree::leaf_base(next_leaf)
-                    + items
-                        .iter()
-                        .map(|e| BPlusTree::vec_item_bytes(e) as i64)
-                        .sum::<i64>();
+                    + items.iter().map(BPlusTree::entry_bytes).sum::<i64>();
                 assert_eq!(formula, real, "叶子字节公式不等于真实序列化（pad={pad}）");
             }
 
@@ -1983,10 +2136,132 @@ mod tests {
             };
             let real = bincode::serialize(&node).unwrap().len() as i64;
             let formula = BPlusTree::internal_base()
-                + keys.iter().map(|k| BPlusTree::vec_item_bytes(k) as i64).sum::<i64>()
+                + keys.iter().map(BPlusTree::key_bytes).sum::<i64>()
                 + (keys.len() as i64 + 1) * BPlusTree::internal_child_unit();
             assert_eq!(formula, real, "内部节点字节公式不等于真实序列化（pad={pad}）");
         }
+
+        // 混合形状：键长每档不同 + 每三条有一条 `RowId(None)`
+        let mixed: Vec<(Key, RowId)> = (0..60)
+            .map(|i| {
+                (
+                    format!("{:04}{}", i, "@".repeat(i % 17)).into_bytes(),
+                    if i % 3 == 0 {
+                        RowId(None)
+                    } else {
+                        RowId(Some(vec![b'v'; i % 29]))
+                    },
+                )
+            })
+            .collect();
+        for next_leaf in [None, Some(PageId(3))] {
+            let node = BTreeNode::Leaf {
+                entries: mixed.clone(),
+                next_leaf,
+            };
+            let real = bincode::serialize(&node).unwrap().len() as i64;
+            let formula = BPlusTree::leaf_base(next_leaf)
+                + mixed.iter().map(BPlusTree::entry_bytes).sum::<i64>();
+            assert_eq!(
+                formula, real,
+                "混合键长 + 空 RowId 的叶子公式与真实序列化不等"
+            );
+        }
+        // 逐条单独对拍：常量的线性假设若错，这里就是第一处红（不必等到整页级）
+        let vec_base = bincode::serialized_size(&Vec::<(Key, RowId)>::new()).unwrap() as i64;
+        for e in &mixed {
+            let probe = bincode::serialized_size(&[e][..]).unwrap() as i64 - vec_base;
+            assert_eq!(
+                BPlusTree::entry_bytes(e),
+                probe,
+                "单条字节与探针不等（键 {} 字节）",
+                e.0.len()
+            );
+        }
+    }
+
+    /// 顺序灌行时**下降一趟都不许摸盘**：写完的页必须直接回填解析缓存（M34）。
+    ///
+    /// 判据：灌 N 行期间 `page_reads()` 平均 < 0.1 次/行。这把尺子在两种回归下都会响：
+    /// ① 下降退回裸 `read_page` + 解析 ⇒ 实测 **2.94 次/行**（每层一次，M34 修前的读数）；
+    /// ② 走了缓存但**不回填** ⇒ 每行 ≥ 1 次（上一条自己刚写脏的那一页，下一条马上要用）。
+    /// 为什么不用"解析次数"当判据：退回 ① 的时候解析发生在 `node_of` 之外，那把尺子读到的是
+    /// **0** —— 一个"看起来更省"的空转读数，抓不到回归（M34 第一版就是被这个 0 骗了一次）。
+    ///
+    /// 变异验证：删掉 `insert` 写回循环里那句 `cache_written` ⇒ 每行 1.00 次，红。
+    #[test]
+    fn test_sequential_insert_descends_without_touching_pages() {
+        const N: usize = 8000;
+        let mut tree = BPlusTree::new(64, 4096);
+        let k = |i: usize| -> Key {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        };
+        let r0 = crate::bplus_tree::page::page_reads();
+        for i in 0..N {
+            assert!(
+                tree.insert(k(i), RowId(Some(vec![b'v'; 47]))),
+                "插入第 {i} 行失败"
+            );
+        }
+        let reads = crate::bplus_tree::page::page_reads() - r0;
+        assert!(
+            reads * 10 <= N as u64,
+            "顺序灌行平均每行摸 {:.3} 次页 ⇒ 下降还在从页缓存之外取节点，或者写完的页没回填解析缓存\
+             （N={N}，页读={reads}；修前实测 2.94 次/行）",
+            reads as f64 / N as f64
+        );
+        // 上面那条只证明"没摸盘"，还得证明"数据真在里面"——缓存回填错了也会一个字节都不读。
+        assert_eq!(tree.iter().count(), N, "行数一条不许少");
+        for i in (0..N).step_by(317) {
+            assert!(tree.get(k(i)).is_some(), "第 {i} 行读不回来");
+        }
+    }
+
+    /// 定位一个子节点**不许线性扫整页分隔键**（M34 的第二刀）。
+    ///
+    /// 判据取**单次定位最多比较几把键**，界 = log2(order) + 2（`order=64` ⇒ 8；二分最坏 6）。
+    /// 为什么不用平均值：平均值被树形摊薄 —— 第一版用"平均 ≤ 2·log2"时，退回线性扫只把平均
+    /// 推到 **11.0**（界 12），变异抓不住；而同一次变异下"最坏那一次"是**整页键数**（实测 40+）。
+    /// 为什么这条值得钉成断言：顺序灌行时目标**永远是最后一个子**，线性扫每层都要走满整页键数，
+    /// 而这笔钱在 µs 上会被本机的跨构建漂移（1.3~1.9×）整个盖住 —— 只有计数看得见。
+    ///
+    /// 变异验证：把 `child_index` 换回线性扫 ⇒ 最坏一次涨到整页键数，红。
+    #[test]
+    fn test_child_location_is_binary_not_linear() {
+        const N: usize = 6000;
+        let mut tree = BPlusTree::new(64, 4096);
+        let k = |i: usize| -> Key {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        };
+        for i in 0..N {
+            assert!(
+                tree.insert(k(i), RowId(Some(vec![b'v'; 47]))),
+                "插入第 {i} 行失败"
+            );
+        }
+        // 升序读：这是线性扫的**最坏**情况（每次都扫到页尾），也是灌行的实际形状
+        let l0 = descent_lookups();
+        let c0 = descent_key_comps();
+        for i in 0..N {
+            assert!(tree.get(k(i)).is_some(), "第 {i} 行读不回来");
+        }
+        let lookups = descent_lookups() - l0;
+        let comps = descent_key_comps() - c0;
+        assert!(lookups > 0, "这把尺子没数到定位次数 ⇒ 空转");
+        let per = comps as f64 / lookups as f64;
+        let worst = descent_max_comps();
+        let bound = (64f64).log2() as u64 + 2;
+        eprintln!(
+            "[descent] 定位 {lookups} 次 / 平均 {per:.1} 把 / 最坏一次 {worst} 把（界 {bound}，order=64）"
+        );
+        assert!(
+            worst >= 4,
+            "最坏一次只比较 {worst} 把 ⇒ 这棵树的内部节点窄到没东西可量，这条判据在空转"
+        );
+        assert!(
+            worst <= bound,
+            "单次定位最多比较 {worst} 把分隔键（界 {bound}）⇒ 下降退回线性扫"
+        );
     }
 
     /// delete 密集之后**页数必须收回来到 rows/每页容量** —— 这条才是"合并后再分裂"的验收。
