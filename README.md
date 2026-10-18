@@ -6,8 +6,8 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 288 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M29**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 291 个单元测试 + 4 个集成测试
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M30**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账)—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -18,15 +18,15 @@
 (发布于 2026-10-15,未 yank)。**这一版已经包含**七条"随 uptime 恶化"通道的修复与 M9 的门面
 改造(`KvEngine: Send + Sync`、类型化选型、`EngineName`)⇒ 版本号依赖就能拿到。
 
-但 0.4.0 那个发布件**不含 10-16 之后的 M10–M29**:LSM 点查的常驻文件句柄与稀疏索引二分
+但 0.4.0 那个发布件**不含 10-16 之后的 M10–M30**:LSM 点查的常驻文件句柄与稀疏索引二分
 (下游实测单次点查 0.86 ms 那条就是它)、四引擎窗口/前缀 scan 的界下推、bitcask 懒分配写缓冲、
 B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`、四引擎
 事务内核合成一份、`migrate` + `scan_page`、LSM 灌行 O(N²)、`seek_prev` 整段物化、游标未下推、
-B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实、有界回收一片改惰性归并。
-磁盘格式这二十批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
+B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账。
+磁盘格式这二十一批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M29
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M30
 storage-engines = { path = "../storage-engines" }
 
 # (b) 走远端:git 依赖(gitee 与 github 内容一致)
@@ -36,7 +36,7 @@ storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branc
 storage-engines = "0.4"
 ```
 
-`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M29 又想要版本号依赖,
+`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M30 又想要版本号依赖,
 只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
 MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
@@ -727,9 +727,10 @@ lsm 灌行 20.7 / 20.6 / 23.5（记 14.5）⇒ 本机（`D:` 是 5400 转机械�
   不用墙钟；把条件退回无条件 ⇒ 红在 `[0,1,0,0] ≠ [2,0,0,0]`，且它自带"形状没造出来就报空转"的
   前置断言）、`test_open_persists_redo_before_truncating_wal`（反面对照：把 flush 整个删掉也过第一条，
   所以这条量的是**WAL 截断之后的第二次重开还读不读得回来** + memtable 必须已空 ⇒ 红在 `1 ≠ 0`）。
-- ⚠️ **诚实边界**：压实没有消失，只是不再由"打开库"来做。带 redo 的崩溃恢复仍然要 flush ⇒
-  仍然 14.4 s（跨轮 12~17 s，这一笔挂在未修队列，根因是压实的输入整篇物化，见 M27 那条末尾）；
-  而干净重启后第一次写或 `checkpoint` 会把这笔 L0 压实付掉。改的是**"重启即服务"的等待时间**，
+- ⚠️ **诚实边界**：压实没有消失，只是不再由"打开库"来做。带 redo 的崩溃恢复仍然要 flush；
+  M30 之前那一步是 12~17 s，**M30 拆分计时后查到真元凶是 `SstBuilder::estimated_bytes()`
+  每行重求和整表**（不是"输入整篇物化"），修完同档 **14.43 s → 3.55 s**（见下面 M30 那段）；
+  而干净重启后第一次写或 `checkpoint` 会把这笔 L0 压实付掉。M28 改的是**"重启即服务"的等待时间**，
   不是总写放大。
 - ⚠️ 另外两家**没跟着改**，理由是量出来的差别而不是"以后统一"：bitcask 的 `flush()` = 空缓冲直接
   返回 + 一次 fsync，bplus 的 `flush_all()` 还兼着把 `next_version` 落到 meta 页（redo 为空也必须做）。
@@ -812,6 +813,8 @@ REOPEN_PROBE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture \
 # （计数与构建档位无关，debug 也能量 —— 墙钟才是 release 的活）
 LSM_VAC_ROWS=20000 LSM_VAC_FILES=24 cargo test --release --lib -- --ignored --nocapture \
     --test-threads=1 vacuum_slice_fold_attribution
+# M30 的压实耗时拆分：把「物化输入 / 纯归并 / 归并+写盘」三段分别计时 ⇒ 结构嫌疑不等于时间元凶
+LSM_COMPACT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture     --test-threads=1 compaction_cost_split
 ```
 
 ### WAL 与崩溃恢复
@@ -1095,8 +1098,9 @@ data.db.lock       单写者锁(内含 pid)
   重开常驻 12.1 → **1.9 MB**;机制是 bulk 的 `finish()` 把 L0 正好留在阈值(8)上,而 200k 只有 4 个
   文件不越线 —— **两档比不出阈值,这条就是被"只比两档"藏住的**。守卫两条(尺子=层文件数,不用墙钟),
   两次变异各自证红,见上面"三档复测"那节。
-  ⚠️ **没消失,只是不再由"打开库"付**:带 redo 的崩溃恢复仍然必须 flush ⇒ 仍然 14.4 s,跨轮 12~17 s(根因是下条
-  整篇物化);干净重启后第一次写/`checkpoint` 会把这笔压实付掉。改的是重启等待,不是总写放大。
+  ⚠️ **没消失,只是不再由"打开库"付**:带 redo 的崩溃恢复仍然必须 flush —— 那一步原先 12~17 s,
+  **M30 查明元凶是压实里"每行重求和整表"的尺寸判定(不是下条那个整篇物化)**,修完同档 3.55 s;
+  干净重启后第一次写/`checkpoint` 会把这笔压实付掉。改的是重启等待,不是总写放大。
   ⚠️ bitcask / bplus 两家 open 里那两处 flush **故意没跟着改**:量下来它们的 flush 是有界的
   (一次 fsync / 顺带把 `next_version` 落 meta 页),给它们加条件既没有可证的收益、也造不出
   不空转的断言 —— 两处的代码注释里写明了"若将来长出随库涨的活,照哪把尺子改"。
@@ -1109,10 +1113,19 @@ data.db.lock       单写者锁(内含 pid)
   ⚠️ 连带删掉了旧实现里"窗口太窄就放大 4 倍重试"那套补偿(惰性流不会切在半组上,那个情形结构上
   不存在),以及 `scan_latest_light_window` / `light_view_break_from` 两个 pub 入口 —— **对 0.4.0 是
   破坏性变更**,已在 CHANGELOG 列出。
-- **压实与修复的输入是整篇物化**:`merge_to_ssts` 收的是 `Vec<Vec<(键, 条目)>>`,而
+- **压实的尺寸判定曾按行走整表(M30 已修)**:`merge_to_ssts` 每交一行问一次
+  `b.estimated_bytes() >= target`,旧实现是 `entries.iter().map(...).sum()` ⇒ 每个输出文件
+  O(表内行数²)(一张 2 MiB 表 ≈19 000 行 ⇒ 每输入行摊到 30 µs)。改成在 `add` 里增量维护的账之后,
+  同档"归并+写盘" **18 018.5 → 3 113.6 ms**、带 redo 的重开 **14.43 s → 3.55 s**。
+  这是 M19("flush 判定每插一行数一遍 memtable")同一个病的第二次出现,这次在 SST 写侧 ——
+  **同类病灶要按"每行都问一次的判定"这个形状去扫,不是按"memtable"这个名字去扫。**
+- **压实与修复的输入是整篇物化**(这是**内存**账,M30 之后仍然挂着):`merge_to_ssts` 收的是 `Vec<Vec<(键, 条目)>>`,而
   `SstFile::iter_entries()` 把一个文件全读进内存 ⇒ 一次压实的瞬时内存 ≈ **所有输入文件的条目总和**
   (不是"约一个 SST")。`SstBuilder` 侧确实是流式的,`sst.rs` 那句注释只写对了一半。修复重叠共用
   同一条账单,没有额外恶化;把它改成真正的流式源是独立的一条待办。
+  ⚠️ **但这条不是"压实慢"的原因**:M30 的拆分实测(600k 行)是 物化输入 0.62 s / 纯归并 0.48 s /
+  **归并+写盘 18.0 s(占 94%)** ⇒ 时间是上面那条 `estimated_bytes()` 给的,不是这句 `collect()` 给的。
+  我原先把 12~17 s 归给它,那是错的,这里留着这条修订。
 - compact 时每个 key 只保留最新一条,`enable_snapshot_gc` 并未真正按 snapshot 水位保留旧版本(源码注释已自陈)
 - `blobs/` 旁路的回收挂在 `vacuum()` 的全库轮次上(compact 判不了"别的层里还有更新的版本引用同一个 blob");**有界轮次不动 blob**,引用关系只有全库才看得全
 - `start_bg_compact` 只建控制块不起线程,真正的后台线程要显式调 `spawn_bg_compactor`
@@ -1343,7 +1356,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:288 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:291 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(21 个,含大库基线台架;四引擎全覆盖)
 SCALE_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline
                               # 四引擎 × 每种操作的大库基线(µs/次 + 常驻/峰值 MB)

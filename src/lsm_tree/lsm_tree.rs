@@ -1144,6 +1144,12 @@ impl LSMTree {
         self.sst_block_count()
     }
 
+    /// 测试专用：第 0 层的文件句柄（M30 的耗时拆分要从这里取压实输入）
+    #[cfg(test)]
+    pub(crate) fn l0_for_test(&self) -> &[SstFile] {
+        self.levels.first().map(|l| l.as_slice()).unwrap_or(&[])
+    }
+
     /// 测试专用：把一批**已按键升序**的条目直接写成一个 SST 挂进某一层。
     ///
     /// 为什么要它：`repair_level_overlaps` 要收拾的那个形状（同层两个范围重叠的文件）

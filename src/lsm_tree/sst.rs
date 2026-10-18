@@ -1394,6 +1394,40 @@ pub struct SstBuilder {
     enable_bloom: bool,
     bloom_bits_per_key: usize,
     entries: Vec<(Vec<u8>, StoredEntry)>,
+    /// `entries` 的字节账，**增量维护**（M30）。
+    ///
+    /// 为什么必须是计数器而不是现算：`merge_to_ssts` 每交出一行就问一次
+    /// `estimated_bytes() >= target_bytes`，而旧实现是 `entries.iter().map(...).sum()` ——
+    /// 于是**每个输出文件**内部是 O(表内行数²)。600k 行压实的实测拆分：整条 18.0 s，其中
+    /// "归并+写盘"占 17.5 s（94%），而"物化输入"只有 0.6 s、"纯归并"0.5 s ⇒
+    /// 每输入行摊到 ≈30 µs，正好是"一张表 ~19 000 行、每行重求和半表"的常数量级。
+    /// 这条与 M19（`flush` 判定每插一行数一遍 memtable）是同一个病的第二次出现，
+    /// 所以口径那句 (`k.len() + se.estimate_bytes() + 8`) 一字不动地搬进增量里，
+    /// 并留 `estimated_bytes_slow` 当对拍对照 + 一把"为判定走过多少条目"的尺子。
+    est_bytes: usize,
+}
+
+// 测试专用尺子：一次"要不要切文件"的判定**走过了多少个条目**。
+// 生产路径必须是 0；`estimated_bytes_slow`（对拍用）负责证明这把尺子不是空转。
+#[cfg(test)]
+thread_local! {
+    static BUILDER_SIZE_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn builder_size_walks() -> u64 {
+    BUILDER_SIZE_WALKS.with(|c| c.get())
+}
+
+/// `entries` 的字节数（旧算法，留着当对拍与尺子；生产路径一步都不该走它）
+#[cfg(test)]
+fn sum_entries_bytes(entries: &[(Vec<u8>, StoredEntry)]) -> usize {
+    #[cfg(test)]
+    BUILDER_SIZE_WALKS.with(|c| c.set(c.get() + entries.len() as u64));
+    entries
+        .iter()
+        .map(|(k, se)| k.len() + se.estimate_bytes() + 8)
+        .sum()
 }
 
 impl SstBuilder {
@@ -1419,6 +1453,7 @@ impl SstBuilder {
             enable_bloom,
             bloom_bits_per_key: 10,
             entries: Vec::new(),
+            est_bytes: 0,
         }
     }
 
@@ -1429,6 +1464,8 @@ impl SstBuilder {
                 "SST keys must be non-decreasing"
             );
         }
+        // 口径与 `sum_entries_bytes` 里那句一字不差（对拍守卫钉着这两处）
+        self.est_bytes += key.len() + se.estimate_bytes() + 8;
         self.entries.push((key, se));
     }
 
@@ -1444,11 +1481,16 @@ impl SstBuilder {
         self.entries.is_empty()
     }
 
+    /// O(1)：读增量账。**不许**改回 `entries.iter().sum()` —— 这里每被调一次都要走一遍整表的话，
+    /// `merge_to_ssts` 的"每行问一次"就把压实变成 O(表内行数²)（实测 600k 行 18.0 s，94% 在这一步）。
     pub fn estimated_bytes(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|(k, se)| k.len() + se.estimate_bytes() + 8)
-            .sum()
+        self.est_bytes
+    }
+
+    /// 慢口径，只给守卫当对拍与尺子用（见 `test_builder_estimated_bytes_matches_slow_scan`）
+    #[cfg(test)]
+    pub(crate) fn estimated_bytes_slow(&self) -> usize {
+        sum_entries_bytes(&self.entries)
     }
 
     pub fn finish(self) -> std::io::Result<SstFile> {
@@ -1741,6 +1783,121 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         crate::common::tmp_test_path("sst", tag, ".sst")
+    }
+
+    /// 增量账必须与旧算法**逐字节同口径**（M30）。
+    ///
+    /// 这条不是装饰：`est_bytes` 是把一句求和手搬进 `add` 里维护的，搬掉那个 `+8`（每行一条的
+    /// 帧头）就会让"什么时候切文件"悄悄变 —— 输出文件的数量与大小跟着变，而在压测表上那只
+    /// 表现为"慢了 3%"，没人会往这里查。
+    #[test]
+    fn test_builder_estimated_bytes_matches_slow_scan() {
+        let mut b = SstBuilder::with_options(1, tmp("est_parity"), 64, false);
+        assert_eq!(b.estimated_bytes(), 0, "空表两边都该是 0");
+        for i in 0..500usize {
+            b.add(
+                format!("k{i:05}").into_bytes(),
+                StoredEntry::put(i as u64, Some(vec![b'v'; i % 37])),
+            );
+        }
+        assert_eq!(
+            b.estimated_bytes(),
+            b.estimated_bytes_slow(),
+            "增量账与慢口径不一致 ⇒ 切文件的时机变了"
+        );
+        // 空 value 与墓碑也得同口径（那句 `+8` 是行头，不是常数 8）
+        let mut t = SstBuilder::with_options(2, tmp("est_tomb"), 64, false);
+        t.add(b"a".to_vec(), StoredEntry::put(1, None));
+        t.add(b"b".to_vec(), StoredEntry::drop_at(2));
+        t.add(b"cccc".to_vec(), StoredEntry::put(3, Some(b"xyz".to_vec())));
+        assert_eq!(t.estimated_bytes(), t.estimated_bytes_slow());
+    }
+
+    /// "要不要切文件"这个判定**不许走整表**（M30）。
+    ///
+    /// 触发它的测量：压实的耗时拆分台架 `compaction_cost_split` 显示 600k 行那一趟 18.0 s 里
+    /// **94% 在"归并+写盘"**，而"物化输入"只 0.62 s、"纯归并"只 0.48 s ⇒ 病**不在**我原先点名的
+    /// "整篇物化"，在 `merge_to_ssts` 每交出一行都问一次 `estimated_bytes()`，而旧实现把当前表
+    /// 从头求和一遍 ⇒ 每个输出文件 O(表内行数²)。这是 M19（flush 判定每插一行数一遍 memtable）
+    /// 同一个病的第二次出现，这次在 SST 写侧。
+    ///
+    /// 尺子 = **为判定走过的条目数**，生产路径必须是 0；同一条用例里主动慢算一次，
+    /// 证明这把尺子确实数得到（不然上面那条断言是空转）。
+    #[test]
+    fn test_builder_size_check_does_not_walk_entries_per_add() {
+        const N: usize = 4000;
+        let mut b = SstBuilder::with_options(1, tmp("est_hot"), 64, false);
+        let s0 = builder_size_walks();
+        for i in 0..N {
+            b.add(
+                format!("k{i:05}").into_bytes(),
+                StoredEntry::put(i as u64, Some(vec![b'x'; 40])),
+            );
+            // 照 `merge_to_ssts` 的形状每行问一次"够不够切一个文件"
+            if b.estimated_bytes() >= usize::MAX {
+                panic!("哨兵条件不该命中：这条用例只关心判定走过多少条目");
+            }
+        }
+        let walks = builder_size_walks() - s0;
+        assert_eq!(
+            walks, 0,
+            "灌 {N} 行为回答「该不该切文件」走了 {walks} 个条目 ⇒ 判定又变回每行重求和一遍整表\
+             （旧形状 ≈ {} 步）",
+            (N * (N - 1) / 2) as u64
+        );
+        // 对照：主动慢算一次，探针必须数得到 —— 注意**单位**：尺子数的是"走过的条目数"，
+        // 而 `estimated_bytes_slow` 返回的是字节数，两者不能直接比。
+        let w1 = builder_size_walks();
+        let slow_bytes = b.estimated_bytes_slow();
+        let control_steps = builder_size_walks() - w1;
+        assert!(
+            control_steps >= N as u64,
+            "探针空转：慢口径只走了 {control_steps} 个条目，对照必须数到 ≥{N}"
+        );
+        assert!(
+            slow_bytes > 0,
+            "慢口径返回 0 ⇒ 这条对照本身没建立，上面的 0 断言不算数"
+        );
+    }
+
+    /// 真调用点上这条账也必须是 0（M30）：上面那条量的是形状，这条量的是 `merge_to_ssts` 本身。
+    #[test]
+    fn test_merge_to_ssts_does_not_walk_entries_for_size_check() {
+        const PER: usize = 3000;
+        let sources: Vec<Vec<(Vec<u8>, StoredEntry)>> = vec![
+            (0..PER)
+                .map(|i| {
+                    (
+                        format!("a{i:06}").into_bytes(),
+                        StoredEntry::put(i as u64, Some(vec![1u8; 60])),
+                    )
+                })
+                .collect(),
+            (0..PER)
+                .map(|i| {
+                    (
+                        format!("b{i:06}").into_bytes(),
+                        StoredEntry::put(i as u64, Some(vec![1u8; 60])),
+                    )
+                })
+                .collect(),
+        ];
+        let mut id = 0u64;
+        let s0 = builder_size_walks();
+        // target 给 64 KiB ⇒ 6000 行该切出好几个文件（"每行问一次判定"这一步真的被走到）
+        let files = merge_to_ssts(sources, |_, _| true, || {
+            id += 1;
+            SstBuilder::with_options(id, tmp(&format!("est_merge_{id}")), 64, false)
+        }, 64 * 1024)
+        .unwrap();
+        let walks = builder_size_walks() - s0;
+        assert!(
+            files.len() >= 3,
+            "形状没造出来：target 64 KiB 下 6000 行只切了 {} 个文件 ⇒ 判定可能一次都没问过",
+            files.len()
+        );
+        assert_eq!(walks, 0, "{} 行 × {} 个文件的压实里，尺寸判定走了 {walks} 个条目", PER * 2, files.len());
+        drop(files);
     }
 
     /// 命中一次的代价**不随驻留块数涨**（M23 自己引入的回归，留下的守卫）。

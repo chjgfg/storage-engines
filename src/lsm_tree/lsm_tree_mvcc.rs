@@ -2393,6 +2393,161 @@ mod tests {
         cleanup(&path);
     }
 
+    /// 压实的耗时到底在哪一段（M30 的先量，不改语义）。
+    ///
+    /// 为什么要拆：`reopen_shape_probe` 只给出"13.9 s 全在 `flush` 里"，而 `flush` 里混着
+    /// **三件事** —— ①把每个输入文件整篇读进 `Vec`（`iter_entries` = `iter_all().collect()`）、
+    /// ②k 路归并（每步克隆键与值）、③边归并边写新 SST（`SstBuilder` 侧本来就是流式的）。
+    /// "改成流式源"只治 ①，如果时间其实在 ② 或 ③，那这一刀就买错了东西。
+    ///
+    /// 四段各量两次里的两次：`t_materialize` → `t_merge_write`（消费第一份物化），
+    /// 再 `t_materialize2`（页缓存已热，用来看 ① 里有多少是冷读）→ `t_merge_only`（纯归并，
+    /// sink 只计数）。⇒ **写 ≈ merge_write − merge_only**，冷读分量 ≈ materialize − materialize2。
+    ///
+    /// # 量出来的答案（release，600k 行 = 8 个输入文件 61 MB → 34 个输出文件 67 MB）
+    ///
+    /// | 段 | 修前 | 修后 | 每输入行（修前 → 修后） |
+    /// |---|---|---|---|
+    /// | ① 物化输入 | 618 ms | 906 ms | 1.03 → 1.51 µs（噪声内，**不是病**） |
+    /// | ② 纯归并 | 476 ms | 765 ms | 0.79 → 1.27 µs |
+    /// | ③ 归并+写盘 | **18 018 ms** | **3 114 ms** | **30.03 → 5.19 µs** |
+    ///
+    /// ⇒ 病在 ③，占修前 ①+③ 的 **94%**；而 ③ 里唯一"每行都做一次、且随表长"的事是
+    /// `merge_to_ssts` 的 `if b.estimated_bytes() >= target_bytes` —— 旧实现每次调用都把当前
+    /// builder 的整表从头求和一遍（一张 2 MiB 的表 ≈19 000 行 ⇒ 每行摊到 ~30 µs，正是实测那个数）。
+    /// **我原先点名的"整篇物化"只值 0.6 s**：那是**内存**问题（瞬时 ≈ 输入条目总和），不是时间问题。
+    /// 修法就是 M19 的同一个动作：把求和改成增量账。连带效果：带 redo 的重开 14.43 s → **3.55 s**，
+    /// 而 `facade` 干净重开 30.8 ms 不变（M28 那条仍然成立）。
+    ///
+    /// ```text
+    /// LSM_COMPACT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture \
+    ///     --test-threads=1 compaction_cost_split
+    /// ```
+    #[test]
+    #[ignore = "压实耗时拆分，手动 release 单线程跑：LSM_COMPACT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 compaction_cost_split"]
+    fn compaction_cost_split() {
+        use std::time::Instant;
+        use crate::lsm_tree::sst::{SstBuilder, StoredEntry, merge_streaming, merge_to_ssts};
+
+        let rows: usize = std::env::var("LSM_COMPACT_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+        let files: usize = std::env::var("LSM_COMPACT_FILES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+
+        // 压实与 L0 背压都抬到不会触发：这条要在**压实之前**把输入抓在手里反复量
+        let mut opts = LSMTreeOptions::for_mvcc();
+        opts.l0_compact_threshold = usize::MAX / 4;
+        opts.max_compactions_per_flush = 0;
+        opts.l0_slowdown_trigger = usize::MAX / 8;
+        opts.l0_stop_trigger = usize::MAX / 8;
+
+        let dir = tmp_db("compact_split");
+        let out_dir = tmp_db("compact_split_out");
+        {
+            let mvcc = MVCC::try_open_with(&dir, Some(opts.clone())).unwrap();
+            let per = (rows + files - 1) / files;
+            for f in 0..files {
+                let lo = f * per;
+                let hi = (lo + per).min(rows);
+                if lo >= hi {
+                    break;
+                }
+                let mut bulk = mvcc.begin_bulk();
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    (lo..hi).map(|i| (key(i), val(i))).collect();
+                bulk.put_batch_owned(items);
+                bulk.finish();
+            }
+            let st = mvcc.kv.lock().unwrap().stats();
+            eprintln!(
+                "=== 压实拆分 rows={rows} 文件={files} | L0 实际 {} 个 | 盘上 {} MB ===",
+                st.l0_files,
+                st.level_bytes.iter().sum::<u64>() / 1_048_576
+            );
+        }
+
+        let tree = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+        let n_files = tree.l0_for_test().len();
+
+        let t = Instant::now();
+        let sources: Vec<Vec<_>> = tree.l0_for_test().iter().rev().map(|s| s.iter_entries()).collect();
+        let t_materialize = t.elapsed();
+        let total_rows: usize = sources.iter().map(|s| s.len()).sum();
+        let bytes: usize = sources
+            .iter()
+            .flat_map(|s| s.iter())
+            .map(|(k, se)| k.len() + se.estimate_bytes())
+            .sum();
+
+        let block_entries = opts.sst_block_entries;
+        let bloom = opts.enable_bloom;
+        let bits = opts.bloom_bits_per_key;
+        let target = opts.target_sst_bytes;
+        let mut next_id = 0u64;
+        let out_path = out_dir.clone();
+        let mut make = move || {
+            next_id += 1;
+            let p = out_path.join("sst").join(format!("{next_id:08}.sst"));
+            SstBuilder::with_options(next_id, p, block_entries, bloom).with_bloom_bits(bits)
+        };
+        let t = Instant::now();
+        let written = merge_to_ssts(sources, |_: &[u8], _: &StoredEntry| true, &mut make, target).unwrap();
+        let t_merge_write = t.elapsed();
+        let out_bytes: u64 = written.iter().map(|s| s.size_bytes).sum();
+
+        // 第二遍：再物化一次（页缓存已热）+ 纯归并（sink 只计数，不写盘）
+        let t = Instant::now();
+        let sources2: Vec<Vec<_>> = tree.l0_for_test().iter().rev().map(|s| s.iter_entries()).collect();
+        let t_materialize2 = t.elapsed();
+        let mut emitted = 0usize;
+        let t = Instant::now();
+        merge_streaming(sources2, &mut |_: &[u8], _: &StoredEntry| true, |_: Vec<u8>, _| {
+            emitted += 1;
+        });
+        let t_merge_only = t.elapsed();
+
+        eprintln!(
+            "  输入 {total_rows} 行 / {} MB | 输出 {} 个文件 {} MB | 纯归并交出 {emitted} 把键",
+            bytes / 1_048_576,
+            written.len(),
+            out_bytes / 1_048_576
+        );
+        eprintln!(
+            "  ① 物化输入   {:>12.1} ms（热身后 {:.1} ms）⇒ 每行 {:.3} / {:.3} µs",
+            t_materialize.as_secs_f64() * 1e3,
+            t_materialize2.as_secs_f64() * 1e3,
+            t_materialize.as_secs_f64() * 1e6 / total_rows as f64,
+            t_materialize2.as_secs_f64() * 1e6 / total_rows as f64,
+        );
+        eprintln!(
+            "  ② 纯归并     {:>12.1} ms ⇒ 每行 {:.3} µs | ③ 归并+写盘 {:>12.1} ms ⇒ 每输入行 {:.3} µs \
+             | 写这一段 ≈ {:.1} ms（占 ①+③ 的 {:.0}%）",
+            t_merge_only.as_secs_f64() * 1e3,
+            t_merge_only.as_secs_f64() * 1e6 / total_rows as f64,
+            t_merge_write.as_secs_f64() * 1e3,
+            t_merge_write.as_secs_f64() * 1e6 / total_rows as f64,
+            (t_merge_write.as_secs_f64() - t_merge_only.as_secs_f64()) * 1e3,
+            (t_merge_write.as_secs_f64() - t_merge_only.as_secs_f64())
+                * 100.0
+                / (t_materialize.as_secs_f64() + t_merge_write.as_secs_f64()).max(1e-9),
+        );
+        eprintln!("  文件数={n_files}（压实输入个数）| 输出目标 {target} B/文件");
+        drop(tree);
+        drop(written);
+        cleanup(&dir);
+        cleanup(&out_dir);
+    }
+
     /// 一片有界回收**只许走它预算那么多行**（M29）。
     ///
     /// 触发它的测量：三档基线里 `lsm vacuum_bounded 一片`（预算 2048）= 2 716.3 / 10 277.0 /
