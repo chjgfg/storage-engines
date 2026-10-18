@@ -31,6 +31,27 @@ pub(crate) fn node_parses() -> u64 {
     NODE_PARSES.with(|c| c.get())
 }
 
+// 测试专用：`node_cache` 为了腾地方**走过多少个条目**、走**几趟**（M31 的尺子）。
+//
+// 为什么要单独数：M22 把整表 `clear()` 换成 `retain(只留钉住的)`，那次改动是对的（不再白丢上层
+// 页的解析结果），但它留在**每次插入**上 ⇒ 表装满之后每插一条都要走一遍整表（O(容量)），
+// 而随机点读恰好一直把它装满。这笔钱与读盘无关，所以 hits/misses 两把尺子都看不见它。
+#[cfg(test)]
+thread_local! {
+    static NODE_CACHE_SWEEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static NODE_CACHE_VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn node_cache_sweeps() -> u64 {
+    NODE_CACHE_SWEEPS.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn node_cache_visited() -> u64 {
+    NODE_CACHE_VISITED.with(|c| c.get())
+}
+
 /// 行ID：指向数据在磁盘/内存中的位置
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 // pub struct RowId(pub u64);
@@ -349,6 +370,11 @@ impl BPlusTree {
             self.page_manager.pin(page_id);
         }
         if self.node_cache.len() >= self.page_manager.cache_capacity() {
+            #[cfg(test)]
+            {
+                NODE_CACHE_SWEEPS.with(|c| c.set(c.get() + 1));
+                NODE_CACHE_VISITED.with(|c| c.set(c.get() + self.node_cache.len() as u64));
+            }
             // 上限跟页缓存同源；超了丢**没钉住的**，留下钉住的。
             // 以前这里是整表 `clear()`：那等于每装满 cap 个节点就把上层页的解析结果白丢一次，
             // 而下一趟下降立刻要用它们 —— 走查之后点读变贵的那 30% 就是这笔账。
