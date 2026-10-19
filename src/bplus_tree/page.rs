@@ -110,12 +110,19 @@ pub struct PageManager {
     /// （同一份五千行的库，3.3 KB 键时上层占到 **50%**），所以预算必须跟容量挂钩：
     /// 见 [`PageManager::pin_limit`]，钉住的部分永远不超过容量的一半。
     pinned: HashSet<u64>,
+    /// 钉住预算（**可配**，M49）：默认 [`DEFAULT_PIN_BUDGET_PAGES`]，行为与写死那一版一字不差。
+    ///
+    /// 为什么要能调**小**：钉住的那部分是"不参与换出"的容量，它和叶子抢同一份预算。
+    /// 实测 2048 页的顶下住着 1986 页，其中钉住 1024 页全是上层 ⇒ 留给叶子的只有 962 页，
+    /// 而那份库有 1300 片叶子 ⇒ 一轮随机点读缺 1621 页。上层值多少由键长决定，
+    /// 调用方比库清楚自己那份库的叶子住不住得下 —— 这一档的决定权在这里交出。
+    pin_budget: usize,
 }
 
-impl PageManager {
-    /// 钉住的上层页最多多少页（一页 4 KB ⇒ 预算 ≈ 4 MB）
-    const PIN_BUDGET_PAGES: usize = 1024;
+/// 钉住的上层页默认预算（一页 4 KB ⇒ 默认上限 ≈ 4 MB）
+pub(crate) const DEFAULT_PIN_BUDGET_PAGES: usize = 1024;
 
+impl PageManager {
     /// 某页已被写入多少次（上层解析缓存的校验凭据）
     pub fn write_count(&self, page_id: PageId) -> u64 {
         self.page_writes.get(&page_id).copied().unwrap_or(0)
@@ -134,7 +141,7 @@ impl PageManager {
         self.max_cache_pages = pages.max(1);
     }
 
-    /// 钉住预算的**生效上限** = 绝对预算 与 **容量的一半** 取小。
+    /// 钉住预算的**生效上限** = 调用方给的预算 与 **容量的一半** 取小。
     ///
     /// ⚠️ 为什么必须跟容量挂钩，而不是只钉一个绝对数：上层页占全库多少**不是常数**，
     /// 它由"一页装得下几个键"决定 —— 实测同一份五千行的库，35 B 键时上层占 3.0%
@@ -142,8 +149,35 @@ impl PageManager {
     /// 长键 ⇒ 扇出掉到 4 以下、树深从 3 层涨到 8 层）。只按绝对数钉，碰上后者就会把整个缓存
     /// 钉成"一动不动"，叶子一页都装不下 —— 那比不钉还糟。留一半给叶子是这条策略的底线
     /// （守卫里 `pinned × 2 ≤ 容量` 钉的就是它）。
+    ///
+    /// ⚠️ 这半边底线**不跟调用方商量**：`set_pin_budget` 只允许把预算**往小**调的效果，
+    /// 传一个比容量一半还大的数不会突破那条线（否则"抬顶"与"调钉住预算"两个旋钮合起来
+    /// 就能把整份缓存钉死，那正是上面那句话要避免的事故）。
     fn pin_limit(&self) -> usize {
-        Self::PIN_BUDGET_PAGES.min((self.max_cache_pages / 2).max(1))
+        self.pin_budget.min((self.max_cache_pages / 2).max(1))
+    }
+
+    /// 设钉住预算（页数为单位）。`0` = 一页都不钉（叶子拿到全部容量）。
+    ///
+    /// ⚠️ **调小会把已经钉住的页全部放开**（页还在缓存里，只是重新参与换出）：
+    /// 不然"把预算调小"这一动作对一份已经焐热的缓存**完全没有效果** —— 已经钉着的那 1024 页
+    /// 会继续占着容量，叶子一页都进不来，而这个旋钮存在的理由就是"让叶子住满"。
+    /// 放开之后下一次下降会按新预算重新钉几页，代价是那一轮多读几页上层（有界的）。
+    pub fn set_pin_budget(&mut self, pages: usize) {
+        self.pin_budget = pages;
+        if self.pinned.len() > self.pin_limit() {
+            self.pinned.clear();
+        }
+    }
+
+    /// 调用方给的那一档（不是生效值；生效值还要与容量一半取小，见 [`Self::pin_limit`]）
+    pub fn pin_budget(&self) -> usize {
+        self.pin_budget
+    }
+
+    /// 生效的钉住上限（`tuning()` 报的是这个 —— 与 M22/M32"报生效值"的口径一致）
+    pub fn effective_pin_limit(&self) -> usize {
+        self.pin_limit()
     }
 
     /// 这页被钉住了吗（上层下降路上那几个节点）
@@ -307,6 +341,7 @@ impl PageManager {
             bulk_mode: false,
             page_writes: HashMap::new(),
             pinned: HashSet::new(),
+            pin_budget: DEFAULT_PIN_BUDGET_PAGES,
         };
 
         if file_len == 0 {

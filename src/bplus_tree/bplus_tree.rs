@@ -321,6 +321,30 @@ impl BPlusTree {
         self.auto_max_pages
     }
 
+    /// 钉住预算（M49）：把"上层页可以占多少容量"这一档的决定权交给调用方。
+    ///
+    /// 病灶（M32 记下、当时没碰的第二点）：抬顶之后叶子**拿不到整个容量** —— 实测 2048 页的顶下
+    /// 住着 1986 页，其中**钉住 1024 页全是上层**，留给叶子 962 页，而那份库有 1300 片叶子
+    /// ⇒ 一轮随机点读缺 1621 页。上层值多少由键长决定（35 B 键时占 3%，3.3 KB 键时占 50%），
+    /// 库替调用方做不了这个决定，所以这一档改成可配；默认仍是 1024 页
+    /// （`page::DEFAULT_PIN_BUDGET_PAGES`），**不调就和改前一字不差**。
+    ///
+    /// ⚠️ 生效值还要与**容量的一半**取小（`min(预算, 容量/2)`）：那条底线不许被这个旋钮突破，
+    /// 否则"抬顶"+"调大钉住预算"合起来能把整份缓存钉死、叶子一页装不下 —— 比不钉还糟。
+    pub fn set_pin_budget_pages(&mut self, pages: usize) {
+        self.page_manager.set_pin_budget(pages);
+    }
+
+    /// 调用方给的那一档（生效值看 [`Self::pin_limit_pages`]）
+    pub fn pin_budget_pages(&self) -> usize {
+        self.page_manager.pin_budget()
+    }
+
+    /// 生效的钉住上限 = `min(预算, 生效容量 / 2)`
+    pub fn pin_limit_pages(&self) -> usize {
+        self.page_manager.effective_pin_limit()
+    }
+
     pub fn cache_policy(&self) -> (usize, usize, bool) {
         (
             self.page_manager.cache_capacity(),
