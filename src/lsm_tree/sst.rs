@@ -271,7 +271,7 @@ pub(crate) fn sst_entry_walks() -> u64 {
 
 // 测试专用：本线程「把带 value 的条目整个物化出来」的次数。
 //
-// 这是全库折叠那条通道真正的代价单位：重量路径（`iter_all` / `mem_view_at`）每行都要
+// 这是全库折叠那条通道真正的代价单位：重量路径（`iter_all` / `mem_iter_at`）每行都要
 // 克隆 value；轻量路径（`light_view` / `mem_view_light`）只带 seq 与种类。所以 ② 用这个
 // 量来守，而不是用块读取次数（块是省不掉的，value 才省得掉）。
 #[cfg(test)]

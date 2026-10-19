@@ -319,12 +319,20 @@ impl ExportWriter {
     }
 
     /// 交给导出回调的那一步：`true` = 接着折。已经错过就一律 `false`（一行都不再写）。
+    ///
+    /// 门面导出（`ExportRecord`：只有键与已剥壳的值）走这条；裸 LSM 引擎那条给的是
+    /// `(键, 值, seq)` 三元组，用 [`Self::push_record`] —— 两者都只是行形状不同，
+    /// 编码与"错过就收手"这套胶只有一份。
     pub fn push(&mut self, rec: ExportRecord) -> bool {
+        self.push_record(KvRecord::new(rec.key, rec.value))
+    }
+
+    /// [`Self::push`] 的通用版：行已经是 `KvRecord`（可以带 seq）时用这条。
+    pub fn push_record(&mut self, rec: KvRecord) -> bool {
         if self.err.is_some() {
             return false;
         }
-        let kv = KvRecord::new(rec.key, rec.value);
-        match self.sink.write(&kv) {
+        match self.sink.write(&rec) {
             Ok(()) => true,
             Err(e) => {
                 self.err = Some(e);
@@ -484,7 +492,7 @@ mod tests {
     #[test]
     fn test_b64_round_trips_every_length() {
         for len in 0usize..=64 {
-            let raw: Vec<u8> = (0..len).map(|i| (b'a' + (i % 26) as u8)).collect();
+            let raw: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
             let enc = b64_encode(&raw);
             let back = b64_decode(&enc)
                 .unwrap_or_else(|e| panic!("长度 {len} 往返失败: {e}（enc={enc}）"));

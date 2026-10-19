@@ -1714,7 +1714,7 @@ mod tests {
 
     /// ② 全库折叠：不该再物化「带 value 的条目」。
     ///
-    /// 计数挂在重量路径上（`SstEntryIter::next` 与 `mem_view_at`），所以这条一旦变红
+    /// 计数挂在重量路径上（`SstEntryIter::next` 与 `mem_iter_at`），所以这条一旦变红
     /// 就说明折叠又被改回 `iter()` —— 那意味着一次扫描的峰值内存约等于整个库。
     #[test]
     fn test_collect_latest_does_not_materialize_values() {
@@ -1756,7 +1756,7 @@ mod tests {
 
     /// vacuum 的分组阶段不该再把每行的 value 物化出来。
     ///
-    /// 量尺用「带 value 的条目物化次数」（挂在 `SstEntryIter::next` / `mem_view_at` 上）。
+    /// 量尺用「带 value 的条目物化次数」（挂在 `SstEntryIter::next` / `mem_iter_at` 上）。
     /// 注意 vacuum 尾部的 flush→compact 本来就要把**存活行**读一遍重写 SST，那部分是
     /// compaction 的本职、不是 vacuum 的浪费 —— 所以界按存活行数量级给（`KEYS × 8`），
     /// 不按历史行数。实测 0 次（未修前是 1200 次）。

@@ -13,9 +13,29 @@ use std::{
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
-    merge_latest_streaming, merge_to_ssts, vec_inputs, BlockCache, EntryValue,
+    merge_latest_streaming, merge_streaming, merge_to_ssts, vec_inputs, BlockCache, EntryValue,
     LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry,
 };
+
+/// 一路可被"当场收手"的源（M46）：收到停止信号之后一律吐 `None`。
+///
+/// 为什么要它：`merge_streaming` 是压实/修复共用的公开件，把它的 `emit` 改成返回 `bool`
+/// 是给下游的破坏性变更。而"收手"真正需要的是**各源不再往下拉** —— 源一空，堆就空，
+/// 归并按它自己的逻辑结束（剩下 O(源数) 次弹出，不再读盘、不再克隆 value）。
+struct Stoppeable<I> {
+    it: I,
+    stopped: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<I: Iterator> Iterator for Stoppeable<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<I::Item> {
+        if self.stopped.get() {
+            return None;
+        }
+        self.it.next()
+    }
+}
 
 // ─── Options ─────────────────────────────────────────────────────────────────
 
@@ -992,26 +1012,100 @@ impl LSMTree {
         out
     }
 
-    fn mem_view_at(map: &MemMap, snap_seq: u64) -> Vec<(Vec<u8>, StoredEntry)> {
-        let mut out = Vec::new();
-        for (k, vers) in map {
-            if let Some(se) = vers
-                .iter()
-                .rev()
-                .find(|(seq, _)| **seq <= snap_seq)
-                .map(|(seq, v)| StoredEntry {
+    /// mem / immutable 的**重量**视图，但是**惰性**的（M46）：判据与改前那条 `mem_view_at`（整表折进 `Vec`，M46 起删除）
+    /// 一字不差（每把键取"≤ snap 的最大 seq"那一版，`MemMap` 本来就是按键升序），
+    /// 区别只有一个 —— 不再一次折成 `Vec`。
+    fn mem_iter_at<'a>(
+        map: &'a MemMap,
+        snap_seq: u64,
+    ) -> impl Iterator<Item = (Vec<u8>, StoredEntry)> + 'a {
+        map.iter().filter_map(move |(k, vers)| {
+            let (seq, ev) = vers.iter().rev().find(|(s, _)| **s <= snap_seq)?;
+            // 重量路径：value 被整个克隆出来。全库折叠不该走这里 —— 计数探针就是用来
+            // 发现「不知不觉又用回重量路径」。守卫另靠它数"交出第一行之前已经物化了多大一截"。
+            #[cfg(test)]
+            crate::lsm_tree::sst::note_value_materialization();
+            Some((
+                k.clone(),
+                StoredEntry {
                     seq: *seq,
-                    value: v.clone(),
-                })
-            {
-                // 重量路径：value 被整个克隆出来。全库折叠不该走这里 ——
-                // 计数探针就是用来发现「不知不觉又用回重量路径」。
-                #[cfg(test)]
-                crate::lsm_tree::sst::note_value_materialization();
-                out.push((k.clone(), se));
+                    value: ev.clone(),
+                },
+            ))
+        })
+    }
+
+    /// 归并的**源**（惰性，M46）：mem → immutables → L0 新→旧 → 更高层。
+    ///
+    /// 归并本身从 M33 起就吃 `Box<dyn Iterator>`（[`merge_streaming`]），坏的一直是这里：
+    /// 改前每个 memtable 走 `mem_view_at`（整表折进 `Vec`，M46 起删除）、每个 SST 走
+    /// `iter_all().filter(...).collect()`（整篇折进 `Vec`）⇒ **所有源同时活着**，
+    /// 于是"全库折叠"的峰值 = 一份全库重量视图 + 归并输出。这正是 M39 在 MVCC 那道门
+    /// （`scan_latest_light`）上治过的同一个形状，只是裸引擎这道门当时没走过。
+    ///
+    /// 源顺序与"每源按键升序"这两条是归并取胜的前提，一字没改；`vec_inputs` 那条兼容入口
+    /// 也留着（压实的输入本来就在内存里，换个类型而已）。
+    fn merge_inputs_at(&self, snap_seq: u64) -> Vec<MergeInput<'_, StoredEntry>> {
+        let mut sources: Vec<MergeInput<'_, StoredEntry>> = Vec::new();
+        if !self.mem.is_empty() {
+            sources.push(Box::new(Self::mem_iter_at(&self.mem, snap_seq)));
+        }
+        for imm in &self.immutables {
+            sources.push(Box::new(Self::mem_iter_at(imm, snap_seq)));
+        }
+        if let Some(l0) = self.levels.first() {
+            for sst in l0.iter().rev() {
+                sources.push(Box::new(
+                    sst.iter_all()
+                        .filter(move |(_, se)| se.visible_at(snap_seq)),
+                ));
             }
         }
-        out
+        for level in self.levels.iter().skip(1) {
+            for sst in level {
+                sources.push(Box::new(
+                    sst.iter_all()
+                        .filter(move |(_, se)| se.visible_at(snap_seq)),
+                ));
+            }
+        }
+        sources
+    }
+
+    /// 全库跨源归并的**流式**版（M46）：折一行交一行，`on` 返回 `false` 就收手 ——
+    /// 收手之后各源不再往下拉。返回实际交出去的行数。
+    ///
+    /// 为什么"收手"要套一层 [`Stoppeable`] 而不是改 [`merge_streaming`] 的签名：那条是
+    /// 压实/修复共用的公开件，把它的 `emit` 改成返回 `bool` 是给下游的破坏性变更；
+    /// 而"收手"要的只是让各源尽快吐 `None`，堆一空归并自然结束（剩下的收尾是 O(源数) 次弹出）。
+    pub(crate) fn merge_latest_at(
+        &self,
+        snap_seq: u64,
+        on: &mut dyn FnMut(Vec<u8>, StoredEntry) -> bool,
+    ) -> usize {
+        let stopped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut handed = 0usize;
+        let sources: Vec<MergeInput<'_, StoredEntry>> = self
+            .merge_inputs_at(snap_seq)
+            .into_iter()
+            .map(|it| {
+                Box::new(Stoppeable {
+                    it,
+                    stopped: stopped.clone(),
+                }) as MergeInput<'_, StoredEntry>
+            })
+            .collect();
+        merge_streaming(sources, |_, _| true, |k, se| {
+            if stopped.get() {
+                return;
+            }
+            if on(k, se) {
+                handed += 1;
+            } else {
+                stopped.set(true);
+            }
+        });
+        handed
     }
 
     /// 全库「每个 enc key 的胜者」的**轻量**视图（跨源取胜规则与 [`Self::iter`] 一致：
@@ -1936,38 +2030,16 @@ impl LSMTree {
     }
 
     fn merge_all_at(&self, snap_seq: u64) -> Vec<(Vec<u8>, StoredEntry)> {
-        let mut sources: Vec<Vec<(Vec<u8>, StoredEntry)>> = Vec::new();
-        if !self.mem.is_empty() {
-            let part = Self::mem_view_at(&self.mem, snap_seq);
-            if !part.is_empty() {
-                sources.push(part);
-            }
-        }
-        for imm in &self.immutables {
-            let part = Self::mem_view_at(imm, snap_seq);
-            if !part.is_empty() {
-                sources.push(part);
-            }
-        }
-        if let Some(l0) = self.levels.first() {
-            for sst in l0.iter().rev() {
-                sources.push(
-                    sst.iter_all()
-                        .filter(|(_, se)| se.visible_at(snap_seq))
-                        .collect(),
-                );
-            }
-        }
-        for level in self.levels.iter().skip(1) {
-            for sst in level {
-                sources.push(
-                    sst.iter_all()
-                        .filter(|(_, se)| se.visible_at(snap_seq))
-                        .collect(),
-                );
-            }
-        }
-        merge_latest_streaming(vec_inputs(sources), |_, _| true)
+        // M46：这条改成 [`Self::merge_latest_at`] 的**收集壳** —— 归并取胜的判据只剩一份实现，
+        // "整库快照"与"逐行流式"不再是两条会各自漂移的路。省下的是**源**那一头：
+        // 原先每个 memtable 与每个 SST 都先整篇折进各自的 `Vec` 才开始归并（所有源同时活着）。
+        // ⚠️ 它仍然返回全库的 `Vec`（那是调用方要的形状）；只要"逐行"的人请直接用流式那条。
+        let mut out: Vec<(Vec<u8>, StoredEntry)> = Vec::new();
+        self.merge_latest_at(snap_seq, &mut |k, se| {
+            out.push((k, se));
+            true
+        });
+        out
     }
 
     // ─── MANIFEST ────────────────────────────────────────────────────────────
@@ -2140,23 +2212,50 @@ impl LSMTree {
             .collect()
     }
 
-    /// 导出逻辑 KV + 写序号（迁移/调试）
+    /// 导出逻辑 KV + 写序号。
+    ///
+    /// M46 起这条是 [`Self::export_records_with_seq_for_each`] 的**收集壳**：取胜与"墓碑要不要参与"
+    /// 的判据只剩一份实现。⚠️ 它返回整库的 `Vec`（那是调用方要的形状）—— 只要"把行交出去"的人
+    /// （导出到文件）请直接用流式那条。
     pub fn export_records_with_seq(
         &self,
         include_deleted: bool,
     ) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64)> {
-        self.merge_all_at(u64::MAX)
-            .into_iter()
-            .filter_map(|(k, se)| match se.value {
-                EntryValue::Put(val) => {
-                    if val.is_none() && !include_deleted {
-                        return None;
-                    }
-                    Some((k, val, se.seq))
+        let mut out: Vec<(Vec<u8>, Option<Vec<u8>>, u64)> = Vec::new();
+        self.export_records_with_seq_for_each(include_deleted, &mut |k, v, seq| {
+            out.push((k, v, seq));
+            true
+        });
+        out
+    }
+
+    /// **流式**导出（M46）：归并一行、判一行、立刻交给 `on`，返回交出去的行数；
+    /// `on` 返回 `false` 当场收手，后面的键不再折、不再读盘。
+    ///
+    /// 为什么裸引擎也要给一条：M44 给门面加了流式出口之后，四家 CLI 里只剩
+    /// `lsm_tree/bin/export_kv.rs` 还在物化整库 —— 因为它走的是这条**裸引擎**入口
+    /// （`merge_all_at`），当时归并的**源**每个都先整篇折进 `Vec`（M46 修的就是这个）。
+    pub fn export_records_with_seq_for_each(
+        &self,
+        include_deleted: bool,
+        on: &mut dyn FnMut(Vec<u8>, Option<Vec<u8>>, u64) -> bool,
+    ) -> usize {
+        let mut handed = 0usize;
+        self.merge_latest_at(u64::MAX, &mut |k, se| match se.value {
+            EntryValue::Put(val) => {
+                if val.is_none() && !include_deleted {
+                    return true; // 墓碑不参与，但也不算"交出去一行"：继续走
                 }
-                EntryValue::Drop => None,
-            })
-            .collect()
+                let keep = on(k, val, se.seq);
+                if keep {
+                    handed += 1;
+                }
+                keep
+            }
+            // 硬删（Drop）不参与导出 —— 与改前那份 filter_map 一字不差
+            EntryValue::Drop => true,
+        });
+        handed
     }
 
     /// 手动触发一轮 compact（测试 / 运维）
@@ -2400,6 +2499,109 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// M46 的守卫：全库归并交出**第一行**之前，不该已经把整库的值物化过一遍。
+    ///
+    /// 尺子 = `sst::value_materializations()`（重量路径每出一条记一次：`SstEntryIter::next`
+    /// 与 `mem_iter_at`）。为什么拿它当凭据而不是内存高水位：并行用例会互相污染
+    /// （M27/M36 各栽过一次），而"交出第一行之前已经物化了多大一截"正是这条路径的代价单位。
+    /// 改前的形状是 `merge_all_at` 把每个 memtable `mem_view_at` 整表折进 `Vec`、每个 SST
+    /// `iter_all().collect()` 整篇折进 `Vec` ⇒ 归并还没开始，计数器就已经是**全库**。
+    ///
+    /// 三条各自防一种坏法：
+    /// ① 只要 1 行 ⇒ 物化次数在"源数量级"，不是全库（回归成整篇物化源就冲到 20 000+）；
+    /// ② 全库那一趟 ⇒ 物化次数 ≥ 行数 —— 这一档是给 ① 作证的：不响的尺子读出来的"小数字"没意义；
+    /// ③ 取胜规则没变：导出的行与**逐把点查**一字不差（点查是另一条路径，M26 立的那条不变量）。
+    ///
+    /// 变异验证：把 `merge_inputs_at` 里 SST 那一支换回 `.collect()` 再 `vec_inputs` 递进去 ⇒
+    /// 红在 ①（交出第一行之前已物化 20 000 条）。
+    #[test]
+    fn test_merge_streams_sources_instead_of_materializing_them() {
+        use crate::lsm_tree::sst::value_materializations;
+        const N: usize = 20_000;
+        const FILES: usize = 4;
+        let dir = tmp_dir("merge_lazy_sources");
+        {
+            // 两档都钉开：memtable 不会自己 flush（flush 由我按次发起，源数才算得准），
+            // L0 也不会自己 compact（默认 4 篇就合，那样"4 个源"这个形状当场就没了）
+            let mut db = LSMTree::open_with_options(&dir, usize::MAX / 8, 64).unwrap();
+            // 分成 FILES 次 flush ⇒ 归并的源是 FILES 篇 SST（不是一只 memtable），
+            // 这样"每个源整篇折进 Vec"才会显形为"全库"
+            for f in 0..FILES {
+                for i in 0..(N / FILES) {
+                    let k = format!("k{:06}", f * (N / FILES) + i).into_bytes();
+                    db.put(k, vec![b'v'; 8]);
+                }
+                db.flush().unwrap();
+            }
+            assert_eq!(db.stats().total_sst as usize, FILES, "没造出 {FILES} 篇 SST ⇒ 形状不对");
+            assert!(db.stats().mem_entries == 0, "还有行留在 memtable ⇒ 源数不对");
+
+            // ── ① 只要第一行 ──
+            let base = value_materializations();
+            let mut seen = 0usize;
+            let handed = db.merge_latest_at(u64::MAX, &mut |_k, _se| {
+                seen += 1;
+                false // 当场收手
+            });
+            let first_mats = value_materializations() - base;
+            eprintln!(
+                "[merge lazy] 交出 {handed} 行（回调收到 {seen} 行）⇒ 第一行之前物化了 {first_mats} 条（库里 {N} 行、源 {FILES} 个）"
+            );
+            assert_eq!(handed, 0, "收手那一行不该算交出去（返回的行数说它算了）");
+            assert_eq!(seen, 1, "回调被叫了 {seen} 次 ⇒ 收手没生效");
+            assert!(
+                first_mats <= 64,
+                "交出第一行之前已物化 {first_mats} 条（库 {N} 行）⇒ 源又被整篇折进 Vec 了"
+            );
+
+            // ── ② 同一把尺子在全库那一趟必须响（不然上面那个小数可能是空转）──
+            let base = value_materializations();
+            let mut all = 0usize;
+            let handed_all = db.merge_latest_at(u64::MAX, &mut |_k, _se| {
+                all += 1;
+                true
+            });
+            let full_mats = value_materializations() - base;
+            eprintln!("[merge lazy] 全库一趟：交出 {handed_all} 行、物化 {full_mats} 条");
+            assert_eq!(handed_all, N, "全库归并交出的行数不对");
+            assert_eq!(all, N, "回调次数与返回行数不同");
+            assert!(
+                full_mats >= N as u64,
+                "全库那一趟只物化了 {full_mats} 条（应 ≥ {N}）⇒ 尺子空转，上面那个 ≤64 不算数"
+            );
+
+            // ── ③ 取胜规则没变：导出的行必须与逐把点查一字不差 ──
+            let exported: Vec<(Vec<u8>, Option<Vec<u8>>)> = db.export_records(false);
+            assert_eq!(exported.len(), N, "导出的行数不对");
+            let keys: Vec<Vec<u8>> = exported.iter().map(|(k, _)| k.clone()).collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted, keys, "导出不是按键升序且互不相同 ⇒ 归并的取胜/去重坏了");
+            let mut by_key: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> =
+                exported.into_iter().collect();
+            for i in (0..N).step_by(N / 32) {
+                let k = format!("k{i:06}").into_bytes();
+                let got = db.get(&k);
+                let row = by_key.remove(&k).unwrap_or_else(|| panic!("导出里没有键 {k:?}"));
+                assert_eq!(row.as_deref(), got.as_deref(), "第 {i} 把键：导出与点查不一致");
+            }
+
+            // ── ④ 流式导出的"收手"：一行都不许再多折 ──
+            let base = value_materializations();
+            let handed_stop =
+                db.export_records_with_seq_for_each(false, &mut |_k, _v, _seq| false);
+            let stop_mats = value_materializations() - base;
+            eprintln!("[merge lazy] 一行的导出：交出 {handed_stop} 行、物化 {stop_mats} 条");
+            assert_eq!(handed_stop, 0, "回调一律拒绝，却还是交出了行");
+            assert!(
+                stop_mats <= 64,
+                "一行的导出物化了 {stop_mats} 条 ⇒ 收手没传到源那一头"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// M41b 的**校准**：memtable 里一条条目在堆上到底占多少字节。
     ///
     /// 为什么要有这条：`maybe_flush_mem` 读的 `mem_bytes` 只数载荷账（`key.len() +
@@ -2410,6 +2612,52 @@ mod tests {
     ///
     /// ⚠️ 只能单线程跑（`live()` 是进程级的，并行用例会互相污染 —— M27/M36 各栽过一次），
     /// 所以它是 `#[ignore]` 台架而不是守卫。
+    /// M46 的内存凭据：裸引擎"全库导出"那一趟的瞬时峰值（`#[ignore]`，手动 release 单线程跑）。
+    ///
+    /// 为什么要有它：M44 之后四家 CLI 只剩 `lsm_tree/bin/export_kv.rs` 还在物化整库，而它走的
+    /// 是**裸引擎**入口（`merge_all_at`）—— 门面那台的 `export` 读数照不到这条路。
+    /// 改前那一列不是这里切的臂（测量臂跑完就摘了，不属于产品）：它是同一段代码把
+    /// `merge_inputs_at` 里 SST 那一支换回 `iter_all().collect()` + `vec_inputs` 之后读到的，
+    /// 守卫 `test_merge_streams_sources_instead_of_materializing_them` 的变异用的就是这个换法
+    /// —— 计数器（20 000 条 vs 5 条）与这里的 MB（100.4 vs 0.4）是同一件事的两把尺子。
+    ///
+    /// ```text
+    /// LSM_RAW_EXPORT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture     ///   --test-threads=1 lsm_raw_export_peak
+    /// LSM_MERGE_OLD_SHAPE=1 LSM_RAW_EXPORT_ROWS=600000 cargo test --release --lib --     ///   --ignored --nocapture --test-threads=1 lsm_raw_export_peak
+    /// ```
+    #[test]
+    #[ignore = "裸引擎全库导出的内存台架，手动 release 单线程跑：LSM_RAW_EXPORT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_raw_export_peak"]
+    fn lsm_raw_export_peak() {
+        use crate::lsm_tree::sst::value_materializations;
+        let rows: usize = std::env::var("LSM_RAW_EXPORT_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let mb = |b: u64| b as f64 / 1024.0 / 1024.0;
+        let dir = tmp_dir("raw_export_peak");
+        {
+            let mut db = LSMTree::open_with_options(&dir, usize::MAX / 8, 64).unwrap();
+            for i in 0..rows {
+                db.put(format!("{i:08}").into_bytes(), vec![b'v'; 24]);
+            }
+            db.flush().unwrap();
+            let files = db.stats().total_sst;
+            let base = crate::mem_probe::reset_peak();
+            let m0 = value_materializations();
+            let t = std::time::Instant::now();
+            let n = db.export_records_with_seq_for_each(false, &mut |_k, _v, _seq| true);
+            let d = t.elapsed();
+            let peak = crate::mem_probe::peak().saturating_sub(base);
+            let mats = value_materializations() - m0;
+            eprintln!(
+                "=== 裸引擎全库导出 rows={rows} 源={files} 交出 {n} 行 ⇒ 瞬时峰值 {:.1} MB、物化 {mats} 条、耗时 {:.2} s ===",
+                mb(peak),
+                d.as_secs_f64()
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "memtable 每条真实字节数的校准，手动 release 单线程跑：LSM_MEM_CAL=200000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_memtable_bytes_per_entry"]
     fn lsm_memtable_bytes_per_entry() {

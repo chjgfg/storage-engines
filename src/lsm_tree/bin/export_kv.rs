@@ -1,6 +1,6 @@
 //! 导出 lsm-tree 为 JSONL / BPEXP001|002（可选带 seq）。
 
-use storage_engines::common::kv_snapshot::{write_bin, write_jsonl, KvRecord};
+use storage_engines::common::kv_snapshot::{ExportWriter, KvRecord};
 use storage_engines::lsm_tree::LSMTree;
 use std::env;
 use std::path::PathBuf;
@@ -57,21 +57,26 @@ fn main() {
     println!("=== lsm export_kv ===");
     let t0 = Instant::now();
     let db = LSMTree::open(&dir).expect("打开 LSM");
-    let records: Vec<KvRecord> = if with_seq {
-        db.export_records_with_seq(include_deleted)
-            .into_iter()
-            .map(|(k, v, seq)| KvRecord::with_seq(k, v, seq))
-            .collect()
-    } else {
-        db.export_records(include_deleted)
-            .into_iter()
-            .map(|(k, v)| KvRecord::new(k, v))
-            .collect()
+    // M46：**归并一行、写一行**。原先这里两条分支都要先把整库物化成 `Vec<KvRecord>` 再交给
+    // writer —— 而它归并的**源**当时每个都先整篇折进 `Vec`（`merge_all_at`），于是"导一个库"
+    // 同时在内存里握着：全部源 + 归并输出 + 那份 `Vec<KvRecord>`。现在三笔都塌成"当前这一行"。
+    // 两分支共用同一条流式判据（`export_records_with_seq_for_each`），不带 seq 时把 seq 丢掉。
+    let mut writer = match format {
+        Format::Bin => ExportWriter::bin(&out, with_seq).expect("创建导出文件失败"),
+        Format::Jsonl => ExportWriter::jsonl(&out).expect("创建导出文件失败"),
     };
-    let stats = match format {
-        Format::Bin => write_bin(&out, &records).expect("写 bin"),
-        Format::Jsonl => write_jsonl(&out, &records).expect("写 jsonl"),
-    };
+    let mut handed = 0usize;
+    db.export_records_with_seq_for_each(include_deleted, &mut |k, v, seq| {
+        handed += 1;
+        let rec = if with_seq {
+            KvRecord::with_seq(k, v, seq)
+        } else {
+            KvRecord::new(k, v)
+        };
+        writer.push_record(rec)
+    });
+    let stats = writer.finish().expect("写导出文件失败");
+    assert_eq!(handed, stats.records, "折出的行数与写出的行数不同");
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!(
         "EXPORT records={} live={} deleted={} with_seq={with_seq} → {:?} ({:.2} MB) in {:.3}s",

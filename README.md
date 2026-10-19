@@ -7,7 +7,7 @@
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 312 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M45**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M46**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -23,10 +23,10 @@
 B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`、四引擎
 事务内核合成一份、`migrate` + `scan_page`、LSM 灌行 O(N²)、`seek_prev` 整段物化、游标未下推、
 B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、页读路径与 CRC32 提速、**缓存自动档的顶可以由调用方抬（`set_cache_auto_max`）且覆盖率的分母可读**、**压实的输入改流式源（一次压实瞬时内存 156.8 MB → 6.3 MB）**、**四家 `vacuum()` 与 bitcask `merge()` 的走查改按块**（bitcask 那一家的整段瞬时 171.4 MB → 87.2 MB）、**大库台架的内存量具修好**（此前 `峰值` 列只看得见"超过历史最高点的部分"，排在后面的操作一律报 +0.0）、**lsm 的 `flush()` 改流式吐 memtable，且 memtable 的 flush 阈值改读真内存**（600k 键 × 2 版那档 `vacuum()` 的 ① 段 158.6 MB → **33.1 MB**；"mem 32 MB"这句从此才算数）、**`SstBuilder` 攒满一块就落盘**（一次压实的瞬时 6.3 MB → **3.1 MB**、单文件握住的未落盘条目 18 333 条 → **64 条**；输出的 SST **逐字节不变**，由 golden 钉着）、**`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化**（600k 档瞬时内存 +123.7 MB → **0.6~1.2 MB**；四家 `search_keys` 与四家 `scan_foreach` 的复制各合成一份）。
-磁盘格式这三十七批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
+磁盘格式这三十八批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M45
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M46
 storage-engines = { path = "../storage-engines" }
 
 # (b) 走远端:git 依赖(gitee 与 github 内容一致)
@@ -36,7 +36,7 @@ storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branc
 storage-engines = "0.4"
 ```
 
-`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M45 又想要版本号依赖,
+`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M46 又想要版本号依赖,
 只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
 MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
@@ -1467,10 +1467,10 @@ M40 之后 `merge()` 剩的那一笔不是快照，是**产物**：走查时每�
 ⚠️ **µs/行 那一列不许横着比**：物化那一臂不写文件，流式那一臂把文件也写了（600k 档 3.4~4.4 µs/行 vs
 1.6~1.9，两臂差都在本机噪声地板里）⇒ 两臂做的不是同一件事，判据只有内存那一列。
 
-⚠️ **没改的那一家**：`lsm_tree/bin/export_kv.rs` 走的是**裸引擎**的 `LSMTree::export_records_with_seq`，
-它建在 `merge_all_at` 上（把 memtable + 每个 SST **整篇**折进 `Vec`，所有源同时活着 —— 正是 M39 在
-MVCC 那条门上治过的形状，只是裸引擎这道门当时没走过）。单把它的**写侧**改成流式省不到东西
-（大头在源侧），所以这一刀不半改它，`merge_all_at` 另立一条。
+⚠️ ~~**没改的那一家**：`lsm_tree/bin/export_kv.rs` 走的是**裸引擎**的 `LSMTree::export_records_with_seq`~~
+**（修订（M46）：这一家也接上了。** 它当时确实半改不动 —— 大头不在写侧而在**源**：`merge_all_at`
+把 memtable 与每个 SST 都先整篇折进 `Vec` 才开始归并。M46 把源改成惰性、给裸引擎配了
+`export_records_with_seq_for_each`，四家 `export_kv` 到这才算齐。）**
 
 守卫：
 
@@ -1568,6 +1568,44 @@ bitcask-export-kv --dir m45_db --out m45_out.jsonl             ⇒ SCAN 301 keys
 `read_jsonl` 的代码。**bin 格式（`BPEXP001`/`BPEXP002`）不过 base64，从来没中过**；`migrate`（走
 `scan_page` + `set_raw`）与库内读写路径都不受影响。所以已经用 JSONL 搬过数据的人，要按"键可能被截短、
 互相覆盖过"来复核一次那批库。
+
+**M46 —— 裸 `LSMTree::merge_all_at` 的源改惰性：600k 档全库导出瞬时 100.4 → 0.4 MB（同一构建两臂），四家 `export_kv` 到这才算齐**
+
+M44 之后四家 `export_kv` 里只剩 lsm 那家还在物化整库，原因是它走的不是门面而是**裸引擎入口**
+`LSMTree::export_records_with_seq` → `merge_all_at`：归并本身从 M33 起就吃 `Box<dyn Iterator>`，
+坏的是**源** —— 每个 memtable 走 `mem_view_at`（整表折进 `Vec`）、每个 SST 走
+`iter_all().filter(...).collect()`（整篇折进 `Vec`），于是归还没开始，**所有源已经同时活着**。
+这与 M39 在 MVCC 那道门（`scan_latest_light` 把每个源整篇物化 ⇒ `health()` 瞬时 +126.1 MB）治过的是
+同一个形状，只是裸引擎这道门当时没走过。
+
+改法（M39 那一招原样搬）：新增 `mem_iter_at`（惰性重量视图，判据与 `mem_view_at` 一字不差）与
+`merge_inputs_at`（每源一路 `Box<dyn Iterator>`；**源顺序与"每源按键升序"这两条取胜前提一字未改**），
+`merge_all_at` 变成 `merge_latest_at` 的**收集壳**，其上再开 `export_records_with_seq_for_each`，
+`lsm_tree/bin/export_kv.rs` 接上 M44 的 `ExportWriter`（带 seq 的形状走新增的 `push_record`，
+编码仍然只有一份）。`mem_view_at` 删除，重量路径的探针移进 `mem_iter_at`（同一个计数器）。
+
+同一构建两臂（`LSM_RAW_EXPORT_ROWS=600000`；改前那一臂是把 SST 那一支换回 `collect() + vec_inputs`
+的临时测量代码，读完就摘，不属于产品）：
+
+| 600k 行、1 个源、两臂都交出 600 000 行 | 瞬时峰值 | 耗时 |
+|---|---|---|
+| 改前（每个源整篇折进 `Vec`） | **100.4 MB** | 0.72 s |
+| 改后（源惰性，逐行归并） | **0.4 MB** | **0.47 s** |
+
+⇒ **省 100 MB（251×）**，而且**顺手快了 1.53×** —— 那次"先把源折完再归并"不只是内存账：
+60 万次 `Vec` 扩容 + 每条一次克隆本身就是工作。⚠️ `merge_all_at` 另外五个调用点
+（`iter` / `iter_at` / `entry_count` / `len` / `refresh_stats_cache`）共用这份收益；其中
+`entry_count` 是 `merge_all_at(...).len()` —— 为一个数物化整库，与 M35 那刀里 `key_count`
+同一个形状，**这一刀没顺手改**（记在队列里，别把它算进本条的收益）。
+
+守卫 `test_merge_streams_sources_instead_of_materializing_them`（20 000 行 / 4 篇 SST，
+尺子 = 已有的 `value_materializations()`：重量路径每出一条记一次）：
+① **交出第一行之前物化 5 条**（= 源数量级，判据 ≤ 64）；② 同一把尺子在全库那一趟必须读到
+≥ 20 000 条 ⇒ 给 ① 作证（不响的尺子读出来的"小数字"没有意义 —— M44 那条就栽在这里）；
+③ 取胜规则没变：导出的行升序、互不相同，且与**逐把点查**一字不差（点查是另一条路径，M26 立的不变量）；
+④ 回调一律拒绝时交出 0 行、物化仍是 5 条 ⇒ 收手传到了源那一头。
+变异：把 `merge_inputs_at` 里 SST 那一支换回 `iter_all().collect()` + `vec_inputs` ⇒ ① 红在
+"交出第一行之前已物化 20 000 条（库 20 000 行）⇒ 源又被整篇折进 `Vec` 了"。
 
 ### 本轮全量复测（三档 20k / 200k / 600k × 四引擎 × 31 项，同一份构建，2026-10-19）判据：**单价倍数 = 原始比值 ÷ 期望量级**；`memory` 引擎那一列就是本机噪声地板（1.2~1.6×）。
 
@@ -2247,7 +2285,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:319 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:320 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(32 个,含大库基线台架;四引擎全覆盖)
 cargo test --lib cache_auto_max   # 缓存自动档"顶"这一档的三条守卫(门面路由 + bplus 覆盖率 + lsm 覆盖率)
                               # 判据全是计数:bplus 那条量在**磁盘层**(一轮点读落盘几次),

@@ -495,6 +495,32 @@
     第一遍读数时我差点把"lsm 灌行 30.5、点读 11.6"当成自己引入的回归写进文档 —— 安静复跑三轮
     是 20.6~23.5 与 **6.2~6.9**（记录 9.6），而且**刚编译完那一轮**（编译器还没退出）量到的就是
     那个 11.6。所以：跨构建的 µs 列一律不作因果凭据，只作历史快照；凭据是同构建 A/B 的计数。
+- **裸 `LSMTree::merge_all_at` 的**源**改惰性：600k 档全库导出瞬时 100.4 → 0.4 MB，顺手快 1.53×，四家 `export_kv` 到这才算齐（M46）**：
+  M44 之后四家 CLI 只剩 lsm 那家还在物化整库 —— 它走的不是门面而是裸引擎入口
+  `export_records_with_seq` → `merge_all_at`。归并本身从 M33 起就吃 `Box<dyn Iterator>`，坏的是**源**：
+  每个 memtable 走 `mem_view_at`（整表折进 `Vec`）、每个 SST 走 `iter_all().filter().collect()`（整篇折进
+  `Vec`）⇒ 归还没开始，所有源已经同时活着。**这与 M39 在 MVCC 那道门（`scan_latest_light` ⇒ `health()`
+  瞬时 +126.1 MB）治过的是同一个形状，裸引擎这道门当时没走过。**
+  - 改法照 M39：新增 `mem_iter_at`（惰性重量视图，判据与 `mem_view_at` 一字不差）与 `merge_inputs_at`
+    （每源一路迭代器；**源顺序与"每源按键升序"这两条取胜前提一字未改**）；`merge_all_at` 变成
+    `merge_latest_at` 的**收集壳**（"整库快照"与"逐行流式"从此不再有两份会各自漂移的实现）；其上开
+    `export_records_with_seq_for_each`；`lsm_tree/bin/export_kv.rs` 接上 M44 的 `ExportWriter`（带 seq 的
+    形状走新增的 `ExportWriter::push_record`，编码仍只有一份）。`mem_view_at` 删除，重量路径的探针
+    移进 `mem_iter_at`（同一个计数器）。
+  - 同一构建两臂（`LSM_RAW_EXPORT_ROWS=600000`；改前一臂是把 SST 那一支换回 `collect()+vec_inputs` 的
+    临时测量代码，读完就摘，不属于产品）：600k 行、**两臂都交出 600 000 行** ⇒ 瞬时
+    **100.4 MB → 0.4 MB（251×）**、耗时 **0.72 s → 0.47 s**。⚠️ 那笔"先折完再归并"不只是内存账：
+    60 万次 `Vec` 扩容 + 每条一次克隆本身就是工作，所以这一刀时间与内存一起赚。
+  - ⚠️ `merge_all_at` 另外五个调用点（`iter`/`iter_at`/`entry_count`/`len`/`refresh_stats_cache`）共用这份
+    收益；其中 `entry_count` 是 `merge_all_at(...).len()` —— **为一个数物化整库**，与 M35 那刀里
+    `key_count` 同一个形状，本条没顺手改 ⇒ 别把它算进这里的收益，另立一条。
+  - 守卫 `test_merge_streams_sources_instead_of_materializing_them`（20 000 行 / 4 篇 SST，尺子 = 已有的
+    `value_materializations()`：重量路径每出一条记一次）：① **交出第一行之前物化 5 条**（源数量级，判据 ≤64）；
+    ② 同一把尺子在全库那一趟必须读到 ≥20 000 条 ⇒ 给 ① 作证（M44 那条判据就栽在"尺子读 0 其实是没接上"）；
+    ③ 取胜规则没变：升序、互不相同、与**逐把点查**一字不差；④ 回调一律拒绝 ⇒ 交出 0 行、物化仍 5 条
+    （收手传到源那一头）。"收手"为什么套一层 `Stoppeable` 而不把 `merge_streaming` 的 `emit` 改成返回
+    `bool`：那条是压实/修复共用的**公开件**，改签名是给下游的破坏性变更。
+    变异：SST 那一支换回 `iter_all().collect()` ⇒ ① 红在"交出第一行之前已物化 20 000 条"。
 - ✅ **修掉 `b64_decode` 在非 3 倍数长度上掉字节：JSONL 导入静默丢数据，端到端从「301 行进、32 行出」修到 301 → 301 → 301（M45）**：
   M44 的往返台架抓到一条先前就存在的缺陷。M44 当时把它写成"bulk 的 `put` 要已打信封的字节"，
   **那条嫌疑被自己的复现推翻**（原文在 M44 条目里就地加了修订，不删）：
@@ -542,9 +568,9 @@
     memory 123.8→0.6）⇒ **瞬时 206×，那份"只为等着被写出去"的整库 `Vec` 整个没了**；20k 档同一对是
     +4.4~4.9 MB → +0.6~0.9 MB、常驻 3.5~3.9 → **0.0**。⚠️ **µs/行那一列不许横着比** —— 物化那一臂不写文件，
     流式那一臂把文件也写了，两臂做的不是同一件事，判据只有内存那一列。
-  - ⚠️ **没改的那一家**：`lsm_tree/bin/export_kv.rs` 走的是**裸引擎** `LSMTree::export_records_with_seq`，
-    它建在 `merge_all_at` 上（把 memtable + 每个 SST **整篇**折进 `Vec`、所有源同时活着 —— M39 在 MVCC 那道门
-    治过的形状，裸引擎这道门当时没走过）。单把它的写侧改成流式省不到东西（大头在源侧）⇒ 不半改，另立一条。
+  - ~~⚠️ **没改的那一家**：`lsm_tree/bin/export_kv.rs`~~ **（修订（M46）：这一家也接上了 ——
+    当时确实半改不动：大头不在写侧而在**源**，`merge_all_at` 把每个源都先整篇折进 `Vec`。
+    M46 把源改惰性、给裸引擎配了 `export_records_with_seq_for_each`，四家 `export_kv` 到这才算齐。）**
   - 守卫 `all_engines_export_streams_without_holding_the_library`（四家跑同一套断言），**主尺子 =
     `user_value_copies()` 在"只要 1 行"那一趟里的增量**：流式只剥 1 条壳，任何"先折完全库再逐行回调"
     的形状会拷 `want` 条 ⇒ 一个数分开两种形状。判据：只要 1 行 ⇒ 交出 1 行、拷出 ≤2 条
