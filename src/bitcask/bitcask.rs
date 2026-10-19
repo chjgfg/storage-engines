@@ -364,6 +364,118 @@ pub fn write_hint_file(
     Ok(())
 }
 
+/// hint 记录的**流式解码器**（M52c）。两份格式共用一把读法：v2 带 `file_id`，v1 一律 0。
+///
+/// 为什么是迭代器而不是"先解成 `Vec<记录>` 再折成树"（那是本格的第一版写法）：那份 `Vec`
+/// 是**整库形状**的中间物 —— 600k 条 × 48 B 的骨架就是 28.8 MB，而树本身才 57.7 MB，
+/// 等于让"读索引"这一步临时多要半棵索引。`collect()` 直接从这个迭代器取，
+/// `BTreeMap` 的有序批量填充照旧生效（台架 A 臂读数没掉回 E 臂那一档就是证据）。
+///
+/// ⚠️ `entry_count` 是从文件头读来的，**不可信**：改前第一版给它做 `with_capacity`，
+/// 一个写 2^60 的坏 hint 就会让我们先申请几 GB。迭代器这一版没有那一格 —— 预留由不上了，
+/// 真正的记录数由读取本身说话：撞 EOF ⇒ `Err` ⇒ 调用方的处置是回退全量扫。
+/// 同一处还修掉一条旧的不一致：v1 那份循环漏了 `key_len` 的上界检查，会先 `vec![0u8; key_len]`
+/// 再去读；共用之后两份都先检查（越界 ⇒ 报错），一个荒谬的键长不再先把自己撑爆。
+struct HintEntries<'a, R> {
+    r: &'a mut R,
+    /// 还剩几条没解（由文件头声明，读不满就报错）
+    left: u64,
+    with_file_id: bool,
+}
+
+impl<'a, R: std::io::Read> HintEntries<'a, R> {
+    fn new(r: &'a mut R, entry_count: u64, with_file_id: bool) -> Self {
+        Self {
+            r,
+            left: entry_count,
+            with_file_id,
+        }
+    }
+
+    /// 解一条记录。`Ok(None)` = **未知种类** ⇒ 丢掉但继续往下读（沿用改前口径，不许变成"当作存活"）；
+    /// `Err` = 读不出来 / 坏键长 ⇒ 调用方据此回退全量扫。
+    fn one(&mut self) -> Result<Option<(Vec<u8>, KeyLoc)>> {
+        let mut nbuf = [0u8; 4];
+        let mut pbuf = [0u8; 8];
+        self.r.read_exact(&mut nbuf)?;
+        let key_len = u32::from_le_bytes(nbuf) as usize;
+        self.r.read_exact(&mut nbuf)?;
+        let flag = i32::from_le_bytes(nbuf);
+        let file_id = if self.with_file_id {
+            self.r.read_exact(&mut nbuf)?;
+            u32::from_le_bytes(nbuf)
+        } else {
+            0
+        };
+        self.r.read_exact(&mut pbuf)?;
+        let pos = u64::from_le_bytes(pbuf);
+        self.r.read_exact(&mut nbuf)?;
+        let len = u32::from_le_bytes(nbuf);
+        if key_len > 16 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "hint key_len 异常",
+            ));
+        }
+        let mut key: Vec<u8> = vec![0u8; key_len];
+        self.r.read_exact(&mut key)?;
+        Ok(match flag {
+            HINT_FLAG_LIVE => Some((key, KeyLoc::Live { file_id, pos, len })),
+            FLAG_SOFT_TOMBSTONE => Some((key, KeyLoc::SoftTombstone { file_id })),
+            _ => None,
+        })
+    }
+}
+
+impl<R: std::io::Read> Iterator for HintEntries<'_, R> {
+    /// 项里套 `Option` 是为了让"丢掉这一条"和"这一条读不出来"分成两件事；
+    /// 上面用 `.map(transpose).flatten()` 把它们收拢成 `io::Result<(键, 位置)>` 的流。
+    type Item = Result<Option<(Vec<u8>, KeyLoc)>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        Some(self.one())
+    }
+}
+
+/// hint 记录 → `KeyDir`。
+///
+/// ⚠️ 这里**不是一条一条 `insert`**（M52a）。hint 里的键本来就是按键升序写出的
+/// （`write_hint_file` 遍历的就是排好序的 `KeyDir`），而 `BTreeMap::insert` 对有序输入
+/// 每次都要从根沿最右一路走到底，还会把沿途每个节点**劈成半满**：
+/// 同构建 A/B（`bitcask_hint_load_stage_split`，四轮两种顺序取最小）600k 档
+/// 时间 **405.3 → 205.6 ms（1.97×）**、200k 档 **180.6 → 62.8 ms（2.87×）**；
+/// 建好之后**还活着** 65.4 → 39.7 MB —— 差的 **25.7 MB** 与大库台架那一格
+/// `冷重开 常驻 83.4 → 57.7 MB` **一字不差**，而两臂解出的键数相同 ⇒
+/// 那 25.7 MB 纯粹是**半满节点**，不是内容。重复键的取舍与逐条 `insert` 相同（后者胜）。
+fn hint_entries_to_keydir<R: std::io::Read>(
+    r: &mut R,
+    entry_count: u64,
+    with_file_id: bool,
+) -> Result<KeyDir> {
+    // 台架对照臂（门控 `HINT_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）：**同一个解码器**，
+    // 只把折树那一步退回逐条 `insert`。共用解码器是故意的 —— 两臂只差一件事，
+    // 读出来的比值才只归因于形状（大库台架那一趟读的是现场形状：版本键混着软墓碑、
+    // 进程已经分配过 1 GB），而臂级台架读的是一份干净的 600k 升序键。
+    #[cfg(test)]
+    if std::env::var("HINT_OLD_SHAPE").is_ok() {
+        let mut key_dir = KeyDir::new();
+        for item in HintEntries::new(r, entry_count, with_file_id) {
+            if let Some((key, loc)) = item? {
+                key_dir.insert(key, loc);
+            }
+        }
+        return Ok(key_dir);
+    }
+    HintEntries::new(r, entry_count, with_file_id)
+        .map(std::result::Result::transpose)
+        .flatten()
+        .collect()
+}
+
 /// 读取 hint。成功返回 `(KeyDir, active_id, active_log_size)`
 pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
     let mut f = std::fs::File::open(path)?;
@@ -375,46 +487,8 @@ pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
         let active_id = u32::from_le_bytes(rest[0..4].try_into().unwrap());
         let active_log_size = u64::from_le_bytes(rest[8..16].try_into().unwrap());
         let entry_count = u64::from_le_bytes(rest[16..24].try_into().unwrap());
-        let mut key_dir = KeyDir::new();
         let mut r = BufReader::new(f);
-        for _ in 0..entry_count {
-            let mut nbuf = [0u8; 4];
-            r.read_exact(&mut nbuf)?;
-            let key_len = u32::from_le_bytes(nbuf) as usize;
-            r.read_exact(&mut nbuf)?;
-            let flag = i32::from_le_bytes(nbuf);
-            r.read_exact(&mut nbuf)?;
-            let file_id = u32::from_le_bytes(nbuf);
-            let mut pbuf = [0u8; 8];
-            r.read_exact(&mut pbuf)?;
-            let pos = u64::from_le_bytes(pbuf);
-            r.read_exact(&mut nbuf)?;
-            let len = u32::from_le_bytes(nbuf);
-            if key_len > 16 * 1024 * 1024 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "hint key_len 异常",
-                ));
-            }
-            let mut key: Vec<u8> = vec![0u8; key_len];
-            r.read_exact(&mut key)?;
-            match flag {
-                HINT_FLAG_LIVE => {
-                    key_dir.insert(
-                        key,
-                        KeyLoc::Live {
-                            file_id,
-                            pos,
-                            len,
-                        },
-                    );
-                }
-                FLAG_SOFT_TOMBSTONE => {
-                    key_dir.insert(key, KeyLoc::SoftTombstone { file_id });
-                }
-                _ => {}
-            }
-        }
+        let key_dir = hint_entries_to_keydir(&mut r, entry_count, true)?;
         Ok((key_dir, active_id, active_log_size))
     } else if &magic == HINT_MAGIC_V1 {
         // 兼容旧 hint：file_id 全 0，header 剩余 24 字节
@@ -422,38 +496,8 @@ pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
         f.read_exact(&mut rest)?;
         let log_size = u64::from_le_bytes(rest[0..8].try_into().unwrap());
         let entry_count = u64::from_le_bytes(rest[8..16].try_into().unwrap());
-        let mut key_dir = KeyDir::new();
         let mut r = BufReader::new(f);
-        for _ in 0..entry_count {
-            let mut nbuf = [0u8; 4];
-            r.read_exact(&mut nbuf)?;
-            let key_len = u32::from_le_bytes(nbuf) as usize;
-            r.read_exact(&mut nbuf)?;
-            let flag = i32::from_le_bytes(nbuf);
-            let mut pbuf = [0u8; 8];
-            r.read_exact(&mut pbuf)?;
-            let pos = u64::from_le_bytes(pbuf);
-            r.read_exact(&mut nbuf)?;
-            let len = u32::from_le_bytes(nbuf);
-            let mut key: Vec<u8> = vec![0u8; key_len];
-            r.read_exact(&mut key)?;
-            match flag {
-                HINT_FLAG_LIVE => {
-                    key_dir.insert(
-                        key,
-                        KeyLoc::Live {
-                            file_id: 0,
-                            pos,
-                            len,
-                        },
-                    );
-                }
-                FLAG_SOFT_TOMBSTONE => {
-                    key_dir.insert(key, KeyLoc::SoftTombstone { file_id: 0 });
-                }
-                _ => {}
-            }
-        }
+        let key_dir = hint_entries_to_keydir(&mut r, entry_count, false)?;
         Ok((key_dir, 0, log_size))
     } else {
         Err(std::io::Error::new(
@@ -2019,6 +2063,128 @@ mod tests {
         cleanup(&path);
     }
 
+    /// M52 的守卫：hint 读侧从"逐条 `insert`"换成"攒有序 `Vec` 再一次 `collect`"之后，
+    /// 解出来的 `KeyDir` 必须与**逐条 insert 的那一份一字不差**。
+    ///
+    /// 为什么不只测"写一遍再读回来对得上"：那只证明**新写新读自洽**（M42 立过这条：格式类改动
+    /// 的凭据得是独立基准），证明不了换解码形状没动语义。所以基准在测试里**手工逐条 insert** 出来。
+    ///
+    /// 覆盖面（少一种就有一种退化溜过去）：
+    /// - 存活行 / 软墓碑行 / **未知种类**的行（改前是静默丢弃 ⇒ 必须继续丢弃，不能变成"当作存活"）
+    /// - **重复键**（`collect` 与逐条 `insert` 同为"后者胜"，这条不对称一旦不同就是静默改数据）
+    /// - v1 与 v2 两份格式（v1 没有 `file_id`，一律 0）
+    /// - **降序**写出的一份 hint：`write_hint_file` 永远不会产出降序，但读侧不该依赖它 ——
+    ///   依赖"有序"只是性能优化，正确性必须与顺序无关。
+    #[test]
+    fn test_hint_read_matches_record_by_record_insert() {
+        let path = tmp_log("hint_shape");
+        let hint = hint_path_for(&path);
+        // (键, flag, file_id, pos, len)
+        let rows: Vec<(Vec<u8>, i32, u32, u64, u32)> = vec![
+            (b"aa".to_vec(), HINT_FLAG_LIVE, 3, 64, 11),
+            (
+                b"bb".to_vec(),
+                FLAG_SOFT_TOMBSTONE,
+                4,
+                0,
+                0,
+            ),
+            (b"cc".to_vec(), 99, 5, 128, 7), // 未知种类 ⇒ 两边都不许把它当存活键
+            (b"dup".to_vec(), HINT_FLAG_LIVE, 1, 200, 3),
+            (b"dup".to_vec(), FLAG_SOFT_TOMBSTONE, 2, 0, 0), // 重复键 ⇒ 后者胜
+            (b"ee".to_vec(), HINT_FLAG_LIVE, 6, 300, 9),
+        ];
+        for (v2, order) in [(true, false), (true, true), (false, false)] {
+            let mut feed = rows.clone();
+            if order {
+                feed.reverse();
+            }
+            build_hint_file(&hint, v2, &feed, None);
+            let (got, active_id, log_size) = read_hint_file(&hint).unwrap_or_else(|e| {
+                panic!("读不出自己搭的 hint（v2={v2} 降序={order}）：{e}");
+            });
+            // 基准：逐条 insert（= 改前的读法）
+            let mut want = KeyDir::new();
+            for (k, flag, fid, pos, len) in &feed {
+                let fid = if v2 { *fid } else { 0 };
+                match *flag {
+                    HINT_FLAG_LIVE => {
+                        want.insert(
+                            k.clone(),
+                            KeyLoc::Live {
+                                file_id: fid,
+                                pos: *pos,
+                                len: *len,
+                            },
+                        );
+                    }
+                    FLAG_SOFT_TOMBSTONE => {
+                        want.insert(k.clone(), KeyLoc::SoftTombstone { file_id: fid });
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                got, want,
+                "解出来的 KeyDir 与逐条 insert 那份不同（v2={v2} 降序={order}）"
+            );
+            let want_id = if v2 { 7 } else { 0 };
+            assert_eq!(active_id, want_id, "active_id（v2={v2}）");
+            assert_eq!(log_size, 4096, "active_log_size（v2={v2}）");
+        }
+        // 坏 `key_len`：两份格式都必须报错（改前 v1 那份漏了这道检查 ⇒ 现在一并拦下），
+        // 调用方据此回退全量扫。先信了荒谬的键长，就会先分配一个大 `Vec` 再去读。
+        for v2 in [true, false] {
+            build_hint_file(&hint, v2, &rows, Some(600 << 20));
+            let err = read_hint_file(&hint).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "坏 key_len 没被拦住（v2={v2}）"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// 手工按文档布局搭一份 hint（不经 `write_hint_file`，为的是能造出未知种类 / 重复键 / 降序）。
+    /// `lie_last_key_len` = 把**最后一条**记录声明的键长改成这个值（造坏 hint 用）。
+    fn build_hint_file(
+        path: &Path,
+        v2: bool,
+        rows: &[(Vec<u8>, i32, u32, u64, u32)],
+        lie_last_key_len: Option<usize>,
+    ) {
+        let mut bytes = Vec::new();
+        if v2 {
+            bytes.extend_from_slice(HINT_MAGIC_V2);
+            bytes.extend_from_slice(&7u32.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&4096u64.to_le_bytes());
+            bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(HINT_MAGIC_V1);
+            bytes.extend_from_slice(&4096u64.to_le_bytes());
+            bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+        }
+        for (i, (k, flag, fid, pos, len)) in rows.iter().enumerate() {
+            let declared = match lie_last_key_len {
+                Some(n) if i + 1 == rows.len() => n,
+                _ => k.len(),
+            };
+            bytes.extend_from_slice(&(declared as u32).to_le_bytes());
+            bytes.extend_from_slice(&flag.to_le_bytes());
+            if v2 {
+                bytes.extend_from_slice(&fid.to_le_bytes());
+            }
+            bytes.extend_from_slice(&pos.to_le_bytes());
+            bytes.extend_from_slice(&len.to_le_bytes());
+            bytes.extend_from_slice(k);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
     /// 写缓冲必须是**懒分配**：打开一个空库不该先占 4 MiB。
     ///
     /// 大库基线台架量到 `open 空库` 就"常驻 8.4 MB"，来源正是数据日志缓冲与 blob 缓冲各
@@ -2146,58 +2312,144 @@ mod tests {
         let mut c_best = std::time::Duration::MAX;
         let mut a_best = std::time::Duration::MAX;
         let mut d_best = std::time::Duration::MAX;
+        let mut e_best = std::time::Duration::MAX;
+        let mut a_live = 0i64;
+        let mut e_live = 0i64;
+        let mut a_over = 0i64;
+        let mut e_over = 0i64;
+        let mut d_over = 0i64;
         let mut seen = 0usize;
-        for round in 0..2 {
-            // ── 臂 B：只解字段（键留在复用的 scratch 里，不留存）──
-            let t = std::time::Instant::now();
-            seen = walk(&hint, |_k, _f, _id, _p, _l| {});
-            let d = t.elapsed();
-            if round == 1 {
-                b_best = d;
-            }
 
-            // ── 臂 C：解字段 + 每键一次分配，按顺序塞进 `Vec`（不插树）──
-            let mut out: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(rows);
-            let t = std::time::Instant::now();
-            walk(&hint, |k, _f, id, p, l| {
-                out.push((k.to_vec(), KeyLoc::Live { file_id: id, pos: p, len: l }));
-            });
-            let d = t.elapsed();
-            assert_eq!(out.len(), rows, "臂 C 少折了条目");
-            drop(out);
-            if round == 1 {
-                c_best = d;
-            }
+        // ⚠️ **四轮、每轮两种顺序交替、每臂取最小**（M52 补的方法，理由有两条，都是本机踩过的）：
+        // ① 顺序偏差：五臂排在**最后**那一臂会替前面几臂的分配器碎片状态买单 —— 第一版只跑两轮
+        //    固定顺序，E 臂读到 557 ms，而同一个形状在 M48 那一轮的 A 臂是 270~320 ms（1.7~2.1×），
+        //    这个差跟"逐条插树"没关系，纯粹是排位。② **刚编译完那一轮不读数**（本机 1.3~1.9×）：
+        //    这一趟就是紧接着 `cargo test --release` 编译起来的第一轮。取最小 = 只信最快那一轮。
+        macro_rules! arm_b {
+            () => {{
+                let t = std::time::Instant::now();
+                seen = walk(&hint, |_k, _f, _id, _p, _l| {});
+                let d = t.elapsed();
+                if d < b_best {
+                    b_best = d;
+                }
+            }};
+        }
+        macro_rules! arm_c {
+            () => {{
+                let mut out: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(rows);
+                let t = std::time::Instant::now();
+                walk(&hint, |k, _f, id, p, l| {
+                    out.push((k.to_vec(), KeyLoc::Live { file_id: id, pos: p, len: l }));
+                });
+                let d = t.elapsed();
+                assert_eq!(out.len(), rows, "臂 C 少折了条目");
+                drop(out);
+                if d < c_best {
+                    c_best = d;
+                }
+            }};
+        }
+        // ── 臂 A：真门 —— `read_hint_file`（M52 之后：流式解码 + 有序 `collect` 成树）──
+        // ⚠️ 顺手量两件事，都不靠墙钟：
+        // ① **树建好之后还活着多少字节**（`a_live`/`e_live`）：大库台架那一格读到
+        //    `冷重开 常驻 83.4 → 57.7 MB`，而两臂解出来的键数一模一样 ⇒ 差的不可能是内容，
+        //    只能是形状（升序逐条 `insert` 会把每个叶/内部节点劈成半满，有序批量填则填满）。
+        // ② **建的过程中超出常驻多少**（`a_over`/`e_over`）：这一格是为了回答"流式解码到底有没有
+        //    把中间那份 `Vec` 省掉"—— 如果 `BTreeMap::from_iter` 自己先把项攒下来，
+        //    换不换写法峰值一样，那就该选简单的那一份写法（M52c 靠这一格定去留）。
+        macro_rules! arm_a {
+            () => {{
+                let l0 = crate::mem_probe::live() as i64;
+                let pbase = crate::mem_probe::reset_peak();
+                let t = std::time::Instant::now();
+                let (got, _, _) = read_hint_file(&hint).unwrap();
+                let d = t.elapsed();
+                let alive = crate::mem_probe::live() as i64 - l0;
+                let over = crate::mem_probe::peak().saturating_sub(pbase) as i64 - alive;
+                assert_eq!(got.len(), rows, "臂 A 少折了条目");
+                drop(got);
+                if d < a_best {
+                    a_best = d;
+                    a_live = alive;
+                    a_over = over;
+                }
+            }};
+        }
+        // ── 臂 D：同样解 + 分配，但**先攒进有序的 `Vec`，再一次 `collect` 成树**──
+        // 为什么加这一臂：hint 里的键本来就是升序写出的，而 ③ 那 74% 到底是
+        // "插一棵 BTreeMap  unavoidable"，还是"逐条 insert 每次都要从根走一遍"，
+        // 只有把这两件事拆开才答得了 —— 这一臂就是 M52 实际采用的形状。
+        macro_rules! arm_d {
+            () => {{
+                let t0 = std::time::Instant::now();
+                let mut acc: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(rows);
+                walk(&hint, |k, _f, id, p, l| {
+                    acc.push((k.to_vec(), KeyLoc::Live { file_id: id, pos: p, len: l }));
+                });
+                let l0 = crate::mem_probe::live() as i64;
+                let pbase = crate::mem_probe::reset_peak();
+                let built: KeyDir = acc.into_iter().collect();
+                let d = t0.elapsed();
+                let alive = crate::mem_probe::live() as i64 - l0;
+                let over = crate::mem_probe::peak().saturating_sub(pbase) as i64 - alive;
+                assert_eq!(built.len(), rows, "臂 D 少折了条目");
+                drop(built);
+                if d < d_best {
+                    d_best = d;
+                    d_over = over;
+                }
+            }};
+        }
+        // ── 臂 E：M52 **改前**的真门形状（解 + 每键分配 + 逐条 `insert` 进 `BTreeMap`）──
+        // 为什么留这一臂：M52 把 A 换成了 D 那个形状，于是"改前的 A"在这个二进制里再也读不到，
+        // 只能拿 E 复现它。A/E 必须在**同一份构建、同一个文件**上比（跨构建的 µs 在本机漂 1.3~1.9×）。
+        macro_rules! arm_e {
+            () => {{
+                let l0 = crate::mem_probe::live() as i64;
+                let pbase = crate::mem_probe::reset_peak();
+                let t = std::time::Instant::now();
+                let mut old_shape = KeyDir::new();
+                walk(&hint, |k, _f, id, p, l| {
+                    old_shape.insert(
+                        k.to_vec(),
+                        KeyLoc::Live {
+                            file_id: id,
+                            pos: p,
+                            len: l,
+                        },
+                    );
+                });
+                let d = t.elapsed();
+                let alive = crate::mem_probe::live() as i64 - l0;
+                let over = crate::mem_probe::peak().saturating_sub(pbase) as i64 - alive;
+                assert_eq!(old_shape.len(), rows, "臂 E 少折了条目");
+                drop(old_shape);
+                if d < e_best {
+                    e_best = d;
+                    e_live = alive;
+                    e_over = over;
+                }
+            }};
+        }
 
-            // ── 臂 A：真门 —— `read_hint_file`（解 + 分配 + 逐条插 `BTreeMap`）──
-            let t = std::time::Instant::now();
-            let (got, _, _) = read_hint_file(&hint).unwrap();
-            let d = t.elapsed();
-            assert_eq!(got.len(), rows, "臂 A 少折了条目");
-            drop(got);
-            if round == 1 {
-                a_best = d;
-            }
-
-            // ── 臂 D：同样解 + 分配，但**先攒进有序的 `Vec`，再一次 `collect` 成树**──
-            // 为什么加这一臂：hint 里的键本来就是升序写出的，而 ③ 那 74% 到底是
-            // "插一棵 BTreeMap  unavoidable"，还是"逐条 insert 每次都要从根走一遍"，
-            // 只有把这两件事拆开才答得了 —— 这一臂就是 M49 的候选修法本身。
-            let t = std::time::Instant::now();
-            let mut acc: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(rows);
-            walk(&hint, |k, _f, id, p, l| {
-                acc.push((k.to_vec(), KeyLoc::Live { file_id: id, pos: p, len: l }));
-            });
-            let built: KeyDir = acc.into_iter().collect();
-            let d = t.elapsed();
-            assert_eq!(built.len(), rows, "臂 D 少折了条目");
-            drop(built);
-            if round == 1 {
-                d_best = d;
+        for round in 0..4 {
+            if round % 2 == 0 {
+                arm_b!();
+                arm_c!();
+                arm_a!();
+                arm_d!();
+                arm_e!();
+            } else {
+                arm_e!();
+                arm_d!();
+                arm_a!();
+                arm_c!();
+                arm_b!();
             }
         }
         eprintln!(
-            "=== hint 三臂 rows={rows} 文件 {:.1} MB（每条 {:.1} B）解出 {seen} 条 ===",
+            "=== hint 三臂 rows={rows} 文件 {:.1} MB（每条 {:.1} B）解出 {seen} 条｜四轮两种顺序交替、每臂取最小 ===",
             bytes as f64 / 1e6,
             bytes as f64 / rows.max(1) as f64
         );
@@ -2227,6 +2479,39 @@ mod tests {
             per(d_best),
             ms(a_best) - ms(d_best),
             ms(a_best) / ms(d_best).max(0.001)
+        );
+        eprintln!(
+            "  E 改前形状(逐条 insert) {:>8.1} ms  {:>6.3} µs/条  ⇒ 同构建 A/B：A(现门) 比 E 省 {:>7.1} ms（{:.2}×）",
+            ms(e_best),
+            per(e_best),
+            ms(e_best) - ms(a_best),
+            ms(e_best) / ms(a_best).max(0.001)
+        );
+        eprintln!(
+            "  建好之后**还活着**：A {:.1} MB / E {:.1} MB ⇒ 同一批 {rows} 把键，形状差 {:>5.1} MB（{:.2}×）\
+             \n    ⇒ 大库台架那一格 `冷重开 常驻 83.4 → 57.7 MB` 的机制就在这里：升序逐条 `insert` 把每个节点劈成半满。",
+            a_live as f64 / 1e6,
+            e_live as f64 / 1e6,
+            (e_live - a_live) as f64 / 1e6,
+            e_live as f64 / (a_live.max(1) as f64)
+        );
+        // ⚠️ 这三笔 `over` 才是 M52c 的去留判据：`over` = 折树过程中**超出最终常驻**的那部分瞬时字节。
+        //    600k 两轮读数一字不差：**E 逐条 insert 0.0 ｜ D 自带 `Vec` 再 collect 28.8（正好是那根骨架）
+        //    ｜ A 流式 collect 50.3**。A 比我明确写出来的那根骨架还高 ⇒ "流式一定更省内存"这句**不成立**，
+        //    而这 21.5 MB 差值住在哪我没归因（怀疑在 `BTreeMap` 有序批量填充自己怎么攒节点）⇒
+        //    这一格**不进判据**，只登记。留流式那一版的理由只有两条实打实的：
+        //    少一个 `Vec<整库记录>` 这种"中间物形状"、少一格 `with_capacity(entry_count)` 的预算陷阱
+        //    （`entry_count` 从文件头读来，不可信）。时间两臂在比值噪声带里，不许当成证据。
+        eprintln!(
+            "  折树过程中的瞬时超出（`over`，MB）：A 流式 collect {:>6.1} ｜ D 我攒的 Vec 再 collect {:>6.1} ｜ E 逐条 insert {:>6.1}",
+            a_over as f64 / 1e6,
+            d_over as f64 / 1e6,
+            e_over as f64 / 1e6
+        );
+        assert!(
+            e_live > a_live,
+            "两臂解出的键数相同（各自断言过 == {rows}），常驻却不再差这么多 ⇒ \
+             这一格报的是**树形状**的账（半满节点），不是内容：{a_live} vs {e_live} 字节"
         );
         eprintln!(
             "  合计拆分：① {:>5.1}% ② {:>5.1}% ③ {:>5.1}%（按 A 那一臂的墙钟）",

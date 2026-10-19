@@ -906,13 +906,11 @@ impl BulkLoader {
         // bulk 结束后写 hint，避免下次 open 全量扫
         let _ = kv.dump_hint();
         let next_ver = self.core.next_version().load(Ordering::SeqCst);
-        let _ = wal.append(WalRecord::Checkpoint {
-            next_version: next_ver,
-            root_page_id: 0,
-            next_page_id: 0,
-        });
-        let _ = wal.sync();
-        let _ = wal.truncate();
+        // M52：以前这里是 `append(Checkpoint) → sync → truncate` —— `truncate()` 只留 header，
+        // **刚写的那条 Checkpoint 被自己抹掉**，于是下一次 open 拿不到起点 ⇒ 退到
+        // `scan_max_version` = O(全库 KeyDir)（M48 实测 600k 档那一次多花 89 ms）。
+        // 收口顺序是 `seal_wal_checkpoint` 的既有规矩（先截断再写回），别再抄第二份。
+        let _ = seal_wal_checkpoint(&mut wal, next_ver);
     }
 }
 
@@ -1394,6 +1392,71 @@ mod tests {
     /// 却把 N 个 value 全读出来丢掉。
     ///
     /// 这条断言在当前代码上**必然失败**，失败信息里的两个数字就是这个 bug 的量级证明。
+    /// M52：`BulkLoader` 收尾必须给 WAL 留下**一条还能用的 Checkpoint**。
+    ///
+    /// 洞（M48 那 89 ms 的真因）：`finish_inner` 原来是 `append(Checkpoint) -> sync -> truncate()`，
+    /// 而 `truncate()` 只留 header —— **刚写的那条记录被自己抹掉**。下一次 open 因此拿不到起点，
+    /// 只能退回 O(全库 KeyDir) 的 `scan_max_version`（bitcask 600k 档实测多花 89 ms）。
+    /// 正确的收口顺序在 `seal_wal_checkpoint` 里本来就有一份（先截断再写回）——
+    /// 这次把抄写的几处全部接回那一份：bitcask / bplus / lsm 的 bulk 收尾，加 bplus 的 `Drop`。
+    ///
+    /// 判据不看墙钟：收口之后**直接读 WAL** —— 应当恰好只剩一条 `Checkpoint`；
+    /// 再重开一趟，数据必须一行不少（起点拿小了真正危险的是版本号复用，不只是慢）。
+    #[test]
+    fn test_bulk_finish_leaves_a_usable_wal_checkpoint() {
+        use crate::bitcask::storage::wal_path;
+        use crate::bitcask::wal::{Wal, WalRecord};
+        let path = tmp_db("bulk_wal");
+        let c0 = scan_max_calls();
+        {
+            // 全新库的第一次 open：WAL 里没有 checkpoint ⇒ 退路必然被走一次（给下面那个 0 作证）
+            let mvcc = MVCC::open(&path);
+            assert!(
+                scan_max_calls() > c0,
+                "`scan_max_calls` 没数到全新库那次 open 的退路 ⇒ 尺子没接上，下面那个 0 不算数"
+            );
+            let tx = mvcc.begin_transaction();
+            for i in 0..200u64 {
+                assert!(tx.set(format!("k{i:06}").as_bytes(), b"v".to_vec()), "灌一把键失败");
+            }
+            tx.commit();
+            let mut bulk = mvcc.begin_bulk();
+            for i in 200..260u64 {
+                bulk.put(format!("k{i:06}").as_bytes(), b"w".to_vec());
+            }
+            bulk.finish();
+            let mut wal = Wal::open(wal_path(&path)).unwrap();
+            let entries = wal.read_all().unwrap();
+            let cps: Vec<u64> = entries
+                .iter()
+                .filter_map(|e| match &e.record {
+                    WalRecord::Checkpoint { next_version, .. } => Some(*next_version),
+                    _ => None,
+                })
+                .collect();
+            eprintln!("[bulk 收口] bitcask WAL 剩 {} 条，Checkpoint = {:?}", entries.len(), cps);
+            assert_eq!(
+                cps.len(),
+                1,
+                "bulk 收尾没留下可用的 Checkpoint => 顺序又退回 append -> truncate（自己抹掉自己）"
+            );
+            assert_eq!(entries.len(), 1, "截断没生效：WAL 里还剩 {} 条", entries.len());
+        }
+        // 重开：起点接上了 => 那条 O(全库) 的退路必须不再被走
+        let c1 = scan_max_calls();
+        let mvcc = MVCC::open(&path);
+        let used = scan_max_calls() - c1;
+        assert_eq!(
+            used, 0,
+            "bulk 之后的 open 又走了 `scan_max_version` => WAL 里的起点没被用上（M48 实测 89 ms）"
+        );
+        let tx = mvcc.begin_transaction();
+        assert_eq!(tx.key_count(b"k"), 260, "重开之后行数不对 => 收口把数据弄坏了");
+        tx.commit();
+        drop(mvcc);
+        cleanup(&path);
+    }
+
     #[test]
     fn test_point_op_cost_independent_of_chain_length() {
         fn probe(chain_len: u64) -> (u64, u64) {

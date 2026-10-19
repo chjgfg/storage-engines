@@ -672,13 +672,8 @@ impl Drop for MVCC {
             kv.flush_all();
             let root = kv.root_page_id();
             let next_page = kv.next_page_id();
-            let _ = wal.append(WalRecord::Checkpoint {
-                next_version: next_ver,
-                root_page_id: root.0,
-                next_page_id: next_page,
-            });
-            let _ = wal.sync();
-            let _ = wal.truncate();
+            // M52：`Drop` 里同一个洞 ⇒ 同一份收口（先截断再写回）
+            let _ = seal_wal_checkpoint(&mut wal, next_ver, root.0, next_page);
         }
         if let Ok(mut blob) = self.blob.lock() {
             let _ = blob.sync();
@@ -805,13 +800,10 @@ impl BulkLoader {
         kv.set_bulk_mode(false);
         let root = kv.root_page_id();
         let next_page = kv.next_page_id();
-        let _ = wal.append(WalRecord::Checkpoint {
-            next_version: next_ver,
-            root_page_id: root.0,
-            next_page_id: next_page,
-        });
-        let _ = wal.sync();
-        let _ = wal.truncate();
+        // M52：这里是 `append(Checkpoint) → sync → truncate()` —— `truncate()` 只留 header，
+        // 刚写的那条 Checkpoint 被自己抹掉 ⇒ 下一次 open 拿不到起点（bplus 还有 `NVER` meta
+        // 兜着，所以表现为"README 写的第二级永远走不到"）。收口只有一份：`seal_wal_checkpoint`。
+        let _ = seal_wal_checkpoint(&mut wal, next_ver, root.0, next_page);
     }
 }
 
@@ -1287,6 +1279,88 @@ mod tests {
     /// 版本键大端有序 ⇒ 最新版本必然在链尾 ⇒ 下降到高界再往回一步就该停。
     /// 修复前是从 `low` 下降后沿 `next_leaf` 正向走完整个区间：N 行版本横跨
     /// N/order 片叶子，每片都要 read_page + 整节点 bincode 反序列化。
+    /// M52：`BulkLoader` 收尾必须给 WAL 留下**一条还能用的 Checkpoint**。
+    ///
+    /// 洞（M48 那 89 ms 的真因）：`finish_inner` 原来是 `append(Checkpoint) -> sync -> truncate()`，
+    /// 而 `truncate()` 只留 header —— **刚写的那条记录被自己抹掉**。下一次 open 因此拿不到起点，
+    /// 只能退回 O(全库 KeyDir) 的 `scan_max_version`（bitcask 600k 档实测多花 89 ms）。
+    /// 正确的收口顺序在 `seal_wal_checkpoint` 里本来就有一份（先截断再写回）——
+    /// 这次把抄写的几处全部接回那一份：bitcask / bplus / lsm 的 bulk 收尾，加 bplus 的 `Drop`。
+    ///
+    /// 判据不看墙钟：收口之后**直接读 WAL** —— 应当恰好只剩一条 `Checkpoint`；
+    /// 再重开一趟，数据必须一行不少（起点拿小了真正危险的是版本号复用，不只是慢）。
+    #[test]
+    fn test_bulk_finish_leaves_a_usable_wal_checkpoint() {
+        use crate::bplus_tree::wal::{Wal, WalRecord};
+        let path = tmp_db("bulk_wal");
+        {
+            let mvcc = MVCC::open(&path, 64, 0);
+            let tx = mvcc.begin_transaction();
+            for i in 0..200u64 {
+                assert!(tx.set(format!("k{i:06}").as_bytes(), b"v".to_vec()), "灌一把键失败");
+            }
+            tx.commit();
+            let mut bulk = mvcc.begin_bulk();
+            for i in 200..260u64 {
+                bulk.put(format!("k{i:06}").as_bytes(), b"w".to_vec());
+            }
+            bulk.finish();
+            let mut wal = Wal::open(wal_path(&path)).unwrap();
+            let entries = wal.read_all().unwrap();
+            let cps: Vec<u64> = entries
+                .iter()
+                .filter_map(|e| match &e.record {
+                    WalRecord::Checkpoint { next_version, .. } => Some(*next_version),
+                    _ => None,
+                })
+                .collect();
+            eprintln!("[bulk 收口] bplus WAL 剩 {} 条，Checkpoint = {:?}", entries.len(), cps);
+            assert_eq!(
+                cps.len(),
+                1,
+                "bulk 收尾没留下可用的 Checkpoint => 又退回 append -> truncate（自己抹掉自己）"
+            );
+            assert_eq!(entries.len(), 1, "截断没生效：WAL 里还剩 {} 条", entries.len());
+        }
+        let mvcc = MVCC::open(&path, 64, 0);
+        let tx = mvcc.begin_transaction();
+        assert_eq!(tx.key_count(b"k"), 260, "重开之后行数不对 => 收口把数据弄坏了");
+        tx.commit();
+        drop(mvcc);
+        cleanup(&path);
+    }
+
+    /// M52：`Drop` 是**另一个**收口点（与 `finish_inner` 不是一个函数），同一个洞也在那儿。
+    /// 抄写两份就得各钉一次 —— 正常关闭库时刚 append 的 Checkpoint 会被随后的 truncate 抹掉。
+    #[test]
+    fn test_drop_leaves_a_usable_wal_checkpoint() {
+        use crate::bplus_tree::wal::{Wal, WalRecord};
+        let path = tmp_db("drop_wal");
+        {
+            let mvcc = MVCC::open(&path, 64, 0);
+            let tx = mvcc.begin_transaction();
+            for i in 0..50u64 {
+                assert!(tx.set(format!("d{i:04}").as_bytes(), b"v".to_vec()));
+            }
+            tx.commit();
+        }
+        // mvcc 已离开作用域 => Drop 里的收口跑完了，直接看盘上那份 WAL
+        let mut wal = Wal::open(wal_path(&path)).unwrap();
+        let entries = wal.read_all().unwrap();
+        let n_ckpt = entries
+            .iter()
+            .filter(|e| matches!(e.record, WalRecord::Checkpoint { .. }))
+            .count();
+        eprintln!("[Drop 收口] bplus WAL 剩 {} 条、Checkpoint {n_ckpt} 条", entries.len());
+        assert_eq!(n_ckpt, 1, "Drop 之后 WAL 里没有可用的 Checkpoint（同一个洞的第二处）");
+        let mvcc = MVCC::open(&path, 64, 0);
+        let tx = mvcc.begin_transaction();
+        assert_eq!(tx.key_count(b"d"), 50, "重开之后行数不对");
+        tx.commit();
+        drop(mvcc);
+        cleanup(&path);
+    }
+
     #[test]
     fn test_point_op_cost_independent_of_chain_length() {
         fn probe(chain_len: u64) -> (u64, u64) {
@@ -3779,4 +3853,5 @@ impl crate::common::VersionedStore for Transaction {
     fn materialize(&self, row: Option<Vec<u8>>) -> crate::common::RowValue {
         self.read_row(&row)
     }
+
 }
