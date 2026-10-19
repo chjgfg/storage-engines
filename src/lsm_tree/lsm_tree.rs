@@ -1146,7 +1146,6 @@ impl LSMTree {
         snap_seq: u64,
     ) -> LightMerge<'a> {
         let probe_low = from.unwrap_or(&[]);
-        let probe_high = to.unwrap_or(&[0xffu8; 8]);
         let mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + '_>> = Vec::new();
         if !self.mem.is_empty() {
             sources.push(Box::new(Self::mem_light_iter(&self.mem, from, to, snap_seq)));
@@ -1165,7 +1164,16 @@ impl LSMTree {
             ssts.extend(level.iter());
         }
         for sst in ssts {
-            if !sst.may_overlap(probe_low, probe_high) {
+            // ⚠️ M47：`to == None` 时**不能**拿一个合成的上界去剪文件 —— 键是任意字节，
+            // 任何"够大的填充值"都存在比它更大的真键（改前那行用 `&[0xffu8; 8]`，
+            // 于是 `min_key = [0xff;12]` 的文件在"全库"走查里被整篇跳过：少数、少扫、不报错）。
+            // 有上界时才用 min/max 双向剪；没有上界就只剪"整篇在 `from` 之下"的那一头。
+            let alive = !(sst.min_key.is_empty() && sst.max_key.is_empty());
+            let overlaps = match to {
+                Some(hi) => alive && sst.may_overlap(probe_low, hi),
+                None => alive && sst.max_key.as_slice() >= probe_low,
+            };
+            if !overlaps {
                 continue; // min/max 不相干 ⇒ 整篇不读
             }
             sources.push(Box::new(sst.light_iter(from, to, snap_seq)));
@@ -1511,20 +1519,46 @@ impl LSMTree {
             .collect()
     }
 
+    /// 跨源去重之后的**键数**（三种赢家行都算：有值、空值、`Drop` 墓碑）。
+    ///
+    /// M47：只数不物化 —— 改前是 `merge_all_at(u64::MAX).len()`，为一个数把整库连 value 折出来
+    /// （与 M35 那刀里 `key_count` 同一个形状）。判据复用 [`Self::count_kinds_at`]。
     pub fn entry_count(&self) -> usize {
-        self.merge_all_at(u64::MAX).len()
+        let (put, empty, drop) = self.count_kinds_at(u64::MAX);
+        put + empty + drop
     }
 
-    /// 存活 key 数。优先返回缓存；`stats_dirty` 时会全量 merge（昂贵）。
+    /// 三类赢家行的条数：`(Put(Some), Put(None), Drop)`。
+    ///
+    /// 为什么一条就够：`entry_count`、`len` 的 dirty 路径、`refresh_stats_cache` 问的其实都是
+    /// "每一类各多少条"，只是各自取不同的一撮 ⇒ 三份"为一个数把整库折出来"合成一份
+    /// （M5a/M5b 一路的做法：同形状的判定不许留三份）。
+    /// 判据（谁算一个键、跨源怎么选赢家）走 M39 那条惰性轻量归并，与重量归并一字不差；
+    /// 轻量视图只带 `seq` 与 `kind` 字节 ⇒ **一行 value 都不克隆**
+    /// （守卫拿 `sst::value_materializations()` 钉这一格必须是 0）。
+    fn count_kinds_at(&self, snap_seq: u64) -> (usize, usize, usize) {
+        let (mut put, mut empty, mut drop) = (0usize, 0usize, 0usize);
+        for (_k, le) in self.light_iter_range(None, None, snap_seq) {
+            match le.kind {
+                0 => put += 1,
+                1 => empty += 1,
+                2 => drop += 1,
+                // 种类字节只有这三种；走到这里说明两边口径分了家。
+                // ⚠️ 宁可少算，也不要把一个不认识的种类当成存活键（那是假数，不是崩溃）。
+                _ => {}
+            }
+        }
+        (put, empty, drop)
+    }
+
+    /// 存活 key 数。优先返回缓存；`stats_dirty` 时会走查全库（O(全库条目)，M47 起一行 value 都不克隆）。
     /// 刚 `open` 后若未写过，缓存为 0——需要精确值请用 [`stats_exact`]。
     pub fn len(&self) -> usize {
         if !self.stats_dirty {
             return self.cached_live;
         }
-        self.merge_all_at(u64::MAX)
-            .iter()
-            .filter(|(_, se)| matches!(se.value, EntryValue::Put(Some(_))))
-            .count()
+        // M47：只数不物化（改前是 `merge_all_at(...).iter().filter(Put(Some)).count()`）
+        self.count_kinds_at(u64::MAX).0
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1562,8 +1596,8 @@ impl LSMTree {
         }
     }
 
-    /// 全量 merge 后刷新 `cached_live`/`cached_tomb`，返回精确 stats。
-    /// 大库 O(全量条目)，仅对账 / 测试使用。
+    /// 走查全库后刷新 `cached_live`/`cached_tomb`，返回精确 stats。
+    /// 大库 O(全库条目)，仅对账 / 测试使用。⚠️ M47 起这一趟**不折 value**（只数种类）。
     pub fn stats_exact(&mut self) -> LsmStats {
         self.refresh_stats_cache();
         self.stats()
@@ -1577,18 +1611,12 @@ impl LSMTree {
     }
 
     fn refresh_stats_cache(&mut self) {
-        let all = self.merge_all_at(u64::MAX);
-        let mut live = 0usize;
-        let mut tomb = 0usize;
-        for (_, se) in &all {
-            match &se.value {
-                EntryValue::Put(Some(_)) => live += 1,
-                EntryValue::Put(None) => tomb += 1,
-                EntryValue::Drop => {}
-            }
-        }
-        self.cached_live = live;
-        self.cached_tomb = tomb;
+        // M47：只数不物化。改前这里是 `merge_all_at(u64::MAX)` 把整库连 value 折出来，
+        // 再逐条 match —— 与 `entry_count`/`len` 是同一个形状的第三份复制。
+        // 口径一字未动：`Put(Some)` → live、`Put(None)` → tomb、`Drop` 两处都不计。
+        let (put, empty, _drop) = self.count_kinds_at(u64::MAX);
+        self.cached_live = put;
+        self.cached_tomb = empty;
         self.stats_dirty = false;
     }
 
@@ -2602,6 +2630,157 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// M47 的守卫：三格"为一个数物化整库"（`entry_count`、`len` 的 dirty 路径、
+    /// `stats_exact` → `refresh_stats_cache`）改成只数不物化之后，**数要一字不差**，
+    /// 而 value 一次都不该被克隆。
+    ///
+    /// 两把尺子各钉各的（M44 的教训：一把读 0 的尺子可能只是没接上）：
+    /// ① **对拍重量归并** —— 测试里直接把 `merge_all_at` 跑一遍按类数出来当基准，
+    ///   形状必须混：存活行、空值 `Put(None)`、`Drop` 墓碑，再加"同一把键在 memtable 与
+    ///   多份 SST 里都有"（跨源取胜才是这条路径真正在算的东西）；
+    /// ② `value_materializations()` 在三格上增量必须是 **0**，而同一个测试里基准那一趟
+    ///   必须读到 ≥ 全库 ⇒ 证明这把尺子确实接在重量路径上。
+    #[test]
+    fn test_counting_paths_do_not_materialize_values() {
+        use crate::lsm_tree::sst::value_materializations;
+        let dir = tmp_dir("count_no_materialize");
+        {
+            let mut db = LSMTree::open(&dir).unwrap();
+            for i in 0..400usize {
+                db.put(format!("k{i:04}").into_bytes(), vec![b'v'; 4]);
+            }
+            for i in 100..140usize {
+                db.insert(format!("e{i:04}").into_bytes(), None);
+            }
+            for i in 200..230usize {
+                db.delete(format!("k{i:04}").into_bytes());
+            }
+            // `remove` 写的是第三种赢家行 `EntryValue::Drop`（`delete` 只写 `Put(None)`）：
+            // 三种种类都要在场，否则 `count_kinds_at` 里那一支 match 分支量不到。
+            for i in 50..62usize {
+                assert!(db.remove(format!("k{i:04}").as_bytes()));
+            }
+            db.flush().unwrap();
+            // 同一把键再写一遍 ⇒ memtable 与 SST 里都有它，跨源取胜才被判到
+            for i in 300..340usize {
+                db.put(format!("k{i:04}").into_bytes(), vec![b'w'; 9]);
+            }
+            db.insert(
+                format!("e{:04}", 105).into_bytes(),
+                Some(b"again".to_vec()),
+            );
+            db.flush().unwrap();
+            for i in 350..360usize {
+                db.delete(format!("k{i:04}").into_bytes());
+            }
+            for i in 100..108usize {
+                assert!(db.remove(format!("k{i:04}").as_bytes()));
+            }
+            assert!(
+                db.stats().total_sst >= 2,
+                "没造出两份以上 SST ⇒ 这次对拍量不到跨源"
+            );
+
+            // ── 基准：重量归并逐条数（这就是改前三格的实现）──
+            let base = value_materializations();
+            let all = db.merge_all_at(u64::MAX);
+            let want = (
+                all.iter()
+                    .filter(|(_, se)| matches!(se.value, EntryValue::Put(Some(_))))
+                    .count(),
+                all.iter()
+                    .filter(|(_, se)| matches!(se.value, EntryValue::Put(None)))
+                    .count(),
+                all.iter()
+                    .filter(|(_, se)| matches!(se.value, EntryValue::Drop))
+                    .count(),
+            );
+            let heavy = value_materializations() - base;
+            eprintln!(
+                "[count] 重量基准 live={} 空值={} 墓碑={}（这一趟物化 {} 条）",
+                want.0, want.1, want.2, heavy
+            );
+            assert!(want.1 > 0 && want.2 > 0, "形状没混起来：空值 {} 墓碑 {}", want.1, want.2);
+            assert!(
+                heavy >= all.len() as u64,
+                "重量基准只物化了 {} 条（全库 {} 行）⇒ 尺子没接上，下面那个 0 不算数",
+                heavy,
+                all.len()
+            );
+
+            // ── ① 数一字不差 ──
+            assert_eq!(db.count_kinds_at(u64::MAX), want, "轻量计数与重量归并不一致");
+            assert_eq!(db.entry_count(), all.len(), "entry_count 与改前不同数");
+            assert!(db.stats_dirty, "没走在 dirty 路径上 ⇒ 这一格量的不是那次全量计数");
+            assert_eq!(db.len(), want.0, "len（dirty 路径）与改前不同数");
+
+            // ── ② 三格合起来一行 value 都不许克隆 ──
+            let base = value_materializations();
+            let n = db.entry_count();
+            let m = db.len();
+            let st = db.stats_exact();
+            let mats = value_materializations() - base;
+            eprintln!(
+                "[count] 只数不物化：entry_count={} len={} live={} tomb={} ⇒ 物化 {} 条",
+                n, m, st.live_keys, st.tombstones, mats
+            );
+            assert_eq!(mats, 0, "计数这三格克隆了 {mats} 条 value ⇒ 还在为一个数折整库");
+            assert_eq!(n, all.len(), "entry_count 二次调用给了不同的数");
+            assert_eq!(st.live_keys as usize, want.0, "stats_exact 的 live 与基准不同");
+            assert_eq!(st.tombstones as usize, want.1, "stats_exact 的 tomb 与基准不同");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M47 顺带挖出来的一条**先前就存在**的少算：轻量走查在"没有上界"时拿一个合成上界
+    /// `&[0xffu8; 8]` 去剪 SST ⇒ 一篇 `min_key` 比它更大的文件被**整篇跳过**，
+    /// 全库计数/首页扫描少了那些键，而且不报错。
+    ///
+    /// 这一格为什么归这里：M47 把 `entry_count` 接到 `light_iter_range` 上，剪枝判据从此
+    /// 也在"数出全库有多少键"这条路上生效 —— 少算的不再是"某一页少几行"而是"整个数不对"。
+    /// 同一个判据的用户（`scan_page` / 窗口搜索 / 有界 vacuum / `health()`）一起受益。
+    #[test]
+    fn test_light_scan_without_upper_bound_keeps_files_past_the_old_sentinel() {
+        let dir = tmp_dir("count_high_keys");
+        {
+            let mut db = LSMTree::open(&dir).unwrap();
+            for i in 0..50usize {
+                db.put(format!("k{i:04}").into_bytes(), vec![b'v'; 4]);
+            }
+            db.flush().unwrap();
+            // 这一篇里**每一把键**都大于 `[0xff;8]`（12 个 0xff，末位才动）⇒ 改前那行
+            // `may_overlap(low, &[0xffu8; 8])` 判定 `min_key <= high` 为假 ⇒ 整篇不读。
+            for i in 0..7u8 {
+                let mut k = vec![0xffu8; 12];
+                k[11] = i;
+                db.put(k, vec![b'w'; 4]);
+            }
+            db.flush().unwrap();
+            assert!(
+                db.stats().total_sst >= 2,
+                "没造出独立的第二篇 SST ⇒ 这一格量不到剪枝"
+            );
+
+            // 重量归并不剪文件，它就是基准
+            let all = db.merge_all_at(u64::MAX);
+            assert_eq!(all.len(), 57, "基准本身不对：{all:?}");
+            assert_eq!(
+                db.entry_count(),
+                all.len(),
+                "全库计数漏掉了 min_key 高于旧合成上界的那篇 SST"
+            );
+            // 有下界、无上界的那一趟同样不许把尾部剪掉
+            let tail: Vec<_> = db.light_iter_range(Some(b"k0049"), None, u64::MAX).collect();
+            assert_eq!(tail.len(), 1 + 7, "开区间走查少算：{tail:?}");
+            assert_eq!(
+                db.count_kinds_at(u64::MAX).0,
+                all.len(),
+                "计数与开区间走查口径分家"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// M41b 的**校准**：memtable 里一条条目在堆上到底占多少字节。
     ///
     /// 为什么要有这条：`maybe_flush_mem` 读的 `mem_bytes` 只数载荷账（`key.len() +
@@ -2651,6 +2830,91 @@ mod tests {
             let mats = value_materializations() - m0;
             eprintln!(
                 "=== 裸引擎全库导出 rows={rows} 源={files} 交出 {n} 行 ⇒ 瞬时峰值 {:.1} MB、物化 {mats} 条、耗时 {:.2} s ===",
+                mb(peak),
+                d.as_secs_f64()
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M47 的内存凭据：三格"为一个数物化整库"（`entry_count`、`len` 的 dirty 路径、
+    /// `stats_exact` → `refresh_stats_cache`）那一趟到底瞬时涨多少（`#[ignore]`，手动 release 单线程跑）。
+    ///
+    /// 两臂在**同一个构建**里，只切 `LSM_COUNT_OLD_SHAPE=1`：那一臂把三格各自的旧写法
+    /// （各调一次 `merge_all_at(u64::MAX)` 再数）就地重放一遍。⚠️ 两臂都在每一格之前把
+    /// `stats_dirty` 压回 true —— 否则第二、三格读的是缓存，量的就不是那三扇门了
+    /// （M44 的教训：尺子必须钉在旧形状真正流过的那扇门上）。
+    ///
+    /// ```text
+    /// LSM_COUNT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_counting_doors_peak
+    /// LSM_COUNT_OLD_SHAPE=1 LSM_COUNT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_counting_doors_peak
+    /// ```
+    #[test]
+    #[ignore = "三格计数的内存台架，手动 release 单线程跑：LSM_COUNT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_counting_doors_peak"]
+    fn lsm_counting_doors_peak() {
+        use crate::lsm_tree::sst::value_materializations;
+        let rows: usize = std::env::var("LSM_COUNT_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let old = std::env::var("LSM_COUNT_OLD_SHAPE").map(|v| v == "1").unwrap_or(false);
+        let mb = |b: u64| b as f64 / 1024.0 / 1024.0;
+        let dir = tmp_dir("counting_doors_peak");
+        {
+            let mut db = LSMTree::open_with_options(&dir, usize::MAX / 8, 64).unwrap();
+            for i in 0..rows {
+                db.put(format!("{i:08}").into_bytes(), vec![b'v'; 24]);
+            }
+            db.flush().unwrap();
+            let files = db.stats().total_sst;
+
+            let base = crate::mem_probe::reset_peak();
+            let m0 = value_materializations();
+            let t = std::time::Instant::now();
+            let (n_entry, n_live, st) = if old {
+                // 改前：每一格各自把整库连 value 折出来再数（口径与那一版一字不差）
+                db.stats_dirty = true;
+                let n_entry = db.merge_all_at(u64::MAX).len();
+                db.stats_dirty = true;
+                let n_live = db
+                    .merge_all_at(u64::MAX)
+                    .iter()
+                    .filter(|(_, se)| matches!(se.value, EntryValue::Put(Some(_))))
+                    .count();
+                db.stats_dirty = true;
+                let st = {
+                    let all = db.merge_all_at(u64::MAX);
+                    let live = all
+                        .iter()
+                        .filter(|(_, se)| matches!(se.value, EntryValue::Put(Some(_))))
+                        .count();
+                    let tomb = all
+                        .iter()
+                        .filter(|(_, se)| matches!(se.value, EntryValue::Put(None)))
+                        .count();
+                    db.cached_live = live;
+                    db.cached_tomb = tomb;
+                    db.stats_dirty = false;
+                    db.stats()
+                };
+                (n_entry, n_live, st)
+            } else {
+                db.stats_dirty = true;
+                let n_entry = db.entry_count();
+                db.stats_dirty = true;
+                let n_live = db.len();
+                db.stats_dirty = true;
+                let st = db.stats_exact();
+                (n_entry, n_live, st)
+            };
+            let d = t.elapsed();
+            let peak = crate::mem_probe::peak().saturating_sub(base);
+            let mats = value_materializations() - m0;
+            eprintln!(
+                "=== 三格计数 rows={rows} 源={files} 臂={} ⇒ entry_count={n_entry} len={n_live} live={} tomb={} 瞬时峰值 {:.1} MB、物化 {mats} 条、耗时 {:.2} s ===",
+                if old { "改前(整库折出来)" } else { "改后(只数)" },
+                st.live_keys,
+                st.tombstones,
                 mb(peak),
                 d.as_secs_f64()
             );

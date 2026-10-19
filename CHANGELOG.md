@@ -495,6 +495,42 @@
     第一遍读数时我差点把"lsm 灌行 30.5、点读 11.6"当成自己引入的回归写进文档 —— 安静复跑三轮
     是 20.6~23.5 与 **6.2~6.9**（记录 9.6），而且**刚编译完那一轮**（编译器还没退出）量到的就是
     那个 11.6。所以：跨构建的 µs 列一律不作因果凭据，只作历史快照；凭据是同构建 A/B 的计数。
+- **LSM 三格"为一个数物化整库"改成只数不物化：600k 档 100.4 → 0.4 MB、快 1.49×；顺带修掉一条先前就存在的少算（M47）**：
+  M46 末尾自己记下的那一格 —— `entry_count()` 是 `merge_all_at(u64::MAX).len()`，`len()` 的 dirty 路径与
+  `refresh_stats_cache` 也各折一趟整库 ⇒ **数一个数要先把 60 万行连 value 折出来**，与 M35 那刀里
+  `key_count` 同一个形状。
+  - 改法：三条合成一条 `count_kinds_at(snap_seq) -> (Put(Some), Put(None), Drop)`，走 M39/M46 那条
+    **惰性轻量归并**（`light_iter_range`）⇒ 一行 value 都不克隆。`entry_count` = 三者之和、
+    `len` 的 dirty 路径取 `.0`、`refresh_stats_cache` 取 `.0`/`.1`（`Drop` 两处都不计，口径一字未动）。
+    ⚠️ 这一合并不只是省内存：三格原本各自漂移，现在只有一份判据。
+  - 同一构建两臂（`LSM_COUNT_ROWS=600000`，切 `LSM_COUNT_OLD_SHAPE=1` 就地重放改前那三行写法；
+    **两臂都在每一格之前把 `stats_dirty` 压回 true**，否则第二、三格读缓存、量的不是那三扇门）：
+    600k 行 / 1 个源、两臂交出同样的三个数（`entry_count=600000 len=600000 live=600000 tomb=0`）⇒
+    瞬时峰值 **100.4 MB → 0.4 MB（251×）**、`EntryValue` 克隆 **1 800 000 条 → 0 条**、耗时 min **1.50 s → 1.01 s**。
+    两臂各两轮交错跑，峰值两轮都是 100.4 / 0.4（内存读数没有墙钟那种 ±1.3~1.9× 的漂）。
+    台架 `lsm_counting_doors_peak`（`#[ignore]`，单线程手动跑）留在库里当凭据。
+  - 守卫 `test_counting_paths_do_not_materialize_values`（440 行 / ≥2 篇 SST，**三种赢家行都在场**：
+    341 条 `Put(Some)`、79 条 `Put(None)`、20 条 `Drop` —— ⚠️ `delete()` 写的是 `Put(None)`，第三种只能由
+    `remove()` 造出来；少了它那一支 match 分支就量不到）两把尺子：① 与重量归并**逐类对拍**；
+    ② 三格合起来 `value_materializations()` 增量必须是 **0**，而同一个测试里基准那一趟必须读到
+    **541 ≥ 440** ⇒ 给 ② 作证。
+    变异：A 把 `count_kinds_at` 换回 `merge_all_at` ⇒ 红在"物化 1623 条"；B 把墓碑算进存活 ⇒
+    红在"轻量计数与重量归并不一致"。⚠️ **B 这一格 `entry_count` 的总数照样是 440** —— 只断总数抓不到分类漂移，
+    必须逐类对拍（M45 那条"两个错合成一个对"的同一课）。
+- **⚠️ 顺带挖出并修掉一条先前就存在的少算：轻量走查在"无上界"时拿合成上界剪 SST**（M47 把计数接到
+  `light_iter_range` 上才撞见的）：
+  - 一句话：`probe_high = to.unwrap_or(&[0xffu8; 8])` ⇒ 当 `to == None`（"一直到库尾"）时用**一个假的 8 字节
+    全 `0xff` 上界**去跑 `may_overlap` ⇒ 一篇 `min_key` 比它更大的文件（键以 ≥8 个 `0xff` 开头且更长）
+    被**整篇跳过**：少扫、少数、少收，**不报错**。键是任意字节，任何"够大的填充值"都存在比它更大的真键。
+  - 影响面（这些都是 `to = None` 的用户）：`health()`（M39 那条全库走查）、`key_count` / 精确 `total`（M35）、
+    `vacuum_bounded` 的一片（M29/M37）、`scan_latest_light`，以及 M47 新接的三格计数。
+    **点读从来没中过** —— `get_at` 用的是真键（`may_overlap(key, key)`）。所以现场的形状是"读得到、扫不到"。
+  - 修法：只在**真有上界**时做 min/max 双向剪；无上界就只剪"整篇在 `from` 之下"的那一头
+    （`sst.max_key >= probe_low`）⇒ 常见的全库走查（`from=None`）判据结果不变，开区间那趟不再误剪。
+    **不动磁盘格式、不动 API。**
+  - 守卫 `test_light_scan_without_upper_bound_keeps_files_past_the_old_sentinel`（57 把键，其中 7 把是
+    `[0xff;12]` 且单独成一篇 SST）：`entry_count` 必须等于重量归并的 57、开区间走查必须交出 1+7 行。
+    变异 C：把合成上界装回去 ⇒ 红在 `left: 50, right: 57` —— **少的那 7 把就是现场被整篇跳过的文件**。
 - **裸 `LSMTree::merge_all_at` 的**源**改惰性：600k 档全库导出瞬时 100.4 → 0.4 MB，顺手快 1.53×，四家 `export_kv` 到这才算齐（M46）**：
   M44 之后四家 CLI 只剩 lsm 那家还在物化整库 —— 它走的不是门面而是裸引擎入口
   `export_records_with_seq` → `merge_all_at`。归并本身从 M33 起就吃 `Box<dyn Iterator>`，坏的是**源**：

@@ -1596,7 +1596,8 @@ M44 之后四家 `export_kv` 里只剩 lsm 那家还在物化整库，原因是�
 60 万次 `Vec` 扩容 + 每条一次克隆本身就是工作。⚠️ `merge_all_at` 另外五个调用点
 （`iter` / `iter_at` / `entry_count` / `len` / `refresh_stats_cache`）共用这份收益；其中
 `entry_count` 是 `merge_all_at(...).len()` —— 为一个数物化整库，与 M35 那刀里 `key_count`
-同一个形状，**这一刀没顺手改**（记在队列里，别把它算进本条的收益）。
+同一个形状，**这一刀没顺手改**（记在队列里，别把它算进本条的收益）。→ **下一条 M47 做了**，
+`iter` / `iter_at` 那两格仍是要 `Vec` 的形状（调用方要的就是整库）。
 
 守卫 `test_merge_streams_sources_instead_of_materializing_them`（20 000 行 / 4 篇 SST，
 尺子 = 已有的 `value_materializations()`：重量路径每出一条记一次）：
@@ -1606,6 +1607,63 @@ M44 之后四家 `export_kv` 里只剩 lsm 那家还在物化整库，原因是�
 ④ 回调一律拒绝时交出 0 行、物化仍是 5 条 ⇒ 收手传到了源那一头。
 变异：把 `merge_inputs_at` 里 SST 那一支换回 `iter_all().collect()` + `vec_inputs` ⇒ ① 红在
 "交出第一行之前已物化 20 000 条（库 20 000 行）⇒ 源又被整篇折进 `Vec` 了"。
+
+**M47 —— LSM 三格"为一个数物化整库"改成只数不物化：600k 档 100.4 → 0.4 MB；顺带修掉一条先前就存在的少算**
+
+M46 末尾自己记下那一格：`entry_count()` = `merge_all_at(u64::MAX).len()`，`len()` 的 dirty 路径和
+`refresh_stats_cache` 也各折一趟整库 ⇒ **数一个数之前先把 60 万行连 value 折出来**（M35 那刀里
+`key_count` 同一个形状，只是这三格住在裸引擎里、那把尺子照不到）。
+
+改法：三条合成一条
+
+```rust
+fn count_kinds_at(&self, snap_seq: u64) -> (usize, usize, usize)  // (Put(Some), Put(None), Drop)
+```
+
+走 M39/M46 那条**惰性轻量归并**（`light_iter_range`，一行轻量记录只带 `seq` + 种类字节）⇒
+**一行 value 都不克隆**。`entry_count` 取三者之和，`len` 的 dirty 路径取 `.0`，
+`refresh_stats_cache` 取 `.0`/`.1`（`Drop` 两处都不计 —— 口径一字未动）。
+⚠️ 合一份不只是省内存：那三格原本会各自漂移。
+
+同一构建两臂（`LSM_COUNT_ROWS=600000`，只切 `LSM_COUNT_OLD_SHAPE=1` 就地重放改前那三行写法；
+**两臂都在每一格之前把 `stats_dirty` 压回 true** —— 否则第二、三格读的是缓存，量的就不是那三扇门）：
+
+| 600k 行 / 1 个源，两臂交出同样的三个数 | 瞬时峰值 | `EntryValue` 克隆 | 耗时（两轮 min） |
+|---|---|---|---|
+| 改前（三格各折一趟整库） | **100.4 MB** | **1 800 000 条** | 1.50 s |
+| 改后（只数不物化） | **0.4 MB** | **0 条** | **1.01 s** |
+
+⇒ **省 100 MB（251×）、快 1.49×**。两臂各两轮交错跑，峰值两轮都是 100.4 / 0.4 ——
+内存读数没有墙钟那种 ±1.3~1.9× 的漂。台架 `lsm_counting_doors_peak`（`#[ignore]`，单线程手动跑）留在库里。
+
+守卫 `test_counting_paths_do_not_materialize_values`（440 行 / ≥2 篇 SST，**三种赢家行都在场**：
+341 条 `Put(Some)` + 79 条 `Put(None)` + 20 条 `Drop`。⚠️ `delete()` 写的是 `Put(None)`，第三种只有
+`remove()` 造得出来 —— 少了它 `count_kinds_at` 里那一支 match 分支量不到）。两把尺子各钉各的：
+① 与重量归并**逐类对拍**；② 三格合起来 `value_materializations()` 增量必须是 0，而同一个测试里
+基准那一趟必须读到 541 ≥ 440 ⇒ 给 ② 作证。
+变异 A（把 `count_kinds_at` 换回 `merge_all_at`）⇒ 红在"物化 1623 条"；
+变异 B（把墓碑算进存活）⇒ 红在"轻量计数与重量归并不一致"。⚠️ **B 那一臂 `entry_count` 的总数照样是 440**
+⇒ 只断总数抓不到分类漂移，必须逐类对拍（M45"两个错合成一个对"的同一课）。
+
+顺带挖出来的一条**先前就存在**的少算（M47 把计数接到 `light_iter_range` 上才撞见的）：
+
+```rust
+let probe_high = to.unwrap_or(&[0xffu8; 8]);   // ← 改前
+```
+
+`to == None` 说的是"一直到库尾"，可这句拿一个**假的 8 字节全 `0xff` 上界**去跑 `may_overlap`
+⇒ 一篇 `min_key` 比它更大的文件（键以 ≥8 个 `0xff` 开头且更长）被**整篇跳过**：少扫、少数、少收，
+**不报错**。键是任意字节，任何"够大的填充值"都存在比它更大的真键。
+影响面就是所有 `to = None` 的用户：`health()`（M39 的全库走查）、`key_count` / 精确 `total`（M35）、
+`vacuum_bounded` 的一片（M29/M37）、`scan_latest_light`，加上 M47 新接的这三格。
+**点读从来没中过**（`get_at` 用真键 `may_overlap(key, key)`）⇒ 现场的形状是"读得到、扫不到"。
+
+修法：只在**真有上界**时做 min/max 双向剪；无上界就只剪"整篇在 `from` 之下"那一头
+（`sst.max_key >= probe_low`）⇒ 全库走查（`from=None`）判据结果不变，开区间那趟不再误剪。
+**不动磁盘格式、不动 API。** 守卫 `test_light_scan_without_upper_bound_keeps_files_past_the_old_sentinel`
+（57 把键，其中 7 把 `[0xff;12]` 且单独成一篇 SST）：`entry_count` 必须等于重量归并的 57，
+开区间走查必须交出 1+7 行。变异 C（装回合成上界）⇒ 红在 `left: 50, right: 57` —— 少的那 7 把
+就是现场被整篇跳过的文件。
 
 ### 本轮全量复测（三档 20k / 200k / 600k × 四引擎 × 31 项，同一份构建，2026-10-19）判据：**单价倍数 = 原始比值 ÷ 期望量级**；`memory` 引擎那一列就是本机噪声地板（1.2~1.6×）。
 
@@ -2285,7 +2343,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:320 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:322 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(32 个,含大库基线台架;四引擎全覆盖)
 cargo test --lib cache_auto_max   # 缓存自动档"顶"这一档的三条守卫(门面路由 + bplus 覆盖率 + lsm 覆盖率)
                               # 判据全是计数:bplus 那条量在**磁盘层**(一轮点读落盘几次),
@@ -2299,6 +2357,11 @@ LSM_CACHE_AUTO=0 LSM_POINT_ROWS=5002 cargo test --release --lib -- --ignored --n
                               # LSM 点读台架:换规模(`LSM_POINT_ROWS`)、换块缓存自动档
                               # (`LSM_CACHE_AUTO=0` = 关掉,回到钉死 256 槽)做**同构建 A/B** ——
                               # 结论取计数(块/次、未命中/次、探文件/次、条目比较/次),不取墙钟
+LSM_COUNT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_counting_doors_peak
+LSM_COUNT_OLD_SHAPE=1 LSM_COUNT_ROWS=600000 cargo test --release --lib -- --ignored --nocapture \
+  --test-threads=1 lsm_counting_doors_peak
+                              # M47 的三格计数内存台架:同一个二进制只切 `LSM_COUNT_OLD_SHAPE`,
+                              # 改前那一臂就地重放"每格各折一趟整库"的写法(峰值 100.4 → 0.4 MB)
 cargo test --test test_lsm_tree
 ```
 
