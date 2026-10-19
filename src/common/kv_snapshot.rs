@@ -9,6 +9,7 @@
 //! [`write_bin`] 按记录里是否有 `seq` 自动选择，所以不带 seq 的导出与
 //! 旧版 `BPEXP001` **逐字节一致**；[`read_bin`] 两种都认。
 
+use crate::common::types::ExportRecord;
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Write},
@@ -148,58 +149,203 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
 
 // ─── 写 ─────────────────────────────────────────────────────────────────────
 
-pub fn write_bin(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats> {
-    let with_seq = records.iter().any(|r| r.seq.is_some());
-    let f = File::create(path)?;
-    let mut w = BufWriter::new(f);
-    w.write_all(if with_seq { BIN_MAGIC_V2 } else { BIN_MAGIC })?;
-    let mut stats = IoStats::default();
-    for rec in records {
-        w.write_all(&(rec.key.len() as u32).to_le_bytes())?;
-        w.write_all(&rec.key)?;
-        match &rec.value {
-            Some(v) => {
-                w.write_all(&(v.len() as u32).to_le_bytes())?;
-                w.write_all(v)?;
-            }
-            None => w.write_all(&TOMBSTONE_LEN.to_le_bytes())?,
-        }
-        if with_seq {
-            w.write_all(&rec.seq.unwrap_or(0).to_le_bytes())?;
-        }
-        stats.push(&rec.value);
-    }
-    w.flush()?;
-    Ok(stats)
+/// bin 导出格式的**逐行**写口（M44）。
+///
+/// 为什么要有它：`write_bin(path, &[KvRecord])` 要求调用方先把整库装进一个 `Vec`。
+/// 库侧的折叠早就是流式的（`fold_rows_streaming`，一行都不攒），但出口这里逼着调用方
+/// 再攒一份 —— 600k 档那一次导出实测峰值 **+123.7 MB**，其中一半只是"等着被写出去"。
+/// 有了写口，导出可以是"折一行、写一行"，峰值 = 当前这一行 + 写缓冲。
+///
+/// ⚠️ `with_seq` 必须在 `create` 时就定：魔数是文件的**第一**八个小节，而 v2 多出来的
+/// 每条 8 B 序号也是在这里决定的 —— 逐行写的人没法先看完全部记录再回头改头部。
+/// 收集壳 `write_bin` 自己扫一遍切片来定，所以它的行为一字没变。
+pub struct BinWriter {
+    w: BufWriter<File>,
+    stats: IoStats,
+    with_seq: bool,
 }
 
-pub fn write_jsonl(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats> {
-    let f = File::create(path)?;
-    let mut w = BufWriter::new(f);
-    let mut stats = IoStats::default();
-    for rec in records {
+impl BinWriter {
+    pub fn create(path: &Path, with_seq: bool) -> std::io::Result<Self> {
+        let f = File::create(path)?;
+        let mut w = BufWriter::new(f);
+        w.write_all(if with_seq { BIN_MAGIC_V2 } else { BIN_MAGIC })?;
+        Ok(Self {
+            w,
+            stats: IoStats::default(),
+            with_seq,
+        })
+    }
+
+    pub fn write(&mut self, rec: &KvRecord) -> std::io::Result<()> {
+        self.w.write_all(&(rec.key.len() as u32).to_le_bytes())?;
+        self.w.write_all(&rec.key)?;
+        match &rec.value {
+            Some(v) => {
+                self.w.write_all(&(v.len() as u32).to_le_bytes())?;
+                self.w.write_all(v)?;
+            }
+            None => self.w.write_all(&TOMBSTONE_LEN.to_le_bytes())?,
+        }
+        if self.with_seq {
+            self.w.write_all(&rec.seq.unwrap_or(0).to_le_bytes())?;
+        }
+        self.stats.push(&rec.value);
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> std::io::Result<IoStats> {
+        self.w.flush()?;
+        Ok(self.stats)
+    }
+}
+
+/// jsonl 导出的**逐行**写口，与 [`BinWriter`] 同一条理由。
+pub struct JsonlWriter {
+    w: BufWriter<File>,
+    stats: IoStats,
+}
+
+impl JsonlWriter {
+    pub fn create(path: &Path) -> std::io::Result<Self> {
+        let f = File::create(path)?;
+        Ok(Self {
+            w: BufWriter::new(f),
+            stats: IoStats::default(),
+        })
+    }
+
+    pub fn write(&mut self, rec: &KvRecord) -> std::io::Result<()> {
         let k = b64_encode(&rec.key);
         match &rec.value {
             Some(v) => {
                 let v = b64_encode(v);
                 if let Some(seq) = rec.seq {
-                    writeln!(w, "{{\"key\":\"{k}\",\"value\":\"{v}\",\"seq\":{seq}}}")?;
+                    writeln!(self.w, "{{\"key\":\"{k}\",\"value\":\"{v}\",\"seq\":{seq}}}")?;
                 } else {
-                    writeln!(w, "{{\"key\":\"{k}\",\"value\":\"{v}\"}}")?;
+                    writeln!(self.w, "{{\"key\":\"{k}\",\"value\":\"{v}\"}}")?;
                 }
             }
             None => {
                 if let Some(seq) = rec.seq {
-                    writeln!(w, "{{\"key\":\"{k}\",\"value\":null,\"seq\":{seq}}}")?;
+                    writeln!(
+                        self.w,
+                        "{{\"key\":\"{k}\",\"value\":null,\"seq\":{seq}}}"
+                    )?;
                 } else {
-                    writeln!(w, "{{\"key\":\"{k}\",\"value\":null}}")?;
+                    writeln!(self.w, "{{\"key\":\"{k}\",\"value\":null}}")?;
                 }
             }
         }
-        stats.push(&rec.value);
+        self.stats.push(&rec.value);
+        Ok(())
     }
-    w.flush()?;
-    Ok(stats)
+
+    pub fn finish(mut self) -> std::io::Result<IoStats> {
+        self.w.flush()?;
+        Ok(self.stats)
+    }
+}
+
+/// 收集壳：行形状与编码只有一份（[`BinWriter::write`]）。
+pub fn write_bin(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats> {
+    let with_seq = records.iter().any(|r| r.seq.is_some());
+    let mut w = BinWriter::create(path, with_seq)?;
+    for rec in records {
+        w.write(rec)?;
+    }
+    w.finish()
+}
+
+/// 收集壳：行形状与编码只有一份（[`JsonlWriter::write`]）—— 改这里就等于改出第二种格式。
+pub fn write_jsonl(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats> {
+    let mut w = JsonlWriter::create(path)?;
+    for rec in records {
+        w.write(rec)?;
+    }
+    w.finish()
+}
+
+// ─── 流式导出接盘（M44）─────────────────────────────────────────────────────
+
+/// 折出来的行往哪儿写：两种导出格式各一个，接口一样。
+pub enum Sink {
+    Jsonl(JsonlWriter),
+    Bin(BinWriter),
+}
+
+impl Sink {
+    pub fn jsonl(path: &Path) -> std::io::Result<Self> {
+        Ok(Self::Jsonl(JsonlWriter::create(path)?))
+    }
+
+    pub fn bin(path: &Path, with_seq: bool) -> std::io::Result<Self> {
+        Ok(Self::Bin(BinWriter::create(path, with_seq)?))
+    }
+
+    pub fn write(&mut self, rec: &KvRecord) -> std::io::Result<()> {
+        match self {
+            Self::Jsonl(w) => w.write(rec),
+            Self::Bin(w) => w.write(rec),
+        }
+    }
+}
+
+/// 把"折一行交一行"的导出接到 [`Sink`] 上的那层胶（M44）。
+///
+/// 为什么要在共用件里给一份，而不是让四个 CLI 各写各的：导出侧回调的签名是
+/// `FnMut(ExportRecord) -> bool`（`false` = 收手），**回调里没有 `Result`**，所以写盘失败
+/// 只能"记下来、当场收手、最后再抛"。这三步每个调用方都要做一遍 —— 少做一步就是
+/// "文件写坏了而 CLI 报成功"（四家各抄一遍正是这个项目一路在收的东西）。
+///
+/// 行是**移动**进文件的（`ExportRecord` 的 key/value 直接交给 `KvRecord`），全程没有复制，
+/// 也不存在"先把整库摆一份"的那一步。
+pub struct ExportWriter {
+    sink: Sink,
+    err: Option<std::io::Error>,
+}
+
+impl ExportWriter {
+    pub fn jsonl(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            sink: Sink::jsonl(path)?,
+            err: None,
+        })
+    }
+
+    pub fn bin(path: &Path, with_seq: bool) -> std::io::Result<Self> {
+        Ok(Self {
+            sink: Sink::bin(path, with_seq)?,
+            err: None,
+        })
+    }
+
+    /// 交给导出回调的那一步：`true` = 接着折。已经错过就一律 `false`（一行都不再写）。
+    pub fn push(&mut self, rec: ExportRecord) -> bool {
+        if self.err.is_some() {
+            return false;
+        }
+        let kv = KvRecord::new(rec.key, rec.value);
+        match self.sink.write(&kv) {
+            Ok(()) => true,
+            Err(e) => {
+                self.err = Some(e);
+                false
+            }
+        }
+    }
+
+    /// 收口：中途写过错就抛那个错（并把缓冲冲下去）
+    pub fn finish(self) -> std::io::Result<IoStats> {
+        let stats = match self.sink {
+            Sink::Jsonl(w) => w.finish()?,
+            Sink::Bin(w) => w.finish()?,
+        };
+        match self.err {
+            Some(e) => Err(e),
+            None => Ok(stats),
+        }
+    }
 }
 
 // ─── 读 ─────────────────────────────────────────────────────────────────────
@@ -328,6 +474,96 @@ mod tests {
         assert_eq!(b64_encode(b"fo"), "Zm8=");
         assert_eq!(b64_encode(b"foo"), "Zm9v");
         assert_eq!(b64_decode("Zm9v").unwrap(), b"foo");
+    }
+
+    /// 逐行写口（M44）与整批写的**字节必须一字不差**：导出文件的格式是跨引擎的合同
+    /// （`import_kv` 要能读回来，旧版工具也要能读 `BPEXP001`），而 CLI 从"整批"换成了"逐行"。
+    ///
+    /// ⚠️ 这一条与 `test_plain_is_bpexp001` 那份 golden 是两件事：那份钉"编码本身"，
+    /// 这一份钉"换写法没换格式"。两条都要 —— 只留后者的话，编码哪天动了它俩还互相对齐。
+    ///
+    /// ⚠️ 没有覆盖的一支：`ExportWriter::push` 在写失败之后一律收手、错误由 `finish()` 抛。
+    /// 那一支要真把盘弄坏才触发（Windows 上还留着句柄的文件删不掉），恒真的模拟测试不给信息，
+    /// 所以留注释不留测试。
+    #[test]
+    fn test_streaming_sink_writes_identical_bytes() {
+        let pid = std::process::id();
+        let streamed = std::env::temp_dir().join(format!("kv_snap_stream_{pid}.bin"));
+        let batched = std::env::temp_dir().join(format!("kv_snap_batch_{pid}.bin"));
+        let jsonl_streamed = std::env::temp_dir().join(format!("kv_snap_stream_{pid}.jsonl"));
+        let jsonl_batched = std::env::temp_dir().join(format!("kv_snap_batch_{pid}.jsonl"));
+        let recs = vec![
+            KvRecord::new(b"alpha".to_vec(), Some(b"1".to_vec())),
+            KvRecord::new(b"beta".to_vec(), None),
+            KvRecord::with_seq(b"gamma".to_vec(), Some(b"3".to_vec()), 7),
+        ];
+
+        // bin：不带 seq 的一支（CLI 走的就是这条 —— 导出的行里没有 seq）
+        let plain = vec![
+            KvRecord::new(b"alpha".to_vec(), Some(b"1".to_vec())),
+            KvRecord::new(b"beta".to_vec(), None),
+        ];
+        let mut w = BinWriter::create(&streamed, false).unwrap();
+        let mut handed = 0usize;
+        for r in &plain {
+            w.write(r).unwrap();
+            handed += 1;
+        }
+        let st_stream = w.finish().unwrap();
+        let st_batch = write_bin(&batched, &plain).unwrap();
+        assert_eq!(
+            std::fs::read(&streamed).unwrap(),
+            std::fs::read(&batched).unwrap(),
+            "逐行写的 bin 与整批写不是同一份字节"
+        );
+        assert_eq!(handed, 2);
+        assert_eq!(st_stream.records, st_batch.records);
+        assert_eq!(st_stream.live, st_batch.live);
+        assert_eq!(st_stream.deleted, st_batch.deleted);
+
+        // jsonl：同一批记录
+        let mut w = JsonlWriter::create(&jsonl_streamed).unwrap();
+        for r in &recs {
+            w.write(r).unwrap();
+        }
+        w.finish().unwrap();
+        write_jsonl(&jsonl_batched, &recs).unwrap();
+        assert_eq!(
+            std::fs::read(&jsonl_streamed).unwrap(),
+            std::fs::read(&jsonl_batched).unwrap(),
+            "逐行写的 jsonl 与整批写不是同一份字节"
+        );
+
+        // `ExportWriter`（CLI 用的那层胶）也必须给出同一份字节
+        let glued = std::env::temp_dir().join(format!("kv_snap_glue_{pid}.bin"));
+        {
+            let mut g = ExportWriter::bin(&glued, false).unwrap();
+            for r in &plain {
+                assert!(
+                    g.push(ExportRecord {
+                        key: r.key.clone(),
+                        value: r.value.clone(),
+                    }),
+                    "逐行推送中途被拒"
+                );
+            }
+            g.finish().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&glued).unwrap(),
+            std::fs::read(&batched).unwrap(),
+            "ExportWriter 与整批写不是同一份字节"
+        );
+
+        for p in [
+            &streamed,
+            &batched,
+            &jsonl_streamed,
+            &jsonl_batched,
+            &glued,
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

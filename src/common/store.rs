@@ -178,6 +178,63 @@ pub fn fold_rows_streaming<S, F>(
     );
 }
 
+/// 导出行形状**唯一那份判据**（M44）：折一行、判一行、立刻交给 `on`，一行都不攒。
+///
+/// 为什么要新加一条而不是让调用方继续用 `export_latest_visible`：那条返回
+/// `Vec<ExportRecord>` —— 那笔 `Vec` 是"要整库的人"的合同，可**导出到文件**的人要的是
+/// "写出去"，不是"在内存里再摆一份"。600k 档实测一次 `export 全库(物化)` 峰值 **+123.7 MB**，
+/// 而折叠侧（[`fold_rows_streaming`]）从 M27 起就一行不攒 ⇒ 卡住的那一头在出口。
+///
+/// 四家的 `export_latest_visible` 现在都是**这条的收集壳**（M39 那招：判据只剩一份实现）：
+/// 墓碑 / 过期或坏壳 / 读不到三类怎么处置，四家必须一字不差；它们唯一的差别是
+/// "逻辑字节 → 用户字节"那一步住在哪家，所以那一步当参数进来（`unseal`）。
+///
+/// 返回值 = 实际交给 `on` 的行数。`on` 返回 `false` ⇒ 当场收手，**后面的键不再折**。
+pub fn export_rows_streaming<S, U>(
+    store: &S,
+    include_deleted: bool,
+    unseal: U,
+    on: &mut dyn FnMut(ExportRecord) -> bool,
+) -> usize
+where
+    S: VersionedStore,
+    // 按值收：折叠交出来的那份逻辑字节本来就是 owned `Vec`，剥壳要把它拆开看 ——
+    // 借成 `&[u8]` 再复制一份出来，正是这一刀要省掉的那类占用。
+    U: Fn(Vec<u8>) -> Option<Vec<u8>>,
+{
+    let mut handed = 0usize;
+    // `include_deleted` 直接交给折叠放行：为 false 时墓碑根本不会进来，为 true 时
+    // "墓碑记成 value=None" 由下面这份映射判 —— 与改前 `collect_rows_as` 的判据同一份。
+    fold_rows_streaming(store, include_deleted, None, None, |key, _ver, value| {
+        let rec = match value {
+            RowValue::Tombstone => Some(ExportRecord { key, value: None }),
+            RowValue::Value(bytes) => match unseal(bytes) {
+                Some(user) => Some(ExportRecord {
+                    key,
+                    value: Some(user),
+                }),
+                None => {
+                    if include_deleted {
+                        Some(ExportRecord { key, value: None })
+                    } else {
+                        None
+                    }
+                }
+            },
+            // 读不到与墓碑不是一回事：整行不参与
+            RowValue::Missing => None,
+        };
+        match rec {
+            Some(r) => {
+                handed += 1;
+                on(r)
+            }
+            None => true,
+        }
+    });
+    handed
+}
+
 /// 折叠的**迭代下界**：`start`（含）与 `after`（不含）里字节序更大的那个。
 ///
 /// 为什么可以拿 `after` 当起点而不是只在循环里过滤它：任何 `raw > after` 的键，它的版本键

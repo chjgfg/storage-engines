@@ -275,6 +275,38 @@ pub struct WinCandidate<V> {
 /// 可分辨的差别（判据见守卫，别凭感觉调这个数字）。
 const FOLD_CHUNK: usize = 4096;
 
+// 测试专用（M44 的尺子）：**收集门**最多同时攒了多少行。
+//
+// 为什么钉这一格而不是钉内存：`export` 这类"整库返回"的路径与"流式逐行交出去"的路径，
+// 语义判据是同一份（流式那条就是收集壳的核），真正的差别只有一条 —— **中间有没有一个
+// `Vec`**。`fold_window` 是收集门、`fold_window_emit` 是流式门，所以"这一趟走的哪扇门"
+// 可以直接数：流式臂必须读到 **0**。进程高水位在并行用例里互相污染（M27/M36 各栽过），
+// 而这个数是线程局部的计数。
+#[cfg(test)]
+thread_local! {
+    static COLLECT_HELD_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_collect_held(n: usize) {
+    COLLECT_HELD_MAX.with(|c| {
+        let n = n as u64;
+        if n > c.get() {
+            c.set(n);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn collect_held_max() -> u64 {
+    COLLECT_HELD_MAX.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_collect_held() {
+    COLLECT_HELD_MAX.with(|c| c.set(0));
+}
+
 /// 窗口折叠的共用驱动（四引擎一份）。
 ///
 /// `round(after, budget)`：从 `after` 这组**之后**开始折，最多交 `budget` 组候选，
@@ -302,6 +334,8 @@ where
     // 这里只负责交够数就停
     fold_window_emit(wanted, round, keep, |t| {
         out.push(t);
+        #[cfg(test)]
+        note_collect_held(out.len());
         true
     });
     out

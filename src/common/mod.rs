@@ -20,14 +20,17 @@ pub use codec::{
 // M35 的尺子：用户字节被拷出来过几条（守卫拿它与"只数不物化"的那条路对拍）
 #[cfg(test)]
 pub(crate) use codec::user_value_copies;
+// M44 的尺子：**收集门**（`fold_window`）最多同时攒了几行 ⇒ 流式那趟必须读到 0
+#[cfg(test)]
+pub(crate) use kernel::{collect_held_max, reset_collect_held};
 pub use types::{
     DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
     SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use store::{
-    RowValue, VersionedStore, collect_rows, collect_rows_as, count_window, fold_lower_bound,
-    fold_rows_streaming, live_record_of_logical, scan_live_records, scan_page, search_bounds,
-    search_page, search_window, seek_prev_with,
+    RowValue, VersionedStore, collect_rows, collect_rows_as, count_window, export_rows_streaming,
+    fold_lower_bound, fold_rows_streaming, live_record_of_logical, scan_live_records, scan_page,
+    search_bounds, search_page, search_window, seek_prev_with,
 };
 pub use txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 pub use version::{

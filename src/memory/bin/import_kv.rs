@@ -126,7 +126,19 @@ fn main() {
     let stats = apply_to_db(&mvcc, &records);
     let elapsed = t0.elapsed();
 
-    let live = mvcc.export_latest_visible(false);
+    // M44：行数 + 前 5 条抽样。原先这里把整库折成 `Vec<ExportRecord>`，只为数一个个数、
+    // 再打印前五条 ⇒ 全库在内存里摆一整份。现在流式数，抽样只留最多 5 条。
+    let mut live_keys = 0usize;
+    let mut sample: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    mvcc.export_latest_visible_for_each(false, |rec| {
+        live_keys += 1;
+        if sample.len() < 5 {
+            sample.push((rec.key, rec.value));
+            true
+        } else {
+            false // 抽样够了就收手：后面的键一个都不再折
+        }
+    });
     println!(
         "IMPORT records={} live={} deleted={} in {:.3}s",
         stats.records,
@@ -135,21 +147,20 @@ fn main() {
         elapsed.as_secs_f64()
     );
     println!(
-        "VERIFY export_latest_visible live_keys={}",
-        live.len()
+        "VERIFY export 流式数行数 live_keys={}",
+        live_keys
     );
 
-    // 抽样打印前几条
-    for r in live.iter().take(5) {
-        let k = String::from_utf8_lossy(&r.key);
-        let v = r
-            .value
+    // 抽样打印（最多 5 条 ⇒ 这一支现在与库的大小无关）
+    for (k, v) in &sample {
+        let k = String::from_utf8_lossy(k);
+        let v = v
             .as_ref()
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_else(|| "<none>".into());
         println!("  sample {k:?} => {v:?}");
     }
-    if live.len() > 5 {
+    if live_keys > sample.len() {
         println!("  ...");
     }
 

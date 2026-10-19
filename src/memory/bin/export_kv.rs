@@ -9,7 +9,7 @@
 //! cargo run --release --bin export_kv -- --demo 50 --out snapshot.jsonl --format jsonl
 //! ```
 
-use storage_engines::common::kv_snapshot::{write_bin, write_jsonl, IoStats, KvRecord};
+use storage_engines::common::kv_snapshot::{ExportWriter, IoStats};
 use storage_engines::memory::MVCC;
 use std::env;
 use std::path::PathBuf;
@@ -129,19 +129,23 @@ fn main() {
     if args.demo > 0 {
         seed_demo(&mvcc, args.demo);
     }
-    let records: Vec<KvRecord> = mvcc
-        .export_latest_visible(args.include_deleted)
-        .into_iter()
-        .map(|r| KvRecord::new(r.key, r.value))
-        .collect();
+    // M44：**折一行、写一行**。原先这两步是"先把整库折成 `Vec<ExportRecord>`，再 `.map()`
+    // 成第二份 `Vec<KvRecord>`，最后交给 writer"—— 一次导出要在内存里同时摆**两遍**全库
+    // （600k 键那一档，光是返回 `Vec` 的那条实测峰值就 +123.7 MB）。现在两趟并成一趟：
+    // 内存里只剩"当前这一行"加写缓冲，输出字节一个没变（编码只有一份实现）。
+    let mut writer = match args.format {
+        Format::Jsonl => ExportWriter::jsonl(&args.out).expect("创建导出文件失败"),
+        Format::Bin => ExportWriter::bin(&args.out, false).expect("创建导出文件失败"),
+    };
+    let handed =
+        mvcc.export_latest_visible_for_each(args.include_deleted, |rec| writer.push(rec));
     let export_elapsed = t0.elapsed();
 
     let t1 = Instant::now();
-    let stats: IoStats = match args.format {
-        Format::Jsonl => write_jsonl(&args.out, &records).expect("写 jsonl 失败"),
-        Format::Bin => write_bin(&args.out, &records).expect("写 bin 失败"),
-    };
+    let stats: IoStats = writer.finish().expect("写导出文件失败");
     let write_elapsed = t1.elapsed();
+    // 折出来几行就必须写出去几行：中途的 IO 错误由 `finish()` 抛，这里只核对计数
+    assert_eq!(handed, stats.records, "折出的行数与写出的行数不一致");
 
     let out_size = std::fs::metadata(&args.out).map(|m| m.len()).unwrap_or(0);
     println!(
@@ -167,7 +171,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storage_engines::common::kv_snapshot::{read_bin, write_bin, write_jsonl};
+    use storage_engines::common::kv_snapshot::{read_bin, write_bin, write_jsonl, KvRecord};
 
     fn tmp(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

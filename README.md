@@ -7,7 +7,7 @@
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 312 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M43**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M44**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -23,10 +23,10 @@
 B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`、四引擎
 事务内核合成一份、`migrate` + `scan_page`、LSM 灌行 O(N²)、`seek_prev` 整段物化、游标未下推、
 B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、页读路径与 CRC32 提速、**缓存自动档的顶可以由调用方抬（`set_cache_auto_max`）且覆盖率的分母可读**、**压实的输入改流式源（一次压实瞬时内存 156.8 MB → 6.3 MB）**、**四家 `vacuum()` 与 bitcask `merge()` 的走查改按块**（bitcask 那一家的整段瞬时 171.4 MB → 87.2 MB）、**大库台架的内存量具修好**（此前 `峰值` 列只看得见"超过历史最高点的部分"，排在后面的操作一律报 +0.0）、**lsm 的 `flush()` 改流式吐 memtable，且 memtable 的 flush 阈值改读真内存**（600k 键 × 2 版那档 `vacuum()` 的 ① 段 158.6 MB → **33.1 MB**；"mem 32 MB"这句从此才算数）、**`SstBuilder` 攒满一块就落盘**（一次压实的瞬时 6.3 MB → **3.1 MB**、单文件握住的未落盘条目 18 333 条 → **64 条**；输出的 SST **逐字节不变**，由 golden 钉着）、**`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化**（600k 档瞬时内存 +123.7 MB → **0.6~1.2 MB**；四家 `search_keys` 与四家 `scan_foreach` 的复制各合成一份）。
-磁盘格式这三十五批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
+磁盘格式这三十六批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M43
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M44
 storage-engines = { path = "../storage-engines" }
 
 # (b) 走远端:git 依赖(gitee 与 github 内容一致)
@@ -36,7 +36,7 @@ storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branc
 storage-engines = "0.4"
 ```
 
-`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M43 又想要版本号依赖,
+`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M44 又想要版本号依赖,
 只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
 MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
@@ -984,6 +984,11 @@ bitcask / lsm 各还有一笔大的（存活行清单 + blob 重写 + bitcask �
 
 同一轮量具修好后**新冒出来的内存账**（旧量具全报 +0.0，看不见）：lsm `health()` **+126.1 MB**、
 lsm 灌行 **+106.8 MB**、四家 `export` / `scan` / `migrate` 的整库物化 **+114.7~124.3 MB**。
+> **修订（M44）**：这一句里 `migrate` 那一笔归错了。600k 档重测：`migrate → memory` 峰值 **+116.1 MB**，
+> 而读侧每片只在收集门里攒到**页宽**（守卫量到 `scan_page` 那趟是 701 行 / 页宽 700）⇒
+> 那 116 MB 是**目标 memory 库自己**装下 601k 行的常驻，不是搬家物化的中间账。
+> `export` / `scan` 两笔则确实是「返回整库的 `Vec`」，而那份 `Vec` 就是调用方要的合同 ——
+> M44 为此加了流式出口 `export_latest_visible_for_each`（见下面那一节）。
 这些是 M38 之后的新排产依据，不是回归 —— 它们一直在那儿，只是量不到。
 
 还剩下的那笔（如实，记在 M37）：全库轮次仍要把"存活行清单 `keep`"交给 blob GC，而
@@ -1423,7 +1428,94 @@ M40 之后 `merge()` 剩的那一笔不是快照，是**产物**：走查时每�
 这点整洁；**正确性由 `usable()` 那一拦负责**。这条也是"先加失败模式的守卫、再改"的正面样本：
 守卫跑红之前，我以为自己知道它在钉什么。
 
+**M44 —— 导出不必再把整库摆进内存：新增流式出口 `export_latest_visible_for_each`（四家 + 门面），`export_kv` 工具不再把全库装两遍**
+
+根因一句话：折叠那一段**早就是流式的**（M27 的 `fold_rows_streaming`，每片 `FOLD_CHUNK` 组、一行不攒），
+可**出口只有一条** —— `export_latest_visible() -> Vec<ExportRecord>`。于是"把 600k 键的库导成文件"
+必须在内存里先把 60 万行摆好，只为等着逐行写出去；本仓库那三个 `export_kv` 工具还在它上面
+**又** `.map()` 成一份 `Vec<KvRecord>` ⇒ 一次导出，全库同时在内存里摆**两遍**。
+
+改法（四件事，都在共用件里落一次，不在四家各抄一遍）：
+
+| 落点 | 做了什么 |
+|---|---|
+| `common::export_rows_streaming` | 导出行形状的**唯一一份判据**（墓碑 / 过期或坏壳 / 读不到），引擎只供"逻辑字节 → 用户字节"那一步（`logical_to_user` 当参数进来，按值收 ⇒ 不复制） |
+| 四家 `Transaction` / `MVCC` | 各加 `export_latest_visible_for_each`；原来的 `export_latest_visible` 改成它的**收集壳** ⇒ 两条路不可能各自漂移（M39 同一招） |
+| `KvEngine` / `KvTxn` 两个 trait | 各加一条 `export_latest_visible_for_each`，**默认实现是"物化后再逐行交"**（⇒ 不是破坏性变更），四家在 `impl_engine!` 里覆盖成真流式 |
+| `common::kv_snapshot` | `BinWriter` / `JsonlWriter` 逐行写口 + `ExportWriter` 那层胶；`write_bin` / `write_jsonl` 改成壳 ⇒ **编码只有一份实现**（`bin` 的 `with_seq` 必须在 `create` 时就定：魔数是文件头，逐行写的人没法回头补） |
+| `export_kv`（bitcask / bplus / memory 三家） | 改成"折一行、写一行"，并断言"折出的行数 == 写出的行数" |
+| `import_kv`（同三家）的 VERIFY | 它原先把**整库**折成 `Vec` 只为 `.len()`（与 M35 那刀里 `key_count` 同一个形状）⇒ 改成流式数行数；memory 那一支还要前 5 条抽样 ⇒ 收满 5 条就**叫停**，后面的键不再折 |
+
+实测（同一场台架、同一个构建，两臂就是同一件事的两种写法）：
+
+| 600k 档 `scale_baseline`（601 001 行 → 磁盘 **59.5 MB**，两臂字节数一样） | 峰值瞬时 | 跑完仍常驻 |
+|---|---|---|
+| `export 全库(物化)` | +123.7 ~ **+124.1 MB** | **105.0 ~ 105.4 MB** |
+| `export 流式(逐行落地)` | **+0.6 ~ +0.8 MB** | **0.0 MB** |
+
+四家逐档读数（峰值 / 常驻）：bitcask `123.7 / 105.0` → **`0.6 / 0.0`**；bplus `124.1 / 105.4` →
+**`0.8 / 0.0`**；lsm `123.9 / 105.0` → **`0.7 / 0.0`**；memory `123.8 / 105.0` → **`0.6 / 0.0`**
+⇒ **瞬时 206×、常驻 105 MB 整份没了**（那份 `Vec` 本来就只为等着被逐行写出去）。
+20k 档同一对（先把形状钉住）：
+
+| 20k 档 | `export 全库(物化)` | `export 流式(逐行落地)` |
+|---|---|---|
+| bitcask | 峰值 +4.4 MB / 常驻 3.5 MB | **+0.6 MB / 常驻 0.0** |
+| bplus_tree | +4.9 / 3.9 | **+0.9 / 0.0** |
+| lsm_tree | +4.7 / 3.9 | **+0.6 / 0.0** |
+
+⚠️ **µs/行 那一列不许横着比**：物化那一臂不写文件，流式那一臂把文件也写了（600k 档 3.4~4.4 µs/行 vs
+1.6~1.9，两臂差都在本机噪声地板里）⇒ 两臂做的不是同一件事，判据只有内存那一列。
+
+⚠️ **没改的那一家**：`lsm_tree/bin/export_kv.rs` 走的是**裸引擎**的 `LSMTree::export_records_with_seq`，
+它建在 `merge_all_at` 上（把 memtable + 每个 SST **整篇**折进 `Vec`，所有源同时活着 —— 正是 M39 在
+MVCC 那条门上治过的形状，只是裸引擎这道门当时没走过）。单把它的**写侧**改成流式省不到东西
+（大头在源侧），所以这一刀不半改它，`merge_all_at` 另立一条。
+
+守卫：
+
+- `all_engines_export_streams_without_holding_the_library`（四家跑同一套断言）。**主尺子 =
+  `user_value_copies()` 在"只要 1 行"那一趟里的增量**：流式那趟只剥 1 条壳（拷 1 条用户值），
+  任何"先把整库折出来再逐行回调"的形状都会拷 `want` 条 ⇒ 一个数就把两种形状分开。
+  判据：只要 1 行 ⇒ 交出 1 行、拷出 ≤2 条（`KvEngine` 那扇门与 `KvTxn` 那扇门**各测一遍**）；
+  全库那一趟 ⇒ 拷出正好 `want` 条（这一档同时给上面那个 `≤2` 作证：尺子不是空转）。
+  ⚠️ **第一版这里用的尺子是错的**：我拿 `collect_held_max()`（**收集门** `fold_window` 攒了几行）当判据，
+  可 M44 之后收集门根本不在导出路径上 —— "退回物化默认实现"的那个 `Vec` 是调用方自己攒的，
+  尺子读 0 照样绿。变异（把 `impl_engine!` 里事务层的流式覆盖删掉）**第一次没红**就是这个原因，
+  换了尺子之后同一支变异红在"只要 1 行却拷出 4960 条用户值"。`collect_held_max` 留着当**次要**判据
+  （流式那趟确实不该走收集门，第一行处采一次、收完再采一次），但它担不起主判据。
+- 语义对拍走**另一条遍历**：`scan_page` 一路翻到底（游标续跑，与流式导出是两份代码）逐行比。
+  ⚠️ 不拿"收集壳 vs 流式核"互比 —— 壳就是核的壳，那种对拍恒真，不给信息。
+  另钉"提前收手恰好停在预算 100 行且交出的是同一批前缀""导出升序""硬删过的键不许出现"。
+- `test_streaming_sink_writes_identical_bytes`：逐行写口（含 `ExportWriter` 那层胶）与整批写的
+  **字节必须一字不差** —— 导出格式是跨引擎的合同（`import_kv` 要读得回来，旧工具也认 `BPEXP001`）。
+  ⚠️ 它与 `test_plain_is_bpexp001` 那份编码 golden 是两件事：那份钉"编码本身"，这一份钉"换写法没换格式"。
+- 变异四条，各自红在不同格：① bitcask 的 `for_each` 改回"先 `collect_rows_as` 折完全库再逐行回调" ⇒
+  红在"只要 1 行却拷出 4960 条用户值"；② 吞掉调用方的收手信号 ⇒ 红在"提前收手没停在 100（实际 4960）"；
+  ③ 删掉 `impl_engine!` 里**事务层**的流式覆盖（悄悄退回物化默认实现）⇒ 红在同一格的"事务层"那一条；
+  ④ 删掉 **KvEngine 层**的覆盖 ⇒ 也红。
+- ⚠️ 没覆盖的一支（如实）：`ExportWriter::push` 写失败之后一律收手、错误由 `finish()` 抛。
+  那一支要真把盘弄坏才触发（Windows 上还挂着句柄的文件删不掉），恒真的模拟测试不给信息 ⇒ 留注释不留测试。
+
+⚠️ **这一轮踩到的台架教训（两条，都写进方法学）**：
+① 新加的读数行自己 panic 了两次都没被发现 —— 因为跑法接了管道
+`cargo test ... | grep ...`，**退出码是 grep 的**（有匹配就 0），panic 被吞。两档读数各少一行才看出来。
+⇒ 以后带 `--test-threads=1` 的大台架：要么不接 grep，要么接了必须另外核对 `test result:` 那一行
+（本轮改成 `set -o pipefail` + grep 里带上 `test result`）。
+② 台架里 `tmp_dir(tag)` **只清残留、不创建目录** —— 磁盘引擎由 open 时自己建，memory 一家没人建
+⇒ 任何"往 `dir` 里写文件"的新读数行都得先 `create_dir_all`，否则只在 memory 那一档炸。
+
+**顺手抓到一条先前就存在的缺陷（不是这一刀带来的，同一份现场在 `HEAD` 上复现过）**：
+`import_kv` 的往返对不上 —— 用 `memory-export-kv --demo 300` 造一份 301 行的 jsonl，
+`bitcask-import-kv` / `bplus-import-kv` 都报 `IMPORT records=301`，可再导出只有 **32 行**，
+且那 32 行的键与值是**错位**的（`demo:000001 → val-1` 变成 `demo:00000 → val-`、`demo:00001 → val-19`）。
+`--include-deleted` 也只有 32 ⇒ 不是"被当成过期"，是**行根本不在库里**。
+嫌疑：`apply_to_db` 用 bulk 的 `put` 写**裸用户字节**，而那条门要求的是**已打信封的逻辑字节**
+（`set` 同一条合同，M16 正是为此才加 `set_raw`）⇒ 写进去的字节被后面的读当成信封解析。
+诊断到这里为止，**没动码**：这是导入侧的写路径与值信封合同不一致，与"导出不物化"是两件事。
+
 ### 本轮全量复测（三档 20k / 200k / 600k × 四引擎 × 31 项，同一份构建，2026-10-19）判据：**单价倍数 = 原始比值 ÷ 期望量级**；`memory` 引擎那一列就是本机噪声地板（1.2~1.6×）。
+
 下表只列**过地板**或**绝对值本身痛**的项（单位写全）。数据在 `C:` SSD 上量，换盘要重标。
 
 ⚠️ **`峰值` 那一列的定义自 M38 起才可信**：量具 `timed()` 以前取的是运行中的**进程高水位**
@@ -1467,7 +1559,9 @@ bplus **+3.9 MB** / memory **+4.0 MB** / lsm **+101.2 MB** / bitcask **+171.4 MB
 ⇒ 要么把 KeyDir 与文件句柄拆成两个可分别借用的对象，要么把全库轮次内部按片循环 ——
 后者会动 `full_sweep` 的门控（blob 重写与 merge 只在全库轮次做），是语义决定，不是收尾清理）。
 **M38 修好量具后新排出来的内存账**（旧量具一律报 +0.0，所以之前看不见）：lsm `health()`
-**+126.1 MB**、lsm 灌行 **+106.8 MB**、四家 `export`/`scan`/`migrate` 的整库物化 **+114.7~124.3 MB**。
+**+126.1 MB**、lsm 灌行 **+106.8 MB**、四家 `export`/`scan`/`migrate` 的整库物化 **+114.7~124.3 MB**
+（⚠️ 修订（M44）：`migrate` 那一笔归错了 —— 实测 600k 档 +116.1 MB 是**目标 memory 库自己**的常驻，
+读侧每片只攒页宽；`export`/`scan` 那两笔才是「返回整库的 `Vec`」，M44 已给流式出口）。
 **（修订：前两条都落地了 —— `health()` = M39（126.1 → 0.1 MB），lsm 灌行 = M41b（同构建 A/B
 77.0 → 45.6 MB，代价是灌行单价 +46%）；剩下那一族"整库物化"就是 M35 的靶子。）**
 **M37 已做（bitcask 那一刀）**：按块走查把 `to_delete`/`keep` 从 O(全库) 压成 O(8192 行) ——
@@ -1670,7 +1764,7 @@ blob:   [0x01] offset(u64 LE) len(u32 LE)   —— 共 13 字节
 
 | trait | 用途 |
 |---|---|
-| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `vacuum_bounded` / `health` / `set_vacuum_auto_slice` / `set_wal_checkpoint_limit` / `wal_checkpoint_limit` / `tuning` / `durability_profile` / `flush` / `checkpoint` / `merge` |
+| `KvEngine` | `begin` / `begin_bulk` / `vacuum` / `vacuum_bounded` / `health` / `set_vacuum_auto_slice` / `set_wal_checkpoint_limit` / `wal_checkpoint_limit` / `tuning` / `durability_profile` / `flush` / `checkpoint` / `merge` / `export_latest_visible` / **`export_latest_visible_for_each`**(M44,流式:折一行交一行,不必把整库摆进内存) |
 | `KvTxn` | 读写 / 批量 / 扫描 / 搜索分页 / TTL / `commit` / `rollback` |
 | `KvBulk` | 批量导入,无冲突检测、不写 WAL |
 
@@ -1928,6 +2022,13 @@ data.db.lock       单写者锁(内含 pid)
   ⚠️ 刻意**没有**加 `get_raw`:`get` 本来就是它的读侧对应物,再造一个同名不同义的口只会让人问"该用哪个";
   真要"不经剥壳的存储字节"那是另一个能力(目前只有引擎内部的 `latest_visible_raw`),未对外承诺。
   仍留的坑:`set` 本身还是要求调用方自己打过信封(现有调用点按这个约定写,改它是破坏性变更)
+- ⚠️ **同一条不对称在自家工具里也成立（M44 的往返台架抓到，本轮只诊断、没动码）**：`import_kv` 的
+  `apply_to_db` 用 bulk 的 `put` 写**裸用户字节** ⇒ `memory-export-kv --demo 300` 造的 301 行 jsonl，
+  `bitcask-import-kv` / `bplus-import-kv` 都报 `IMPORT records=301`，再导出只剩 **32 行**，且那 32 行的
+  键与值**错位**（`demo:000001 → val-1` 变成 `demo:00000 → val-`）；加 `--include-deleted` 也只有 32 行
+  ⇒ 不是"被判过期"，是**行根本不在库里**。同一份现场在 M44 之前的提交上复现过 ⇒ 与"导出不物化"那一刀
+  无关，是导入侧写路径与值信封合同不一致。**跨引擎搬数据的正确走法是 `migrate`（它用 `set_raw`）**，
+  或调用方自己先 `pack_plain`/`pack_ttl` 再喂 bulk。
 - ~~⚠️ **`seek_prev` 是"整段物化再挑一条"**~~ **已修(M20)**：四家原先各一份
   `scan(None, Some(key‖0x00))` + `retain` + `pop` ⇒ 一次调用 = O(库大小) 的时间**和内存**
   （200k 实测单次 **140~610 ms**，同库一次点读 2.9~57 µs）。现在循环只有
@@ -2090,7 +2191,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:314 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:316 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(32 个,含大库基线台架;四引擎全覆盖)
 cargo test --lib cache_auto_max   # 缓存自动档"顶"这一档的三条守卫(门面路由 + bplus 覆盖率 + lsm 覆盖率)
                               # 判据全是计数:bplus 那条量在**磁盘层**(一轮点读落盘几次),

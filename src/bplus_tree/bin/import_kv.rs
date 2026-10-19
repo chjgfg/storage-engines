@@ -125,7 +125,14 @@ fn main() {
     let stats = apply_to_db(&mvcc, &records);
     let elapsed = t0.elapsed();
 
-    let live = mvcc.export_latest_visible(false);
+    // M44：这里要的只是**一个行数**，原先却把整库折成 `Vec<ExportRecord>` 再 `.len()` ——
+    // 与 M35 那一刀里 `key_count` 的形状一模一样（为一个数把全库摆一遍）。现在逐行数，
+    // 内存里只过当前那一行。
+    let mut live_keys = 0usize;
+    mvcc.export_latest_visible_for_each(false, |_| {
+        live_keys += 1;
+        true
+    });
     println!(
         "IMPORT records={} live={} deleted={} in {:.3}s",
         stats.records,
@@ -134,8 +141,8 @@ fn main() {
         elapsed.as_secs_f64()
     );
     println!(
-        "VERIFY export_latest_visible live_keys={} db={:?}",
-        live.len(),
+        "VERIFY export 流式数行数 live_keys={} db={:?}",
+        live_keys,
         args.db
     );
 }
