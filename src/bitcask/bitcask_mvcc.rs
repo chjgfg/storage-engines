@@ -116,6 +116,39 @@ pub(crate) fn scan_max_calls() -> u64 {
     SCAN_MAX_CALLS.with(|c| c.get())
 }
 
+// 测试专用（M37 的先量）：一次全库 `vacuum_bounded` 里**每一段自己的**瞬时峰值（字节）。
+//
+// 为什么要分段而不是只看整段：600k 档 `vacuum()` 用修好的量具（M38）读到 **171.4 MB**，
+// 而这段里叠着四件事 —— ①归组判定、②删除 + flush + blob sync、③blob GC（读存活行 +
+// `rewrite_in_place`）、④`kv.merge()` 重写主日志。M30/M31 两次的教训都是"最合理的那件事
+// 不是元凶"，所以先量再动手。每段之前都 `reset_peak()`：`peak` 是高水位，不压回去后面的段
+// 只会报 0（M36 就是拿这种读数当过凭据）。
+#[cfg(test)]
+thread_local! {
+    static VACUUM_STAGE_PEAKS: std::cell::RefCell<[u64; 4]> = const { std::cell::RefCell::new([0; 4]) };
+}
+
+/// 记一段的峰值并把高水位压回当前活着的字节，返回新的基准。
+///
+/// ⚠️ 只有 `VACUUM_STAGE_SPLIT=1` 时才真的动高水位：`reset_peak()` 会把进程高水位**压低**，
+/// 而无门控的版本会让大库台架外层 `timed()` 对 `vacuum()` 的读数从 171.4 MB 变成 47.2 MB ——
+/// 那不是改进，是把外层的尺子锯短了一截。默认（不设环境变量）这里完全是 no-op。
+#[cfg(test)]
+fn vac_stage_mark(slot: usize, base: u64) -> u64 {
+    if std::env::var("VACUUM_STAGE_SPLIT").is_err() {
+        let _ = slot;
+        return base;
+    }
+    let p = crate::mem_probe::peak().saturating_sub(base);
+    VACUUM_STAGE_PEAKS.with(|s| s.borrow_mut()[slot] = p);
+    crate::mem_probe::reset_peak()
+}
+
+#[cfg(test)]
+pub(crate) fn vacuum_stage_peaks() -> [u64; 4] {
+    VACUUM_STAGE_PEAKS.with(|s| *s.borrow())
+}
+
 /// 把 WAL 收口成「只剩一条 Checkpoint」。
 ///
 /// 顺序反直觉但必须这样：原先是 `append(Checkpoint) → sync → truncate()`，而 `truncate()`
@@ -481,6 +514,14 @@ impl MVCC {
 
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
+        #[cfg(test)]
+        // 门控见 `vac_stage_mark`：不设 `VACUUM_STAGE_SPLIT` 时这里绝不能压高水位，
+        // 否则外层大库台架对 `vacuum()` 的内存读数会被锯短。
+        let mut vac_base = if std::env::var("VACUUM_STAGE_SPLIT").is_ok() {
+            crate::mem_probe::reset_peak()
+        } else {
+            crate::mem_probe::peak()
+        };
 
         // ① 分组只走 KeyDir 元数据：判「留哪一版」只需要版本号 + 是不是软墓碑，不需要 value。
         //    旧实现是两次 `kv.iter()`（每一行连 value 全部读出来），于是 vacuum 自己成了
@@ -488,11 +529,14 @@ impl MVCC {
         let budget_rows = budget_rows.max(1);
         //
         // M36：**只攒当前这一把键的那一组**。以前这里攒的是全库归组的
-        // `BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>>`（每行两个 `Vec`：raw_key 与 enc）
-        // ⇒ vacuum 自己的瞬时内存 = O(全库物理行)，600k 那档实测 **+89.4 MB**（下游 80 MB RSS
-        // 预算一次顶穿）。版本键按 `raw ‖ version_be` 升序到达 ⇒ 同一把键的行必然连续，
-        // 判完一组就地交出去，峰值只与**最长那条链**同阶（守卫
-        // `test_vacuum_peak_memory_scales_with_chain_not_library`）。
+        // `BTreeMap<Vec<u8>, Vec<(u64, Vec<u8>, bool, ())>>`（每行两个 `Vec`：raw_key 与 enc）。
+        // ⚠️ 当时报的"600k 档 +89.4 MB"是**坏量具**读数（M38 修好尺子之前，`峰值` 只看得见超过
+        // 历史最高点的部分）；修好后同一形状同一档：整段 `vacuum()` 瞬时 **171.4 MB**，其中
+        // **① 归组判定 106.0 MB（93 B/扫描行）+ ④ `merge()` 115.0 MB**，②③ 都是 0
+        // ⇒ ①那笔现在的主人是 `to_delete` + `keep` 这两个跨全库累加器，不是"当前一组"（M37）。
+        // 版本键按 `raw ‖ version_be` 升序到达 ⇒ 同一把键的行必然连续，判完一组就地交出去。
+        // 守卫：`all_engines_vacuum_judges_per_group_not_whole_library`（数"判定发生了几次"与
+        // "最大一组的行数"，四家一条各核一次）。
         let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
         // 只有全库轮次要把"存活行清单"交给 blob GC（有界片不碰 blob）⇒ 只在会用到时才攒
@@ -541,6 +585,10 @@ impl MVCC {
         // （`keep`），而 `rewrite_in_place` 又要一次握住**全部存活大 value**。原因是
         // `iter_meta_from` 按 `&self` 借住 KeyDir，走查途中没法再 `get_entry`（那是 `&mut self`），
         // 所以没法"当场读完 blob 指针就丢掉这一项"。那是 blob 结构自己的事，不在这次的边界内。
+        #[cfg(test)]
+        {
+            vac_base = vac_stage_mark(0, vac_base);
+        }
         let removed = to_delete.len();
 
         for enc in &to_delete {
@@ -548,6 +596,10 @@ impl MVCC {
         }
         kv.flush()?;
         blob.sync()?;
+        #[cfg(test)]
+        {
+            vac_base = vac_stage_mark(1, vac_base);
+        }
 
         // Blob GC / 日志压缩都是**全库代价**，只在这一次调用本来就是全库扫描时才做。
         // 判据用 `budget_rows` 而不是「游标回到 None」：一个只有一把 key 的小库，任何
@@ -606,8 +658,16 @@ impl MVCC {
         };
 
         // 压缩：丢掉已硬删除的空间（同样只在全库轮次）
+        #[cfg(test)]
+        {
+            vac_base = vac_stage_mark(2, vac_base);
+        }
         if full_sweep && (removed > 0 || blob_rewritten) {
             let _ = kv.merge();
+            #[cfg(test)]
+            {
+                let _ = vac_stage_mark(3, vac_base);
+            }
         }
 
         Ok(VacuumRound {
@@ -1942,6 +2002,68 @@ mod tests {
                 assert_eq!(tx.get(k), Some(format!("v{}", CHAIN - 1).into_bytes()));
             }
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// 一次全库 `vacuum()` 的瞬时内存分在哪一段（M37 的先量，`#[ignore]`）。
+    ///
+    /// 为什么要拆：修好量具（M38）之后 600k 档 `vacuum()` 读到 **171.4 MB**，而这一段里叠着
+    /// 四件事 —— ①归组判定、②删除 + `flush` + blob `sync`、③blob GC（读存活行 +
+    /// `rewrite_in_place`）、④`kv.merge()` 重写主日志。"存活行清单"是①里那块，但 M30/M31
+    /// 两次的教训都是**最合理的那件事不是元凶**，所以先分段再决定这一刀砍哪里。
+    /// 每段之前都 `reset_peak()` ⇒ 报的是**这一段自己**的瞬时峰值，不是进程历史最高点。
+    ///
+    /// ```text
+    /// BITCASK_VAC_ROWS=200000 cargo test --release --lib -- --ignored --nocapture \
+    ///     --test-threads=1 bitcask_vacuum_stage_split
+    /// ```
+    #[test]
+    #[ignore = "vacuum 分段内存台架，手动 release 单线程跑：BITCASK_VAC_ROWS=200000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 bitcask_vacuum_stage_split"]
+    fn bitcask_vacuum_stage_split() {
+        use std::time::Instant;
+        let rows: u64 = std::env::var("BITCASK_VAC_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let mb = |b: u64| b as f64 / 1024.0 / 1024.0;
+        let path = tmp_db("vac_stages");
+        {
+            let mvcc = MVCC::open(&path);
+            // 每把键两个版本 ⇒ 第二趟写完之后第一版全都 < xmin，全部可裁
+            for round in 0..2u64 {
+                let tx = mvcc.begin_transaction();
+                for i in 0..rows {
+                    let k = format!("{i:08}#/worldquant/datafields/x.json");
+                    assert!(tx.set(k.as_bytes(), format!("round{round}").into_bytes()), "第 {i} 把键写失败");
+                }
+                tx.commit();
+            }
+            let t = Instant::now();
+            let st = mvcc.vacuum().unwrap();
+            let d = t.elapsed();
+            let p = vacuum_stage_peaks();
+            println!(
+                "=== bitcask vacuum 分段瞬时峰值 rows={rows} 裁掉 {} 行 / 扫 {} 行，总耗时 {:.2} s ===",
+                st.versions_removed,
+                st.rows_scanned,
+                d.as_secs_f64()
+            );
+            println!(
+                "  ① 归组判定 {:>8.1} MB ｜ ② 删除+flush+sync {:>8.1} MB ｜ ③ blob GC {:>8.1} MB ｜ ④ merge {:>8.1} MB",
+                mb(p[0]),
+                mb(p[1]),
+                mb(p[2]),
+                mb(p[3])
+            );
+            println!(
+                "  合计（分段各自峰值，非同时成立）{:>8.1} MB ｜ 每扫描行摊 ①={:.0} B ②={:.0} B ③={:.0} B ④={:.0} B",
+                mb(p[0] + p[1] + p[2] + p[3]),
+                p[0] as f64 / st.rows_scanned.max(1) as f64,
+                p[1] as f64 / st.rows_scanned.max(1) as f64,
+                p[2] as f64 / st.rows_scanned.max(1) as f64,
+                p[3] as f64 / st.rows_scanned.max(1) as f64,
+            );
         }
         cleanup(&path);
     }
