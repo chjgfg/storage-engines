@@ -29,6 +29,14 @@ use std::path::{Path, PathBuf};
 
 const KEY_VAL_HEADER_LEN: u32 = 4;
 const MERGE_FILE_EXT: &str = "merge";
+
+/// M40：一次 `merge()` 从 KeyDir 抄块的**块大小**（把键）。
+///
+/// 为什么要有块：`read_live` 要 `&mut self`，而走 `key_dir` 是按 `&self` 借用 ⇒ 原先只能先把
+/// 整库抄成一份 `Vec<(key.clone(), loc.clone())>` 快照（600k 键 × 2 版那档 **115.0 MB**）。
+/// 块化之后那份重复的键表是 O(本常数)。取 8192 与四家 vacuum 的块界同值，好记也好钉
+/// （守卫 `test_merge_walks_key_dir_in_bounded_chunks`）。
+const MERGE_CHUNK_KEYS: usize = 8192;
 /// 写缓冲目标大小：攒够再落盘，减少 syscall
 const WRITE_BUF_TARGET: usize = 4 * 1024 * 1024;
 // ─── Hint 文件格式 ───────────────────────────────────────────────────────────
@@ -119,6 +127,35 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn note_keydir_visit() {
     KEYDIR_VISITS.with(|c| c.set(c.get() + 1));
+}
+
+// 测试专用（M40 的尺子）：一次 `merge()` 里**单块从 KeyDir 抄出多少把键**的历史最大值。
+//
+// 为什么钉这个而不是钉内存：`mem_probe` 的高水位是进程级的、并行用例互相污染（M27/M36 各栽过
+// 一次），而"块界有没有生效"是个纯计数 —— 与四家 vacuum 那条 `vac_pending_max` 同形。
+#[cfg(test)]
+thread_local! {
+    static MERGE_CHUNK_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_merge_chunk(n: usize) {
+    MERGE_CHUNK_MAX.with(|c| {
+        let n = n as u64;
+        if n > c.get() {
+            c.set(n);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn merge_chunk_max() -> u64 {
+    MERGE_CHUNK_MAX.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_merge_chunk() {
+    MERGE_CHUNK_MAX.with(|c| c.set(0));
 }
 
 /// 当前线程折候选时检查过的编码键数（测试探针用）
@@ -930,39 +967,70 @@ impl Bitcask {
         let mut merge_path = target.clone();
         merge_path.set_extension(MERGE_FILE_EXT);
 
-        let snapshot: Vec<(Vec<u8>, KeyLoc)> = self
-            .key_dir
-            .iter()
-            .map(|(k, loc)| (k.clone(), loc.clone()))
-            .collect();
-
+        // M40：**按块走 KeyDir**。这里原先是一次 `.collect()` 出整库的
+        // `(key.clone(), loc.clone())` 快照 —— 600k 键 × 2 版那档分段实测 **115.0 MB**
+        // （100 B/扫描行），是 `vacuum()` 现在唯一的大头。为什么要快照：循环里 `read_live`
+        // 要 `&mut self`，不能一边借用 `key_dir` 一边读盘 ⇒ 只能先把范围抄出来。
+        // 每块只抄 `MERGE_CHUNK_KEYS` 把键（借用一结束就处理这一块），那份重复的键表就从
+        // O(全库) 变成 O(一块)。
+        // ⚠️ 别把这一刀说成"merge 不再吃内存"：剩下的 `new_key_dir` 本身就是 O(库) —— 那是
+        // **替换用的新索引**（活到函数结束），不是瞬时账。要连它一起省，得原地更新 `key_dir`
+        // 里的 `pos/file_id`，而那会碰"崩在文件切换点上"的语义（下面 `merge_hold` 那段）⇒ 另立一条。
         let mut new_log = Log::new(merge_path)?;
         let mut new_key_dir = KeyDir::new();
         let new_file_id = 0u32;
-
-        for (key, loc) in snapshot {
-            match loc {
-                KeyLoc::Live {
-                    file_id,
-                    pos,
-                    len,
-                } => {
-                    let value = self.read_live(file_id, pos, len)?;
-                    let (value_pos, value_len, _) =
-                        new_log.append_entry(&key, Some(&value), false)?;
-                    new_key_dir.insert(
-                        key,
-                        KeyLoc::Live {
-                            file_id: new_file_id,
-                            pos: value_pos,
-                            len: value_len,
-                        },
-                    );
+        // 块间下界在键的字节域：`key ‖ 0x00` 是**严格后继方向**（`key‖0x00 > key`，且任何
+        // `K > key` 都有 `K ≥ key‖0x00`）⇒ 一行不漏、一行不重。⚠️ 不能用 `‖ 0xFF×8` 那种
+        // 右界写法（会把以 `key` 为前缀的更长键整把跳掉）—— 与 M37 那条 vacuum 块界同一个理由。
+        let mut lower: Vec<u8> = Vec::new();
+        loop {
+            let mut chunk: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(MERGE_CHUNK_KEYS + 1);
+            let mut next_lower: Option<Vec<u8>> = None;
+            {
+                use std::ops::Bound::{Included, Unbounded};
+                for (k, loc) in self
+                    .key_dir
+                    .range::<[u8], _>((Included(lower.as_slice()), Unbounded))
+                {
+                    chunk.push((k.clone(), loc.clone()));
+                    if chunk.len() >= MERGE_CHUNK_KEYS {
+                        let mut bound = k.clone();
+                        bound.push(0u8);
+                        next_lower = Some(bound);
+                        break;
+                    }
                 }
-                KeyLoc::SoftTombstone { .. } => {
-                    new_log.write_soft_tombstone(&key)?;
-                    new_key_dir.insert(key, KeyLoc::SoftTombstone { file_id: new_file_id });
+            }
+            #[cfg(test)]
+            note_merge_chunk(chunk.len());
+            for (key, loc) in chunk {
+                match loc {
+                    KeyLoc::Live {
+                        file_id,
+                        pos,
+                        len,
+                    } => {
+                        let value = self.read_live(file_id, pos, len)?;
+                        let (value_pos, value_len, _) =
+                            new_log.append_entry(&key, Some(&value), false)?;
+                        new_key_dir.insert(
+                            key,
+                            KeyLoc::Live {
+                                file_id: new_file_id,
+                                pos: value_pos,
+                                len: value_len,
+                            },
+                        );
+                    }
+                    KeyLoc::SoftTombstone { .. } => {
+                        new_log.write_soft_tombstone(&key)?;
+                        new_key_dir.insert(key, KeyLoc::SoftTombstone { file_id: new_file_id });
+                    }
                 }
+            }
+            match next_lower {
+                Some(l) => lower = l,
+                None => break,
             }
         }
         new_log.flush_buf()?;
@@ -1468,6 +1536,60 @@ mod tests {
             let mut eng = Bitcask::new(path.clone()).unwrap();
             assert_eq!(eng.get(b"a").unwrap(), Some(b"2".to_vec()));
             assert_eq!(eng.len(), 1);
+        }
+        cleanup(&path);
+    }
+
+    /// `merge()` 走 KeyDir 必须**按块**，不许一次把整库的 `(键, 位置)` 抄进一个 `Vec`（M40）。
+    ///
+    /// 判据（单位：把键）：库里活键数远多于一块时，单块抄出的最大键数 `merge_chunk_max()`
+    /// 必须 ≤ `2 × MERGE_CHUNK_KEYS`。改前那份 `snapshot: Vec<(k.clone(), loc.clone())>`
+    /// 在 600k 键 × 2 版那档分段实测 **115.0 MB**（100 B/扫描行），是 `vacuum()` 现在唯一的
+    /// 大头；块化之后它变成 O(一块)（剩下的 `new_key_dir` 是替换用的新索引，不是瞬时账）。
+    /// 尺子为什么是"单块抄出多少把键"而不是内存：与四家 vacuum 的 `vac_pending_max` 同一条理由
+    /// —— `mem_probe` 的高水位是进程级的，并行用例互相污染。
+    ///
+    /// 变异验证：把 `MERGE_CHUNK_KEYS` 临时抬到一整库那么大 ⇒ 单块抄出 20 000 把 > 界 16 384，红。
+    #[test]
+    fn test_merge_walks_key_dir_in_bounded_chunks() {
+        const KEYS: usize = 20_000;
+        let path = tmp_log("merge_chunks");
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            for i in 0..KEYS {
+                let k = format!("k{i:06}");
+                eng.set(k.as_bytes(), vec![b'v'; 16]).unwrap();
+            }
+            assert_eq!(eng.len(), KEYS, "灌完之后活键数不对 ⇒ 形状没建起来");
+            reset_merge_chunk();
+            eng.merge().unwrap();
+            let max_chunk = merge_chunk_max();
+            eprintln!(
+                "[merge chunks] {} 把活键 ⇒ 单块最多抄 {} 把（块界 {MERGE_CHUNK_KEYS}）",
+                eng.len(),
+                max_chunk
+            );
+            assert!(KEYS > MERGE_CHUNK_KEYS * 2, "这条判据要求库比两块还大（否则界不会被跨过）");
+            assert!(max_chunk > 0, "这把尺子没数到块 ⇒ 空转");
+            assert!(
+                max_chunk <= 2 * MERGE_CHUNK_KEYS as u64,
+                "单块抄出 {max_chunk} 把键（界 {}）⇒ 又变回整库一份快照",
+                2 * MERGE_CHUNK_KEYS as u64
+            );
+            // 分块走之后数据必须还是完整的（顺序、条数、值）
+            assert_eq!(eng.len(), KEYS, "merge 之后活键数变了");
+            for i in (0..KEYS).step_by(997) {
+                let k = format!("k{i:06}");
+                assert_eq!(
+                    eng.get(k.as_bytes()).unwrap(),
+                    Some(vec![b'v'; 16]),
+                    "第 {i} 把键在分块 merge 之后读不回来"
+                );
+            }
+        }
+        {
+            let eng = Bitcask::new(path.clone()).unwrap();
+            assert_eq!(eng.len(), KEYS, "重开之后活键数不对 ⇒ 分块 merge 写坏了日志");
         }
         cleanup(&path);
     }
