@@ -207,6 +207,37 @@ pub fn search_page_from(
     search_page_from_with_total(matched, query, total)
 }
 
+/// 一页的**装配口径唯一一份**（M51）。
+///
+/// 为什么要把 `has_next` / `total_pages` 的算法从 [`search_page_from_with_total`] 里拆出来：
+/// M51 之后取页的那条路不再交回"从头到这一页的整段"，而是交回"这一页 + 有没有下一条"
+/// （[`crate::common::store::search_page_rows`]）⇒ 两个形状都要算同一个 `has_next`。
+/// 分开写就是两处会各自漂移的那种"同一判定两份"（M5a/M5b 一路的规矩），所以这里只留一份，
+/// 老的"整段切片版"改成它的适配层。
+pub fn search_page_build(
+    items: Vec<crate::common::ExportRecord>,
+    page: usize,
+    page_size: usize,
+    total: Option<usize>,
+    has_more: bool,
+) -> crate::common::SearchPage {
+    let (has_next, total_pages) = match total {
+        Some(n) => (
+            n > 0 && page + 1 < (n + page_size - 1) / page_size,
+            Some(if n == 0 { 0 } else { (n + page_size - 1) / page_size }),
+        ),
+        None => (has_more, None),
+    };
+    crate::common::SearchPage {
+        items,
+        total,
+        page,
+        page_size,
+        total_pages,
+        has_next,
+    }
+}
+
 /// [`search_page_from`] 的**外部 total 版**（M35）：`total` 是调用方另外数出来的精确命中数，
 /// `matched` 只需要装得下**那一页**（外加"多取一条"当 `has_next` 的证据）。
 ///
@@ -219,6 +250,9 @@ pub fn search_page_from(
 /// - `None`（没数）：`has_next` 只能靠"窗口外那一条在不在" —— `matched.len() > skip + 页宽`。
 ///   ⚠️ **不许把"没数"报成"到底了"**就是靠这条区分的：走到库尾 / 界尾是真的到底，
 ///   而探到第 `end+1` 条说明后面还有。
+///
+/// ⚠️ M51：`search_page` 已经不走这条了（它用 [`search_page_build]`，跳过的行当场丢掉、不再攒整段）。
+/// 这里留着是给"手上已经有一段命中"的调用方（[`search_page_from`] 以及下游自己折叠的形状）。
 pub fn search_page_from_with_total(
     matched: Vec<crate::common::ExportRecord>,
     query: &crate::common::SearchQuery,
@@ -227,27 +261,14 @@ pub fn search_page_from_with_total(
     let page_size = query.page_size.max(1);
     let page = query.page;
     let skip = page.saturating_mul(page_size);
+    let has_more = matched.len() > skip + page_size;
     let items = if skip >= matched.len() {
         Vec::new()
     } else {
         let end = (skip + page_size).min(matched.len());
         matched[skip..end].to_vec()
     };
-    let (has_next, total_pages) = match total {
-        Some(n) => (
-            n > 0 && page + 1 < (n + page_size - 1) / page_size,
-            Some(if n == 0 { 0 } else { (n + page_size - 1) / page_size }),
-        ),
-        None => (matched.len() > skip + page_size, None),
-    };
-    crate::common::SearchPage {
-        items,
-        total,
-        page,
-        page_size,
-        total_pages,
-        has_next,
-    }
+    search_page_build(items, page, page_size, total, has_more)
 }
 
 /// 折叠一轮产出的**候选组**：一把逻辑 key 的胜出版本行，值**还没取**。
@@ -273,7 +294,10 @@ pub struct WinCandidate<V> {
 /// ⚠️ 片大小与"每轮固定开销"是反向的：每轮都要从游标重新起一条键流（`fold_lower_bound`
 /// 已经把界下推了，见 M21），所以轮数是 `存活键 / 本片`。200k 键 = 49 轮，实测单价没测出
 /// 可分辨的差别（判据见守卫，别凭感觉调这个数字）。
-const FOLD_CHUNK: usize = 4096;
+///
+/// `pub(crate)`（M51）：取页那条路也要按它钳一次预留 —— 页宽可以传很大的数，
+/// 一次 `with_capacity(page_size)` 会把刚省下来的瞬时内存按页宽买回来。
+pub(crate) const FOLD_CHUNK: usize = 4096;
 
 // 测试专用（M44 的尺子）：**收集门**最多同时攒了多少行。
 //

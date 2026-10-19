@@ -272,11 +272,40 @@ pub fn search_bounds<'a>(
     }
 }
 
+/// 一组成员行折出来的**候选** → 用户该看到的那一行（判定的唯一一份实现，M51）。
+///
+/// 为什么单独成一个函数而不是留在 `search_window` 的闭包里：M51 把"取那一页"从
+/// "先把前 `skip+page_size` 行全攒起来"改成"流式只留那一页"，于是**同一条判定出现了第二个用户**。
+/// 判定分两处写就是本仓库反复在防的那件事（M5a/M5b 一路的做法：同形状的判定不许留两份）——
+/// 过期与墓碑同待这条规矩，两处必须永远一致。
+fn record_of<S: VersionedStore>(
+    store: &S,
+    key: Vec<u8>,
+    row: S::Row,
+    include_deleted: bool,
+) -> Option<ExportRecord> {
+    match store.materialize(row) {
+        RowValue::Missing => None,
+        RowValue::Tombstone => include_deleted.then_some(ExportRecord { key, value: None }),
+        // 逻辑值还要剥一次信封；过期与墓碑同待（只在 include_deleted 时出现）
+        RowValue::Value(logical) => match logical_to_user(logical) {
+            Some(user) => Some(ExportRecord {
+                key,
+                value: Some(user),
+            }),
+            None => include_deleted.then_some(ExportRecord { key, value: None }),
+        },
+    }
+}
+
 /// 窗口化的模式搜索：返回**按 key 升序**的命中行，最多 `limit` 条（多要一条给 `has_next` 用）。
 ///
 /// 与 [`collect_rows`] 的分工：这里额外做两件事 —— 把 `pattern`/`mode` 变成折叠侧的
 /// `accept`（键级，先判它才能少取值）与界，再把存储字节剥成用户 value（`logical_to_user`）。
 /// 剥壳后为 `None`（过期）的行与墓碑同待：只在 `include_deleted` 时出现。
+///
+/// ⚠️ 它**攒的是一个 `Vec`**：`limit` 给多大就攒多大。翻到第 1200 页**不要**用它 ——
+/// 那条路走 [`search_page_rows`]（只留那一页），见 M51。
 pub fn search_window<S: VersionedStore>(
     store: &S,
     include_deleted: bool,
@@ -289,25 +318,52 @@ pub fn search_window<S: VersionedStore>(
     fold_window(
         limit,
         |after, budget| store.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
-        |c| match store.materialize(c.row) {
-            RowValue::Missing => None,
-            RowValue::Tombstone => include_deleted.then(|| ExportRecord {
-                key: c.key,
-                value: None,
-            }),
-            // 逻辑值还要剥一次信封；过期与墓碑同待（只在 include_deleted 时出现）
-            RowValue::Value(logical) => match logical_to_user(logical) {
-                Some(user) => Some(ExportRecord {
-                    key: c.key,
-                    value: Some(user),
-                }),
-                None => include_deleted.then(|| ExportRecord {
-                    key: c.key,
-                    value: None,
-                }),
-            },
-        },
+        |c| record_of(store, c.key, c.row, include_deleted),
     )
+}
+
+/// 分页要的**那一页**：跳过 `skip` 行、留 `page_size` 行，外加"还有没有下一条"这一格证据。
+///
+/// 存在的理由（M51，复测抓到的一格）：`search_page` 以前是
+/// `search_window(limit = skip + page_size + 1)` 再切片 ⇒ **翻到末页要先把前面每一页都攒在堆上**。
+/// 600k 键的库翻到第 1200 页，瞬时峰值实测 **188 MB**（四家同形，比"一次全量 scan"的 123.7 MB 还高）。
+/// 那条折叠本身没省（每一行的值都得读出来才判得了过期 ⇒ 见 [`count_window`] 那条同样的老实话），
+/// 省的是**留存**：跳过的行当场丢掉，堆上最多只有 `page_size + 1` 行 ⇒ 峰值从 O(页码×页宽) 变成 O(页宽)。
+pub fn search_page_rows<S: VersionedStore>(
+    store: &S,
+    include_deleted: bool,
+    pattern: Option<&[u8]>,
+    mode: KeyMatchMode,
+    skip: usize,
+    page_size: usize,
+) -> (Vec<ExportRecord>, bool) {
+    let (lo, hi) = search_bounds(pattern, mode);
+    let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
+    let mut items: Vec<ExportRecord> =
+        Vec::with_capacity(page_size.min(crate::common::kernel::FOLD_CHUNK));
+    let mut seen = 0usize;
+    let mut has_more = false;
+    // ⚠️ `wanted` 给 **`None`** 而不是 `skip + page_size + 1`：那才是"每轮固定一片候选"的门
+    // （`fold_window_emit` 里 `budget` 的起点就是 `wanted`，给了它就是把整段前缀的候选
+    // 一次装进 `Vec` ⇒ 省下的留存又被候选买回来）。收手由 `emit` 返回 `false` 负责。
+    fold_window_emit(
+        None,
+        |after, budget| store.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
+        |c| record_of(store, c.key, c.row, include_deleted),
+        |rec| {
+            seen += 1;
+            if seen <= skip {
+                return true; // 前面的页：**当场丢掉**，一行都不留
+            }
+            if items.len() < page_size {
+                items.push(rec);
+                return true;
+            }
+            has_more = true; // 第 `page_size + 1` 条 = 还有下一页
+            false
+        },
+    );
+    (items, has_more)
 }
 
 /// 游标式有界扫描：`after`（**不含**）之后最多 `limit` 行可见记录，返回 `(行, 下一页游标)`；
@@ -455,19 +511,21 @@ pub fn count_window<S: VersionedStore>(
 /// `items` 可能来自两个瞬间（旧形状一次折叠，两者必然同时）。事务视图不受影响 —— 它按快照读。
 pub fn search_page<S: VersionedStore>(store: &S, query: &SearchQuery) -> SearchPage {
     let page_size = query.page_size.max(1);
-    // 窗口那条"多要一条"的合同：它既给 `has_next` 当证据，也让"走到库尾"与"后面还有"分得开
-    let limit = Some(query.page.saturating_mul(page_size) + page_size + 1);
-    let matched = search_window(
+    let skip = query.page.saturating_mul(page_size);
+    // M51：取那一页走**流式**（只留 `page_size` 行 + 一条"还有下一页"的证据），
+    // 不再把前面每一页都攒进 `Vec`。窗口那条"多要一条"的合同原样保留，只是-holder 的人换成了这里。
+    let (items, has_more) = search_page_rows(
         store,
         query.include_deleted,
         Some(query.pattern.as_slice()),
         query.mode,
-        limit,
+        skip,
+        page_size,
     );
     let total = query.need_total.then(|| {
         count_window(store, query.include_deleted, Some(query.pattern.as_slice()), query.mode)
     });
-    crate::common::search_page_from_with_total(matched, query, total)
+    crate::common::search_page_build(items, query.page, page_size, total, has_more)
 }
 
 // 测试专用：`seek_prev_with` 为了返回一行，往回退过几把键。

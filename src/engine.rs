@@ -2968,9 +2968,127 @@ mod tests {
                 Some((want_a + PAGE - 1) / PAGE),
                 "{name}: total_pages 与 total/页宽不一致"
             );
+
+            // ④ M51：末页这一趟**交出的行**必须与改前逐行相同（内存那一格在专门的守卫里钉：
+            //    `deep_search_pages_do_not_materialize_earlier_pages` —— 这个库规模下动态范围不够，
+            //    末页与第 0 页的高水位只差百分之几，比值判据拦不住旧形状，别在这儿装样子）。
+            let deep_again = tx.search_keys(&SearchQuery::prefix(b"aa", last_page, PAGE));
+            assert_eq!(
+                deep_again.items.len(),
+                deep.items.len(),
+                "{name}: 流式取页与整段切片给出的末页行数不同"
+            );
+            for (i, rec) in deep_again.items.iter().enumerate() {
+                assert_eq!(rec.key, deep.items[i].key, "{name}: 流式取页交出的末页不是同几行");
+            }
+
+            // ⑤ 语义必须一字不差：**每一页**都等于"全量折叠"的对应切片（含末页之后那一页）。
+            //    只断"末页行数对"不够 —— 跳过 `skip` 行这条逻辑一旦错位（多跳/少跳/跳错键），
+            //    行数照样可能对，行却是别的行。逐行比键才拦得住。
+            let truth = tx.prefix_scan(b"aa");
+            assert_eq!(truth.len(), want_a, "{name}: 对拍基准那一趟少了几行");
+            for p in 0..=last_page + 1 {
+                let pg = tx.search_keys(&SearchQuery::prefix(b"aa", p, PAGE));
+                let lo = (p * PAGE).min(truth.len());
+                let hi = ((p + 1) * PAGE).min(truth.len());
+                assert_eq!(pg.items.len(), hi - lo, "{name}: 第 {p} 页行数与切片不一致");
+                for (i, rec) in pg.items.iter().enumerate() {
+                    assert_eq!(
+                        rec.key, truth[lo + i].key,
+                        "{name}: 第 {p} 页第 {i} 行的键不是切片里那一行 ⇒ skip 跳错了"
+                    );
+                }
+                assert_eq!(
+                    pg.has_next,
+                    (p + 1) * PAGE < truth.len(),
+                    "{name}: 第 {p} 页 has_next 不对（免 total 那支靠它，不许把没数报成到底）"
+                );
+                let pg_nt = tx.search_keys(&SearchQuery::prefix(b"aa", p, PAGE).without_total());
+                assert_eq!(
+                    pg_nt.items.len(),
+                    pg.items.len(),
+                    "{name}: 第 {p} 页在要/不要 total 两条路上不同长"
+                );
+                assert_eq!(pg_nt.has_next, pg.has_next, "{name}: 第 {p} 页两条路的 has_next 分家");
+            }
             tx.commit();
             // `db` 在每次迭代末尾自己就掉了（事务 `tx` 比它先结束），所以这里不需要显式 `drop`；
             // 写在这里是因为 Windows 上文件句柄没释放就 `remove_dir_all` 会失败。
+        }
+        cleanup(dirs);
+    }
+
+    /// M51 的守卫：**深翻到末页不许把前面每一页都攒在堆上**（复测抓到的那格：600k 档
+    /// `search 末页(深翻)` 瞬时峰值 **188 MB**、四家同形，比"一次全量 scan"的 123.7 MB 还高）。
+    ///
+    /// 改之前取页 = `search_window(limit = skip + 页宽 + 1)` 再切片 ⇒ 第 159 页要先把前 7 950 行
+    /// 连键带值折进一个 `Vec`。现在走流式门：跳过的行当场丢掉，堆上最多只有一页。
+    ///
+    /// 判据 = **收集门攒了几行**（[`crate::common::collect_held_max`]，M44 那把尺子；线程局部的计数，
+    /// 不像进程高水位会被并行用例污染）：取页改走流式门之后这一格必须是 **0**，
+    /// 而旧形状（`search_window(limit = skip + 页宽 + 1)`）会读到 8001。
+    /// 先给尺子作证：同一趟里 `scan_page(None, ROWS)`（真走收集门）必须读到 ≈ 全库 ——
+    /// ⚠️ 我第一版的对照臂错用了 `prefix_scan`，它 M27 之后就逐片走了 ⇒ 读到 0，
+    /// 看着像"没攒"其实是"门不在这条路上"（读数 0 有两种解释，M38/M44 就是这个坑）。
+    #[test]
+    fn deep_search_pages_do_not_materialize_earlier_pages() {
+        const ROWS: usize = 8000;
+        const PAGE: usize = 50;
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            let last = ROWS / PAGE - 1;
+            let tx = db.begin();
+            for i in 0..ROWS {
+                assert!(
+                    tx.set(format!("k{i:06}").as_bytes(), vec![b'v'; 24]),
+                    "{name}: 第 {i} 把键写失败"
+                );
+            }
+            // 作证：这把尺子在真走收集门的那条路上读得到"整段"
+            crate::common::reset_collect_held();
+            let (many, _next) = tx.scan_page(None, ROWS);
+            let held_door = crate::common::collect_held_max();
+            assert_eq!(many.len(), ROWS, "{name}: scan_page 一次交不满全库 ⇒ 对照臂没建立");
+            assert!(
+                held_door >= ROWS as u64,
+                "{name}: 收集门在 scan_page(限 {ROWS}) 上只读到 {held_door} ⇒ 尺子没接在门上，\
+                 下面那个 0 不算数"
+            );
+
+            // 判据：深翻末页不得再走收集门
+            crate::common::reset_collect_held();
+            let p0 = tx.search_keys(&SearchQuery::prefix(b"k", 0, PAGE));
+            let held_p0 = crate::common::collect_held_max();
+            crate::common::reset_collect_held();
+            let pd = tx.search_keys(&SearchQuery::prefix(b"k", last, PAGE));
+            let held_deep = crate::common::collect_held_max();
+            eprintln!(
+                "[深翻取页] {name}: {ROWS} 行 ÷ 页宽 {PAGE}｜对照臂 scan_page 收集门读到 {held_door}；\
+                 第 0 页攒 {held_p0} 行、末页(第 {last} 页)攒 {held_deep} 行\
+                 （旧形状那一臂末页要攒 {} 行）",
+                last * PAGE + PAGE + 1
+            );
+            // 语义没动：两页都是满页、total 照给、末页第一行就是第 `last*PAGE` 行
+            assert_eq!(p0.items.len(), PAGE, "{name}: 第 0 页不是满页");
+            assert_eq!(pd.items.len(), PAGE, "{name}: 末页不是满页");
+            assert_eq!(pd.total, Some(ROWS), "{name}: 末页的 total 不对");
+            assert_eq!(
+                pd.items[0].key,
+                format!("k{:06}", last * PAGE).into_bytes(),
+                "{name}: 末页起点跳错了 ⇒ `skip` 那一笔多跳/少跳"
+            );
+            assert!(!pd.has_next, "{name}: 末页还报有下一页");
+            assert_eq!(
+                held_deep, 0,
+                "{name}: 末页这一趟在收集门攒了 {held_deep} 行 ⇒ 取页还在把前面每一页物化成 `Vec`"
+            );
+            assert_eq!(
+                held_p0, 0,
+                "{name}: 第 0 页也攒了 {held_p0} 行 ⇒ 流式门根本没生效"
+            );
+            tx.commit();
         }
         cleanup(dirs);
     }

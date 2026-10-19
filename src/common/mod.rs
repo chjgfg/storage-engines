@@ -30,7 +30,7 @@ pub use types::{
 pub use store::{
     RowValue, VersionedStore, collect_rows, collect_rows_as, count_window, export_rows_streaming,
     fold_lower_bound, fold_rows_streaming, live_record_of_logical, scan_live_records, scan_page,
-    search_bounds, search_page, search_window, seek_prev_with,
+    search_bounds, search_page, search_page_rows, search_window, seek_prev_with,
 };
 pub use txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 pub use version::{
@@ -58,7 +58,8 @@ pub(crate) fn tmp_test_path(prefix: &str, tag: &str, suffix: &str) -> std::path:
     ))
 }
 pub use kernel::{
-    fold_window, fold_window_emit, is_unfinished, search_page_from, search_page_from_with_total,
+    fold_window, fold_window_emit, is_unfinished, search_page_build, search_page_from,
+    search_page_from_with_total,
     visible_at, HealthFold,
     VacuumScheduler, WalPolicy,
     WinCandidate,
