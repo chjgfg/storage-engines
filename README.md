@@ -6,8 +6,8 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 301 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M38**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 302 个单元测试 + 4 个集成测试
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M39**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -18,15 +18,15 @@
 (发布于 2026-10-15,未 yank)。**这一版已经包含**七条"随 uptime 恶化"通道的修复与 M9 的门面
 改造(`KvEngine: Send + Sync`、类型化选型、`EngineName`)⇒ 版本号依赖就能拿到。
 
-但 0.4.0 那个发布件**不含 10-16 之后的 M10–M38**:LSM 点查的常驻文件句柄与稀疏索引二分
+但 0.4.0 那个发布件**不含 10-16 之后的 M10–M39**:LSM 点查的常驻文件句柄与稀疏索引二分
 (下游实测单次点查 0.86 ms 那条就是它)、四引擎窗口/前缀 scan 的界下推、bitcask 懒分配写缓冲、
 B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`、四引擎
 事务内核合成一份、`migrate` + `scan_page`、LSM 灌行 O(N²)、`seek_prev` 整段物化、游标未下推、
 B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、页读路径与 CRC32 提速、**缓存自动档的顶可以由调用方抬（`set_cache_auto_max`）且覆盖率的分母可读**、**压实的输入改流式源（一次压实瞬时内存 156.8 MB → 6.3 MB）**。
-磁盘格式这二十七批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
+磁盘格式这二十八批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M38
+# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M39
 storage-engines = { path = "../storage-engines" }
 
 # (b) 走远端:git 依赖(gitee 与 github 内容一致)
@@ -36,7 +36,7 @@ storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branc
 storage-engines = "0.4"
 ```
 
-`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M38 又想要版本号依赖,
+`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M39 又想要版本号依赖,
 只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
 MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
@@ -960,6 +960,33 @@ lsm 灌行 **+106.8 MB**、四家 `export` / `scan` / `migrate` 的整库物化 
 
 耗时那一笔是干净的（与量具无关）：bitcask 600k `vacuum()` 5.82 → **4.04 s**，少了一趟全库归组。
 
+**M39 —— lsm `health()` 不再把每个源整篇物化：瞬时 +126.1 MB → +0.1 MB（600k 档，同一把修好的量具）**
+
+这条是 **M38 修好量具之后才看见的**：`health()` 是个"报统计"的调用，600k 档一次却瞬时涨
+**126.1 MB**（旧量具报 `+0.0`，因为高水位早被前面的灌行/`scan` 抬到顶上了 —— 见上面 M38 那段）。
+
+根因一句话：`health()` 走 `LSMTree::scan_latest_light`，而那份实现是**先把每个源整篇折进 `Vec`**
+（memtable 用 `mem_view_light` 整表遍历、每个 SST 用 `SstFile::light_view` 整篇读完，**所有源同时活着**）
+再交给跨源归并 ⇒ 峰值 = 「2 × 全库轻量视图」。归并本身早就有惰性版本（`light_iter_range`，
+M15b/M29 那条路），只是这个调用没用它。
+
+改法：① `health()` 改走 `light_iter_range(None, None, snap)`；② `scan_latest_light` 改成它的
+**收集壳**（`.collect()`）—— 这样跨源取胜规则**只剩一份实现**，而公开签名没动；③ 死掉的
+`mem_view_light` 删除；④ `SstFile::light_view` 上加一把计数尺 `light_view_materialized()`
+（**单位 = 条目数**，与 M33 那把同形）。磁盘格式没动。
+
+实测（600k 档、同一份构建、M38 修好的量具）：`health()` 瞬时 **+126.1 MB → +0.1 MB**，
+耗时 742 → **461 ms/次**。
+
+守卫 `test_health_does_not_materialize_its_sources`：跑一次 `health()`，`light_view_materialized()`
+的差值必须是 **0**；先 `flush()` 逼数据真落在 SST 里（全在 memtable 时这条是空转，所以还加了
+`live_keys >= 300` 的形状断言）。⚠️ 和 M36 一样**不拿分配计数当判据**（进程级、并行会互相污染），
+钉的是"走没走那条物化路径"。变异验证：把 `light_iter_range` 里 SST 那几路源临时换成
+`sst.light_view(snap).into_iter()`（旧形状）⇒ 红在"health 期间有 300 条被整篇物化"。
+
+同一轮还留着没动的邻账：lsm **灌行**瞬时 **+106.8 MB**、bitcask `vacuum()` 的 **① 归组判定 106 MB
++ ④ `merge()` 115 MB**（600k 键 × 2 版那档的分段拆分见 M37 段）—— 都是"跨全库的累加器"，不是归并惰性化能顺手带走的。
+
 ### 本轮全量复测（三档 20k / 200k / 600k × 四引擎 × 31 项，同一份构建，2026-10-19）
 
 判据：**单价倍数 = 原始比值 ÷ 期望量级**；`memory` 引擎那一列就是本机噪声地板（1.2~1.6×）。
@@ -1618,7 +1645,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:301 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:302 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(32 个,含大库基线台架;四引擎全覆盖)
 cargo test --lib cache_auto_max   # 缓存自动档"顶"这一档的三条守卫(门面路由 + bplus 覆盖率 + lsm 覆盖率)
                               # 判据全是计数:bplus 那条量在**磁盘层**(一轮点读落盘几次),

@@ -13,7 +13,7 @@ use std::{
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
-    merge_latest_streaming, merge_streaming, merge_to_ssts, vec_inputs, BlockCache, EntryValue,
+    merge_latest_streaming, merge_to_ssts, vec_inputs, BlockCache, EntryValue,
     LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry,
 };
 
@@ -1000,57 +1000,19 @@ impl LSMTree {
         out
     }
 
-    /// 内存表的**轻量**视图：每个键只带 `seq` 与种类字节，**不克隆 value**。
-    fn mem_view_light(map: &MemMap, snap_seq: u64) -> Vec<(Vec<u8>, LightEntry)> {
-        let mut out = Vec::new();
-        for (k, vers) in map {
-            if let Some((seq, ev)) = vers.iter().rev().find(|(s, _)| **s <= snap_seq) {
-                out.push((
-                    k.clone(),
-                    LightEntry {
-                        seq: *seq,
-                        kind: ev.kind_byte(),
-                    },
-                ));
-            }
-        }
-        out
-    }
-
     /// 全库「每个 enc key 的胜者」的**轻量**视图（跨源取胜规则与 [`Self::iter`] 一致：
     /// 源新→旧优先，同 src 取更大 seq）。
     ///
-    /// 与 `iter()` 的差别就在**不克隆 value**：`iter()` 会把每个源的条目整个 `collect()`
-    /// 进内存（连 value），所以一次全库扫描的峰值内存约等于整个库；这里的峰值只有键字节。
-    /// 需要 value 的调用方对少数胜出行再点查 [`Self::get_value_at`]（会解析 blob 指针），语义与归并取胜一致。
+    /// 与 `iter()` 的差别就在**不克隆 value**：需要 value 的调用方对少数胜出行再点查
+    /// [`Self::get_value_at`]（会解析 blob 指针），语义与归并取胜一致。
+    ///
+    /// M39 起这份实现就是 [`Self::light_iter_range`] 的**收集壳**：以前它自己把每个 memtable
+    /// `mem_view_light` 整表遍历、每个 SST `light_view` 整篇折进 `Vec`，再把所有源同时握着做归并
+    /// ⇒ 峰值 = 「2 × 全库轻量视图」。600k 档那笔 **瞬时 +126.1 MB** 就是这么来的
+    /// （`health()` 当时是它唯一的生产调用方，现已改走惰性迭代器）。
+    /// 签名保留给"确实要一次拿到整份快照"的调用方：它仍然返回 `Vec`，但中途不再另握一份源副本。
     pub fn scan_latest_light(&self, snap_seq: u64) -> Vec<(Vec<u8>, LightEntry)> {
-        let mut sources: Vec<Vec<(Vec<u8>, LightEntry)>> = Vec::new();
-        if !self.mem.is_empty() {
-            let part = Self::mem_view_light(&self.mem, snap_seq);
-            if !part.is_empty() {
-                sources.push(part);
-            }
-        }
-        for imm in &self.immutables {
-            let part = Self::mem_view_light(imm, snap_seq);
-            if !part.is_empty() {
-                sources.push(part);
-            }
-        }
-        // 源顺序必须与 merge_all_at 一致：levels[0] 的 vec 是旧→新，反转成新→旧
-        if let Some(l0) = self.levels.first() {
-            for sst in l0.iter().rev() {
-                sources.push(sst.light_view(snap_seq));
-            }
-        }
-        for level in self.levels.iter().skip(1) {
-            for sst in level {
-                sources.push(sst.light_view(snap_seq));
-            }
-        }
-        let mut out = Vec::new();
-        merge_streaming(vec_inputs(sources), |_, _| true, |k, le| out.push((k, le)));
-        out
+        self.light_iter_range(None, None, snap_seq).collect()
     }
 
     /// `[from, to)` 的跨源轻量视图。取胜规则与 [`Self::scan_latest_light`] 一字不差，

@@ -495,6 +495,25 @@
     第一遍读数时我差点把"lsm 灌行 30.5、点读 11.6"当成自己引入的回归写进文档 —— 安静复跑三轮
     是 20.6~23.5 与 **6.2~6.9**（记录 9.6），而且**刚编译完那一轮**（编译器还没退出）量到的就是
     那个 11.6。所以：跨构建的 µs 列一律不作因果凭据，只作历史快照；凭据是同构建 A/B 的计数。
+- **lsm `health()` 不再把每个源整篇物化：600k 档瞬时 +126.1 MB → +0.1 MB（M39）**：这条是 M38
+  修好内存量具之后才看见的 —— `health()` 是"报统计"的调用，一次却瞬时涨 126 MB（旧量具报 +0.0）。
+  - 根因一句话：`health()` 走 `LSMTree::scan_latest_light`，而那份实现**先把每个源整篇折进 `Vec`**
+    （memtable `mem_view_light` 整表遍历、每个 SST `SstFile::light_view` 整篇读完，**所有源同时活着**）
+    再交给跨源归并 ⇒ 峰值 = 「2 × 全库轻量视图」。惰性归并版本 `light_iter_range` 早就存在
+    （M15b/M29 那条路），只是这个调用没用它。
+  - 改法：① `health()` 改走 `light_iter_range(None, None, snap)`；② `scan_latest_light` 改成它的
+    **收集壳** `.collect()` ⇒ 跨源取胜规则**只剩一份实现**，公开签名没动（不是兼容层，是去重）；
+    ③ 随之死掉的 `mem_view_light` 删除；④ `SstFile::light_view` 上加计数尺
+    `light_view_materialized()`（**单位 = 条目数**，与 M33 那把同形）。磁盘格式没动。
+  - 实测（600k 档、同一份构建、修好的量具）：瞬时 **+126.1 → +0.1 MB**，耗时 742 → **461 ms/次**。
+  - 守卫 `test_health_does_not_materialize_its_sources`：一次 `health()` 期间
+    `light_view_materialized()` 差值必须为 **0**；先 `flush()` 逼数据落在 SST 里（全在 memtable 时
+    这条会空转，所以另加 `live_keys >= 300` 的形状断言）。⚠️ 判据仍不取分配计数 —— 那是进程级、
+    并行用例互相污染（M27/M36 各栽过一次）。变异验证：把 `light_iter_range` 的 SST 源换成
+    `sst.light_view(snap).into_iter()` ⇒ 红在"health 期间有 300 条被 `SstFile::light_view` 整篇物化"。
+  - 邻账未动（如实）：lsm 灌行瞬时 **+106.8 MB**；bitcask `vacuum()` 分段拆出来是
+    **① 归组判定 106 MB（93 B/扫描行）+ ④ `merge()` 115 MB（100 B/行）**，②③ 都是 0 ——
+    即"元凶是 `to_delete`/`keep` 这两个跨全库累加器 + `merge()` 自己"，不是 blob 那一段。见 M37。
 - **大库台架的内存量具修好：`timed()` 每段之前 `reset_peak()`（M38）**：`mem_probe::peak` 是
   **进程级单调高水位**，只增不减 ⇒ 旧写法 `peak() - 上一次 peak()` 让"排在后面的操作"一律报
   `+0.0 MB`，哪怕它自己瞬时涨了一百 MB。这一版改成每段之前把高水位压回"当前活着的字节"，

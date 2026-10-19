@@ -440,8 +440,9 @@ impl MVCC {
         }
     }
 
-    /// 全库健康度快照。**只走轻量视图**（`scan_latest_light`：版本号 + 是不是墓碑），
-    /// 一趟、不物化任何 value。
+    /// 全库健康度快照。**只走惰性的轻量归并**（[`LSMTree::light_iter_range`]：版本号 + 是不是
+    /// 墓碑），一趟、不物化任何 value，也不把任何一个源整篇读进 `Vec`（M39 之前它走
+    /// `scan_latest_light`，那个会把每个 SST 整篇折进内存 ⇒ 瞬时 +126.1 MB @600k）。
     ///
     /// `kind == 2`（[`crate::lsm_tree::lsm_tree::EntryValue::Drop`]，已被硬删的行）不计入
     /// —— 和 [`MVCC::vacuum`] 看到的行集合严格一致，否则「vacuum 把 max_chain 压到 1」
@@ -454,7 +455,12 @@ impl MVCC {
         // 分组折叠用四引擎共用的 [`HealthFold`]：按 enc 升序 ⇒ 同 key 相邻成块 ⇒ 一趟数得出链长
         let mut fold = HealthFold::default();
         // merge_streaming 按 enc 升序输出 ⇒ 同一逻辑 key 的版本块相邻
-        for (enc, le) in kv.scan_latest_light(u64::MAX) {
+        //
+        // ⚠️ M39：必须走**惰性**的 `light_iter_range`，不能走 `scan_latest_light` —— 后者以前
+        // 把每个 SST 用 `SstFile::light_view` 整篇折进 `Vec`、所有源同时活着，600k 档一次
+        // `health()` 瞬时 **+126.1 MB**（旧内存量具报 +0.0，直到 M38 修好尺子才看见）。
+        // 守卫：`test_health_does_not_materialize_its_sources`。
+        for (enc, le) in kv.light_iter_range(None, None, u64::MAX) {
             if le.kind == 2 {
                 continue;
             }
@@ -2972,6 +2978,49 @@ mod tests {
             assert_eq!(after.total_rows, 4, "vacuum 后应只剩每 key 一行");
             assert_eq!(after.live_keys, 4);
             assert_eq!(after.rows_above_one, 0);
+        }
+        cleanup(&path);
+    }
+
+    /// `health()` 不许把任何一个 SST 的轻量视图**整篇物化**（M39）。
+    ///
+    /// 判据：尺子 `light_view_materialized()`，**单位 = 条目数**；一次 `health()` 的差值必须是 0。
+    /// 为什么钉"路径"而不钉内存：分配计数（`mem_probe`）是**进程级**的，并行用例互相抬高峰值 ⇒
+    /// 内存读数只能待在 `--test-threads=1` 的台架里（M27 栽过一次，M36 又拿坏量具的读数当过凭据）。
+    /// 而"有没有走 `SstFile::light_view`"是一条一次就能数出来的路径事实。
+    /// 内存那笔（M38 修好量具之后）：600k 档 `health()` 瞬时改前 **+126.1 MB**。
+    ///
+    /// 变异验证：把 `LSMTree::light_iter_range` 里 SST 那几路源临时改成
+    /// `Box::new(sst.light_view(snap_seq).into_iter())`（旧形状：每个文件整篇折进 `Vec` 再归并）
+    /// ⇒ 差值 = 全库条目数，红。
+    #[test]
+    fn test_health_does_not_materialize_its_sources() {
+        const KEYS: u64 = 300;
+        let path = tmp_db("health_lazy");
+        {
+            let mvcc = MVCC::open(&path);
+            for i in 0..KEYS {
+                let key = format!("k{i:04}");
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key.as_bytes(), b"v".to_vec()), "第 {i} 把键写失败");
+                tx.commit();
+            }
+            // 必须落在 SST 里：全在 memtable 时这条判据是空转
+            mvcc.flush();
+
+            let before = crate::lsm_tree::sst::light_view_materialized();
+            let h = mvcc.health();
+            let used = crate::lsm_tree::sst::light_view_materialized() - before;
+            assert!(
+                h.live_keys >= KEYS,
+                "库里必须有东西可折（live_keys {}）",
+                h.live_keys
+            );
+            assert_eq!(
+                used, 0,
+                "health 期间有 {used} 条被 `SstFile::light_view` 整篇物化 ⇒ 又走回\
+                 「每个源先整份 Vec 化再归并」那个形状（600k 档 +126.1 MB 的来处）"
+            );
         }
         cleanup(&path);
     }

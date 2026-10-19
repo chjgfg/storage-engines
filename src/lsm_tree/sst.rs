@@ -181,6 +181,27 @@ pub(crate) fn merge_inputs_materialized() -> u64 {
     MERGE_INPUTS_MATERIALIZED.with(|c| c.get())
 }
 
+// 测试专用：有多少条被 `SstFile::light_view()` **整篇物化**（M39）。
+//
+// 与上一条同形，但盯的是**轻量视图**那条路：`health()` 以前走 `scan_latest_light`，而它
+// 把每个 SST 用 `light_view()` 整篇读进 `Vec`（所有源同时活着）⇒ 600k 档一次 `health()`
+// 瞬时 **+126.1 MB**（旧内存量具报 +0.0，看不见 —— M38 修好尺子才露出来）。
+// ⚠️ 单位 = 条目数。改走惰性 `light_iter_range` 之后这里必须始终是 0。
+#[cfg(test)]
+thread_local! {
+    static LIGHT_VIEWS_MATERIALIZED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_light_view_materialized(n: u64) {
+    LIGHT_VIEWS_MATERIALIZED.with(|c| c.set(c.get() + n));
+}
+
+#[cfg(test)]
+pub(crate) fn light_view_materialized() -> u64 {
+    LIGHT_VIEWS_MATERIALIZED.with(|c| c.get())
+}
+
 // 测试专用：一次点读在 SST 里**比较过多少个条目键**，以及探过多少个 SST 文件。
 //
 // 为什么必须分开数：bloom 通过之后，取那一行有两条路 —— 稀疏索引二分 + 定位块（`find_block`），
@@ -748,6 +769,9 @@ impl SstFile {
                 }
             }
         }
+        // 计数尺（M39）：这条路把**整个文件**折进一个 Vec，谁在惰性路径上调用它就必须看得见。
+        #[cfg(test)]
+        note_light_view_materialized(out.len() as u64);
         out
     }
 
