@@ -196,42 +196,49 @@ impl WalPolicy {
 /// 存在的理由：这四行逻辑原先在四个引擎里各抄一遍，而 M15 的改动恰好只动这四行 ——
 /// 一处改完，四家一起变，不存在"三家改了、一家漏了"。
 ///
-/// `matched` 有两种长度，含义不同，所以 `has_next` 分两条路算：
-/// - **要 total**（`need_total = true`）：调用方把整段（界内）命中都交过来，
-///   `total` 就是它的长度，"还有没有下一页"由页码推出来。
-/// - **不要 total**（`need_total = false`）：调用方最多交 `skip + page_size + 1` 条
-///   （多取那一条就是用来探边的）。此时要么正好数到"窗口外还有一条"，要么已经走到库尾 /
-///   界尾 —— 后者 `matched.len() <= end` ⇒ 没有下一页。**不许把"没数"报成"到底了"是
-///   靠这条区分的**：走到库尾是真的到底，而探到第 `end+1` 条说明后面还有。
+/// 这条入口假定调用方**已经把界内命中全交过来**，所以 `total` 就是 `matched.len()`。
+/// M35 之后 `search_keys` 不走这条（改成"只数一遍 + 只取那一页"，见
+/// [`crate::common::search_page`]）；留着是给"手里本来就有全量"的调用方与测试对拍用的。
 pub fn search_page_from(
     matched: Vec<crate::common::ExportRecord>,
     query: &crate::common::SearchQuery,
 ) -> crate::common::SearchPage {
+    let total = query.need_total.then_some(matched.len());
+    search_page_from_with_total(matched, query, total)
+}
+
+/// [`search_page_from`] 的**外部 total 版**（M35）：`total` 是调用方另外数出来的精确命中数，
+/// `matched` 只需要装得下**那一页**（外加"多取一条"当 `has_next` 的证据）。
+///
+/// 为什么要分开：数 total 与取一页是两笔账 —— 前者要**走一遍界内**（每行的值都得读出来才判得了
+/// 过期），后者只关心 `skip + page_size` 行。把它们合在一条折叠里，就等于"为了一个数把整库
+/// 物化成 `Vec` 再 `len()`"（600k 档实测峰值 **+123.7 MB**）。
+///
+/// `total` 的两条路：
+/// - `Some(n)`：`has_next` / `total_pages` 都由 `n` 推（`n > 0 && page + 1 < ceil(n / 页宽)`）。
+/// - `None`（没数）：`has_next` 只能靠"窗口外那一条在不在" —— `matched.len() > skip + 页宽`。
+///   ⚠️ **不许把"没数"报成"到底了"**就是靠这条区分的：走到库尾 / 界尾是真的到底，
+///   而探到第 `end+1` 条说明后面还有。
+pub fn search_page_from_with_total(
+    matched: Vec<crate::common::ExportRecord>,
+    query: &crate::common::SearchQuery,
+    total: Option<usize>,
+) -> crate::common::SearchPage {
     let page_size = query.page_size.max(1);
     let page = query.page;
     let skip = page.saturating_mul(page_size);
-    let total = query.need_total.then_some(matched.len());
     let items = if skip >= matched.len() {
         Vec::new()
     } else {
         let end = (skip + page_size).min(matched.len());
         matched[skip..end].to_vec()
     };
-    let has_next = if query.need_total {
-        let total = matched.len();
-        total > 0 && page + 1 < (total + page_size - 1) / page_size
-    } else {
-        matched.len() > skip + page_size
-    };
-    let total_pages = if query.need_total {
-        let total = matched.len();
-        Some(if total == 0 {
-            0
-        } else {
-            (total + page_size - 1) / page_size
-        })
-    } else {
-        None
+    let (has_next, total_pages) = match total {
+        Some(n) => (
+            n > 0 && page + 1 < (n + page_size - 1) / page_size,
+            Some(if n == 0 { 0 } else { (n + page_size - 1) / page_size }),
+        ),
+        None => (matched.len() > skip + page_size, None),
     };
     crate::common::SearchPage {
         items,

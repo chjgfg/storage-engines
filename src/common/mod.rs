@@ -14,17 +14,20 @@ pub mod version;
 pub mod wal;
 
 pub use codec::{
-    decode_value_meta, key_matches, logical_to_user, now_unix_secs, pack_plain, pack_ttl,
-    prefix_upper_bound,
+    decode_value_meta, key_matches, logical_is_live, logical_to_user, now_unix_secs, pack_plain,
+    pack_ttl, prefix_upper_bound,
 };
+// M35 的尺子：用户字节被拷出来过几条（守卫拿它与"只数不物化"的那条路对拍）
+#[cfg(test)]
+pub(crate) use codec::user_value_copies;
 pub use types::{
     DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
     SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use store::{
-    RowValue, VersionedStore, collect_rows, collect_rows_as, fold_lower_bound,
-    fold_rows_streaming, live_record_of_logical, scan_page, search_bounds, search_window,
-    seek_prev_with,
+    RowValue, VersionedStore, collect_rows, collect_rows_as, count_window, fold_lower_bound,
+    fold_rows_streaming, live_record_of_logical, scan_live_records, scan_page, search_bounds,
+    search_page, search_window, seek_prev_with,
 };
 pub use txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 pub use version::{
@@ -52,7 +55,8 @@ pub(crate) fn tmp_test_path(prefix: &str, tag: &str, suffix: &str) -> std::path:
     ))
 }
 pub use kernel::{
-    fold_window, fold_window_emit, is_unfinished, search_page_from, visible_at, HealthFold,
+    fold_window, fold_window_emit, is_unfinished, search_page_from, search_page_from_with_total,
+    visible_at, HealthFold,
     VacuumScheduler, WalPolicy,
     WinCandidate,
 };

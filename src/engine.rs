@@ -2783,6 +2783,129 @@ mod tests {
         cleanup(dirs);
     }
 
+    /// 四家的 `key_count` 与"要精确 total 的 `search_keys`"都必须**只数不物化**（M35）。
+    ///
+    /// 尺子 = **用户字节被拷出来的条数**（`common::user_value_copies`；两个拷贝入口都记在这一把
+    /// 上：search 剥壳用的 `logical_to_user`、scan 剥壳用的 `live_record_of_logical`）。判据：
+    /// - `key_count` 一次调用 ⇒ **0 条**。旧形状是 `prefix_scan(prefix).len()`，为了一个数把界内
+    ///   每行的键与值都物化进 `Vec` 再丢掉（600k 档实测 **2.36 s / 峰值 +123.7 MB**）。
+    /// - `search_keys(要 total)` 首页 ⇒ 拷的不超过**页宽 + 1**（旧形状 = 把界内命中全物化再 `len()`，
+    ///   实测 **2.05 s / +123.8 MB**，而免 total 只要 1.2 ms ⇒ 差三个数量级那一格就是这个）。
+    ///
+    /// ⚠️ 另钉两条**语义对拍**（只数不物化不许把判定改窄或改宽）：
+    /// - `key_count` 必须与 `prefix_scan().len()` 同一个数，库里**同时放了墓碑行与过期行**；
+    /// - `search_keys` 的 `total` / `items` / `has_next` 在首页与深页上都必须与"全量物化那一条路"
+    ///   给出的同一个数（`search_page_from` 那条老入口就是对照）。
+    ///
+    /// 为什么钉计数不钉内存：分配计数是进程级的，并行用例互相污染（M27/M36 各栽过一次）；
+    /// 而"数一个数拷了几条 value"是个纯计数。内存那笔（+123.7 MB）留在 `--test-threads=1` 的台架里读。
+    ///
+    /// 变异验证：① 把某一家的 `key_count` 换回 `prefix_scan(prefix).len()` ⇒ 那一家红在
+    /// "拷了 893 条用户字节"；② 把 `count_window` 里的 `logical_is_live` 换成 `logical_to_user`
+    /// ⇒ 四家一起红（那就不是"只数不物化"而是"数之前先拷一遍"）。
+    #[test]
+    fn all_engines_count_without_materializing_values() {
+        const A_KEYS: usize = 900;
+        const B_KEYS: usize = 120;
+        const DEAD: usize = 7;
+        const EXPIRED: usize = 5;
+        const PAGE: usize = 50;
+        // 前缀 `aa` 下的活键：写进去的减去硬删掉的；过期那 5 把另算，它们**不该**被数进来
+        let want_a = A_KEYS - DEAD;
+
+        let engines = open_all();
+        let mut dirs = Vec::new();
+        for (name, db, dir) in engines {
+            dirs.push(dir);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin();
+            for i in 0..A_KEYS {
+                assert!(
+                    tx.set(format!("aa{i:05}").as_bytes(), vec![b'v'; 16]),
+                    "{name}: 第 {i} 把 aa 键写失败"
+                );
+            }
+            for i in 0..B_KEYS {
+                assert!(
+                    tx.set(format!("bb{i:05}").as_bytes(), vec![b'w'; 16]),
+                    "{name}: 第 {i} 把 bb 键写失败"
+                );
+            }
+            for i in 0..DEAD {
+                assert!(
+                    tx.delete(format!("aa{i:05}").as_bytes()),
+                    "{name}: 第 {i} 把 aa 键删失败"
+                );
+            }
+            let past = crate::common::now_unix_secs().saturating_sub(30);
+            for i in 0..EXPIRED {
+                // 走 `set`：它把传进来的字节当作**已打过信封**的逻辑值（`set_raw` 会再包一层
+                // plain 信封，那就不是过期行了 —— 这里要的正是"界内有一批过期行"这个形状）
+                assert!(
+                    tx.set(format!("aa9{i:04}").as_bytes(), crate::common::pack_ttl(b"gone", past)),
+                    "{name}: 第 {i} 把过期行写失败"
+                );
+            }
+            // 对拍的基准：走一遍**真物化**的路（那条路本来就该给出正确的数）
+            let scan_a = tx.prefix_scan(b"aa").len();
+            assert_eq!(
+                scan_a, want_a,
+                "{name}: 基准形状自己就不同（{scan_a} vs {want_a}）⇒ 库的形状没搭对"
+            );
+
+            // ① key_count：只数不物化
+            let base = crate::common::user_value_copies();
+            let got = tx.key_count(b"aa");
+            let copies = crate::common::user_value_copies() - base;
+            eprintln!(
+                "[count only] {name}: key_count={got}（物化对照 {scan_a}）⇒ 期间拷出 {copies} 条用户字节"
+            );
+            assert_eq!(got, want_a, "{name}: key_count 与 prefix_scan 不同数 ⇒ 判定被改了");
+            assert_eq!(
+                copies, 0,
+                "{name}: key_count 拷了 {copies} 条用户字节 ⇒ 又变回'整段物化成一个 Vec 再取 len()'"
+            );
+
+            // ② search_keys（要精确 total）：只拷那一页
+            let q = SearchQuery::prefix(b"aa", 0, PAGE);
+            let base = crate::common::user_value_copies();
+            let page = tx.search_keys(&q);
+            let copies = crate::common::user_value_copies() - base;
+            assert_eq!(page.total, Some(want_a), "{name}: 首页 total 不对");
+            assert_eq!(page.items.len(), PAGE, "{name}: 首页不是满页");
+            assert!(page.has_next, "{name}: {want_a} 条 / 页宽 {PAGE}，首页之后当然还有");
+            assert!(
+                copies <= (PAGE + 1) as u64,
+                "{name}: search_keys 首页拷了 {copies} 条用户字节（页宽 {PAGE}）⇒ total 那一步还在物化全段"
+            );
+            // 免 total 那条分支的 items 必须一模一样（它没被这一刀碰过）
+            let p2 = tx.search_keys(&q.clone().without_total());
+            assert_eq!(p2.total, None, "{name}: 免 total 那条不该给出数");
+            assert_eq!(p2.items.len(), page.items.len(), "{name}: 两条路的首页不同长");
+            assert_eq!(p2.items[0].key, page.items[0].key, "{name}: 两条路的首页不同行");
+
+            // ③ 深页：total 推出来的 has_next / total_pages 要在边界上翻得对
+            let last_page = (want_a + PAGE - 1) / PAGE - 1;
+            let deep = tx.search_keys(&SearchQuery::prefix(b"aa", last_page, PAGE));
+            assert_eq!(
+                deep.items.len(),
+                want_a - last_page * PAGE,
+                "{name}: 末页行数不对（total={} 页宽 {PAGE}）",
+                deep.total.unwrap_or(0)
+            );
+            assert!(!deep.has_next, "{name}: 末页还报有下一页");
+            assert_eq!(
+                deep.total_pages,
+                Some((want_a + PAGE - 1) / PAGE),
+                "{name}: total_pages 与 total/页宽不一致"
+            );
+            tx.commit();
+            // `db` 在每次迭代末尾自己就掉了（事务 `tx` 比它先结束），所以这里不需要显式 `drop`；
+            // 写在这里是因为 Windows 上文件句柄没释放就 `remove_dir_all` 会失败。
+        }
+        cleanup(dirs);
+    }
+
     // ==================== 大库基线台架（四引擎 × 每种操作） ====================
     //
     // 前面所有守卫数的是「访问了多少块/页/盘」—— 那是**复杂度**的尺子。下游报的却是

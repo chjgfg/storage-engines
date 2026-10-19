@@ -14,7 +14,7 @@ use crate::common::codec::{
     decode_value_meta, key_matches, logical_to_user, now_unix_secs, prefix_upper_bound,
 };
 use crate::common::{fold_window, fold_window_emit};
-use crate::common::types::{ExportRecord, KeyMatchMode};
+use crate::common::types::{ExportRecord, KeyMatchMode, SearchPage, SearchQuery};
 use crate::common::WinCandidate;
 
 /// 一组候选取值的结果，三态（见 [`VersionedStore::materialize`]）。
@@ -302,10 +302,115 @@ pub fn live_record_of_logical(
     if m.is_expired_at(now) {
         return None;
     }
+    // M35 的尺子：这一行把用户字节拷出来了（`key_count`/total 改"只数不物化"之后，
+    // 那条路上应当一次都不走到这里）
+    #[cfg(test)]
+    crate::common::codec::note_user_value_copied();
     Some(ExportRecord {
         key,
         value: Some(m.user().to_vec()),
     })
+}
+
+/// 界内**存活行**的流式扫描 —— 四家 `scan_foreach` 的唯一实现（M35 收拢）。
+///
+/// 四份原先是一字不差的四份复制（折叠 + `RowValue` 三态筛 + 剥壳 + 过期判定），而"存活"的
+/// 判据本来就只在 [`live_record_of_logical`] 一处定义 —— 判定抄四遍的意思是"改一处漏三处"，
+/// 而 `seek_prev` 与 `scan` 一旦对同一行给出不同答案，就是静默的数据不一致。
+///
+/// 语义与四份旧复制逐条相同：`include_deleted = false` ⇒ 墓碑与"读不到"都不参与，过期行同待；
+/// `f` 返回 `false` 当场收手，后面的键不再折（M27 那条流式兑现）。
+pub fn scan_live_records<S, F>(
+    store: &S,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    mut f: F,
+) where
+    S: VersionedStore,
+    F: FnMut(ExportRecord) -> bool,
+{
+    let now = now_unix_secs();
+    fold_rows_streaming(store, false, start, end, |key, _ver, value| {
+        let logical = match value {
+            RowValue::Value(bytes) => Some(bytes),
+            // 墓碑与"读不到"都不参与（include_deleted = false）
+            _ => None,
+        };
+        let Some(rec) = live_record_of_logical(key, logical, now) else {
+            return true;
+        };
+        f(rec)
+    });
+}
+
+/// **只数不物化**（M35）：界内"活着行数"，与 [`search_window`] 走同一条折叠、同一套判定，
+/// 但每行只判"算不算一条"，不把用户字节拷出来、不攒结果 `Vec`。
+///
+/// 为什么要有它：`key_count` 原先是 `prefix_scan(prefix).len()`，而 `search_keys` 要精确
+/// total 时是"把界内命中全物化成 `Vec<ExportRecord>` 再取 `len()`" —— 为数一个数把整库的键与值
+/// 都物化一遍（600k 档实测 `key_count` **2.36 s / 峰值 +123.7 MB**、`search 首页(要 total)`
+/// **2.05 s / +123.8 MB**，而免 total 只要 **1.2 ms**）。
+///
+/// ⚠️ 判据与 `search_window` 一字不差，所以两者对同一份库必然给出同一个数：
+/// `Missing` 不算；墓碑与**过期行**同待 —— 只在 `include_deleted` 时算一条。
+/// 过期这一判走 [`crate::common::codec::logical_is_live`]，那是 `decode_value_meta` 的
+/// 不拷贝版（`decode_value_meta` 会把 user 段 `to_vec()` 出来 ⇒ 数一个数要付两次堆分配）。
+///
+/// 落点是 [`crate::common::fold_window_emit`] 的返回值：它数的是"真交给 `emit` 的行数"，
+/// 也就是命中数 ⇒ 一份累加器都不需要。
+pub fn count_window<S: VersionedStore>(
+    store: &S,
+    include_deleted: bool,
+    pattern: Option<&[u8]>,
+    mode: KeyMatchMode,
+) -> usize {
+    let (lo, hi) = search_bounds(pattern, mode);
+    let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
+    fold_window_emit(
+        None,
+        |after, budget| store.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
+        |c| match store.materialize(c.row) {
+            RowValue::Missing => None,
+            RowValue::Tombstone => include_deleted.then_some(()),
+            RowValue::Value(logical) => {
+                if crate::common::codec::logical_is_live(&logical) {
+                    Some(())
+                } else {
+                    // 过期与墓碑同待
+                    include_deleted.then_some(())
+                }
+            }
+        },
+        |_| true,
+    )
+}
+
+/// 模式搜索 + 分页的**唯一一份实现**（M35：四家原先各抄一遍同形的 15 行）。
+///
+/// `need_total` 那一条分支是全部的差别：
+/// - **不要 total**：只折窗口宽（`skip + page_size + 1`，多一条用来探"还有下一页"）。
+/// - **要 total**：改前是"把界内命中全部物化再 `len()`"⇒ 一次调用 O(库) 的堆占用。
+///   现在拆成两步：先 [`count_window`] 只数不物化拿到 `total`，再按窗口宽取那一页。
+///   取值那一段没省（过期判据住在 value 的信封里，不读值就判不了），省的是
+///   **整库的结果 `Vec` 与每行的用户字节拷贝** ⇒ 峰值从 O(库) 变成 O(页)。
+///
+/// ⚠️ 代价的一条：要 total 时"数"与"取页"是**两次折叠**。同一份库正被别的线程写时，`total` 与
+/// `items` 可能来自两个瞬间（旧形状一次折叠，两者必然同时）。事务视图不受影响 —— 它按快照读。
+pub fn search_page<S: VersionedStore>(store: &S, query: &SearchQuery) -> SearchPage {
+    let page_size = query.page_size.max(1);
+    // 窗口那条"多要一条"的合同：它既给 `has_next` 当证据，也让"走到库尾"与"后面还有"分得开
+    let limit = Some(query.page.saturating_mul(page_size) + page_size + 1);
+    let matched = search_window(
+        store,
+        query.include_deleted,
+        Some(query.pattern.as_slice()),
+        query.mode,
+        limit,
+    );
+    let total = query.need_total.then(|| {
+        count_window(store, query.include_deleted, Some(query.pattern.as_slice()), query.mode)
+    });
+    crate::common::search_page_from_with_total(matched, query, total)
 }
 
 // 测试专用：`seek_prev_with` 为了返回一行，往回退过几把键。

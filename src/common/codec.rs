@@ -72,8 +72,52 @@ pub fn logical_to_user(logical: Vec<u8>) -> Option<Vec<u8>> {
     if meta.is_expired_at(now_unix_secs()) {
         None
     } else {
+        #[cfg(test)]
+        note_user_value_copied();
         Some(meta.user().to_vec())
     }
+}
+
+/// 只判「这行还活着吗」，**一个字节都不拷**（M35）。
+///
+/// 为什么不能直接用 [`decode_value_meta`]：它把 user 段 `to_vec()` 出来了，而"数一个数"
+/// 要付的应当只有这一判。判据与它**逐条对齐**（空 → 永久；`0x00` → 永久；`0x01` 且长度够
+/// → 看 8 字节小端 `expire`，`now >= expire` 算过期；其余按旧数据的裸 value = 永久）。
+pub fn logical_is_live(logical: &[u8]) -> bool {
+    if logical.len() < 1 {
+        return true;
+    }
+    match logical[0] {
+        VAL_META_TTL if logical.len() >= 9 => {
+            let expire = u64::from_le_bytes(logical[1..9].try_into().unwrap());
+            now_unix_secs() < expire
+        }
+        _ => true,
+    }
+}
+
+// 测试专用（M35 的尺子）：**用户字节被拷出来过几次**。
+//
+// 为什么钉这个：`key_count` / `search` 的精确 total 要的只是一个数，而旧形状为了那一个数
+// 把界内每行的键与值都物化成 `ExportRecord` 攒进 `Vec`（600k 档实测峰值 **+123.7 MB**、
+// `key_count` 2.36 s）。改"只数不物化"之后，计数那条路上应当**一次都不拷**。
+// 两个拷贝入口都记在这一把尺子上：[`logical_to_user`]（search 的剥壳）与
+// `store::live_record_of_logical`（scan / `key_count` 旧路径的剥壳）。
+// ⚠️ 线程内计数 ⇒ 断言取差值（与 M27/M33/M36 同一理由：进程级分配计数会被并行用例污染）。
+#[cfg(test)]
+thread_local! {
+    static USER_VALUE_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_user_value_copied() {
+    USER_VALUE_COPIES.with(|c| c.set(c.get() + 1));
+}
+
+/// 当前线程拷出来的用户 value 条数（测试探针用）
+#[cfg(test)]
+pub(crate) fn user_value_copies() -> u64 {
+    USER_VALUE_COPIES.with(|c| c.get())
 }
 
 /// 解析用户 value 为 `i64`（计数器用）

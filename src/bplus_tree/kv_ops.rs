@@ -185,9 +185,8 @@ impl Transaction {
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-        mut f: impl FnMut(ExportRecord) -> bool,
+        f: impl FnMut(ExportRecord) -> bool,
     ) {
-        let now = now_unix_secs();
         // 界下推给折叠：窗口扫的代价必须随窗口宽度缩（页数），不是随全库页数缩
         //
         // ⚠️ 逐行**流式**（M27）：这条路径原先写的是 `for … in collect_latest_raw_in(...)`,
@@ -195,22 +194,10 @@ impl Transaction {
         //    "不收集全库到单一大 Vec"那句是假的（200k 键实测中间那份元组头 ≈ 13 MB，与结果
         //    `Vec` 同时活着），而且 `f` 提前叫停也省不到"折"的那一段。
         //    `fold_rows_streaming` 才是那句文档的兑现：折一行交一行，叫停之后的键不再折。
-        crate::common::fold_rows_streaming(self, false, start, end, |key, _ver, value| {
-            let crate::common::RowValue::Value(bytes) = value else {
-                return true; // 墓碑与"读不到"都不参与（include_deleted=false）
-            };
-            let m = decode_value_meta(&bytes);
-            if m.is_expired_at(now) {
-                return true;
-            }
-            if !f(ExportRecord {
-                key,
-                value: Some(m.user().to_vec()),
-            }) {
-                return false;
-            }
-            true
-        });
+        //
+        // M35：折叠 + 剥壳 + 过期判定那四行，四家各抄过一遍，现在收进
+        // [`crate::common::scan_live_records`]（判据只剩 `live_record_of_logical` 一处）。
+        crate::common::scan_live_records(self, start, end, f);
     }
 
     /// 前缀流式扫描
@@ -278,33 +265,9 @@ impl Transaction {
     /// for rec in &page.items { ... }
     /// ```
     pub fn search_keys(&self, query: &SearchQuery) -> SearchPage {
-        // 分页核只有一份：[`crate::common::search_page_from`]。这里唯一的分支是"要不要精确
-        // total"—— 不要的时候折叠能提前收手，首页代价从 O(全库) 变成 O(窗口宽)。
-        let page_size = query.page_size.max(1);
-        let limit = if query.need_total {
-            None
-        } else {
-            Some(query.page.saturating_mul(page_size) + page_size + 1)
-        };
-        let matched = self.collect_for_search(
-            query.include_deleted,
-            Some(query.pattern.as_slice()),
-            query.mode,
-            limit,
-        );
-        crate::common::search_page_from(matched, query)
-    }
-
-    /// 窗口化的模式搜索：界下推、键级过滤、取值、剥壳全在
-    /// [`crate::common::search_window`]（四家一份），这一家只供折叠与取值。
-    fn collect_for_search(
-        &self,
-        include_deleted: bool,
-        pattern: Option<&[u8]>,
-        mode: KeyMatchMode,
-        limit: Option<usize>,
-    ) -> Vec<ExportRecord> {
-        crate::common::search_window(self, include_deleted, pattern, mode, limit)
+        // M35：整条实现收进 [`crate::common::search_page`]（四家一份）。要精确 total 时
+        // 不再把界内命中全物化成 `Vec`，改成"只数一遍 + 只取那一页"。
+        crate::common::search_page(self, query)
     }
 
     // ── 元数据 ──
@@ -351,9 +314,13 @@ impl Transaction {
         }
     }
 
-    /// 前缀下存活 key 数量
+    /// 前缀下存活 key 数量。
+    ///
+    /// M35：走 [`crate::common::count_window`]（**只数不物化**）。旧写法是
+    /// `prefix_scan(prefix).len()` —— 为数一个数把界内每行的键与值都物化成 `ExportRecord`
+    /// 再丢掉（600k 档实测 **2.36 s / 峰值 +123.7 MB**）。判据一字未动：墓碑与过期行都不算。
     pub fn key_count(&self, prefix: &[u8]) -> usize {
-        self.prefix_scan(prefix).len()
+        crate::common::count_window(self, false, Some(prefix), KeyMatchMode::Prefix)
     }
 
     // ── TTL ──

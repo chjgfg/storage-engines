@@ -495,6 +495,35 @@
     第一遍读数时我差点把"lsm 灌行 30.5、点读 11.6"当成自己引入的回归写进文档 —— 安静复跑三轮
     是 20.6~23.5 与 **6.2~6.9**（记录 9.6），而且**刚编译完那一轮**（编译器还没退出）量到的就是
     那个 11.6。所以：跨构建的 µs 列一律不作因果凭据，只作历史快照；凭据是同构建 A/B 的计数。
+- **`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化：600k 档瞬时 +123.7 MB → 0.6~1.2 MB（M35）**：
+  两件事同一个形状 —— **为了一个数把界内每一行都物化出来再丢掉**。`key_count` 四家一字不差是
+  `prefix_scan(prefix).len()`；`search_keys` 要 total 时折叠不给界（`limit = None`），把界内命中全部
+  物化成 `Vec<ExportRecord>` 再 `len()`，而调用方最后只拿走那一页 100 行。
+  - 新增 `common::count_window`：同一条折叠、同一套判据（`Missing` 不算，墓碑与**过期行**同待），
+    每行只判"算不算一条"；落点直接是 `fold_window_emit` 的返回值 ⇒ 一份累加器都不需要。
+    过期判定用新增的 `codec::logical_is_live`（⚠️ 不能用 `decode_value_meta` —— 它把 user 段
+    `to_vec()` 出来，"数一个数"于是先付一次堆拷贝）。
+  - 新增 `common::search_page`（四家一份）：要 total 时拆成"数一遍 + 只取那一页"，`total` 从外面传进
+    `search_page_from_with_total`；`search_page_from` 留成委托壳，**公开签名与旧行为都没动**。
+  - 顺带合并两份"四份同形"的复制：四家 `search_keys` 那 15 行 ⇒ 一行调用（各家 `collect_for_search`
+    中间层删掉）；四家 `scan_foreach` 里一字不差的"折叠 + 三态筛 + 剥壳 + 过期判定" ⇒
+    `common::scan_live_records`（判据本来只在 `live_record_of_logical` 一处定义过，抄四遍 = 改一处漏三处，
+    而 `scan` 与 `seek_prev` 对同一行给出两种答案就是静默的数据不一致）。
+  - 实测（600k 档四引擎）：`search 首页(要 total)` 峰值 **+123.7~123.8 MB → 0.6 / 1.2 / 0.7 / 0.6 MB**、
+    `key_count` **+123.7 MB → 0.6 / 0.8 / 0.6 / 0.6 MB**；对照的 `scan` / `prefix_scan` / `export` /
+    `migrate` **没动**（它们返回整库 `Vec`，那是调用方要的东西，不是实现的浪费）。
+  - ⚠️ **当时给的估价"预期 ~1.5× 时间"被自己的复测打回**：时间在本机噪声带（±25%）里看不出动。
+    原因是**走查与取值才是大头**（过期判据住在 value 信封里，不读值判不了）⇒ 这一格卖出的是内存，
+    不是时间。
+  - 守卫 `all_engines_count_without_materializing_values`（一条钉四家 —— 实现只剩一份了）：
+    尺子 = **用户字节被拷出来的条数**（`user_value_copies`，两个入口都记：`logical_to_user` 与
+    `live_record_of_logical`）；判据 = `key_count` 期间 **0 条**、`search_keys(要 total)` 首页
+    ≤ 页宽 + 1，另加两条**语义对拍**（`key_count` 与 `prefix_scan().len()` 同数，库里同时放墓碑行与
+    过期行；首页与末页的 `total`/`items`/`has_next`/`total_pages` 与全量那条路一致）。
+    两条变异各自验证：① bitcask 的 `key_count` 换回 `prefix_scan().len()` ⇒ 只那一家红"拷出 893 条"；
+    ② `count_window` 里把 `logical_is_live` 换成 `logical_to_user` ⇒ 四家一起红。
+    ⚠️ 变异①第一次跑**没红** —— 尺子当时只钉在新写的那扇门上，旧形状走的是四家各自内联的剥壳 ⇒
+    **尺子必须钉在"旧形状真正流过的那扇门"上**（补齐入口 = 先把四份剥壳合成一份）。310 passed。
 - **memtable 的 flush 判定改读真内存：lsm 全库 `vacuum()` 的 ① 段 119.8 → 33.1 MB（M41b）**：
   `maybe_flush_mem` 的字节那一档读的是 `mem_bytes`，而那是**载荷账**（`key.len() +
   StoredEntry::estimate_bytes()` ⇒ 一条 16 B 编码键的墓碑只算 25 B）⇒ MVCC 档那句 `mem_threshold_bytes:
