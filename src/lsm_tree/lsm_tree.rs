@@ -169,6 +169,22 @@ impl LSMTreeOptions {
 /// user_key -> (seq -> value)；同 key 多版本以支持 Snapshot
 type MemMap = BTreeMap<Vec<u8>, BTreeMap<u64, EntryValue>>;
 
+/// M41b：**一条 memtable 条目在堆上的结构开销**（载荷账之外的部分）。
+///
+/// 为什么需要它：`mem_bytes` 数的是**载荷**（`key.len() + StoredEntry::estimate_bytes()`），
+/// 一条 16 B 编码键的墓碑因此只算 **25 B**。触发判定直接读它 ⇒ `mem_threshold_bytes: 32 MB`
+/// 这一句在 MVCC 档上**永不成立**：600k 条墓碑的载荷账 15 MB，兜底的其实是条数阈值 256k，
+/// 而那 256k 条在堆上是 ~155 MB（`lsm_vacuum_stage_split` 的 ① 段实测）。
+///
+/// 常数取校准台架 `lsm_memtable_bytes_per_entry` 的实测：真堆占用 **476 B/条**，其中载荷账
+/// 只记 25 B ⇒ 结构 **451 B**（外层 `BTreeMap` 节点槽 + 内层 `BTreeMap` 的盒子与节点 + 键的
+/// `Vec`）。n=100k 与 n=400k 两档都读到同一个 476 ⇒ 这条是线性的，不是规模凑出来的。
+///
+/// ⚠️ 两个已知边界：① 校准时**一把键一条版本**（正是 MVCC 的形状 —— 编码键自带版本号），
+/// 同一把键堆多个版本时真实开销低于 `条数 × 本常数`，于是判定会**偏保守**（提前 flush），
+/// 不会反过来低估；② 键更长时开销也涨（节点装得更少），那部分由载荷项顶着，同样是保守方向。
+const MEM_ENTRY_OVERHEAD: usize = 451;
+
 // 测试专用：本线程「为了数 memtable 条目而走过的条目数」。
 //
 // M19 的复杂度尺子。它数的不是" flush 判定的结果对不对"，而是**判定本身花了多少步**：
@@ -1092,7 +1108,15 @@ impl LSMTree {
         // 插入都走一遍整表 ⇒ 灌 N 行 O(N²)。判定语义（"版本条数 ≥ 阈值就 flush"）一字未动。
         let by_entries = self.opts.mem_threshold_entries > 0
             && self.mem_entries >= self.opts.mem_threshold_entries;
-        let by_bytes = self.mem_bytes >= self.opts.mem_threshold_bytes;
+        // M41b：字节这一档读的是**真内存**（载荷 + 条数 × 结构开销），不是载荷账。
+        // 改前 `mem_threshold_bytes` 在"小值/墓碑"形状上从不触发（一条 16 B 编码键的墓碑只算 25 B
+        // 载荷），于是 memtable 的实际大小由条数阈值说话 —— MVCC 档那一句"mem 32 MB"因此是空的：
+        // 262 144 条在堆上是 ~155 MB。⚠️ `stats().mem_bytes` 对外仍是**载荷账**，没改口径，
+        // 改的只有这一句判定；两个都是增量计数器 ⇒ 仍然是 O(1)，不把 M19 的 O(N²) 请回来。
+        let by_bytes = self
+            .mem_bytes
+            .saturating_add(self.mem_entries.saturating_mul(MEM_ENTRY_OVERHEAD))
+            >= self.opts.mem_threshold_bytes;
         if by_entries || by_bytes {
             let _ = self.flush_mem();
         }
@@ -2374,6 +2398,131 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M41b 的**校准**：memtable 里一条条目在堆上到底占多少字节。
+    ///
+    /// 为什么要有这条：`maybe_flush_mem` 读的 `mem_bytes` 只数载荷账（`key.len() +
+    /// StoredEntry::estimate_bytes()`），一条 16 B 编码键的墓碑因此只算 **25 B**。MVCC 档写着
+    /// `mem_threshold_bytes: 32 MB`，可 60 万条墓碑的载荷账才 15 MB ⇒ 那一条永不触发，
+    /// 兜底的是条数阈值 256k，而 256k 条在堆上是 **~155 MB**（分段台架 ① 段的实测斜率）。
+    /// 要把"memtable 多大"这句话改成真内存，常数得是量出来的。
+    ///
+    /// ⚠️ 只能单线程跑（`live()` 是进程级的，并行用例会互相污染 —— M27/M36 各栽过一次），
+    /// 所以它是 `#[ignore]` 台架而不是守卫。
+    #[test]
+    #[ignore = "memtable 每条真实字节数的校准，手动 release 单线程跑：LSM_MEM_CAL=200000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_memtable_bytes_per_entry"]
+    fn lsm_memtable_bytes_per_entry() {
+        let n: usize = std::env::var("LSM_MEM_CAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let dir = tmp_dir("mem_cal");
+        {
+            let opts = LSMTreeOptions {
+                // 两档阈值都钉到不会触发 ⇒ 全程只有一只 memtable 在长
+                mem_threshold_entries: usize::MAX / 8,
+                mem_threshold_bytes: usize::MAX / 8,
+                enable_mem_wal: false,
+                ..LSMTreeOptions::default()
+            };
+            let mut db = LSMTree::open_with_config(&dir, opts).unwrap();
+            let base = crate::mem_probe::live();
+            for i in 0..n {
+                // 键长 16 B：与 MVCC 的编码键 `raw(8) ‖ version(8)` 同量级；值取空 ⇒
+                // 载荷账 = 16 + (8 + 1) = 25 B，与一条墓碑同量级
+                db.put(format!("k{i:015}").into_bytes(), Vec::new());
+            }
+            let held = crate::mem_probe::live() - base;
+            assert_eq!(db.stats().mem_entries, n, "中途 flush 过 ⇒ 量的不是同一只 memtable");
+            let per = held / n as u64;
+            // 载荷账按**生产口径**读（`stats().mem_bytes`），不是自己另算一遍：
+            // 一条 = `key.len()` + `StoredEntry::estimate_bytes()`
+            let pay = db.stats().mem_bytes as u64 / n as u64;
+            println!(
+                "=== memtable 校准 n={n}：真堆占用每条 {per} B，判定用的载荷账每条 {pay} B ⇒ 结构 {struct_} B ===",
+                struct_ = per - pay
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M41b：`mem_threshold_bytes` 说的必须是 memtable 的**真内存**，不是载荷账。
+    ///
+    /// 校准过的边界（每条载荷账 25 B + 结构 `MEM_ENTRY_OVERHEAD` = 476 B）：阈值钉 256 KB 时
+    /// - **550 条** = 261 800 B < 262 144 ⇒ 还**不该** flush；
+    /// - **551 条** = 262 276 B ≥ 262 144 ⇒ 必须 flush。
+    /// 两臂同构建、只差一行，所以既钉住"开销项进了判定"（少算 ⇒ 551 那一臂不 flush），
+    /// 也钉住"没把它 inflate"（多算 ⇒ 550 那一臂提前 flush）。条数阈值钉到不可能触发，
+    /// 让字节这一档单独说话。
+    ///
+    /// 另外钉一条口径：`stats().mem_bytes` **仍然是载荷账**（对外含义没变，改的只有判定）。
+    ///
+    /// 变异验证：把判定里那句 `+ mem_entries × MEM_ENTRY_OVERHEAD` 去掉 ⇒ 551 条那臂红
+    /// （载荷账只有 13 775 B，离 256 KB 远着呢，于是 memtable 一路涨到条数阈值那么高才 flush ——
+    /// 就是 600k 档 ① 段那 155 MB 的来处）。
+    #[test]
+    fn test_memtable_flush_trigger_reads_real_bytes() {
+        const THRESH: usize = 256 * 1024;
+        // 每条 = 载荷账 25 B（16 B 键 + `StoredEntry::estimate_bytes()` 9）+ 结构开销
+        let per_entry = 25 + MEM_ENTRY_OVERHEAD;
+        let n_no = THRESH / per_entry; // 差一条不到阈值
+        let n_yes = n_no + 1;
+        assert!(
+            n_no * per_entry < THRESH && n_yes * per_entry >= THRESH,
+            "边界算错了：{n_no} 条 = {} B，{n_yes} 条 = {} B，阈值 {THRESH}",
+            n_no * per_entry,
+            n_yes * per_entry
+        );
+
+        for (n, should_flush) in [(n_no, false), (n_yes, true)] {
+            let dir = tmp_dir(&format!("mem_real_{n}"));
+            {
+                let opts = LSMTreeOptions {
+                    mem_threshold_bytes: THRESH,
+                    // 只让"字节"这一档说话：条数阈值高到碰不到
+                    mem_threshold_entries: usize::MAX / 8,
+                    enable_mem_wal: false,
+                    ..LSMTreeOptions::default()
+                };
+                let mut db = LSMTree::open_with_config(&dir, opts).unwrap();
+                for i in 0..n {
+                    db.put(format!("k{i:015}").into_bytes(), Vec::new());
+                }
+                let st = db.stats();
+                if should_flush {
+                    assert_eq!(
+                        st.total_sst,
+                        1,
+                        "{n} 条 × {per_entry} B = {} B 已经过阈值 {THRESH} ⇒ 该 flush 了；\
+                         没 flush 说明判定还在只读载荷",
+                        n * per_entry
+                    );
+                    assert_eq!(st.mem_entries, 0, "flush 之后 memtable 应当是空的");
+                } else {
+                    assert_eq!(
+                        st.total_sst, 0,
+                        "{n} 条 = {} B 还没到阈值 {THRESH} 就 flush 了 ⇒ 开销被 inflate 了",
+                        n * per_entry
+                    );
+                    assert_eq!(st.mem_entries, n, "没 flush 却清了 memtable");
+                }
+                // 载荷账的口径没改（flush 之后清零）：一条 = 16 B 键 + `StoredEntry` 的 9 B。
+                // ⚠️ 放在 flush 判定**之后**：先判该 flush 的有没有 flush，失败信息才说得出根因。
+                assert_eq!(
+                    st.mem_bytes,
+                    if should_flush { 0 } else { n * 25 },
+                    "`stats().mem_bytes` 的口径被改了（对外应当仍是载荷账，flush 后清零）"
+                );
+                // 数据还在（不论在 memtable 还是 SST 里）
+                assert_eq!(db.get(b"k000000000000000"), Some(Vec::new()));
+                assert_eq!(
+                    db.get(format!("k{:015}", n - 1).as_bytes()),
+                    Some(Vec::new())
+                );
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// M19 守卫①：增量计数器 `mem_entries` 的**口径**必须与慢算法一字不差。

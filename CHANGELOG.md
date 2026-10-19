@@ -495,6 +495,30 @@
     第一遍读数时我差点把"lsm 灌行 30.5、点读 11.6"当成自己引入的回归写进文档 —— 安静复跑三轮
     是 20.6~23.5 与 **6.2~6.9**（记录 9.6），而且**刚编译完那一轮**（编译器还没退出）量到的就是
     那个 11.6。所以：跨构建的 µs 列一律不作因果凭据，只作历史快照；凭据是同构建 A/B 的计数。
+- **memtable 的 flush 判定改读真内存：lsm 全库 `vacuum()` 的 ① 段 119.8 → 33.1 MB（M41b）**：
+  `maybe_flush_mem` 的字节那一档读的是 `mem_bytes`，而那是**载荷账**（`key.len() +
+  StoredEntry::estimate_bytes()` ⇒ 一条 16 B 编码键的墓碑只算 25 B）⇒ MVCC 档那句 `mem_threshold_bytes:
+  32 MB` 在墓碑/小值形状上从不生效，兜底的是条数阈值 262144 —— 而它对应 **~155 MB** 真内存。
+  - 改成 `mem_bytes + mem_entries × MEM_ENTRY_OVERHEAD`。常数**量出来**的：校准台架
+    `lsm_memtable_bytes_per_entry`（`#[ignore]`、单线程、读 `live()` 差值）⇒ 每条真堆 **476 B**
+    （n=100k 与 n=400k 两档同一个数 ⇒ 线性），载荷账只记 25 B ⇒ 结构 **451 B**。两个已知边界
+    （一把键多版本、键更长）都朝保守方向偏 ⇒ 只会提前 flush，不会反过来低估。
+  - **先算后量、两档都对得上**：M41a 之后 ① = 校准 476 B × 262 144 条 = 预测 119.2 MB（实测 119.8）；
+    M41b 之后 32 MB ÷ 476 B ≈ 70.7k 条 ⇒ 预测 33.7 MB（**实测 33.1 MB**）。
+  - 守卫 `test_memtable_flush_trigger_reads_real_bytes`：阈值 256 KB、条数阈值钉到碰不到，
+    按 476 B/条取**边界两侧各一条** —— 550 条不该 flush、551 条必须 flush（两臂同构建只差一行 ⇒
+    少算开销红、inflate 开销也红）；另钉 `stats().mem_bytes` **仍是载荷账**（对外口径没改）。
+    判定仍是两个增量计数器相加 ⇒ O(1)，M19 的 O(N²) 没被请回来。变异：去掉 `+ entries × OVERHEAD`
+    ⇒ 红在"551 条已经过阈值该 flush 了"。309 passed。
+  - ⚠️ **行为变更**（磁盘格式与公开 API 都不动）：默认档的 memtable 从"65536 条 ≈ 30 MB 真内存"
+    变成"`4 MB` 在 ~8800 条生效"，MVCC 档从"约 26 万条（≈155 MB）"变成"约 7 万条（≈33 MB）"
+    ⇒ **SST 更多更密、压实更勤**，换来的是那句内存预算说得出口。
+  - **这一刀买内存、花时间 —— 同构建 A/B**（把 `MEM_ENTRY_OVERHEAD` 临时置 0 = 改前口径，其余不动）：
+    lsm 灌 600k 行 **17.1 → 24.9 µs/行（+46%）**、峰值 **77.0 → 45.6 MB（−41%）**；`vacuum()` 全库
+    2.05 → 2.48 s（+21%）。同一对照里没被碰过的 bitcask/memory/bplus 灌行在 ±25% 里晃 ⇒ 本机噪声地板
+    有这么宽，lsm 那 +46% 是"在地板之上"而不是"远超"。机制只算作**推测**（flush 次数 2.3 → 8.5 次 ⇒
+    L0 更容易攒到压实阈值），没做分段计时。要买回时间：`mem_threshold_bytes` 调大即可 ——
+    预算与写单价的取舍从此是明写的一个数，而不是"写着 32 MB、实际 155 MB"。
 - **lsm 的 `flush()` 改成流式吐 memtable：① 158.6 → 119.8 MB、② 18.6 → 0.0 MB（M41a）**：
   `flush_one_immutable` 原来走 `mem_to_sorted_entries(&imm)` —— 把整张 memtable 连键带值**克隆**进
   一个 `Vec` 再 `sort_by((键, seq))`。而 `MemMap = BTreeMap<键, BTreeMap<seq, 值>>` 两级本来就升序
@@ -516,9 +540,13 @@
   - **同构建 A/B 不动代码、只转旋钮**（`LSM_MEM_ENTRIES` → `mem_threshold_entries`）：4 096 ⇒ ① 7.0 MB、
     32 768 ⇒ 20.3 MB、256 000（默认）⇒ 155.7 MB ⇒ ① ≈ 4.5 MB 地板 + **~0.6 KB × flush 前 memtable 的条数**。
     元凶是**删除落进 memtable 而它要攒到 25 万条才 flush**，不是走查的形状。
-  - 根因（策略）：`mem_bytes` 只数载荷（一条墓碑 17 B）⇒ 60 万条 = 10.2 MB，`mem_threshold_bytes: 32 MB`
-    永不触发；条数阈值 256k 在堆上实际是 **~155 MB** ⇒ "memtable 32 MB"在墓碑形状上低估真实占用
-    **~35 倍**（BTreeMap 节点、内层 map 的盒子、键的 `Vec` 头都不在账上）。同一个根挂着 lsm **灌行 +106.8 MB**。
+  - 根因（策略）：`mem_bytes` 只数**载荷账**（`key.len() + StoredEntry::estimate_bytes()` ⇒ 一条 16 B
+    键的墓碑 25 B）⇒ 60 万条 = 15 MB，`mem_threshold_bytes: 32 MB` 永不触发；条数阈值 256k 在堆上
+    实际是 **~155 MB** ⇒ "memtable 32 MB"在墓碑形状上低估真实占用 **~19 倍**（校准实测真堆占用
+    **476 B/条**：BTreeMap 节点、内层 map 的盒子、键的 `Vec` 头都不在账上）。同一个根挂着 lsm **灌行 +106.8 MB**。
+    **（修订：本条初版写的是"一条墓碑 17 B / 10.2 MB / ~35 倍"，那是按 `键长+值长` 口算的，
+    与 `mem_bytes` 的真实口径差一个 `StoredEntry` 的 8 B 序号 ⇒ M41b 校准时改成 25 B / 15 MB / 19 倍，
+    结论方向不变。）**
   - 根因（形状）：`flush_mem` 的 `mem_to_sorted_entries` 把整张 memtable 连键带值克隆进 `Vec` 再
     `sort_by` —— 而 `MemMap = BTreeMap<键, BTreeMap<seq, 值>>` 两级本来就升序 ⇒ 那个序是白拿的。
   - 后续两刀：M41a flush 改流式、M41b 触发判定改读真内存。标尺 `stage_base`/`stage_mark`/`stage_peaks`
