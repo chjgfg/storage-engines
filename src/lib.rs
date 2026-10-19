@@ -147,7 +147,6 @@ pub(crate) mod mem_probe {
     // 用法：门的**最外面**调一次 `open_stage_t0()`（放基准），每走完一段调
     // `open_stage_mark(槽号)`；槽号 = 这一段的名字（见 bitcask 里那张表）。
     // 内层函数只 mark、不 t0 —— 否则会把外层已经记下的槽清掉。
-    pub(crate) const OPEN_STAGE_SLOTS: usize = 8;
     static OPEN_STAGE_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     static OPEN_LAST_NS: AtomicU64 = AtomicU64::new(0);
 
