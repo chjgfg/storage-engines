@@ -2674,9 +2674,15 @@ mod tests {
                 tx.commit();
             }
             let t = Instant::now();
+            // M42 的先量：builder 单文件最多握住多少条（reset 之后整段 vacuum 里的 flush 都算进来）
+            crate::lsm_tree::sst::reset_builder_held_max();
             let st = mvcc.vacuum().unwrap();
             let d = t.elapsed();
             let p = crate::mem_probe::stage_peaks();
+            let held = crate::lsm_tree::sst::builder_held_max();
+            println!(
+                "  （builder 单文件最多同时握住 {held} 条未落盘条目 —— M42 的先量）"
+            );
             println!(
                 "=== lsm vacuum 分段瞬时峰值 rows={rows} mem阈值={mem} 裁掉 {} 行 / 扫 {} 行，总耗时 {:.2} s ===",
                 st.versions_removed,
@@ -2896,6 +2902,7 @@ mod tests {
         // ── ② 旧形状：源 = ① 那份物化好的 Vec ──
         let t = Instant::now();
         let m1 = crate::mem_probe::reset_peak();
+        crate::lsm_tree::sst::reset_builder_held_max();
         let written = merge_to_ssts(
             vec_inputs(sources),
             |_: &[u8], _: &StoredEntry| true,
@@ -2905,6 +2912,7 @@ mod tests {
         .unwrap();
         let t_merge_write = t.elapsed();
         let old_peak = crate::mem_probe::peak().saturating_sub(m1);
+        let held_old = crate::lsm_tree::sst::builder_held_max();
         let out_bytes: u64 = written.iter().map(|s| s.size_bytes).sum();
         let n_out = written.len();
         drop(written);
@@ -2913,6 +2921,7 @@ mod tests {
         // 两臂的输出必须**逐字节同口径**，否则"省了内存"可能只是"少写了东西"。
         let t = Instant::now();
         let m2 = crate::mem_probe::reset_peak();
+        crate::lsm_tree::sst::reset_builder_held_max();
         let written_stream = merge_to_ssts(
             tree.l0_for_test()
                 .iter()
@@ -2926,6 +2935,7 @@ mod tests {
         .unwrap();
         let t_stream = t.elapsed();
         let new_peak = crate::mem_probe::peak().saturating_sub(m2);
+        let held_new = crate::lsm_tree::sst::builder_held_max();
         let out_bytes_stream: u64 = written_stream.iter().map(|s| s.size_bytes).sum();
         assert_eq!(
             written_stream.len(),
@@ -2971,15 +2981,26 @@ mod tests {
         );
         eprintln!(
             "  ② 旧形状 归并+写盘 {:>10.1} ms ⇒ 每输入行 {:.3} µs | 这一段峰值涨 {:.1} MB\
-             （源=①那份 Vec ⇒ 输入的 154 MB 已记在 ① 上）",
+             （源=①那份 Vec ⇒ 输入的 154 MB 已记在 ① 上）| builder 单文件最多握住 {held_old} 条",
             t_merge_write.as_secs_f64() * 1e3,
             t_merge_write.as_secs_f64() * 1e6 / total_rows as f64,
             mb(old_peak),
         );
         eprintln!(
-            "  ③ 新形状 流式源     {:>10.1} ms ⇒ 每输入行 {:.3} µs | 峰值涨 {:.1} MB",
+            "  ③ 新形状 流式源     {:>10.1} ms ⇒ 每输入行 {:.3} µs | 峰值涨 {:.1} MB\
+             | builder 单文件最多握住 {held_new} 条（输出 {n_out} 个文件、平均 {:.0} 行/文件）",
             t_stream.as_secs_f64() * 1e3,
             t_stream.as_secs_f64() * 1e6 / total_rows as f64,
+            mb(new_peak),
+            total_rows as f64 / (n_out.max(1) as f64),
+        );
+        eprintln!(
+            "  ⇒ builder 那块缓冲占 ③ 峰值的 {:.0}%（{held_new} 条 × 平均每条 {:.0} B = {:.1} MB，\
+             段峰值 {:.1} MB）｜ 一文件切在 target={target} B",
+            100.0 * held_new as f64 * (bytes as f64 / total_rows.max(1) as f64)
+                / (new_peak.max(1) as f64),
+            bytes as f64 / total_rows.max(1) as f64,
+            mb(held_new as u64 * (bytes as u64 / total_rows.max(1) as u64)),
             mb(new_peak),
         );
         // ⚠️ 报"省了多少"必须按**整条操作**比，不能拿 ② 与 ③ 两段各截一段比 ——

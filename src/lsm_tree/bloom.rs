@@ -40,9 +40,22 @@ impl Bloom {
             return;
         }
         let (h1, h2) = Self::hash_pair(key);
+        self.set_pair(h1, h2);
+    }
+
+    /// 用**已经算好的哈希对**设位。
+    ///
+    /// M42 需要它：`SstBuilder` 现在一块一块落盘，而位图宽度 `m = 条数 × bits_per_key`
+    /// 要等总条数知道才能定 ⇒ 建表期间先把每条的 `(h1, h2)` 存下来（8 B/条），
+    /// `finish` 时按最终的 `m` 设位。设位顺序与位位置和原来逐键 `insert` **一字不差**。
+    pub(crate) fn set_pair(&mut self, h1: u32, h2: u32) {
+        if self.is_empty() {
+            return;
+        }
         let nbits = self.bits.len() * 8;
         for i in 0..self.n_hashes {
-            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) as usize % nbits;
+            let bit =
+                (h1 as u64).wrapping_add((i as u64).wrapping_mul(h2 as u64)) as usize % nbits;
             self.bits[bit / 8] |= 1 << (bit % 8);
         }
     }
@@ -55,7 +68,8 @@ impl Bloom {
         let (h1, h2) = Self::hash_pair(key);
         let nbits = self.bits.len() * 8;
         for i in 0..self.n_hashes {
-            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) as usize % nbits;
+            let bit =
+                (h1 as u64).wrapping_add((i as u64).wrapping_mul(h2 as u64)) as usize % nbits;
             if self.bits[bit / 8] & (1 << (bit % 8)) == 0 {
                 return false;
             }
@@ -63,13 +77,14 @@ impl Bloom {
         true
     }
 
-    fn hash_pair(key: &[u8]) -> (u64, u64) {
+    /// 两个 32 位哈希（都是 crc32 值 ⇒ `u32` 装得下，建表期间每条只留 8 B）
+    pub(crate) fn hash_pair(key: &[u8]) -> (u32, u32) {
         let c1 = crc32(key);
         // 二次哈希：扰动
         let mut buf = key.to_vec();
         buf.push(0xA5);
         let c2 = crc32(&buf);
-        (c1 as u64 | 1, (c2 as u64) | 1) // 保证奇数，周期更好
+        (c1 | 1, c2 | 1) // 保证奇数，周期更好
     }
 
     /// 序列化：n_hashes u32 + len u32 + bits

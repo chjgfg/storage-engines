@@ -1505,10 +1505,29 @@ pub(crate) fn builder_size_walks() -> u64 {
     BUILDER_SIZE_WALKS.with(|c| c.get())
 }
 
+// 测试专用尺子（M42 的先量）：**一个 builder 同时握住多少条还没落盘的条目**的历史最大值。
+//
+// 为什么要先量它：M33 把压实的**输入**改成流式源之后，输出侧仍然"攒满一整张表才在 `finish()`
+// 里编块写盘" —— 于是 flush 与压实各自还剩一条"1×"下限，是这块缓冲定的，不是流式源能顺手带走的。
+// 要不要拆它、拆完能省多少，看的是这一个数（条目数 × 每条字节），不是猜。
+#[cfg(test)]
+thread_local! {
+    static BUILDER_HELD_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn builder_held_max() -> u64 {
+    BUILDER_HELD_MAX.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_builder_held_max() {
+    BUILDER_HELD_MAX.with(|c| c.set(0));
+}
+
 /// `entries` 的字节数（旧算法，留着当对拍与尺子；生产路径一步都不该走它）
 #[cfg(test)]
 fn sum_entries_bytes(entries: &[(Vec<u8>, StoredEntry)]) -> usize {
-    #[cfg(test)]
     BUILDER_SIZE_WALKS.with(|c| c.set(c.get() + entries.len() as u64));
     entries
         .iter()
@@ -1553,6 +1572,13 @@ impl SstBuilder {
         // 口径与 `sum_entries_bytes` 里那句一字不差（对拍守卫钉着这两处）
         self.est_bytes += key.len() + se.estimate_bytes() + 8;
         self.entries.push((key, se));
+        #[cfg(test)]
+        BUILDER_HELD_MAX.with(|c| {
+            let n = self.entries.len() as u64;
+            if n > c.get() {
+                c.set(n);
+            }
+        });
     }
 
     pub fn add_put(&mut self, key: Vec<u8>, seq: u64, value: Option<Vec<u8>>) {
@@ -1896,6 +1922,41 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         crate::common::tmp_test_path("sst", tag, ".sst")
+    }
+
+    /// M42 的**格式钉子**：同一批条目必须产出**逐字节相同**的 SST。
+    ///
+    /// 为什么需要它：这一刀改的是 builder 的内部形状（"攒满一整张表才编块"→"攒满一块就落盘"），
+    /// 那种改动出错的方式不是崩，而是**悄悄换了文件格式** —— 块的切法、index 的偏移、bloom 的
+    /// 位图宽度，任何一个动了，旧文件还能读、新文件读得回，但两边对不上同一份口径。
+    /// 所以钉两个数：文件长度与全文件 crc32。
+    ///
+    /// ⚠️ 这两个常数是在**改前**的实现上跑出来的（下面断言里写的是当时的实测值）⇒
+    /// 改完之后红就代表格式被动过，不是测试写错了。
+    #[test]
+    fn test_sst_builder_byteprint_is_stable() {
+        let path = tmp("byteprint");
+        {
+            let mut b = SstBuilder::with_options(7, &path, 64, true).with_bloom_bits(10);
+            for i in 0..1000usize {
+                b.add(
+                    format!("k{i:06}").into_bytes(),
+                    StoredEntry::put(i as u64, Some(vec![(i % 251) as u8; i % 13])),
+                );
+            }
+            let sst = b.finish().unwrap();
+            // 回读必须与写入逐条一致（这一半不需要 golden 也成立）
+            let back = sst.iter_entries();
+            assert_eq!(back.len(), 1000, "读回来的条目数不对");
+            assert_eq!(back[0].0, b"k000000".to_vec());
+            assert_eq!(back[999].0, b"k000999".to_vec());
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let fc = crc32(&bytes);
+        eprintln!("[byteprint] 长度={} crc32={fc:08x}", bytes.len());
+        assert_eq!(bytes.len(), 31_823, "SST 字节长度变了 ⇒ 块切法/索引/布隆的口径被动过");
+        assert_eq!(fc, 0x7911_d92d, "SST 内容 crc32 变了 ⇒ 写出去的字节与改前不一致");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 增量账必须与旧算法**逐字节同口径**（M30）。
