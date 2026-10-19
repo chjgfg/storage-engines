@@ -804,15 +804,21 @@ impl Bitcask {
         // 「data.log 被删了、真数据还在 data.merge 里」这个现场就被永久抹平 ——
         // 表现是打开一个空库，谁都不报错。
         Self::recover_merge_artifact(&base_path)?;
+        // ── M48 冷启动分段耗时标尺（门控 `OPEN_STAGE_SPLIT`；八张槽的名字都写在
+        // `MVCC::try_open_with` 上面那张表里，这里占 1/2/3 三格）──
+        // ⚠️ 只 mark、不 t0：基准由最外面那层放（门面那扇 open 才是被量的对象）。
         let sealed_ids = discover_sealed_ids(&base_path);
         let hint_path = hint_path_for(&base_path);
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(1);
 
         // 尝试 hint 快路径
         let mut from_hint: Option<(KeyDir, u32, u64)> = None;
         if let Ok((kd, active_id, active_size)) = read_hint_file(&hint_path) {
             from_hint = Some((kd, active_id, active_size));
         }
-
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(2);
         let (key_dir, active_id, active) = if let Some((mut kd, active_id, active_size)) = from_hint
         {
             let mut active = Log::new(base_path.clone())?;
@@ -841,6 +847,8 @@ impl Bitcask {
         } else {
             Self::full_rebuild(&base_path, &sealed_ids)?
         };
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(3);
 
         Ok(Self {
             base_path,
@@ -2046,5 +2054,186 @@ mod tests {
             );
         }
         cleanup(&dir);
+    }
+
+    /// M48 的**归因**台架（只量不改）：大库台架的分段读数把 600k 档冷重开的 320 ms 里
+    /// 307.9 ms 钉在了 `read_hint_file` 这一格，但那一格里面叠着**三件**事：
+    /// ① 逐字段解记录（五次 `read_exact` + 一次带长度的读）、② 每条键一次 `vec![0u8; key_len]`、
+    /// ③ 每折一条就往 `KeyDir`（**`BTreeMap<Vec<u8>, _>`**，不是哈希表）插一次。
+    ///
+    /// 为什么不能报一句"hint 反序列化 308 ms"就收：那一句既没说是**分配**还是**树**，
+    /// 也没说单价随规模怎么涨 —— 而这两条决定下一步动哪里。树那一支尤其有理由怀疑：
+    /// 键是变长字节串（比较是 `memcmp`），hint 里的键又正好是**升序**写出的
+    /// ⇒ 每次插入都要沿最右那一路走下去。三臂读**同一个文件**、只差②③做不做。
+    ///
+    /// ```text
+    /// HINT_LOAD_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 bitcask_hint_load_stage_split
+    /// ```
+    /// ⚠️ 单线程跑；每一臂跑两遍取**第二遍**（第一遍要把文件读进 OS 缓存）。
+    #[test]
+    #[ignore = "hint 反序列化的三臂拆分，手动 release 单线程跑：HINT_LOAD_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 bitcask_hint_load_stage_split"]
+    fn bitcask_hint_load_stage_split() {
+        let rows: usize = std::env::var("HINT_LOAD_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let path = tmp_log("hint_split");
+        let hint = hint_path_for(&path);
+
+        // 造一份与真库同形状的 hint：16 字节的键（MVCC 的编码键 = raw(8) ‖ version(8)，同宽）、
+        // 按键升序（`write_hint_file` 走的就是排好序的 KeyDir，所以台架和现场同一个顺序）。
+        let mut kd = KeyDir::new();
+        for i in 0..rows {
+            let mut k = vec![0u8; 16];
+            k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            k[8..].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            kd.insert(
+                k,
+                KeyLoc::Live {
+                    file_id: 0,
+                    pos: i as u64 * 64,
+                    len: 24,
+                },
+            );
+        }
+        write_hint_file(&hint, &kd, 0, 1).expect("写 hint");
+        let bytes = std::fs::metadata(&hint).map(|m| m.len()).unwrap_or(0);
+        drop(kd);
+
+        // 一把读法，三臂共用：`on_entry` 决定"这条键要不要留下来、留下来放哪儿"。
+        // scratch 是**复用**的 ⇒ 臂 B 里每键零分配（这才把②单独摘出来）。返回条目数。
+        fn walk(hint: &std::path::Path, mut on_entry: impl FnMut(&[u8], i32, u32, u64, u32)) -> usize {
+            use std::io::{BufReader, Read};
+            let f = std::fs::File::open(hint).unwrap();
+            let mut r = BufReader::new(f);
+            let mut magic = [0u8; 8];
+            r.read_exact(&mut magic).unwrap();
+            assert_eq!(&magic, HINT_MAGIC_V2, "台架只量 v2 那份格式");
+            let mut rest = [0u8; HINT_HEADER_SIZE_V2 - 8];
+            r.read_exact(&mut rest).unwrap();
+            let entry_count = u64::from_le_bytes(rest[16..24].try_into().unwrap()) as usize;
+            let mut nbuf = [0u8; 4];
+            let mut pbuf = [0u8; 8];
+            let mut scratch: Vec<u8> = Vec::new();
+            for _ in 0..entry_count {
+                r.read_exact(&mut nbuf).unwrap();
+                let key_len = u32::from_le_bytes(nbuf) as usize;
+                r.read_exact(&mut nbuf).unwrap();
+                let flag = i32::from_le_bytes(nbuf);
+                r.read_exact(&mut nbuf).unwrap();
+                let file_id = u32::from_le_bytes(nbuf);
+                r.read_exact(&mut pbuf).unwrap();
+                let pos = u64::from_le_bytes(pbuf);
+                r.read_exact(&mut nbuf).unwrap();
+                let len = u32::from_le_bytes(nbuf);
+                scratch.resize(key_len, 0);
+                r.read_exact(&mut scratch).unwrap();
+                on_entry(&scratch, flag, file_id, pos, len);
+            }
+            // ⚠️ 这条不是走形式：循环体一次都没进的话，"读全了"和"一条没读"都报 0 ms
+            assert_eq!(entry_count, rows_hinted(hint), "hint 里的条目数与文件大小对不上");
+            entry_count
+        }
+        /// 独立算一遍分母：(文件字节 − 头部) ÷ 每条 (24 B 定长字段 + 16 B 键)
+        fn rows_hinted(hint: &std::path::Path) -> usize {
+            let bytes = std::fs::metadata(hint).map(|m| m.len()).unwrap_or(0) as usize;
+            (bytes - HINT_HEADER_SIZE_V2) / (24 + 16)
+        }
+
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / rows as f64;
+        let mut b_best = std::time::Duration::MAX;
+        let mut c_best = std::time::Duration::MAX;
+        let mut a_best = std::time::Duration::MAX;
+        let mut d_best = std::time::Duration::MAX;
+        let mut seen = 0usize;
+        for round in 0..2 {
+            // ── 臂 B：只解字段（键留在复用的 scratch 里，不留存）──
+            let t = std::time::Instant::now();
+            seen = walk(&hint, |_k, _f, _id, _p, _l| {});
+            let d = t.elapsed();
+            if round == 1 {
+                b_best = d;
+            }
+
+            // ── 臂 C：解字段 + 每键一次分配，按顺序塞进 `Vec`（不插树）──
+            let mut out: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(rows);
+            let t = std::time::Instant::now();
+            walk(&hint, |k, _f, id, p, l| {
+                out.push((k.to_vec(), KeyLoc::Live { file_id: id, pos: p, len: l }));
+            });
+            let d = t.elapsed();
+            assert_eq!(out.len(), rows, "臂 C 少折了条目");
+            drop(out);
+            if round == 1 {
+                c_best = d;
+            }
+
+            // ── 臂 A：真门 —— `read_hint_file`（解 + 分配 + 逐条插 `BTreeMap`）──
+            let t = std::time::Instant::now();
+            let (got, _, _) = read_hint_file(&hint).unwrap();
+            let d = t.elapsed();
+            assert_eq!(got.len(), rows, "臂 A 少折了条目");
+            drop(got);
+            if round == 1 {
+                a_best = d;
+            }
+
+            // ── 臂 D：同样解 + 分配，但**先攒进有序的 `Vec`，再一次 `collect` 成树**──
+            // 为什么加这一臂：hint 里的键本来就是升序写出的，而 ③ 那 74% 到底是
+            // "插一棵 BTreeMap  unavoidable"，还是"逐条 insert 每次都要从根走一遍"，
+            // 只有把这两件事拆开才答得了 —— 这一臂就是 M49 的候选修法本身。
+            let t = std::time::Instant::now();
+            let mut acc: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(rows);
+            walk(&hint, |k, _f, id, p, l| {
+                acc.push((k.to_vec(), KeyLoc::Live { file_id: id, pos: p, len: l }));
+            });
+            let built: KeyDir = acc.into_iter().collect();
+            let d = t.elapsed();
+            assert_eq!(built.len(), rows, "臂 D 少折了条目");
+            drop(built);
+            if round == 1 {
+                d_best = d;
+            }
+        }
+        eprintln!(
+            "=== hint 三臂 rows={rows} 文件 {:.1} MB（每条 {:.1} B）解出 {seen} 条 ===",
+            bytes as f64 / 1e6,
+            bytes as f64 / rows.max(1) as f64
+        );
+        eprintln!(
+            "  B 只解字段        {:>8.1} ms  {:>6.3} µs/条",
+            ms(b_best),
+            per(b_best)
+        );
+        eprintln!(
+            "  C +每键一次分配   {:>8.1} ms  {:>6.3} µs/条  ⇒ ②分配 = {:>7.1} ms（{:.2}×）",
+            ms(c_best),
+            per(c_best),
+            ms(c_best - b_best),
+            ms(c_best) / ms(b_best)
+        );
+        eprintln!(
+            "  A 真门 read_hint  {:>8.1} ms  {:>6.3} µs/条  ⇒ ③插 BTreeMap = {:>7.1} ms（{:.2}×）",
+            ms(a_best),
+            per(a_best),
+            ms(a_best - c_best),
+            ms(a_best) / ms(c_best).max(0.001)
+        );
+        eprintln!(
+            "  D 攒有序 Vec 再 collect 成同一棵树 {:>8.1} ms  {:>6.3} µs/条  ⇒ 比 A {:>7.1} ms（{:.2}×）｜③里\"逐条 insert 从根走一遍\"占这一笔"
+            ,
+            ms(d_best),
+            per(d_best),
+            ms(a_best) - ms(d_best),
+            ms(a_best) / ms(d_best).max(0.001)
+        );
+        eprintln!(
+            "  合计拆分：① {:>5.1}% ② {:>5.1}% ③ {:>5.1}%（按 A 那一臂的墙钟）",
+            100.0 * ms(b_best) / ms(a_best),
+            100.0 * ms(c_best - b_best) / ms(a_best),
+            100.0 * ms(a_best - c_best) / ms(a_best),
+        );
+        cleanup(&path);
     }
 }

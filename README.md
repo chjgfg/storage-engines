@@ -1665,6 +1665,59 @@ let probe_high = to.unwrap_or(&[0xffu8; 8]);   // ← 改前
 开区间走查必须交出 1+7 行。变异 C（装回合成上界）⇒ 红在 `left: 50, right: 57` —— 少的那 7 把
 就是现场被整篇跳过的文件。
 
+**M48 —— bitcask 600k 冷重开 320 ms 的归因（只量不改）：96% 在"把整份 hint 折成内存索引"，而那一格里 74% 是"有序输入逐条插 `BTreeMap`"**
+
+队列里那条"未归因"的数（旧记录 253 ms 是跨构建快照，本轮同一场量到 **320.3 ms**）。
+先装尺子再谈修法：`mem_probe::open_stage_t0/mark/clear/open_stages` —— 门控 `OPEN_STAGE_SPLIT`
+的**八段耗时**标尺，钉在真门上（`MVCC::try_open_with` 与 `Bitcask::with_max_file_bytes`），
+大库台架 `scale_baseline` 的两处重开各打印一趟。
+
+600k 那一轮（同一场、同一构建）：
+
+| 段 | `冷重开(恢复)` | `再冷重开` |
+|---|---|---|
+| 门面锁（`create_dir_all` + 文件锁） | 2.5 ms | 3.8 ms |
+| 认残骸 + 发现密封分片 | 0.2 | 0.3 |
+| **hint 反序列化 `read_hint_file`** | **307.9** | **459.0** |
+| 建 KeyDir（增量扫 + `hint_files_exist`） | 6.4 | 8.4 |
+| `BlobStore::open` + `Wal::open` | 0.4 | 0.4 |
+| WAL 读 + 重放 | 0.0 | 0.0 |
+| 起始版本号 | 0.0 | **89.0** |
+| `flush` + `seal_wal_checkpoint` | 2.9 | 4.2 |
+| 合计 | **320.3**（外层 `timed()` 320.326 ⇒ 八段之和能对上） | **565.1** |
+
+⚠️ 同一次重开里 **日志扫过 0 行** ⇒ hint 快路径是生效的，钱不是花在重扫日志上。
+
+三条结论：
+
+1. **大头不是 bug，是设计**：320 ms 里 96% 是"把整份索引折回内存"，而 bitcask 的索引**必须全驻**
+   （同批读到常驻 83.4 MB）。所以这一格不能像 M44/M46 那样"改成流式"就交差 —— 它没有流式形状。
+2. **可修的那一半已经拆到单价**：台架 `bitcask_hint_load_stage_split` 用同一把读法做四臂
+   （B 只解字段 / C 再加"每键一次 `vec![0;key_len]`" / A 真门 `read_hint_file` / D 有序攒进 `Vec`
+   再 `collect()` 成同一棵树）。600k 两轮 + 200k 一轮：
+
+   | 臂 | 200k | 600k（两轮） | 占比（600k） |
+   |---|---|---|---|
+   | B 只解字段 | 5.7 ms | 15.2 / 26.0 ms | ① **5.6~8.1%** |
+   | C +每键一次分配 | 27.1 ms | 70.3 / 83.1 ms | ② **17.8~20.4%** |
+   | A 真门 `read_hint_file` | 93.7 ms | 270.3 / 320.3 ms | ③ **74.0~74.1%** |
+   | D 有序 `Vec` → `collect()` | **36.4 ms** | **104.3 / 116.2 ms** | A 的 **1/2.6~2.8** |
+
+   ⇒ 主犯是"**有序输入逐条 `insert`，每条都从根走到最右叶**"。`KeyDir` 是
+   `BTreeMap<Vec<u8>, KeyLoc>`（不是哈希表），而 hint 里的键**本来就是按键升序写出的**。
+   ⚠️ 单价也随规模涨：A 臂 0.469 µs/条@200k → 0.451~0.534 µs/条@600k，台架那格 0.335 µs/条@20k →
+   0.513 µs/条@600k（1.53×）⇒ 超线性成分就住在③。
+3. **另一条独立通道**：`再冷重开` 比 `冷重开` 多的那 **89 ms** 是起始版本号走了**第三档退路**
+   （WAL 里没有 Checkpoint ⇒ `scan_max_version` = O(全库 KeyDir)）。hint 命中时这条退路根本不必走，
+   而 hint v2 头部那个 `reserved:u64` 现在没人用 —— 它正好可以带 `max_version`。
+
+**本轮不动产品代码。** 2、3 两条各是一个候选里程碑，动手前要先做同构建 A/B 拿凭据（本机墙钟跨轮能漂 ±20%）。
+
+⚠️ 量具两条教训（都写进 `mem_probe` 的注释）：① 插桩必须门控，常开会锯短外层 `timed()` 的读数
+（与 `VACUUM_STAGE_SPLIT` 同一条理由）；② **槽不会自己清** —— 第一版没清，bplus / lsm 把 bitcask 的
+读数原样复述了一遍，**那比读 0 更危险，因为它看着像证据**；现在由读的人先调 `open_stages_clear()`，
+八段全 0 时打印"这一家没插桩"而不是空白。
+
 ### 本轮全量复测（三档 20k / 200k / 600k × 四引擎 × 31 项，同一份构建，2026-10-19）判据：**单价倍数 = 原始比值 ÷ 期望量级**；`memory` 引擎那一列就是本机噪声地板（1.2~1.6×）。
 
 下表只列**过地板**或**绝对值本身痛**的项（单位写全）。数据在 `C:` SSD 上量，换盘要重标。
@@ -2362,6 +2415,13 @@ LSM_COUNT_OLD_SHAPE=1 LSM_COUNT_ROWS=600000 cargo test --release --lib -- --igno
   --test-threads=1 lsm_counting_doors_peak
                               # M47 的三格计数内存台架:同一个二进制只切 `LSM_COUNT_OLD_SHAPE`,
                               # 改前那一臂就地重放"每格各折一趟整库"的写法(峰值 100.4 → 0.4 MB)
+SCALE_ROWS=600000 OPEN_STAGE_SPLIT=1 cargo test --release --lib -- --ignored --nocapture \
+  --test-threads=1 scale_baseline
+                              # M48 的冷启动八段耗时(门控 `OPEN_STAGE_SPLIT`,只有 bitcask 那家插了桩):
+                              # 默认不设这个变量 ⇒ 插桩完全是 no-op,不会锯短外层 `timed()` 的读数
+HINT_LOAD_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 bitcask_hint_load_stage_split
+                              # hint 反序列化的四臂拆分(只解字段 / +每键一次分配 / 真门 read_hint_file /
+                              # 有序 Vec 再 collect 成树)。结论取比值,不取单轮墙钟(本机 ±20%)
 cargo test --test test_lsm_tree
 ```
 

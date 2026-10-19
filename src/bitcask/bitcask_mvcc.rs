@@ -263,11 +263,26 @@ impl MVCC {
         max_file_bytes: Option<u64>,
     ) -> std::io::Result<Self> {
         let db_dir = dir.as_ref().to_path_buf();
+        // ── M48 冷启动**分段耗时**标尺（门控 `OPEN_STAGE_SPLIT`，默认完全 no-op）──
+        // 这里是最外面那一层：基准由这里的 `open_stage_t0()` 放，`Bitcask::with_max_file_bytes`
+        // 只往里落槽。八段：
+        //   0 = 门面前置（`create_dir_all` + 拿文件锁）
+        //   1 = Bitcask 前置（认回 merge 残骸 + 发现密封分片 + hint 路径）
+        //   2 = **hint 反序列化**（`read_hint_file`：整份 KeyDir 从盘上折出来）
+        //   3 = **建 KeyDir**（hint 命中就只增量扫 `active_size` 之后；回退则全量扫所有分片）
+        //   4 = 门面三件（`BlobStore::open` + `Wal::open`）
+        //   5 = WAL `read_all` + `analyze_recovery` + 重放（已提交/未提交两趟）
+        //   6 = 冷启动起始版本号（走 1/2/3 哪一档；⚠️ 第三档是 `scan_max_version` = O(全库 KeyDir)）
+        //   7 = `tree.flush()` + `seal_wal_checkpoint`（这两次落盘）
+        #[cfg(test)]
+        crate::mem_probe::open_stage_t0();
         std::fs::create_dir_all(&db_dir)?;
 
         // 锁文件路径规则是各引擎自己的（bitcask: `dir/bitcask.lock`），锁的**语义**在
         // [`crate::common::disk::FileLock`]（四引擎共用的一份实现）
         let lock = FileLock::try_acquire_at(&lock_path(&db_dir))?;
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(0);
         let data_log = data_path(&db_dir);
         let mut tree = match max_file_bytes {
             Some(n) => Bitcask::with_max_file_bytes(data_log, n)?,
@@ -275,6 +290,8 @@ impl MVCC {
         };
         let blob = BlobStore::open(&db_dir)?;
         let mut wal = Wal::open(wal_path(&db_dir))?;
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(4);
 
         let entries = wal.read_all()?;
         let plan = analyze_recovery(&entries);
@@ -285,6 +302,8 @@ impl MVCC {
         for (_xid, key) in &plan.uncommitted_writes {
             let _ = tree.remove(key);
         }
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(5);
 
         // 冷启动的起始版本号，三级优先（照 bplus 的口径，别让同一个优化在三处有三种成熟度）：
         // 1. WAL 里最后一个 Checkpoint 的 next_version —— checkpoint 先 flush 数据再截断 WAL，
@@ -306,6 +325,8 @@ impl MVCC {
                 disk_max.max(plan.max_xid).saturating_add(1).max(1)
             }
         };
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(6);
 
         // 这一家**保持无条件**：`Bitcask::flush` = 写缓冲空就直接返回 + 一次 fsync，是有界工作。
         // LSM 那一档在 M28 改成了「有 redo 才 flush」，因为它的 `flush()` 末尾挂着无界的
@@ -316,6 +337,8 @@ impl MVCC {
         // 同样要「先截断再写 Checkpoint」，否则这次 open 留下的起点信息会被截断抹掉，
         // 下次 open 只能再全库扫一遍（首次打开的库尤其需要这条快路）。
         seal_wal_checkpoint(&mut wal, start_ver)?;
+        #[cfg(test)]
+        crate::mem_probe::open_stage_mark(7);
 
         Ok(Self {
             kv: Arc::new(Mutex::new(tree)),

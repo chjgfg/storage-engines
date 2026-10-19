@@ -3249,6 +3249,54 @@ mod tests {
         );
     }
 
+    /// M48 的**冷启动分段**读数（门控 `OPEN_STAGE_SPLIT`，插桩在 bitcask 的 open 路径里，
+    /// 八段的名字与边界写在 `MVCC::try_open_with` 上面那张表）。
+    ///
+    /// ⚠️ 每次量之前**必须清槽**（`open_stages_begin` 做这件事）：台架是四家排着跑的，
+    /// 第一版没清，bplus/lsm 就把 bitcask 的读数原样复述了一遍 —— 那比读 0 更危险，
+    /// 因为它看着像证据。八段全 0 时明说"这一家没插桩"，不许把它读成"不花钱"（M38 那条）。
+    fn open_stages_report(engine: &str, scan_max_before: u64) {
+        if std::env::var("OPEN_STAGE_SPLIT").is_err() {
+            return;
+        }
+        let s = crate::mem_probe::open_stages();
+        let scanned = crate::bitcask::bitcask::merge_rescan_rows();
+        let scan_max = crate::bitcask::bitcask_mvcc::scan_max_calls() - scan_max_before;
+        if s.iter().all(|v| *v == 0) {
+            eprintln!(
+                "{engine:<10} 冷启动分段: 八段全 0 ⇒ 这一家没插桩（只有 bitcask 装了），别当成\"不花钱\""
+            );
+            return;
+        }
+        let ms = |v: u64| v as f64 / 1e6;
+        let sum: u64 = s.iter().sum();
+        eprintln!(
+            "{engine:<10} 冷启动分段(ms): 门面锁 {:>6.1} | 认残骸+发现分片 {:>6.1} | hint反序列化 {:>7.1} | 建KeyDir {:>8.1} | Blob+Wal开 {:>6.1} | WAL读+重放 {:>7.1} | 起始版本 {:>7.1} | flush+ckpt {:>7.1} | 合计 {:>7.1}",
+            ms(s[0]),
+            ms(s[1]),
+            ms(s[2]),
+            ms(s[3]),
+            ms(s[4]),
+            ms(s[5]),
+            ms(s[6]),
+            ms(s[7]),
+            ms(sum),
+        );
+        eprintln!(
+            "{engine:<10}   同一次重开里：日志扫过 {scanned} 行、`scan_max_version` 走了 {scan_max} 次（0=没走那条 O(全库) 的退路）"
+        );
+    }
+
+    /// 重开之前调一次：清槽 + 装上行数尺 + 取 `scan_max_calls` 的基准。门控关着返回 0。
+    fn open_stages_begin() -> u64 {
+        if std::env::var("OPEN_STAGE_SPLIT").is_err() {
+            return 0;
+        }
+        crate::mem_probe::open_stages_clear();
+        crate::bitcask::bitcask::arm_merge_rescan_counter();
+        crate::bitcask::bitcask_mvcc::scan_max_calls()
+    }
+
     /// M24 的墙钟台架：**一个事务塞几万行**时，头几百行与尾几百行的单价必须同阶。
     ///
     /// 计数守卫 `write_set_registration_costs_a_hash_not_a_walk` 钉的是形状（每写一行只许考察一把键），
@@ -3368,6 +3416,7 @@ mod tests {
                 eprintln!("{label:<10} {:<24} {:>17}   （内存引擎不落盘：重开 = 空库）", "冷重开(恢复)", "");
                 db
             } else {
+                let st_base = open_stages_begin();
                 drop(db);
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
                 line(
@@ -3379,6 +3428,7 @@ mod tests {
                     peak,
                     &format!("常驻 {:.1} MB", live as f64 / 1e6),
                 );
+                open_stages_report(label, st_base);
                 db
             };
 
@@ -3625,6 +3675,7 @@ mod tests {
                 eprintln!("{label:<10} {:<24} {:>17}", "再冷重开", "（同上，跳过）");
                 db
             } else {
+                let st_base = open_stages_begin();
                 drop(db);
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
                 line(
@@ -3636,6 +3687,7 @@ mod tests {
                     peak,
                     &format!("常驻 {:.1} MB", live as f64 / 1e6),
                 );
+                open_stages_report(label, st_base);
                 db
             };
 

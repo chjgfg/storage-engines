@@ -133,4 +133,70 @@ pub(crate) mod mem_probe {
         }
         out
     }
+
+    // ── 冷启动的**分段耗时**标尺（M48 给 bitcask 的 `open` 装）──
+    //
+    // ⚠️ 同样的门控（`OPEN_STAGE_SPLIT`）：默认完全 no-op —— 门控开着才取一次时钟。
+    // 常开的代价不在 `SystemTime` 那几十 ns，而在于它会诱导人在**产品路径**上长期插桩，
+    // 而大库台架外层 `timed()` 量的就是这扇门 ⇒ 尺子与被打量的对象会互相污染。
+    //
+    // ⚠️ 槽**不会**自己清：读的人必须先调 `open_stages_clear()`（台架在每次重开之前调）。
+    // 没这一句，第二个引擎会读到上一个引擎留下的数 —— M48 第一次跑 20k 时 bplus/lsm
+    // 就原样复述了 bitcask 的读数，那比读 0 更危险，因为它看着像证据。
+    //
+    // 用法：门的**最外面**调一次 `open_stage_t0()`（放基准），每走完一段调
+    // `open_stage_mark(槽号)`；槽号 = 这一段的名字（见 bitcask 里那张表）。
+    // 内层函数只 mark、不 t0 —— 否则会把外层已经记下的槽清掉。
+    pub(crate) const OPEN_STAGE_SLOTS: usize = 8;
+    static OPEN_STAGE_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static OPEN_LAST_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn gated_now() -> u64 {
+        if std::env::var("OPEN_STAGE_SPLIT").is_err() {
+            return 0;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+
+    /// 起点：放基准（**不**清槽 —— 清槽是读的人的活，见 `open_stages_clear`）。门控关着就什么都不做。
+    pub(crate) fn open_stage_t0() {
+        let now = gated_now();
+        if now == 0 {
+            return;
+        }
+        OPEN_LAST_NS.store(now, Relaxed);
+    }
+
+    /// 把八个槽清成 0 ⇒ **每次重开之前**由读的人调一次。
+    /// 不清的话，下一个引擎会读到上一个引擎留下的数（看着像证据，比读 0 更坏）。
+    pub(crate) fn open_stages_clear() {
+        for s in &OPEN_STAGE_NS {
+            s.store(0, Relaxed);
+        }
+    }
+
+    /// 记下"从上一段结束到此刻"这一段。没调过 `open_stage_t0()`（基准为 0）时只放基准、不记槽。
+    pub(crate) fn open_stage_mark(slot: usize) {
+        let now = gated_now();
+        if now == 0 {
+            return;
+        }
+        let last = OPEN_LAST_NS.swap(now, Relaxed);
+        if last != 0 {
+            OPEN_STAGE_NS[slot].store(now.saturating_sub(last), Relaxed);
+        }
+    }
+
+    /// 八段读数（**纳秒**）。槽没被写过就是 0 ⇒ ⚠️ 读到 0 先确认门控开没开、有没有清槽。
+    pub(crate) fn open_stages() -> [u64; 8] {
+        let mut out = [0u64; 8];
+        for (o, s) in out.iter_mut().zip(&OPEN_STAGE_NS) {
+            *o = s.load(Relaxed);
+        }
+        out
+    }
 }
