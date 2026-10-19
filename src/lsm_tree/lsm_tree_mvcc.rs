@@ -4161,6 +4161,120 @@ mod tests {
         }
         cleanup(&path);
     }
+
+    /// M50 的量具重做 + 结构归因（`#[ignore]`，手动 release 单线程跑）。
+    ///
+    /// 为什么要重做量具：10-20 那张三档表里 `seek_prev 中间键` 读的是 `timed()` 里的**一次调用**
+    /// （`src/engine.rs:3522`）。µs 级单次采样在这台机上不能当 A/B 凭据（本机规则：**µs 级 A/B
+    /// 必须交错多轮取最小**），而一次反向定位很容易 just 撞上"某个 SST 块不在缓存里"
+    /// （600k 档点读实测 块/次 5.31、未命中/次 1.31、一次未命中 ≈ 60 µs）
+    /// ⇒ "20k 27.1 µs → 600k 351.1 µs = 12.96×" 里多少是结构、多少是单次运气，那张表答不了。
+    ///
+    /// 这条台架把**同一个动作量 N 次**，并一次给出五把结构尺子（全是计数，不是墙钟）：
+    /// `步/次`（M20 那把 `seek_prev_steps`：一次调用往回退过几把死键）、`探文件/次`、`块/次`、
+    /// `未命中/次`、`条目比较/次`。哪一把跟着规模涨，责任就在哪一层：
+    /// 步数涨 ⇒ 反向定位真在跳更多死键（结构问题，要修）；探文件涨 ⇒ 盘上形状变了；
+    /// 只有 未命中/次 涨 ⇒ 是覆盖率，M23/M32 那本账，不是这一刀。
+    ///
+    /// 两臂只差一个现成旋钮（M32 的手法：**转旋钮、不动代码**）：
+    /// `默认` = `for_mvcc()`（M41b 之后 `mem_threshold_bytes` 读**真内存** ⇒ 8 B 值的库每 ~7.4 万行 flush）；
+    /// `大 memtable` = 字节档抬到不触发、条数档留在 262 144 ⇒ 就是 **M41b 之前**的行为
+    /// （当时 32 MB 载荷账在 8 B 值上从不触发，flush 只由条数说话 ⇒ 60 万行只 flush ~2 次）。
+    /// 两臂都先报**盘上形状**（每层文件数 / SST 总数 / 块数 / 缓存容量）：形状没变，
+    /// "351 µs 是 M41b 换来的形状代价"这句话就还没有对照。
+    ///
+    /// ```text
+    /// LSM_SEEK_SHAPE_AB_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_seek_prev_shape_ab
+    /// ```
+    #[test]
+    #[ignore = "seek_prev 的量具重做 + memtable 形状 A/B，手动 release 单线程跑：LSM_SEEK_SHAPE_AB_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_seek_prev_shape_ab"]
+    fn lsm_seek_prev_shape_ab() {
+        use crate::common::store::seek_prev_steps;
+        use crate::lsm_tree::lsm_tree::LSMTreeOptions;
+        use crate::lsm_tree::sst::{block_misses, block_reads, sst_entry_walks, sst_probes};
+        let rows: usize = std::env::var("LSM_SEEK_SHAPE_AB_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let probes: usize = std::env::var("LSM_SEEK_SHAPE_AB_PROBES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        let key = |i: usize| format!("k{i:06}").into_bytes();
+        // 照抄基线台架的形状：一把键 8 B、值 1 B、一个大事务灌进去、flush + checkpoint、冷重开
+        let snap = || (block_reads(), block_misses(), sst_probes(), sst_entry_walks());
+
+        for big_mem in [false, true] {
+            let name = if big_mem { "大 memtable(照 M41b 前)" } else { "默认(M41b 后)" };
+            let opts = || {
+                let mut o = LSMTreeOptions::for_mvcc();
+                if big_mem {
+                    o.mem_threshold_bytes = usize::MAX / 8;
+                    o.mem_threshold_entries = 256 * 1024;
+                }
+                o
+            };
+            let path = tmp_db("seek_shape_ab");
+            {
+                let mvcc = MVCC::try_open_with(&path, Some(opts())).unwrap();
+                let tx = mvcc.begin_transaction();
+                for i in 0..rows {
+                    assert!(tx.set(&key(i), b"v".to_vec()), "灌第 {i} 把失败");
+                }
+                tx.commit();
+                mvcc.flush();
+                mvcc.checkpoint();
+            }
+            // ⚠️ 必须冷重开再量：写阶段焐热的块缓存会让"反向一步"看起来比生产便宜
+            let mvcc = MVCC::try_open_with(&path, Some(opts())).unwrap();
+            let (st, cap, blocks) = {
+                let kv = mvcc.kv.lock().unwrap();
+                (kv.stats(), kv.block_cache_capacity(), kv.sst_blocks_for_test())
+            };
+            eprintln!(
+                "[形状] 臂={name} 行数 {rows} ⇒ SST {} 篇、层文件 {:?}、块 {blocks}、缓存容量 {cap}",
+                st.total_sst, st.level_files
+            );
+            let mut best = u128::MAX;
+            let mut cold = 0u128;
+            let mut c_best = (0u64, 0u64, 0u64, 0u64);
+            let mut steps_best = 0u64;
+            for round in 0..2 {
+                let tx = mvcc.begin_transaction();
+                let a = snap();
+                let p0 = seek_prev_steps();
+                let t = std::time::Instant::now();
+                for j in 0..probes {
+                    let i = (j * 7919 + 13) % rows;
+                    assert!(tx.seek_prev(&key(i)).is_some(), "seek_prev 第 {i} 把落空");
+                }
+                let spent = t.elapsed().as_micros();
+                let b = snap();
+                let steps = seek_prev_steps() - p0;
+                drop(tx);
+                if round == 0 {
+                    cold = spent;
+                } else if spent < best {
+                    best = spent;
+                    c_best = (b.0 - a.0, b.1 - a.1, b.2 - a.2, b.3 - a.3);
+                    steps_best = steps;
+                }
+            }
+            let per = |x: u64| x as f64 / probes as f64;
+            eprintln!(
+                "[seek_prev A/B] 臂={name} {probes} 次 ⇒ 冷启一趟 {:>7.1} µs/次、焐热一趟 {:>7.1} µs/次 \
+                 | 步/次 {:.2} | 探文件/次 {:.2} | 块/次 {:.2} | 未命中/次 {:.2} | 条目比较/次 {:.1}",
+                cold as f64 / probes as f64,
+                best as f64 / probes as f64,
+                steps_best as f64 / probes as f64,
+                per(c_best.2),
+                per(c_best.0),
+                per(c_best.1),
+                per(c_best.3),
+            );
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 impl crate::common::VersionedStore for Transaction {
