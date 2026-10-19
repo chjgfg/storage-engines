@@ -103,6 +103,43 @@ pub use crate::common::{decode_key, encode_key, VersionedKey};
 /// 「整条链没有一个可见」的退化场景才付到 O(链长)，与旧的整链扫描同阶。
 const VERSION_BACK_STEP: usize = 32;
 
+/// M37：一次全库 `vacuum()` 走查的**块大小**（物理行）。
+///
+/// 为什么要有块：`iter_meta_from` 按 `&self` 借住 KeyDir，而删除与读值都要 `&mut kv` ⇒
+/// 借住期间只能**攒**。攒下来的 `to_delete` / `keep` 就是 M37 分段量出来的那 106 MB
+/// （600k 键 × 2 版 = 120 万物理行那档，93 B/行）。按块走查、每块出借用后立刻清空，
+/// 这两笔就从 O(全库) 变成 O(本常数) —— 实测 ① 段 **106.0 MB → 0.5 MB**。
+/// 取 8192 行：按每行 40 B 算约 0.3 MB，比一页大、比一次事务的写集小，且远小于
+/// 下游会遇到的库量级（守卫 `test_vacuum_deletes_in_bounded_chunks` 钉的就是"不随库涨"）。
+const VAC_CHUNK_ROWS: usize = 8192;
+
+// 测试专用（M37 的尺子）：一次 `vacuum_bounded` 里**单次 flush 前最多攒了多少待处理行**。
+// 判据要的是"这道界真的生效"，所以数的是 `to_delete.len() + kept.len()` 的历史最大值。
+#[cfg(test)]
+thread_local! {
+    static VAC_PENDING_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_vac_pending(n: usize) {
+    VAC_PENDING_MAX.with(|c| {
+        let n = n as u64;
+        if n > c.get() {
+            c.set(n);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn vac_pending_max() -> u64 {
+    VAC_PENDING_MAX.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vac_pending() {
+    VAC_PENDING_MAX.with(|c| c.set(0));
+}
+
 // 测试专用：本线程调用 `scan_max_version`（O(总行数) 的全库 KeyDir 扫描）的次数。
 // 用来守住冷启动的三级优先：有 Checkpoint 时就不该再全库扫。
 #[cfg(test)]
@@ -537,62 +574,117 @@ impl MVCC {
         // 版本键按 `raw ‖ version_be` 升序到达 ⇒ 同一把键的行必然连续，判完一组就地交出去。
         // 守卫：`all_engines_vacuum_judges_per_group_not_whole_library`（数"判定发生了几次"与
         // "最大一组的行数"，四家一条各核一次）。
+        // M37：**按块走查**。`iter_meta_from` 按 `&self` 借住 KeyDir，而删除与读值都要 `&mut kv`
+        // ⇒ 一块一块来：块内只克隆 `(版本号, enc, 是不是软墓碑)`（至多 `VAC_CHUNK_ROWS` 行），
+        // 出借用之后立刻把这一块判出来的行删掉、把保留行的 blob 引用当场读出来然后丢掉。
+        // 于是 M36 之后剩下的那两笔 O(全库) 累加器（分段实测 ①=106.0 MB、93 B/扫描行）
+        // 塌成 O(一块)。只有真有大 value 时 `blob_keys` 才随库涨 —— 那是 `rewrite_in_place`
+        // 必须一次拿到全部存活 value 的结构，不是这一层的账（守卫：同一条四家守卫 + 分段台架）。
+        //
+        // 块间下界用「上一块最后一把 `enc ‖ 0x00`」：那是 enc 域里的**严格后继方向**
+        // （`enc‖0x00 > enc`，且任何 `K > enc` 都满足 `K ≥ enc‖0x00`）⇒ 一行不漏、一行不重。
+        // ⚠️ 反过来 `enc ‖ 0xFF×8`（[`crate::common::version_key_upper_bound`] 那种**右界**用法）
+        // 会把"以 `enc` 为前缀的更长键"整把跳掉 —— 同一个坑在 `common::store::fold_lower_bound`
+        // 的注释里已经写过一次，这里别再踩。
+        // 只有全库轮次要把保留行读出来查 blob 引用（有界片不碰 blob）⇒ 才需要那条当场读的路
+        let full_sweep = budget_rows == u64::MAX;
         let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
-        // 只有全库轮次要把"存活行清单"交给 blob GC（有界片不碰 blob）⇒ 只在会用到时才攒
-        let full_sweep = budget_rows == u64::MAX;
-        let mut keep: Vec<Vec<u8>> = Vec::new();
+        let mut kept: Vec<Vec<u8>> = Vec::new();
+        let mut blob_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (enc, 完整用户值) —— 只有大 value 才进
+        let mut removed = 0usize;
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut truncated = false;
-        for (enc, loc) in kv.iter_meta_from(after) {
-            let Some(vk) = decode_key(enc) else {
-                continue;
-            };
-            // 下界落在 enc 域，而 `raw_key ≤ after` 的那些行（包括 `after` 自己那一整组）
-            // 都还在范围内 —— 显式跳过，游标才是逻辑 key 域的。
-            if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
-                continue;
+        // 首块的下界是调用方给的 `after`（那是**逻辑键**域，靠下面那句显式跳过补齐），之后逐块前推
+        let mut lower: Option<Vec<u8>> = after.map(|k| k.to_vec());
+        loop {
+            let mut chunk_rows = 0usize;
+            let mut next_lower: Option<Vec<u8>> = None;
+            let mut done = false;
+            for (enc, loc) in kv.iter_meta_from(lower.as_deref()) {
+                let Some(vk) = decode_key(enc) else {
+                    continue;
+                };
+                // 下界落在 enc 域，而 `raw_key ≤ after` 的那些行（包括 `after` 自己那一整组）
+                // 都还在范围内 —— 显式跳过，游标才是逻辑 key 域的。
+                if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                    continue;
+                }
+                let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
+                if at_group_start && scanned >= budget_rows {
+                    // 破在这里时 `cur_raw` 那一组已经收齐（刚看到了它的后继）⇒ 游标就是它
+                    truncated = true;
+                    done = true;
+                    break;
+                }
+                if at_group_start {
+                    // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
+                    let (d, k) = vacuum_plan_group(&mut group, xmin);
+                    to_delete.extend(d);
+                    if full_sweep {
+                        kept.extend(k.into_iter().map(|(enc, _)| enc));
+                    }
+                    cur_raw = Some(vk.raw_key.clone());
+                }
+                scanned += 1;
+                group.push((vk.version, enc.clone(), loc.is_soft_tombstone(), ()));
+                chunk_rows += 1;
+                if chunk_rows >= VAC_CHUNK_ROWS {
+                    let mut bound = enc.clone();
+                    bound.push(0u8);
+                    next_lower = Some(bound);
+                    break;
+                }
             }
-            let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
-            if at_group_start && scanned >= budget_rows {
-                // 破在这里时 `cur_raw` 那一组已经收齐（刚看到了它的后继）⇒ 游标就是它
-                // （`group` 正是那一组，收摊时在循环外判掉）
-                truncated = true;
-                break;
-            }
-            if at_group_start {
-                let (d, kept) = vacuum_plan_group(&mut group, xmin);
+            // ⚠️ 走到这里 `for` 里那个按引用迭代 KeyDir 的迭代器已经 drop ⇒ 才拿得到 `&mut kv`
+            if done || next_lower.is_none() {
+                // 最后一块：把还挂在 `group` 里的那一组判掉（它不会再有后继了）
+                let (d, k) = vacuum_plan_group(&mut group, xmin);
                 to_delete.extend(d);
                 if full_sweep {
-                    keep.extend(kept.into_iter().map(|(enc, _)| enc));
+                    kept.extend(k.into_iter().map(|(enc, _)| enc));
                 }
-                cur_raw = Some(vk.raw_key.clone());
             }
-            scanned += 1;
-            group.push((vk.version, enc.clone(), loc.is_soft_tombstone(), ()));
-        }
-        let (d, kept) = vacuum_plan_group(&mut group, xmin);
-        to_delete.extend(d);
-        if full_sweep {
-            keep.extend(kept.into_iter().map(|(enc, _)| enc));
+            #[cfg(test)]
+            note_vac_pending(to_delete.len() + kept.len());
+            for enc in to_delete.drain(..) {
+                let _ = kv.remove(&enc);
+                removed += 1;
+            }
+            if full_sweep {
+                // 保留行的 blob 引用**当场读、读完就丢**：这是这一刀能不要 `keep` 那张清单的原因
+                for enc in kept.drain(..) {
+                    let Ok(Some(stored)) = kv.get_entry(&enc) else {
+                        continue;
+                    };
+                    let Some(stored) = stored else {
+                        continue; // 软墓碑没有 value
+                    };
+                    if stored.first() != Some(&VAL_TAG_BLOB) {
+                        continue;
+                    }
+                    match decode_stored_value(&mut blob, &stored) {
+                        Ok(Some(user)) => blob_keys.push((enc, user)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!("blob decode 失败 key={enc:?}: {e}");
+                        }
+                    }
+                }
+            } else {
+                kept.clear();
+            }
+            match next_lower {
+                Some(l) if !done => lower = Some(l),
+                _ => break,
+            }
         }
         let next_cursor = if truncated { cur_raw } else { None };
 
-        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]。
-        //
-        // ⚠️ 剩下的那笔 O(存活行) 没被这一刀覆盖：全库轮次要把保留行的 enc 收起来交给 blob GC
-        // （`keep`），而 `rewrite_in_place` 又要一次握住**全部存活大 value**。原因是
-        // `iter_meta_from` 按 `&self` 借住 KeyDir，走查途中没法再 `get_entry`（那是 `&mut self`），
-        // 所以没法"当场读完 blob 指针就丢掉这一项"。那是 blob 结构自己的事，不在这次的边界内。
         #[cfg(test)]
         {
             vac_base = vac_stage_mark(0, vac_base);
-        }
-        let removed = to_delete.len();
-
-        for enc in &to_delete {
-            let _ = kv.remove(enc);
         }
         kv.flush()?;
         blob.sync()?;
@@ -610,52 +702,34 @@ impl MVCC {
         // - 无任何 blob 引用 → clear
         // - 仍有引用 → rewrite_in_place 只保留存活大 value，并更新 KeyDir 中的指针
         //
-        // 只读上面 `keep` 里的行（旧实现这里又走一遍全库 iter()）。
+        // `blob_keys` 在上面那个按块的循环里就已经填好了（保留行**当场读、读完就丢**），
+        // 所以这里不再有"整张存活行清单"，也不再有第二次全库 `iter()`。
+        // ⚠️ `rewrite_in_place` 要一次拿到**全部**存活大 value —— 那是 blob 文件的结构，
+        // 不是这一层能省掉的账（没有大 value 时这一段一分钱都不花，M37 分段实测 ③ = 0.0 MB）。
         let blob_rewritten = if !full_sweep {
             false
-        } else {
-            let mut blob_keys: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (enc_key, full_user_value)
-            for enc in &keep {
-                let Ok(Some(stored)) = kv.get_entry(enc) else {
-                    continue;
-                };
-                let Some(stored) = stored else {
-                    continue; // 软墓碑没有 value
-                };
-                if stored.first() != Some(&VAL_TAG_BLOB) {
-                    continue;
-                }
-                match decode_stored_value(&mut blob, &stored) {
-                    Ok(Some(user)) => blob_keys.push((enc.clone(), user)),
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::warn!("blob decode 失败 key={enc:?}: {e}");
-                    }
-                }
-            }
-
-            if blob_keys.is_empty() {
-                let old_len = blob.path().metadata().map(|m| m.len()).unwrap_or(0);
-                if old_len > 8 {
-                    blob.clear_in_place()?;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                let values: Vec<Vec<u8>> = blob_keys.iter().map(|(_, v)| v.clone()).collect();
-                let new_offsets = blob.rewrite_in_place(&values)?;
-                // 更新主日志里的 blob 指针（覆盖写同一 storage key）
-                for ((enc, user), new_off) in blob_keys.into_iter().zip(new_offsets.into_iter()) {
-                    let mut stored = Vec::with_capacity(1 + 8 + 4);
-                    stored.push(VAL_TAG_BLOB);
-                    stored.extend_from_slice(&new_off.to_le_bytes());
-                    stored.extend_from_slice(&(user.len() as u32).to_le_bytes());
-                    let _ = kv.insert(enc, Some(stored));
-                }
+        } else if blob_keys.is_empty() {
+            let old_len = blob.path().metadata().map(|m| m.len()).unwrap_or(0);
+            if old_len > 8 {
+                blob.clear_in_place()?;
                 true
+            } else {
+                false
             }
-        };
+        } else {
+            let values: Vec<Vec<u8>> = blob_keys.iter().map(|(_, v)| v.clone()).collect();
+            let new_offsets = blob.rewrite_in_place(&values)?;
+            // 更新主日志里的 blob 指针（覆盖写同一 storage key）
+            for ((enc, user), new_off) in blob_keys.into_iter().zip(new_offsets.into_iter()) {
+                let mut stored = Vec::with_capacity(1 + 8 + 4);
+                stored.push(VAL_TAG_BLOB);
+                stored.extend_from_slice(&new_off.to_le_bytes());
+                stored.extend_from_slice(&(user.len() as u32).to_le_bytes());
+                let _ = kv.insert(enc, Some(stored));
+            }
+            true
+        }
+        ;
 
         // 压缩：丢掉已硬删除的空间（同样只在全库轮次）
         #[cfg(test)]
@@ -2596,6 +2670,56 @@ mod tests {
             let all = mvcc.export_latest_visible(true);
             assert_eq!(all.len(), 3);
             assert!(all.iter().any(|r| r.key == b"k2" && r.value.is_none()));
+        }
+        cleanup(&path);
+    }
+
+    /// `vacuum()` 必须**按块**删除，不许把整库的待删行攒在一个 `Vec` 里（M37）。
+    ///
+    /// 判据（单位：行）：库里可删的旧版**远多于一块**时，单次 flush 前最多攒的待处理行数
+    /// `vac_pending_max()` 必须 ≤ `2 × VAC_CHUNK_ROWS`。
+    /// 为什么不钉内存而钉这个数：分配计数（`mem_probe`）是**进程级**的，并行跑用例时别家分配的
+    /// 字节会算进来（M27 栽过、M36 又拿坏量具的读数当过凭据）；而"块界有没有生效"是个纯计数。
+    /// `versions_removed > VAC_CHUNK_ROWS` 那条断言保证界**真的被跨过** —— 一个小库任何一片都
+    /// 装得下，那样这条判据就是空转（M33 的守卫第一次就红在这种空转上）。
+    ///
+    /// 变异验证：把 `to_delete.drain(..)` 从块循环里挪到"整库走完之后" ⇒
+    /// `vac_pending_max()` 变成全部可删行数（20 000 > 界 16 384），红。
+    #[test]
+    fn test_vacuum_deletes_in_bounded_chunks() {
+        const KEYS: usize = 20_000;
+        let path = tmp_db("vac_chunks");
+        {
+            let mvcc = MVCC::open(&path);
+            // 自动回收会在提交那一刻就先裁掉一片，那这条判据就量不到手动 vacuum 的界了
+            mvcc.set_vacuum_auto_slice(0);
+            for _ in 0..2u64 {
+                let tx = mvcc.begin_transaction();
+                for i in 0..KEYS {
+                    let k = format!("k{i:06}");
+                    assert!(tx.set(k.as_bytes(), vec![b'v'; 24]), "第 {i} 把键写失败");
+                }
+                tx.commit();
+            }
+            reset_vac_pending();
+            let st = mvcc.vacuum().unwrap();
+            let pending = vac_pending_max();
+            eprintln!(
+                "[vac chunks] 裁掉 {} 行 / 扫 {} 行 ⇒ 单次 flush 前最多攒 {} 行（块界 {VAC_CHUNK_ROWS}）",
+                st.versions_removed, st.rows_scanned, pending
+            );
+            assert!(st.rows_scanned > 0, "一行都没扫到 ⇒ 空转");
+            assert!(
+                st.versions_removed > VAC_CHUNK_ROWS,
+                "可删行数 {} 没超过一块 ⇒ 这条判据量不到界（空转）",
+                st.versions_removed
+            );
+            assert!(pending > 0, "这把尺子没数到待删行 ⇒ 空转");
+            assert!(
+                pending <= 2 * VAC_CHUNK_ROWS as u64,
+                "单次 flush 前攒了 {pending} 行待处理（界 {}）⇒ 又变回整库一个 `Vec`",
+                2 * VAC_CHUNK_ROWS as u64
+            );
         }
         cleanup(&path);
     }
