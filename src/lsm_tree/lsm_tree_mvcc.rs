@@ -28,7 +28,7 @@
 //! - 数据目录：`dir/CURRENT.snap` + `dir/lsm.wal` + `dir/lsm.lock`
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -46,6 +46,40 @@ use crate::common::{HealthFold, VacuumScheduler};
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 use crate::common::vacuum_plan_group;
 use crate::common::version_key_upper_bound;
+
+/// M37：一次 `vacuum_bounded` 走查的**块大小**（物理行）—— 与 bitcask 那条同源同值，
+/// 两家共用"块界"这件事由各自的守卫各自钉住（`test_vacuum_deletes_in_bounded_chunks`）。
+///
+/// 为什么要有块：`light_iter_range` 的 `LightMerge` 按 `&self` 借住 LSM 树，而删除要 `&mut kv`
+/// ⇒ 借住期间只能攒，攒出来的 `to_delete` + 交给 blob GC 的存活行清单就是 M37 分段量出来的
+/// 那笔 O(全库) 的账（600k 档 `vacuum()` 瞬时 101.2 MB）。按块出借用后立刻清空 ⇒ O(本常数)。
+const VAC_CHUNK_ROWS: usize = 8192;
+
+// 测试专用（M37 的尺子，与 bitcask 那把同形）：单次 flush 前最多攒了多少待处理行。
+#[cfg(test)]
+thread_local! {
+    static VAC_PENDING_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_vac_pending(n: usize) {
+    VAC_PENDING_MAX.with(|c| {
+        let n = n as u64;
+        if n > c.get() {
+            c.set(n);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn vac_pending_max() -> u64 {
+    VAC_PENDING_MAX.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vac_pending() {
+    VAC_PENDING_MAX.with(|c| c.set(0));
+}
 
 /// MVCC 存储引擎（LSM 后端）
 pub struct MVCC {
@@ -545,64 +579,94 @@ impl MVCC {
         // 所以 `cur_raw` 那一组收齐了，可以直接当游标。旧那份"窗口太窄就放大 4 倍重试"
         // 整个不需要了 —— 它存在的理由正是窗口右界可能把唯一的完整组切断。
         // M36：**只攒当前这一把键的那一组**（以前是全库归组的 `BTreeMap`，每行两个 `Vec`
-        // ⇒ vacuum 自己的瞬时内存 = O(全库物理行)，600k 那档实测 +89.4 MB 那个形状）。
-        // 归并流的键序是 `raw ‖ version_be` 升序 ⇒ 同一把键的行必然连续，判完一组就地交出去。
+        // ⇒ vacuum 自己的瞬时内存 = O(全库物理行)）。归并流的键序是 `raw ‖ version_be` 升序
+        // ⇒ 同一把键的行必然连续，判完一组就地交出去。
+        // M37：再把**块**加上 —— 每块至多 `VAC_CHUNK_ROWS` 行，出借用（`LightMerge` 按 `&self`
+        // 借住 kv，删除要 `&mut kv`）之后立刻删这一块、并把保留行的 blob 引用当场并进 `referenced`
+        // 然后丢掉 ⇒ `to_delete` 与"整张存活行清单"（原来交给 `gc_blobs(&keep_enc)`）这两笔
+        // O(全库) 的账一起塌成 O(一块)。块间下界用 `enc ‖ 0x00`（严格后继方向，⚠️ 不是
+        // `‖ 0xFF×8` 那种右界写法），与 bitcask 那条同源、同一个理由。
         let full_sweep = budget_rows == u64::MAX;
         let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
-        // 只有全库轮次要把"存活行清单"交给 blob GC（有界片不碰 blob）⇒ 只在会用到时才攒
         let mut keep_enc: Vec<Vec<u8>> = Vec::new();
+        // 只数"真有大 value 的行"，一条一个 u64 ⇒ 没有大 value 时这一份一分钱不花
+        let mut referenced: HashSet<u64> = HashSet::new();
+        let mut removed = 0usize;
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut budget_cut = false;
-        {
-            let mut it = kv.light_iter_range(after, None, u64::MAX);
-            while let Some((enc, le)) = it.next() {
-                // 尺子：这片真的折过多少把编码键（与 M27 那四家守卫同一把）
-                #[cfg(test)]
-                crate::lsm_tree::sst::note_light_visit();
-                let Some(vk) = decode_key(&enc) else {
-                    continue;
-                };
-                if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
-                    continue;
-                }
-                let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
-                if at_group_start && scanned >= budget_rows {
-                    budget_cut = true;
-                    break;
-                }
-                if at_group_start {
-                    let (d, kept) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    if full_sweep {
-                        keep_enc.extend(kept.into_iter().map(|(enc, _)| enc));
+        let mut lower: Option<Vec<u8>> = after.map(|k| k.to_vec());
+        loop {
+            let mut chunk_rows = 0usize;
+            let mut next_lower: Option<Vec<u8>> = None;
+            let mut done = false;
+            {
+                let mut it = kv.light_iter_range(lower.as_deref(), None, u64::MAX);
+                while let Some((enc, le)) = it.next() {
+                    // 尺子：这片真的折过多少把编码键（与 M27 那四家守卫同一把）
+                    #[cfg(test)]
+                    crate::lsm_tree::sst::note_light_visit();
+                    let Some(vk) = decode_key(&enc) else {
+                        continue;
+                    };
+                    if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                        continue;
                     }
-                    cur_raw = Some(vk.raw_key.clone());
+                    let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
+                    if at_group_start && scanned >= budget_rows {
+                        budget_cut = true;
+                        done = true;
+                        break;
+                    }
+                    if at_group_start {
+                        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
+                        let (d, kept) = vacuum_plan_group(&mut group, xmin);
+                        to_delete.extend(d);
+                        if full_sweep {
+                            keep_enc.extend(kept.into_iter().map(|(enc, _)| enc));
+                        }
+                        cur_raw = Some(vk.raw_key.clone());
+                    }
+                    scanned += 1;
+                    // Drop 行也参与「换组」的判定（它照样推进键序），只是不作为裁剪候选
+                    if le.kind == 2 {
+                        continue;
+                    }
+                    group.push((vk.version, enc.clone(), le.kind == 1, ()));
+                    chunk_rows += 1;
+                    if chunk_rows >= VAC_CHUNK_ROWS {
+                        let mut bound = enc.clone();
+                        bound.push(0u8);
+                        next_lower = Some(bound);
+                        break;
+                    }
                 }
-                scanned += 1;
-                // Drop 行也参与「换组」的判定（它照样推进键序），只是不作为裁剪候选
-                if le.kind == 2 {
-                    continue;
-                }
-                group.push((vk.version, enc.clone(), le.kind == 1, ()));
             }
-        }
-        {
-            let (d, kept) = vacuum_plan_group(&mut group, xmin);
-            to_delete.extend(d);
+            if done || next_lower.is_none() {
+                // 最后一块：挂在 `group` 里的那一组判掉（它不会再有后继了）
+                let (d, kept) = vacuum_plan_group(&mut group, xmin);
+                to_delete.extend(d);
+                if full_sweep {
+                    keep_enc.extend(kept.into_iter().map(|(enc, _)| enc));
+                }
+            }
+            #[cfg(test)]
+            note_vac_pending(to_delete.len() + keep_enc.len());
+            for enc in to_delete.drain(..) {
+                let _ = kv.remove(&enc);
+                removed += 1;
+            }
             if full_sweep {
-                keep_enc.extend(kept.into_iter().map(|(enc, _)| enc));
+                kv.collect_blob_refs(&keep_enc, &mut referenced);
+                keep_enc.clear();
+            }
+            match next_lower {
+                Some(l) if !done => lower = Some(l),
+                _ => break,
             }
         }
         let next_cursor = if budget_cut { cur_raw } else { None };
-
-        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
-        let removed = to_delete.len();
-
-        for enc in &to_delete {
-            let _ = kv.remove(enc);
-        }
 
         // 有界轮次只把删除留在 memtable 里，交给正常的 memtable flush 阈值收口：
         // 每片都 flush 会在 L0 造出一堆只装墓碑的小 SST，压实代价比省下的那点持久性贵。
@@ -616,8 +680,10 @@ impl MVCC {
             kv.set_mvcc_xmin_filter(xmin);
 
             // blob 旁路的空间回收：必须在删完旧行之后、且只有全库扫完才敢做 ——
-            // 「还有没有人在引用这个 blob」是个全库问题。
-            blob_rewritten = Some(kv.gc_blobs(&keep_enc)? > 0);
+            // 「还有没有人在引用这个 blob」是个全库问题。引用集合是上面逐块并进来的，
+            // 这里只剩"按集合删孤儿文件"那一半（`gc_blobs` 那个收整张清单的入口仍然在，
+            // 它就是这两半的壳）。
+            blob_rewritten = Some(kv.gc_blobs_referenced(&referenced)? > 0);
         }
 
         Ok(VacuumRound {
@@ -2477,6 +2543,67 @@ mod tests {
     /// 逼这条跨源归并的路径真的被走到。
     /// 键里放了前缀嵌套的 `k1` / `k1x`：两把 key 的区间会互相穿插，这是游标最容易切在
     /// 组中间的情形。
+    /// `vacuum()` 必须**按块**删除，不许把整库的待删行与存活行攒在两个 `Vec` 里（M37）。
+    ///
+    /// 判据（单位：行）：库里可删的旧版**远多于一块**时，单次 flush 前最多攒的待处理行数
+    /// `vac_pending_max()` 必须 ≤ `2 × VAC_CHUNK_ROWS`；与 bitcask 那条同形同值，各家钉各家。
+    /// `versions_removed > VAC_CHUNK_ROWS` 那条断言保证块界**真的被跨过**（小库永远装得下 ⇒ 空转）。
+    /// 为什么这条对 lsm 尤其要紧：它除了 `to_delete` 还要把"存活行清单"交给 `gc_blobs`
+    /// （600k 档 `vacuum()` 瞬时 **101.2 MB** 的四家最大的一笔）—— 现在引用集合逐块并入，
+    /// 清单不再存在。
+    ///
+    /// 变异验证：把块界 `VAC_CHUNK_ROWS` 临时抬到一整库那么大 ⇒ 待攒行数变成全部可删行数
+    /// （20 000 > 界 16 384），红。
+    #[test]
+    fn test_vacuum_deletes_in_bounded_chunks() {
+        const KEYS: usize = 20_000;
+        let path = tmp_db("vac_chunks");
+        {
+            let mvcc = MVCC::open(&path);
+            // 自动回收会在提交那一刻先裁掉一片，那这条判据就量不到手动 vacuum 的界了
+            mvcc.set_vacuum_auto_slice(0);
+            for _ in 0..2u64 {
+                let tx = mvcc.begin_transaction();
+                for i in 0..KEYS {
+                    let k = format!("k{i:06}");
+                    assert!(tx.set(k.as_bytes(), vec![b'v'; 24]), "第 {i} 把键写失败");
+                }
+                tx.commit();
+            }
+            reset_vac_pending();
+            let st = mvcc.vacuum().unwrap();
+            let pending = vac_pending_max();
+            eprintln!(
+                "[vac chunks lsm] 裁掉 {} 行 / 扫 {} 行 ⇒ 单次 flush 前最多攒 {} 行（块界 {VAC_CHUNK_ROWS}）",
+                st.versions_removed, st.rows_scanned, pending
+            );
+            assert!(st.rows_scanned > 0, "一行都没扫到 ⇒ 空转");
+            assert!(
+                st.versions_removed > VAC_CHUNK_ROWS,
+                "可删行数 {} 没超过一块 ⇒ 这条判据量不到界（空转）",
+                st.versions_removed
+            );
+            assert!(pending > 0, "这把尺子没数到待删行 ⇒ 空转");
+            assert!(
+                pending <= 2 * VAC_CHUNK_ROWS as u64,
+                "单次 flush 前攒了 {pending} 行待处理（界 {}）⇒ 又变回整库一个 `Vec`",
+                2 * VAC_CHUNK_ROWS as u64
+            );
+            // 语义还得对：裁完之后每把键读得回最新那一版
+            let tx = mvcc.begin_transaction();
+            for i in (0..KEYS).step_by(997) {
+                let k = format!("k{i:06}");
+                assert_eq!(
+                    tx.get(k.as_bytes()),
+                    Some(vec![b'v'; 24]),
+                    "第 {i} 把键在按块回收后读不回来"
+                );
+            }
+            tx.commit();
+        }
+        cleanup(&path);
+    }
+
     #[test]
     fn test_vacuum_bounded_slices_and_converges() {
         const CHAIN: u64 = 120;

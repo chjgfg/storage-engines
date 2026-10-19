@@ -805,6 +805,17 @@ impl LSMTree {
     /// 留着一个没人引用的 blob 只是占空间。
     pub fn gc_blobs(&self, keep: &[Vec<u8>]) -> std::io::Result<usize> {
         let mut referenced: HashSet<u64> = HashSet::new();
+        self.collect_blob_refs(keep, &mut referenced);
+        self.gc_blobs_referenced(&referenced)
+    }
+
+    /// [`Self::gc_blobs`] 的前半段：把这批保留行引用的 blob `seq` 并进 `into`。
+    ///
+    /// 单独露出来是给 **M37 的按块走查**用的：调用方每块把保留行喂进来就丢弃，于是
+    /// "整张存活行清单"（`keep: &[Vec<u8>]`，600k 档那笔 O(全库) 的账）不需要存在；
+    /// 留下的 `referenced` 只数**真有大 value 的行**（一个 `u64` 一条）。
+    /// 判据与 `gc_blobs` 同一个口径（这份就是它原来的那段循环，没第二条实现）。
+    pub(crate) fn collect_blob_refs(&self, keep: &[Vec<u8>], into: &mut HashSet<u64>) {
         for enc in keep {
             // 外层 None = 这行已经不在；内层 None = Drop 墓碑（墓碑不引用任何 blob）
             // ⚠️ 这里刻意用**不解析**的 get_raw_key_at：GC 靠指针字节认引用，解析就认不出来了
@@ -812,10 +823,14 @@ impl LSMTree {
                 continue;
             };
             if let Some(seq) = Self::blob_ptr_seq(&val) {
-                referenced.insert(seq);
+                into.insert(seq);
             }
         }
+    }
 
+    /// [`Self::gc_blobs`] 的后半段：拿着"还被引用的 seq 集合"去删没人引用的 blob 文件。
+    /// 保守方向不变：宁可留着也不删错（删掉被引用的是**丢数据**）。
+    pub(crate) fn gc_blobs_referenced(&self, referenced: &HashSet<u64>) -> std::io::Result<usize> {
         let blob_dir = self.dir.join("blobs");
         let Ok(rd) = fs::read_dir(&blob_dir) else {
             return Ok(0); // 从没写过大数据 ⇒ 没有旁路目录，正常

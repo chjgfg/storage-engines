@@ -219,55 +219,84 @@ impl MVCC {
         }
         let xmin = self.next_version.load(Ordering::SeqCst);
 
-        let store = self.store.lock().unwrap();
-
         // 分组按引用走表：判「留哪一版」只需要版本号 + 是不是墓碑，
         // 不需要把每行 value 克隆出来（旧实现是 `store.iter().collect()`）。
         //
         // M36：**只攒当前这一把键的那一组**，看到后继就把上一组交出去判 ⇒ 瞬时内存从
         // O(全库物理行)（600k 档实测 +89.4 MB，比要裁的东西大两个数量级）降到
         // O(最长那条链)。版本键按 `raw ‖ version_be` 升序到达，同一把键的行必然连续。
+        // M37：再按块走 —— 走查持读锁、删除要写锁 ⇒ 每块读完就**放掉读锁**再删这一块，
+        // 于是 `to_delete` 从 O(全库) 变成 O(一块)（这一家实测基数小：600k 档 `vacuum()`
+        // 瞬时 4.0 MB，改完是 O(块)；改它的理由是"同根因不留三家"，不是那 4 MB）。
+        // 块间下界 `enc ‖ 0x00`：enc 域的严格后继方向，与 bitcask/lsm 同一个理由。
         let budget_rows = budget_rows.max(1);
         let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut removed = 0usize;
         let mut scanned = 0u64;
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut truncated = false;
-        store.scan_entries_from(after, |enc, val| {
-            let Some(vk) = decode_key(enc) else {
-                return false;
-            };
-            if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
-                return false;
+        let mut lower: Option<Vec<u8>> = after.map(|k| k.to_vec());
+        loop {
+            let mut chunk_rows = 0usize;
+            let mut next_lower: Option<Vec<u8>> = None;
+            let mut done = false;
+            {
+                let store = self.store.lock().unwrap();
+                store.scan_entries_from(lower.as_deref(), |enc, val| {
+                    let Some(vk) = decode_key(enc) else {
+                        return false;
+                    };
+                    if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
+                        return false;
+                    }
+                    let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
+                    if at_group_start && scanned >= budget_rows {
+                        // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）⇒ 游标就是它
+                        // （`group` 正是那一组，收摊时在块尾判掉）
+                        truncated = true;
+                        done = true;
+                        return true;
+                    }
+                    if at_group_start {
+                        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
+                        let (d, _kept) = vacuum_plan_group(&mut group, xmin);
+                        to_delete.extend(d);
+                        cur_raw = Some(vk.raw_key.clone());
+                    }
+                    scanned += 1;
+                    group.push((vk.version, enc.to_vec(), val.is_none(), ()));
+                    chunk_rows += 1;
+                    if chunk_rows >= VAC_CHUNK_ROWS {
+                        let mut bound = enc.to_vec();
+                        bound.push(0u8);
+                        next_lower = Some(bound);
+                        return true;
+                    }
+                    false
+                });
             }
-            let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
-            if at_group_start && scanned >= budget_rows {
-                // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）⇒ 游标就是它
-                // （`group` 正是那一组，收摊时在循环外判掉）
-                truncated = true;
-                return true;
-            }
-            if at_group_start {
+            if done || next_lower.is_none() {
+                // 最后一块：挂在 `group` 里的那一组判掉（它不会再有后继了）
                 let (d, _kept) = vacuum_plan_group(&mut group, xmin);
                 to_delete.extend(d);
-                cur_raw = Some(vk.raw_key.clone());
             }
-            scanned += 1;
-            group.push((vk.version, enc.to_vec(), val.is_none(), ()));
-            false
-        });
-        let (d, _kept) = vacuum_plan_group(&mut group, xmin);
-        to_delete.extend(d);
-        let next_cursor = if truncated { cur_raw } else { None };
-        drop(store);
-
-        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
-        let removed = to_delete.len();
-
-        let mut store = self.store.lock().unwrap();
-        for enc in &to_delete {
-            let _ = store.delete(enc);
+            #[cfg(test)]
+            note_vac_pending(to_delete.len());
+            // 读锁已经放掉 ⇒ 这一块单独拿写锁删（以前是"整库攒完再删一次"）
+            {
+                let mut store = self.store.lock().unwrap();
+                for enc in to_delete.drain(..) {
+                    let _ = store.delete(&enc);
+                    removed += 1;
+                }
+            }
+            match next_lower {
+                Some(l) if !done => lower = Some(l),
+                _ => break,
+            }
         }
+        let next_cursor = if truncated { cur_raw } else { None };
 
         VacuumRound {
             stats: VacuumStats {
@@ -378,6 +407,38 @@ impl crate::common::WalTail for MemStore {}
 /// 常态下一个逻辑 key 只有个位数版本，32 足够一次命中；翻倍只在
 /// 「整条链没有一个满足条件」的退化场景才付到 O(链长)，与旧的整链扫描同阶。
 const VERSION_BACK_STEP: usize = 32;
+
+/// M37：一次 `vacuum_bounded` 走查的**块大小**（物理行）—— 与 bitcask / lsm 同值，
+/// 各家钉各家（守卫同名同形：`test_vacuum_deletes_in_bounded_chunks`）。
+/// 这一家改的收益最小（600k 档 `vacuum()` 瞬时 4.0 MB），改它的理由是**同根因不留三家**：
+/// 走查形状一模一样的 `to_delete` 攒法，四家如果只改两家，下一次改一家漏一家的事故还会重演。
+const VAC_CHUNK_ROWS: usize = 8192;
+
+// 测试专用（M37 的尺子）：单次 flush 前最多攒了多少待删行。
+#[cfg(test)]
+thread_local! {
+    static VAC_PENDING_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_vac_pending(n: usize) {
+    VAC_PENDING_MAX.with(|c| {
+        let n = n as u64;
+        if n > c.get() {
+            c.set(n);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn vac_pending_max() -> u64 {
+    VAC_PENDING_MAX.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_vac_pending() {
+    VAC_PENDING_MAX.with(|c| c.set(0));
+}
 
 /// 未终结（既没 commit 也没 rollback）就被丢弃的事务在此自动回滚。
 ///
@@ -977,6 +1038,58 @@ mod tests {
     /// `vacuum()` 把 store 锁按到整库走完；切片后每轮读的行数有上限（偏差 = 一条链的长度：
     /// 截断只能落在逻辑 key 边界），游标每轮必须前进。
     /// 键里放了前缀嵌套的 `k1` / `k1x`：版本键 `raw ‖ 8B` 下两把 key 的区间会互相穿插。
+    /// `vacuum()` 必须**按块**删除，不许把整库的待删行攒在一个 `Vec` 里（M37）。
+    ///
+    /// 判据与 bitcask / lsm 那条同形同值：可删旧版远多于一块时，单次 flush 前最多攒的待删行
+    /// `vac_pending_max()` ≤ `2 × VAC_CHUNK_ROWS`；`versions_removed > VAC_CHUNK_ROWS` 保证块界
+    /// 真的被跨过（否则空转）。这一家改的收益最小（4.0 MB），但形状是同一份 —— 留下它就是
+    /// "改一家漏两家"那个事故形状的复刻。
+    ///
+    /// 变异验证：把块界临时抬到一整库那么大 ⇒ 待删行数变成 20 000 > 界 16 384，红。
+    #[test]
+    fn test_vacuum_deletes_in_bounded_chunks() {
+        const KEYS: usize = 20_000;
+        let mvcc = MVCC::new();
+        mvcc.set_vacuum_auto_slice(0);
+        for _ in 0..2u64 {
+            let tx = mvcc.begin_transaction();
+            for i in 0..KEYS {
+                let k = format!("k{i:06}");
+                assert!(tx.set(k.as_bytes(), vec![b'v'; 24]), "第 {i} 把键写失败");
+            }
+            tx.commit();
+        }
+        reset_vac_pending();
+        let st = mvcc.vacuum();
+        let pending = vac_pending_max();
+        eprintln!(
+            "[vac chunks memory] 裁掉 {} 行 / 扫 {} 行 ⇒ 单次 flush 前最多攒 {} 行（块界 {VAC_CHUNK_ROWS}）",
+            st.versions_removed, st.rows_scanned, pending
+        );
+        assert!(st.rows_scanned > 0, "一行都没扫到 ⇒ 空转");
+        assert!(
+            st.versions_removed > VAC_CHUNK_ROWS,
+            "可删行数 {} 没超过一块 ⇒ 这条判据量不到界（空转）",
+            st.versions_removed
+        );
+        assert!(pending > 0, "这把尺子没数到待删行 ⇒ 空转");
+        assert!(
+            pending <= 2 * VAC_CHUNK_ROWS as u64,
+            "单次 flush 前攒了 {pending} 行待删（界 {}）⇒ 又变回整库一个 `Vec`",
+            2 * VAC_CHUNK_ROWS as u64
+        );
+        let tx = mvcc.begin_transaction();
+        for i in (0..KEYS).step_by(997) {
+            let k = format!("k{i:06}");
+            assert_eq!(
+                tx.get(k.as_bytes()),
+                Some(vec![b'v'; 24]),
+                "第 {i} 把键在按块回收后读不回来"
+            );
+        }
+        tx.commit();
+    }
+
     #[test]
     fn test_vacuum_bounded_slices_and_converges() {
         const CHAIN: u64 = 120;
