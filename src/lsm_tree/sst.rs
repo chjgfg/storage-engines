@@ -1479,8 +1479,30 @@ pub struct SstBuilder {
     block_entries: usize,
     enable_bloom: bool,
     bloom_bits_per_key: usize,
-    entries: Vec<(Vec<u8>, StoredEntry)>,
-    /// `entries` 的字节账，**增量维护**（M30）。
+    /// **只有一块**的量：攒到 `block_entries` 就编块落盘（M42）。
+    ///
+    /// 为什么必须拆：改前这里是"整张表的条目"，而一张表切多大由 `target_sst_bytes` 说话
+    /// ⇒ 压实与 flush 剩下的那条内存下限由它定。`compaction_cost_split` 600k 档实测
+    /// 单个 builder 最多同时握住 **18 333 条**，按同一批条目量出来的 269 B/条 算 ≈ **4.9 MB**，
+    /// 而那一段的总峰值是 6.3 MB ⇒ **78% 就是这块缓冲**（条目载荷本身只 1.9 MB）。
+    pending: Vec<(Vec<u8>, StoredEntry)>,
+    /// 每条 **8 B** 的哈希对 `(h1, h2)`（两个都是 crc32 值）。
+    ///
+    /// ⚠️ 为什么还留着这一份而不是做到纯 O(块)：布隆的位图宽度 `m = 总条数 × bits_per_key`
+    /// 要等总条数知道才能定，而位位置是 `h % m` ⇒ 边加边设位就会与已写的格式对不上。
+    /// 存哈希而不是存键值：18 333 条 = 143 KB，改前那一整张表是 MB 级。
+    /// `finish` 里按最终的 `m` 逐对设位，位位置与原来"逐键 `insert`"**一字不差**。
+    hashes: Vec<(u32, u32)>,
+    /// 每块一条，随块落盘一起追加（块数 = 条目数 ÷ 块宽 ⇒ O(文件) 但每 64 条才一条）
+    index: Vec<IndexEntry>,
+    /// 第一个**满块**写出时才建文件；不足一块的表与改前一样，到 `finish` 才 create
+    writer: Option<std::io::BufWriter<File>>,
+    /// 已经写进文件的字节数（自己累计 ⇒ 不必每块 `stream_position()` 把缓冲冲一次）
+    written: u64,
+    /// 每块尾键的克隆（**一块一次**，不是每条一次）：footer 的 `max_key` 与有序断言都从它拿
+    tail_key: Option<Vec<u8>>,
+    count: usize,
+    /// `pending` 的字节账，**增量维护**（M30）。
     ///
     /// 为什么必须是计数器而不是现算：`merge_to_ssts` 每交出一行就问一次
     /// `estimated_bytes() >= target_bytes`，而旧实现是 `entries.iter().map(...).sum()` ——
@@ -1489,8 +1511,11 @@ pub struct SstBuilder {
     /// 每输入行摊到 ≈30 µs，正好是"一张表 ~19 000 行、每行重求和半表"的常数量级。
     /// 这条与 M19（`flush` 判定每插一行数一遍 memtable）是同一个病的第二次出现，
     /// 所以口径那句 (`k.len() + se.estimate_bytes() + 8`) 一字不动地搬进增量里，
-    /// 并留 `estimated_bytes_slow` 当对拍对照 + 一把"为判定走过多少条目"的尺子。
+    /// 并留 `sum_entries_bytes` 当对拍对照 + 一把"为判定走过多少条目"的尺子。
     est_bytes: usize,
+    /// `add` 里没有地方返回 IO 错误（`pub fn add(&mut self, …)` 四处调用方在用，改签名是破坏性的）
+    /// ⇒ 第一个错误存下来，`finish()` 如实抛出。**不吞错，也不改公开签名。**
+    io_err: Option<std::io::Error>,
 }
 
 // 测试专用尺子：一次"要不要切文件"的判定**走过了多少个条目**。
@@ -1525,6 +1550,26 @@ pub(crate) fn reset_builder_held_max() {
     BUILDER_HELD_MAX.with(|c| c.set(0));
 }
 
+// 测试专用尺子（M42 剩下的那一小截）：布隆哈希表最长有多少条。
+//
+// 为什么单独一把：块是"攒满就落盘"了，但布隆的 `m` 要等总条数 ⇒ 每条还留 8 B 哈希。
+// 这一份是 **O(文件)** 的残留（18 333 条 = 143 KB，而不是改前那一整张表的 MB 级），
+// 把它和"未落盘条目数"分开钉，是为了下次谁再动这块时能一眼看见"还剩多少、为什么留"。
+#[cfg(test)]
+thread_local! {
+    static BUILDER_HASHED_MAX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn builder_hashed_max() -> u64 {
+    BUILDER_HASHED_MAX.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_builder_hashed_max() {
+    BUILDER_HASHED_MAX.with(|c| c.set(0));
+}
+
 /// `entries` 的字节数（旧算法，留着当对拍与尺子；生产路径一步都不该走它）
 #[cfg(test)]
 fn sum_entries_bytes(entries: &[(Vec<u8>, StoredEntry)]) -> usize {
@@ -1557,28 +1602,97 @@ impl SstBuilder {
             block_entries: block_entries.max(1),
             enable_bloom,
             bloom_bits_per_key: 10,
-            entries: Vec::new(),
+            pending: Vec::with_capacity(block_entries.max(1)),
+            hashes: Vec::new(),
+            index: Vec::new(),
+            writer: None,
+            written: 0,
+            tail_key: None,
+            count: 0,
             est_bytes: 0,
+            io_err: None,
         }
     }
 
     pub fn add(&mut self, key: Vec<u8>, se: StoredEntry) {
-        if let Some((last_k, _)) = self.entries.last() {
-            debug_assert!(
-                last_k.as_slice() <= key.as_slice(),
-                "SST keys must be non-decreasing"
-            );
-        }
+        // 有序断言：上一键可能在还没落盘的那半块里，也可能已经是上一块的尾键
+        debug_assert!(
+            match self.pending.last() {
+                Some((k, _)) => k.as_slice() <= key.as_slice(),
+                None => self.tail_key.as_deref().is_none_or(|k| k <= key.as_slice()),
+            },
+            "SST keys must be non-decreasing"
+        );
         // 口径与 `sum_entries_bytes` 里那句一字不差（对拍守卫钉着这两处）
         self.est_bytes += key.len() + se.estimate_bytes() + 8;
-        self.entries.push((key, se));
+        self.hashes.push(Bloom::hash_pair(&key));
+        self.count += 1;
+        self.pending.push((key, se));
         #[cfg(test)]
         BUILDER_HELD_MAX.with(|c| {
-            let n = self.entries.len() as u64;
+            let n = self.pending.len() as u64;
             if n > c.get() {
                 c.set(n);
             }
         });
+        #[cfg(test)]
+        BUILDER_HASHED_MAX.with(|c| {
+            let n = self.hashes.len() as u64;
+            if n > c.get() {
+                c.set(n);
+            }
+        });
+        if self.pending.len() >= self.block_entries {
+            if let Err(e) = self.emit_block() {
+                // 只留第一个错误：后面再失败是同一件事的重复，而 `finish` 必须如实抛出那一个
+                if self.io_err.is_none() {
+                    self.io_err = Some(e);
+                }
+            }
+        }
+    }
+
+    /// 把攒满的一块编码并写盘，同时追加索引与尾键。
+    ///
+    /// ⚠️ 块的**分组方式与偏移算法与改前逐字一致**（改前是 `finish` 里 `while i < len` 按
+    /// `block_entries` 切片；这里是攒满即写）⇒ 同一个文件字节相同，由
+    /// `test_sst_builder_byteprint_is_stable` 钉住。写失败时**不**清 `pending`（数据还在手里，
+    /// 错误由 `add` 存下、`finish` 抛出）。
+    fn emit_block(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let block_raw = encode_block(&self.pending, true);
+        self.ensure_writer()?;
+        let offset = self.written;
+        // `written` 自己累计 ⇒ 不必每块 `stream_position()` 把 1 MiB 缓冲冲一次
+        if let Some(f) = self.writer.as_mut() {
+            f.write_all(&block_raw)?;
+        }
+        self.written += block_raw.len() as u64;
+        let first_key = self.pending[0].0.clone();
+        self.tail_key = Some(self.pending[self.pending.len() - 1].0.clone());
+        self.index.push(IndexEntry {
+            first_key,
+            offset,
+            len: block_raw.len() as u32,
+        });
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// 建文件（一次）。路径仍是 `<path>.sst.tmp` → `finish` 末尾 rename，与改前同一套落盘顺序。
+    fn ensure_writer(&mut self) -> std::io::Result<()> {
+        if self.writer.is_some() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = self.path.with_extension("sst.tmp");
+        let f = File::create(tmp)?;
+        self.writer = Some(std::io::BufWriter::with_capacity(1024 * 1024, f));
+        Ok(())
     }
 
     pub fn add_put(&mut self, key: Vec<u8>, seq: u64, value: Option<Vec<u8>>) {
@@ -1586,11 +1700,11 @@ impl SstBuilder {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.count == 0
     }
 
     /// O(1)：读增量账。**不许**改回 `entries.iter().sum()` —— 这里每被调一次都要走一遍整表的话，
@@ -1599,90 +1713,87 @@ impl SstBuilder {
         self.est_bytes
     }
 
-    /// 慢口径，只给守卫当对拍与尺子用（见 `test_builder_estimated_bytes_matches_slow_scan`）
-    #[cfg(test)]
-    pub(crate) fn estimated_bytes_slow(&self) -> usize {
-        sum_entries_bytes(&self.entries)
-    }
-
     pub fn finish(self) -> std::io::Result<SstFile> {
         self.finish_with_sync(true)
     }
 
     /// `sync=false`：不 fsync（bulk 导入用，结束时统一落盘）
-    pub fn finish_with_sync(self, sync: bool) -> std::io::Result<SstFile> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+    pub fn finish_with_sync(mut self, sync: bool) -> std::io::Result<SstFile> {
+        // 最后那半块
+        if !self.pending.is_empty() {
+            self.emit_block()?;
         }
-        let tmp = self.path.with_extension("sst.tmp");
-        {
-            let f = File::create(&tmp)?;
-            let mut f = std::io::BufWriter::with_capacity(1024 * 1024, f);
-            let mut index = Vec::new();
-            let mut bloom = if self.enable_bloom {
-                Bloom::new(self.entries.len().max(1), self.bloom_bits_per_key)
-            } else {
-                Bloom::empty()
-            };
-            let mut i = 0;
-            while i < self.entries.len() {
-                let end = (i + self.block_entries).min(self.entries.len());
-                let chunk = &self.entries[i..end];
-                let first_key = chunk[0].0.clone();
-                for (k, _) in chunk {
-                    bloom.insert(k);
-                }
-                let block_raw = encode_block(chunk, true);
-                let offset = f.stream_position()?;
-                f.write_all(&block_raw)?;
-                index.push(IndexEntry {
-                    first_key,
-                    offset,
-                    len: block_raw.len() as u32,
-                });
-                i = end;
-            }
-            let index_blob = encode_index(&index);
-            let index_off = f.stream_position()?;
-            f.write_all(&index_blob)?;
-            let bloom_blob = if self.enable_bloom {
-                bloom.encode()
-            } else {
-                Vec::new()
-            };
-            let bloom_off = f.stream_position()?;
-            if !bloom_blob.is_empty() {
-                f.write_all(&bloom_blob)?;
-            }
-            let (min_key, max_key) = min_max_keys_stored(&self.entries);
-            let mut meta = Vec::new();
-            meta.extend_from_slice(&index_off.to_le_bytes());
-            meta.extend_from_slice(&(index_blob.len() as u32).to_le_bytes());
-            meta.extend_from_slice(&bloom_off.to_le_bytes());
-            meta.extend_from_slice(&(bloom_blob.len() as u32).to_le_bytes());
-            meta.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
-            meta.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
-            meta.extend_from_slice(&min_key);
-            meta.extend_from_slice(&(max_key.len() as u32).to_le_bytes());
-            meta.extend_from_slice(&max_key);
-            meta.push(1u8); // has_seq flag
-            meta.extend_from_slice(SST_MAGIC_V2);
-            let fc = crc32(&meta);
-            let mut footer = meta;
-            footer.extend_from_slice(&fc.to_le_bytes());
-            let footer_len = footer.len() as u32;
-            f.write_all(&footer)?;
-            f.write_all(&footer_len.to_le_bytes())?;
-            f.flush()?;
-            if sync {
-                f.get_mut().sync_all()?;
-            }
+        if let Some(e) = self.io_err.take() {
+            return Err(e);
+        }
+        // 一条都没写过的空表：与改前一样，到这一步才 create
+        self.ensure_writer()?;
+        let mut f = self.writer.take().expect("ensure_writer 之后一定有");
+        let index = std::mem::take(&mut self.index);
+        let mut bloom = if self.enable_bloom {
+            Bloom::new(self.count.max(1), self.bloom_bits_per_key)
+        } else {
+            Bloom::empty()
+        };
+        for &(h1, h2) in &self.hashes {
+            bloom.set_pair(h1, h2);
+        }
+        let index_blob = encode_index(&index);
+        let index_off = self.written;
+        f.write_all(&index_blob)?;
+        self.written += index_blob.len() as u64;
+        let bloom_blob = if self.enable_bloom {
+            bloom.encode()
+        } else {
+            Vec::new()
+        };
+        let bloom_off = self.written;
+        if !bloom_blob.is_empty() {
+            f.write_all(&bloom_blob)?;
+            self.written += bloom_blob.len() as u64;
+        }
+        // min/max 与条目数从增量账拿：`index[0].first_key` 就是第一块的首键，
+        // `tail_key` 就是最后一块的尾键 ⇒ 与改前 `min_max_keys_stored(&entries)` 同一个值
+        let min_key = index.first().map(|e| e.first_key.clone()).unwrap_or_default();
+        let max_key = self.tail_key.clone().unwrap_or_default();
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&index_off.to_le_bytes());
+        meta.extend_from_slice(&(index_blob.len() as u32).to_le_bytes());
+        meta.extend_from_slice(&bloom_off.to_le_bytes());
+        meta.extend_from_slice(&(bloom_blob.len() as u32).to_le_bytes());
+        meta.extend_from_slice(&(self.count as u64).to_le_bytes());
+        meta.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
+        meta.extend_from_slice(&min_key);
+        meta.extend_from_slice(&(max_key.len() as u32).to_le_bytes());
+        meta.extend_from_slice(&max_key);
+        meta.push(1u8); // has_seq flag
+        meta.extend_from_slice(SST_MAGIC_V2);
+        let fc = crc32(&meta);
+        let mut footer = meta;
+        footer.extend_from_slice(&fc.to_le_bytes());
+        let footer_len = footer.len() as u32;
+        f.write_all(&footer)?;
+        f.write_all(&footer_len.to_le_bytes())?;
+        f.flush()?;
+        if sync {
+            f.get_mut().sync_all()?;
         }
         let _ = std::fs::remove_file(&self.path);
-        std::fs::rename(&tmp, &self.path)?;
+        std::fs::rename(self.path.with_extension("sst.tmp"), &self.path)?;
         SstFile::open(self.id, &self.path)
     }
 }
+
+/// 没走到 `finish` 的 builder（`merge_to_ssts` 中途 IO 失败，或调用方提前把它丢了）现在会留下
+/// 一个半截的 `<id>.sst.tmp` —— 改前是"什么都没写，所以什么都不留"。目录扫描不认这个扩展名、
+/// 加载以 MANIFEST 为准，所以它不影响正确性，但**会一直占盘**：长跑进程里这类垃圾是要攒的。
+/// `finish` 成功之后 rename 已经把那个名字移走 ⇒ 这里是一次失败的 `remove_file`，被 `let _ =` 吃掉。
+impl Drop for SstBuilder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.path.with_extension("sst.tmp"));
+    }
+}
+
 
 // ─── Streaming merge ─────────────────────────────────────────────────────────
 
@@ -1968,23 +2079,35 @@ mod tests {
     fn test_builder_estimated_bytes_matches_slow_scan() {
         let mut b = SstBuilder::with_options(1, tmp("est_parity"), 64, false);
         assert_eq!(b.estimated_bytes(), 0, "空表两边都该是 0");
-        for i in 0..500usize {
-            b.add(
-                format!("k{i:05}").into_bytes(),
-                StoredEntry::put(i as u64, Some(vec![b'v'; i % 37])),
-            );
+        // M42 之后 builder 不再握着整张表（攒满一块就落盘）⇒ 慢口径改在**调用方自己那份输入**上算。
+        // 对拍的性质一点没变：同一个口径、同一批条目，比的还是"增量账 vs 逐条慢算"。
+        let fed: Vec<(Vec<u8>, StoredEntry)> = (0..500usize)
+            .map(|i| {
+                (
+                    format!("k{i:05}").into_bytes(),
+                    StoredEntry::put(i as u64, Some(vec![b'v'; i % 37])),
+                )
+            })
+            .collect();
+        for (k, se) in fed.iter().cloned() {
+            b.add(k, se);
         }
         assert_eq!(
             b.estimated_bytes(),
-            b.estimated_bytes_slow(),
+            sum_entries_bytes(&fed),
             "增量账与慢口径不一致 ⇒ 切文件的时机变了"
         );
         // 空 value 与墓碑也得同口径（那句 `+8` 是行头，不是常数 8）
+        let tomb: Vec<(Vec<u8>, StoredEntry)> = vec![
+            (b"a".to_vec(), StoredEntry::put(1, None)),
+            (b"b".to_vec(), StoredEntry::drop_at(2)),
+            (b"cccc".to_vec(), StoredEntry::put(3, Some(b"xyz".to_vec()))),
+        ];
         let mut t = SstBuilder::with_options(2, tmp("est_tomb"), 64, false);
-        t.add(b"a".to_vec(), StoredEntry::put(1, None));
-        t.add(b"b".to_vec(), StoredEntry::drop_at(2));
-        t.add(b"cccc".to_vec(), StoredEntry::put(3, Some(b"xyz".to_vec())));
-        assert_eq!(t.estimated_bytes(), t.estimated_bytes_slow());
+        for (k, se) in tomb.iter().cloned() {
+            t.add(k, se);
+        }
+        assert_eq!(t.estimated_bytes(), sum_entries_bytes(&tomb));
     }
 
     /// "要不要切文件"这个判定**不许走整表**（M30）。
@@ -2002,11 +2125,15 @@ mod tests {
         const N: usize = 4000;
         let mut b = SstBuilder::with_options(1, tmp("est_hot"), 64, false);
         let s0 = builder_size_walks();
+        // M42：builder 不再握着整张表 ⇒ 慢口径改在调用方自己那份输入上算（对拍性质不变）
+        let mut fed: Vec<(Vec<u8>, StoredEntry)> = Vec::with_capacity(N);
         for i in 0..N {
-            b.add(
+            let e: (Vec<u8>, StoredEntry) = (
                 format!("k{i:05}").into_bytes(),
                 StoredEntry::put(i as u64, Some(vec![b'x'; 40])),
             );
+            b.add(e.0.clone(), e.1.clone());
+            fed.push(e);
             // 照 `merge_to_ssts` 的形状每行问一次"够不够切一个文件"
             if b.estimated_bytes() >= usize::MAX {
                 panic!("哨兵条件不该命中：这条用例只关心判定走过多少条目");
@@ -2020,9 +2147,9 @@ mod tests {
             (N * (N - 1) / 2) as u64
         );
         // 对照：主动慢算一次，探针必须数得到 —— 注意**单位**：尺子数的是"走过的条目数"，
-        // 而 `estimated_bytes_slow` 返回的是字节数，两者不能直接比。
+        // 而 `sum_entries_bytes` 返回的是字节数，两者不能直接比。
         let w1 = builder_size_walks();
-        let slow_bytes = b.estimated_bytes_slow();
+        let slow_bytes = sum_entries_bytes(&fed);
         let control_steps = builder_size_walks() - w1;
         assert!(
             control_steps >= N as u64,
@@ -2032,6 +2159,76 @@ mod tests {
             slow_bytes > 0,
             "慢口径返回 0 ⇒ 这条对照本身没建立，上面的 0 断言不算数"
         );
+        assert_eq!(
+            b.estimated_bytes(),
+            slow_bytes,
+            "增量账与慢口径不一致 ⇒ 上面那条 0 的判据也算不上数"
+        );
+        assert_eq!(b.len(), N, "`len()` 不再是「加了多少条」⇒ M42 的计数账被改动了");
+    }
+
+    /// M42：builder 必须**攒满一块就落盘**，不许在 `finish()` 之前握住整张表。
+    ///
+    /// 判据（单位=条）：灌 N 条、块宽 B ⇒ "同时在手的未落盘条目"最多 **B** 条
+    /// （`builder_held_max() ≤ B`）。旧形状这里读到的就是 **N**（`compaction_cost_split` 在
+    /// 600k 档读到单文件 18 333 条 ≈ 4.9 MB，占那一段峰值 6.3 MB 的 78% —— 就是要拆的东西）。
+    ///
+    /// 另钉一条"还剩多少、为什么留"：布隆的位图宽度 `m = 条数 × bits_per_key` 要等总条数知道
+    /// 才能定 ⇒ 每条还留 8 B 哈希（`builder_hashed_max()` 必须正好 = N）。这一小截是**故意**留的，
+    /// 写死在这里是为了让下次动它的人看见自己动的是什么（要清掉它得让调用方预估条数，
+    /// 那是另一个取舍：布隆的 m 一改，写出去的位图与现在就不是同一份口径了）。
+    ///
+    /// 语义一起钉：文件读回来逐条一致、footer 里的 min/max 是第一把与最后一把键。
+    /// （**格式逐字节不变**由 `test_sst_builder_byteprint_is_stable` 那条 golden 钉着。）
+    ///
+    /// 变异验证：把 `add` 末尾那句"攒满就 `emit_block`"去掉（回到攒到 finish 才写）⇒ 红在
+    /// "单块握住 4000 条未落盘条目（块宽 64）"。
+    #[test]
+    fn test_builder_emits_blocks_incrementally() {
+        const N: usize = 4000;
+        const BLOCK: usize = 64;
+        let path = tmp("incr_emit");
+        reset_builder_held_max();
+        reset_builder_hashed_max();
+        {
+            let mut b = SstBuilder::with_options(3, &path, BLOCK, true);
+            for i in 0..N {
+                b.add(
+                    format!("k{i:06}").into_bytes(),
+                    StoredEntry::put(i as u64, Some(vec![b'v'; 20])),
+                );
+            }
+            assert_eq!(b.len(), N, "`len()` 该是加进去的条数");
+            let sst = b.finish().unwrap();
+            let back = sst.iter_entries();
+            assert_eq!(back.len(), N, "落盘的条目数不对 ⇒ 分块写丢行了");
+            assert_eq!(back.first().unwrap().0, b"k000000".to_vec());
+            assert_eq!(
+                back.last().unwrap().0,
+                format!("k{:06}", N - 1).into_bytes()
+            );
+            assert_eq!(sst.min_key, b"k000000".to_vec(), "footer 的 min_key 不对");
+            assert_eq!(
+                sst.max_key,
+                format!("k{:06}", N - 1).into_bytes(),
+                "footer 的 max_key 不对"
+            );
+        }
+        let held = builder_held_max();
+        let hashed = builder_hashed_max();
+        eprintln!(
+            "[incr emit] N={N} 块宽={BLOCK} ⇒ 未落盘条目最多 {held} 条、布隆哈希最多 {hashed} 条"
+        );
+        assert!(
+            held <= BLOCK as u64,
+            "单块握住 {held} 条未落盘条目（块宽 {BLOCK}）⇒ 又变回攒到 finish 才写"
+        );
+        assert_eq!(
+            hashed,
+            N as u64,
+            "布隆哈希表不是每条一份 ⇒ 位图口径动了（那是格式变更，另说）"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 真调用点上这条账也必须是 0（M30）：上面那条量的是形状，这条量的是 `merge_to_ssts` 本身。
