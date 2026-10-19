@@ -495,6 +495,21 @@
     第一遍读数时我差点把"lsm 灌行 30.5、点读 11.6"当成自己引入的回归写进文档 —— 安静复跑三轮
     是 20.6~23.5 与 **6.2~6.9**（记录 9.6），而且**刚编译完那一轮**（编译器还没退出）量到的就是
     那个 11.6。所以：跨构建的 µs 列一律不作因果凭据，只作历史快照；凭据是同构建 A/B 的计数。
+- **给 lsm 的 `vacuum()` 也装分段标尺（M41 第一步，先量）**：M37b 的假设"剩下 45.5 MB 的嫌疑在
+  `kv.flush()`"**被打回** —— 600k 键 × 2 版那档量出来 ① 走查+删除 **158.6 MB**、② `flush()` 18.6 MB、
+  ③ xmin 过滤 + blob GC 0（本仓库第 5 次"最合理的那件事不是元凶"）。
+  - ⚠️ 顺带纠正一处口径：45.5 MB 是大库台架那一档，而那个形状 636 425 行里只有 **35 424 行可删**；
+    事故形状（60 万行全可删）下 lsm 一次 `vacuum()` 的瞬时是 **174.5 MB**。
+  - **同构建 A/B 不动代码、只转旋钮**（`LSM_MEM_ENTRIES` → `mem_threshold_entries`）：4 096 ⇒ ① 7.0 MB、
+    32 768 ⇒ 20.3 MB、256 000（默认）⇒ 155.7 MB ⇒ ① ≈ 4.5 MB 地板 + **~0.6 KB × flush 前 memtable 的条数**。
+    元凶是**删除落进 memtable 而它要攒到 25 万条才 flush**，不是走查的形状。
+  - 根因（策略）：`mem_bytes` 只数载荷（一条墓碑 17 B）⇒ 60 万条 = 10.2 MB，`mem_threshold_bytes: 32 MB`
+    永不触发；条数阈值 256k 在堆上实际是 **~155 MB** ⇒ "memtable 32 MB"在墓碑形状上低估真实占用
+    **~35 倍**（BTreeMap 节点、内层 map 的盒子、键的 `Vec` 头都不在账上）。同一个根挂着 lsm **灌行 +106.8 MB**。
+  - 根因（形状）：`flush_mem` 的 `mem_to_sorted_entries` 把整张 memtable 连键带值克隆进 `Vec` 再
+    `sort_by` —— 而 `MemMap = BTreeMap<键, BTreeMap<seq, 值>>` 两级本来就升序 ⇒ 那个序是白拿的。
+  - 后续两刀：M41a flush 改流式、M41b 触发判定改读真内存。标尺 `stage_base`/`stage_mark`/`stage_peaks`
+    从 bitcask 提到 `crate::mem_probe`（两家一把尺子，门控照旧）。耗时列（7.23/9.50/7.00 s）在本机是噪声。
 - **bitcask `merge()` 的走查也改按块：④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB（M40）**：
   M37 的分段标尺把 ④ 指到 `merge()` 开头那一次 `.collect()` —— 整个 KeyDir 被抄成
   `Vec<(key.clone(), loc.clone())>` 快照（为什么要快照：`read_live` 要 `&mut self`，不能一边按

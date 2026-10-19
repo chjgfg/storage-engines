@@ -561,6 +561,12 @@ impl MVCC {
         let xmin = self.next_version.load(Ordering::SeqCst);
 
         let mut kv = self.kv.lock().unwrap();
+        #[cfg(test)]
+        // M41 的分段标尺（与 bitcask 共用 [`crate::mem_probe`] 那一把）：①走查+删除、
+        // ②`kv.flush()`（memtable → SST，顺带压实）、③`set_mvcc_xmin_filter` + blob GC。
+        // ⚠️ 带门控（`VACUUM_STAGE_SPLIT`），不设时纯读高水位、不压 —— 常开会把外层台架
+        // 对 `vacuum()` 的读数锯短（bitcask 那边实测 171.4 → 47.2 MB）。
+        let mut vac_base = crate::mem_probe::stage_base();
 
         // 分组走 M3a 为轻量视图：判「留哪一版」只需要版本号 + 是不是墓碑。
         // 旧实现用 `kv.iter()`，而它会先把**每个源整个 collect() 进内存（连 value）**
@@ -667,6 +673,10 @@ impl MVCC {
             }
         }
         let next_cursor = if budget_cut { cur_raw } else { None };
+        #[cfg(test)]
+        {
+            vac_base = crate::mem_probe::stage_mark(0, vac_base);
+        }
 
         // 有界轮次只把删除留在 memtable 里，交给正常的 memtable flush 阈值收口：
         // 每片都 flush 会在 L0 造出一堆只装墓碑的小 SST，压实代价比省下的那点持久性贵。
@@ -674,6 +684,10 @@ impl MVCC {
         let mut blob_rewritten = None;
         if budget_rows == u64::MAX {
             kv.flush()?;
+            #[cfg(test)]
+            {
+                vac_base = crate::mem_probe::stage_mark(1, vac_base);
+            }
             // 后续 compact 丢弃 ver < xmin 的 tombstone 版本键。
             // 只在全库轮次下发：判据用 budget 而不是游标，一把 key 的小库任何一片都读到库尾，
             // 用游标判断会让自动回收每片都改动 compact 的过滤条件。
@@ -684,6 +698,10 @@ impl MVCC {
             // 这里只剩"按集合删孤儿文件"那一半（`gc_blobs` 那个收整张清单的入口仍然在，
             // 它就是这两半的壳）。
             blob_rewritten = Some(kv.gc_blobs_referenced(&referenced)? > 0);
+            #[cfg(test)]
+            {
+                let _ = crate::mem_probe::stage_mark(2, vac_base);
+            }
         }
 
         Ok(VacuumRound {
@@ -2600,6 +2618,84 @@ mod tests {
                 );
             }
             tx.commit();
+        }
+        cleanup(&path);
+    }
+
+    /// M41 的**先量**：lsm 全库 `vacuum()` 的分段瞬时峰值。
+    ///
+    /// 为什么还要量：M37b 之后 600k 档 `vacuum()` 还剩 **+45.5 MB**，而它已经不在累加器里
+    /// （`to_delete` 与存活行清单都没了）—— 剩下的三段（①走查+删除 / ②`kv.flush()` /
+    /// ③xmin 过滤 + blob GC）里哪一段是元凶，M30/M31 两轮的教训是"最合理的那件事不是元凶"，
+    /// 所以先分段再动手。⚠️ 标尺带门控：不设 `VACUUM_STAGE_SPLIT` 时它是纯读数，不压高水位。
+    ///
+    /// `LSM_MEM_ENTRIES` 那一档是用来做**同构建 A/B**的：①段里如果装的是 memtable 攒的墓碑，
+    /// 把 memtable 的条数阈值调小，①就得跟着小（阈值不变而①不动 ⇒ 元凶不是 memtable）。
+    #[test]
+    #[ignore = "lsm vacuum 分段内存台架，手动 release 单线程跑：VACUUM_STAGE_SPLIT=1 LSM_VAC_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 lsm_vacuum_stage_split"]
+    fn lsm_vacuum_stage_split() {
+        use std::time::Instant;
+        let rows: u64 = std::env::var("LSM_VAC_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
+        let mem_entries: usize = std::env::var("LSM_MEM_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mb = |b: u64| b as f64 / 1024.0 / 1024.0;
+        let path = tmp_db("vac_stages");
+        {
+            let mem = if mem_entries == 0 {
+                LSMTreeOptions::for_mvcc().mem_threshold_entries
+            } else {
+                mem_entries
+            };
+            let opts = if mem_entries == 0 {
+                None
+            } else {
+                Some(LSMTreeOptions {
+                    mem_threshold_entries: mem_entries,
+                    ..LSMTreeOptions::for_mvcc()
+                })
+            };
+            let mvcc = MVCC::try_open_with(&path, opts).unwrap();
+            // 自动回收会在提交那一刻先裁掉一片，那这段台架量的就不是手动 vacuum 了
+            mvcc.set_vacuum_auto_slice(0);
+            for round in 0..2u64 {
+                let tx = mvcc.begin_transaction();
+                for i in 0..rows {
+                    let k = format!("k{i:06}");
+                    assert!(
+                        tx.set(k.as_bytes(), format!("round{round}").into_bytes()),
+                        "第 {i} 把键写失败"
+                    );
+                }
+                tx.commit();
+            }
+            let t = Instant::now();
+            let st = mvcc.vacuum().unwrap();
+            let d = t.elapsed();
+            let p = crate::mem_probe::stage_peaks();
+            println!(
+                "=== lsm vacuum 分段瞬时峰值 rows={rows} mem阈值={mem} 裁掉 {} 行 / 扫 {} 行，总耗时 {:.2} s ===",
+                st.versions_removed,
+                st.rows_scanned,
+                d.as_secs_f64()
+            );
+            println!(
+                "  ① 走查+删除 {:>8.1} MB ｜ ② flush(memtable→SST，顺带压实) {:>8.1} MB ｜ ③ xmin 过滤+blob GC {:>8.1} MB",
+                mb(p[0]),
+                mb(p[1]),
+                mb(p[2])
+            );
+            println!(
+                "  合计（各段自己的峰值，非同时成立）{:>8.1} MB ｜ 每扫描行摊 ①={:.0} B ②={:.0} B ③={:.0} B",
+                mb(p[0] + p[1] + p[2]),
+                p[0] as f64 / st.rows_scanned.max(1) as f64,
+                p[1] as f64 / st.rows_scanned.max(1) as f64,
+                p[2] as f64 / st.rows_scanned.max(1) as f64,
+            );
         }
         cleanup(&path);
     }

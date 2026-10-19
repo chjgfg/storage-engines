@@ -94,4 +94,43 @@ pub(crate) mod mem_probe {
         PEAK.store(l, Relaxed);
         l
     }
+
+    // ── vacuum 的**分段**瞬时峰值标尺（M37 给 bitcask 装、M41 给 lsm 装 ⇒ 一把尺子两个用户）──
+    //
+    // ⚠️ 门控：只有设了 `VACUUM_STAGE_SPLIT` 才真的动高水位。`reset_peak()` 是把水位**压低**，
+    // 常开会让大库台架外层 `timed()` 对 `vacuum()` 的读数被锯短（实测 171.4 → 47.2 MB）——
+    // 那不是改进，是尺子少了一截。默认（不设环境变量）这里完全是 no-op。
+    static STAGE_PEAKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    /// 分段标尺的**起点**：门控开着就把高水位压回当前活字节并返回基准，否则纯读 `peak()`。
+    ///
+    /// 顺手把四个槽清成 0 —— 同一进程里两个引擎先后用这把尺子（大库台架就是四家排着跑），
+    /// 不清的话上一家留下的槽会被下一家当成自己的读数。
+    pub(crate) fn stage_base() -> u64 {
+        if std::env::var("VACUUM_STAGE_SPLIT").is_err() {
+            return peak();
+        }
+        for s in &STAGE_PEAKS {
+            s.store(0, Relaxed);
+        }
+        reset_peak()
+    }
+
+    /// 记下第 `slot` 段相对 `base` 涨了多少，并把水位压回来，返回下一段的基准。
+    pub(crate) fn stage_mark(slot: usize, base: u64) -> u64 {
+        if std::env::var("VACUUM_STAGE_SPLIT").is_err() {
+            return base;
+        }
+        STAGE_PEAKS[slot].store(peak().saturating_sub(base), Relaxed);
+        reset_peak()
+    }
+
+    /// 四段的读数（字节）。没被写过的槽是 0 ⇒ ⚠️ 读到 0 先确认门控开没开。
+    pub(crate) fn stage_peaks() -> [u64; 4] {
+        let mut out = [0u64; 4];
+        for (o, s) in out.iter_mut().zip(&STAGE_PEAKS) {
+            *o = s.load(Relaxed);
+        }
+        out
+    }
 }

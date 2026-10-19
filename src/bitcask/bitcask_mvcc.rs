@@ -153,38 +153,14 @@ pub(crate) fn scan_max_calls() -> u64 {
     SCAN_MAX_CALLS.with(|c| c.get())
 }
 
-// 测试专用（M37 的先量）：一次全库 `vacuum_bounded` 里**每一段自己的**瞬时峰值（字节）。
+// 测试专用（M37 的先量）：一次全库 `vacuum_bounded` 的分段瞬时峰值标尺在 [`crate::mem_probe`]
+// 里（`stage_base` / `stage_mark` / `stage_peaks`），M41 起 lsm 也用同一把。
 //
 // 为什么要分段而不是只看整段：600k 档 `vacuum()` 用修好的量具（M38）读到 **171.4 MB**，
 // 而这段里叠着四件事 —— ①归组判定、②删除 + flush + blob sync、③blob GC（读存活行 +
 // `rewrite_in_place`）、④`kv.merge()` 重写主日志。M30/M31 两次的教训都是"最合理的那件事
-// 不是元凶"，所以先量再动手。每段之前都 `reset_peak()`：`peak` 是高水位，不压回去后面的段
-// 只会报 0（M36 就是拿这种读数当过凭据）。
-#[cfg(test)]
-thread_local! {
-    static VACUUM_STAGE_PEAKS: std::cell::RefCell<[u64; 4]> = const { std::cell::RefCell::new([0; 4]) };
-}
-
-/// 记一段的峰值并把高水位压回当前活着的字节，返回新的基准。
-///
-/// ⚠️ 只有 `VACUUM_STAGE_SPLIT=1` 时才真的动高水位：`reset_peak()` 会把进程高水位**压低**，
-/// 而无门控的版本会让大库台架外层 `timed()` 对 `vacuum()` 的读数从 171.4 MB 变成 47.2 MB ——
-/// 那不是改进，是把外层的尺子锯短了一截。默认（不设环境变量）这里完全是 no-op。
-#[cfg(test)]
-fn vac_stage_mark(slot: usize, base: u64) -> u64 {
-    if std::env::var("VACUUM_STAGE_SPLIT").is_err() {
-        let _ = slot;
-        return base;
-    }
-    let p = crate::mem_probe::peak().saturating_sub(base);
-    VACUUM_STAGE_PEAKS.with(|s| s.borrow_mut()[slot] = p);
-    crate::mem_probe::reset_peak()
-}
-
-#[cfg(test)]
-pub(crate) fn vacuum_stage_peaks() -> [u64; 4] {
-    VACUUM_STAGE_PEAKS.with(|s| *s.borrow())
-}
+// 不是元凶"，所以先量再动手。⚠️ 标尺带门控（`VACUUM_STAGE_SPLIT`），常开会把外层台架的
+// 读数锯短，见 `mem_probe` 里那段注释。
 
 /// 把 WAL 收口成「只剩一条 Checkpoint」。
 ///
@@ -552,13 +528,9 @@ impl MVCC {
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         #[cfg(test)]
-        // 门控见 `vac_stage_mark`：不设 `VACUUM_STAGE_SPLIT` 时这里绝不能压高水位，
-        // 否则外层大库台架对 `vacuum()` 的内存读数会被锯短。
-        let mut vac_base = if std::env::var("VACUUM_STAGE_SPLIT").is_ok() {
-            crate::mem_probe::reset_peak()
-        } else {
-            crate::mem_probe::peak()
-        };
+        // 分段标尺在 [`crate::mem_probe`]（M41 起 lsm 共用同一把）。⚠️ 它带门控：不设
+        // `VACUUM_STAGE_SPLIT` 时这里绝不能压高水位，否则外层大库台架对 `vacuum()` 的读数会被锯短。
+        let mut vac_base = crate::mem_probe::stage_base();
 
         // ① 分组只走 KeyDir 元数据：判「留哪一版」只需要版本号 + 是不是软墓碑，不需要 value。
         //    旧实现是两次 `kv.iter()`（每一行连 value 全部读出来），于是 vacuum 自己成了
@@ -684,13 +656,13 @@ impl MVCC {
 
         #[cfg(test)]
         {
-            vac_base = vac_stage_mark(0, vac_base);
+            vac_base = crate::mem_probe::stage_mark(0, vac_base);
         }
         kv.flush()?;
         blob.sync()?;
         #[cfg(test)]
         {
-            vac_base = vac_stage_mark(1, vac_base);
+            vac_base = crate::mem_probe::stage_mark(1, vac_base);
         }
 
         // Blob GC / 日志压缩都是**全库代价**，只在这一次调用本来就是全库扫描时才做。
@@ -734,13 +706,13 @@ impl MVCC {
         // 压缩：丢掉已硬删除的空间（同样只在全库轮次）
         #[cfg(test)]
         {
-            vac_base = vac_stage_mark(2, vac_base);
+            vac_base = crate::mem_probe::stage_mark(2, vac_base);
         }
         if full_sweep && (removed > 0 || blob_rewritten) {
             let _ = kv.merge();
             #[cfg(test)]
             {
-                let _ = vac_stage_mark(3, vac_base);
+                let _ = crate::mem_probe::stage_mark(3, vac_base);
             }
         }
 
@@ -2116,7 +2088,7 @@ mod tests {
             let t = Instant::now();
             let st = mvcc.vacuum().unwrap();
             let d = t.elapsed();
-            let p = vacuum_stage_peaks();
+            let p = crate::mem_probe::stage_peaks();
             println!(
                 "=== bitcask vacuum 分段瞬时峰值 rows={rows} 裁掉 {} 行 / 扫 {} 行，总耗时 {:.2} s ===",
                 st.versions_removed,
