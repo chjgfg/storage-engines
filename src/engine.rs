@@ -445,6 +445,11 @@ pub trait KvEngine: Send + Sync {
 
     /// 合并/压实底层文件。仅 `bitcask` 支持，其余返回
     /// [`EngineError::Unsupported`]。
+    ///
+    /// ⚠️ bitcask 这一家从 M43 起在 `merge()` 内部要**重扫新日志**来重建内存索引（为了让峰值
+    /// 只是"一份索引"而不是"两份"）。重扫失败时本方法返回 `Err`，而引擎进入隔离态：此后
+    /// 读写都会返回错，**不会**把"索引里没有"说成"键不存在"。磁盘上的数据是完整的，
+    /// 出路是重新 open。正常成功的那次 merge 期间调用方看不见这个状态（内部持锁）。
     fn merge(&self) -> Result<()> {
         Err(EngineError::Unsupported {
             engine: self.name(),

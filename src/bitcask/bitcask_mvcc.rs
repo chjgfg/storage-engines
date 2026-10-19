@@ -450,6 +450,12 @@ impl MVCC {
     }
 
     /// 压缩数据文件 + 写出 hint
+    ///
+    /// ⚠️ M43 起 `merge()` 内部有一段"索引重扫"：它先把旧的内存索引腾掉，再原地重扫新的
+    /// `data.log`。正常那一次没人看得见（这段代码全程持 `kv` 锁，并发请求只是阻塞在锁上）。
+    /// 但如果**重扫失败**，本方法返回 `Err` 而引擎进入隔离态：此后每一扇能报错的门
+    /// （`get` / `scan_page` 背后的取值 / 写路径 / `dump_hint`）都返回错，**不会再回"键不存在"**。
+    /// 磁盘上的数据是完整的，出路只有重新 `open`（那里会全量扫日志重建索引）。
     pub fn merge(&self) -> std::io::Result<()> {
         self.kv.lock().unwrap().merge()
     }
@@ -709,7 +715,12 @@ impl MVCC {
             vac_base = crate::mem_probe::stage_mark(2, vac_base);
         }
         if full_sweep && (removed > 0 || blob_rewritten) {
-            let _ = kv.merge();
+            // M43：这一句的 Err 从此**不许再吞**。B1 之后 `merge()` 失败会把引擎留在"旧索引已
+            // 腾掉、新索引还没扫完"的隔离态（此后每一扇能报错的门都报错，见 `Bitcask::usable`）；
+            // 吞掉它，`vacuum()` 回 `Ok` 就是宣称"回收完成、库还好"。
+            // 改前的形状里吞得起：那时 merge 要么全程不动 `key_dir`、要么一次性换成完整的新索引，
+            // 失败也留不下半截状态。**这一处跟着改法是必须的，不是顺手清理。**
+            kv.merge()?;
             #[cfg(test)]
             {
                 let _ = crate::mem_probe::stage_mark(3, vac_base);

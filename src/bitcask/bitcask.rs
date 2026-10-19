@@ -158,6 +158,52 @@ pub(crate) fn reset_merge_chunk() {
     MERGE_CHUNK_MAX.with(|c| c.set(0));
 }
 
+// 测试专用（M43 的尺子）：一次 `merge()` 的**重扫**往索引里折了多少行日志。
+//
+// 为什么钉这个而不是钉"同时活着几把索引"：后者要数堆上同时存在的 `KeyDir`，而 `KeyDir` 只是
+// `BTreeMap` 的别名，没有地方挂钩子（做成 newtype 就是破坏性 API 改动）。"索引由重扫得到"是
+// 同一件事的可观测面 —— 回归成"走查时一路抄出第二把索引"（M40 及之前的形状）就让这个数掉回 0。
+#[cfg(test)]
+thread_local! {
+    static MERGE_RESCAN_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// 只有 `merge()` 的重扫那一趟在数：它把计数器上弦、扫完立刻退弦。
+// 放在 `scan_log_into` 里按弦位过滤，是因为同一个函数也服务 open 时的全量/hint 扫 ——
+// 那些不该算进「这次 merge 扫了多少行」。做成 thread_local：`cargo test` 的并行用例
+// 各数各的，别人 open 时的扫描不会串到我这一格。
+#[cfg(test)]
+thread_local! {
+    static MERGE_RESCAN_ARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_merge_rescan_counter() {
+    MERGE_RESCAN_ROWS.with(|c| c.set(0));
+    MERGE_RESCAN_ARMING.with(|a| a.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_merge_rescan_counter() {
+    MERGE_RESCAN_ARMING.with(|a| a.set(false));
+}
+
+#[cfg(test)]
+pub(crate) fn merge_rescan_rows() -> u64 {
+    let n = MERGE_RESCAN_ROWS.with(|c| c.get());
+    MERGE_RESCAN_ARMING.with(|a| a.set(false));
+    n
+}
+
+#[cfg(test)]
+pub(crate) fn note_merge_rescan_row() {
+    MERGE_RESCAN_ARMING.with(|armed| {
+        if armed.get() {
+            MERGE_RESCAN_ROWS.with(|c| c.set(c.get() + 1));
+        }
+    });
+}
+
 /// 当前线程折候选时检查过的编码键数（测试探针用）
 #[cfg(test)]
 pub(crate) fn keydir_visits() -> u64 {
@@ -502,6 +548,8 @@ impl Log {
 
             match read_one {
                 Ok((key, value_pos, flag, value_len)) => {
+                    #[cfg(test)]
+                    note_merge_rescan_row();
                     apply_log_record(key_dir, file_id, key, value_pos, flag, value_len);
                     if flag >= 0 {
                         pos = value_pos + value_len as u64;
@@ -714,6 +762,20 @@ pub struct Bitcask {
     max_file_bytes: u64,
     /// 已打开的密封分片（lazy）
     sealed: std::collections::HashMap<u32, Log>,
+    /// 内存索引正处于"腾掉旧的、还没重扫完"的窗口（M43）。
+    ///
+    /// 为什么要这个状态：`merge()` 为了不把峰值抬到两份索引，必须在重扫**之前**把旧索引丢掉 ——
+    /// 而旧索引的条目指向的 `data.log`/`data.{id}.log` 此刻已经被删除或改名了。留着它，读路径
+    /// 会对每个键返回"不存在"（悄悄错值，正是这批一路在治的东西）；清掉它，读路径至少还能
+    /// **报错**。这个标志就是把"清掉"变成"明说现在不能服务"。
+    ///
+    /// ⚠️ 正常成功的那次 merge 里没人看得见它：置位和复位都在 `merge()` 内部，而门面把 `kv`
+    /// 锁在同一把 `Mutex` 里 ⇒ 并发的读请求阻塞在锁上，不会走进窗口。它只服务一种现场：
+    /// **重扫失败、`merge()` 带着 Err 返回** —— 此后引擎被隔离，除了重新 open 没有别的出路。
+    /// 只能报错的门（返回 `Result` 的那些）报错；`len()` / `iter_meta*` 这几扇不带 `Result` 的门
+    /// 只能看到"空索引"，那会让它们什么也不做（不删、不写），但会把"库是空的"当成真话 ——
+    /// 这就是 B1 的代价，写在 README M43 那一节。
+    index_rebuilding: bool,
 }
 
 impl Drop for Bitcask {
@@ -787,6 +849,7 @@ impl Bitcask {
             key_dir,
             max_file_bytes,
             sealed: std::collections::HashMap::new(),
+            index_rebuilding: false,
         })
     }
 
@@ -875,6 +938,33 @@ impl Bitcask {
         self.max_file_bytes
     }
 
+    /// 索引可用吗？—— 见 [`Bitcask::index_rebuilding`]：重扫窗口里**所有**依赖 KeyDir 的门
+    /// 一律报错，不返回"键不存在"。
+    fn usable(&self) -> Result<()> {
+        if self.index_rebuilding {
+            return Err(std::io::Error::other(
+                "bitcask: 内存索引正在重建（上一次 merge 在重扫处失败），请重新打开数据库",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 测试专用：把引擎推进"重扫窗口"那个现场 —— 与 `merge()` 里那两步**一字不差**：
+    /// 索引腾掉 + 置标志。真机上只有 merge 的重扫失败才进得去。
+    ///
+    /// 必须连索引一起腾：只置标志、索引还满着，`get` 就会读出**对的**值，这条守卫测的
+    /// 就不是那个现场了。窗口里真正的危险是"索引空了而磁盘上全都有"。
+    #[cfg(test)]
+    pub(crate) fn quarantine_index_for_test(&mut self) {
+        self.key_dir = KeyDir::new();
+        self.index_rebuilding = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_index_for_test(&mut self) {
+        self.index_rebuilding = false;
+    }
+
     /// 对应的 hint 文件路径
     pub fn hint_path(&self) -> PathBuf {
         hint_path_for(&self.base_path)
@@ -887,6 +977,11 @@ impl Bitcask {
     /// - 进程优雅退出 / 运维主动 checkpoint
     /// - bulk load `finish` 后（可由上层调用）
     pub fn dump_hint(&mut self) -> Result<()> {
+        // ⚠️ 这道守卫是**数据**守卫，不是性能守卫：hint 是内存索引的持久化副本。重扫窗口里
+        // 把"空索引"写成 hint 落盘，下次 open 就把它当真索引读回来 ⇒ 整库在磁盘上完好，却没人
+        // 知道有哪些键。open 那边的 `hint_files_exist` 兜不住这一支（空表里挑不出"指向已删分片"
+        // 的条目，而"新日志比旧日志长"的时候连长度检查都会放行）。
+        self.usable()?;
         self.active.flush_buf()?;
         let log_size = self.active.end_pos;
         let path = self.hint_path();
@@ -969,16 +1064,21 @@ impl Bitcask {
 
         // M40：**按块走 KeyDir**。这里原先是一次 `.collect()` 出整库的
         // `(key.clone(), loc.clone())` 快照 —— 600k 键 × 2 版那档分段实测 **115.0 MB**
-        // （100 B/扫描行），是 `vacuum()` 现在唯一的大头。为什么要快照：循环里 `read_live`
+        // （100 B/扫描行），是 `vacuum()` 当时唯一的大头。为什么要快照：循环里 `read_live`
         // 要 `&mut self`，不能一边借用 `key_dir` 一边读盘 ⇒ 只能先把范围抄出来。
         // 每块只抄 `MERGE_CHUNK_KEYS` 把键（借用一结束就处理这一块），那份重复的键表就从
         // O(全库) 变成 O(一块)。
-        // ⚠️ 别把这一刀说成"merge 不再吃内存"：剩下的 `new_key_dir` 本身就是 O(库) —— 那是
-        // **替换用的新索引**（活到函数结束），不是瞬时账。要连它一起省，得原地更新 `key_dir`
-        // 里的 `pos/file_id`，而那会碰"崩在文件切换点上"的语义（下面 `merge_hold` 那段）⇒ 另立一条。
+        //
+        // M43（B1）：抄完这一块之后**不再往第二把索引里记位置**。原先每个存活键都要往
+        // `new_key_dir` 插一条，那份表本身就是 O(库) 且活到函数结束 ⇒ 走查期间磁盘上真正的
+        // 峰值是"旧索引 + 新索引"两份同时在（600k 档分段 ④ 实测 **+87.9 MB**）。现在改成
+        // 抄完 + fsync + 删旧 + rename 之后**原地重扫新日志**（下面 `load_index_from`），
+        // 全程只有一份索引。
+        // ⚠️ 代价不是"多扫一遍日志"（多扫那一遍本来就省不掉，索引必须来自日志），而是
+        // **旧索引必须先腾掉**才能重扫 ⇒ 中间有一段窗口里 KeyDir 指向的文件已被删除/改名。
+        // 那段窗口用 [`Bitcask::index_rebuilding`] 明说"现在不服务"，而不是让读路径把
+        // "索引里没有"当成"键不存在"。
         let mut new_log = Log::new(merge_path)?;
-        let mut new_key_dir = KeyDir::new();
-        let new_file_id = 0u32;
         // 块间下界在键的字节域：`key ‖ 0x00` 是**严格后继方向**（`key‖0x00 > key`，且任何
         // `K > key` 都有 `K ≥ key‖0x00`）⇒ 一行不漏、一行不重。⚠️ 不能用 `‖ 0xFF×8` 那种
         // 右界写法（会把以 `key` 为前缀的更长键整把跳掉）—— 与 M37 那条 vacuum 块界同一个理由。
@@ -1011,20 +1111,11 @@ impl Bitcask {
                         len,
                     } => {
                         let value = self.read_live(file_id, pos, len)?;
-                        let (value_pos, value_len, _) =
-                            new_log.append_entry(&key, Some(&value), false)?;
-                        new_key_dir.insert(
-                            key,
-                            KeyLoc::Live {
-                                file_id: new_file_id,
-                                pos: value_pos,
-                                len: value_len,
-                            },
-                        );
+                        // 位置不进任何索引：新日志里的 offset 由后面的重扫自己扫出来
+                        let _ = new_log.append_entry(&key, Some(&value), false)?;
                     }
                     KeyLoc::SoftTombstone { .. } => {
-                        new_log.write_soft_tombstone(&key)?;
-                        new_key_dir.insert(key, KeyLoc::SoftTombstone { file_id: new_file_id });
+                        let _ = new_log.write_soft_tombstone(&key)?;
                     }
                 }
             }
@@ -1090,7 +1181,33 @@ impl Bitcask {
             buf: Vec::new(), // 同 `Log::open`：首次写入才分配
         };
         self.active_id = 0;
-        self.key_dir = new_key_dir;
+        // M43：索引不再"抄"出来，而是**重扫新日志**扫出来。三件事的顺序是死的：
+        //
+        // 1. 先删 hint —— hint 是旧索引的持久化副本，旧索引里那些 `pos` 说的是已被删掉/改名的
+        //    文件。留着它，万一就崩在下面那趟重扫中间，下次 open 会拿它当真索引（长度检查、
+        //    `hint_files_exist` 两道兜底都不是为这一支设计的，见 `dump_hint` 上那段注释）。
+        //    hint 只是缓存，删掉的代价是下次 open 多扫一遍日志。
+        // 2. 再腾掉旧索引 —— 这一步才把"两份索引同时在"变成"一份"，是这一刀的收益本身。
+        // 3. 置标志 → 原地重扫 → 成功才放标志。重扫失败就带着 Err 返回并保持隔离：
+        //    此时磁盘上的日志是完整的，只是内存里没人知道有哪些键 ⇒ 除了重新 open 没有第二条路。
+        let _ = std::fs::remove_file(self.hint_path());
+        self.key_dir = KeyDir::new();
+        self.index_rebuilding = true;
+        #[cfg(test)]
+        arm_merge_rescan_counter();
+        let rebuilt = self.active.load_index_from(&mut self.key_dir, 0, 0);
+        #[cfg(test)]
+        disarm_merge_rescan_counter();
+        if let Err(e) = rebuilt {
+            log::error!(
+                "bitcask: merge 后的索引重扫失败（{}），引擎隔离中：{}",
+                self.base_path.display(),
+                e
+            );
+            return Err(e);
+        }
+        self.index_rebuilding = false;
+
         let _ = std::fs::remove_file(&hold_path);
 
         let _ = self.dump_hint();
@@ -1100,6 +1217,7 @@ impl Bitcask {
     // ── 经典 KV API ──────────────────────────────────────────────────────────
 
     pub fn set(&mut self, key: &[u8], value: Vec<u8>) -> Result<()> {
+        self.usable()?;
         let fid = self.active_id;
         let (value_pos, value_len, _) = self.active.append_entry(key, Some(&value), false)?;
         self.key_dir.insert(
@@ -1115,6 +1233,9 @@ impl Bitcask {
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // 这一道守卫挡的是**静默的"键不存在"**：隔离期里 KeyDir 是空的，不拦就得给每个键
+        // 回 `Ok(None)` —— 门面会把它当成"这版本没有值"，往上就是数据消失。
+        self.usable()?;
         match self.key_dir.get(key).cloned() {
             Some(KeyLoc::Live {
                 file_id,
@@ -1129,6 +1250,7 @@ impl Bitcask {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.usable()?;
         self.active.write_hard_delete(key)?;
         self.key_dir.remove(key);
         self.maybe_rotate()?;
@@ -1176,6 +1298,8 @@ impl Bitcask {
 
     /// 写入版本键。`value=None` → 软 tombstone（KeyDir 保留）。
     pub fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
+        // 隔离期不许落盘：索引是空的、也不会再重扫，写进去的行没人记账 ⇒ 回 `Ok` 就是骗人
+        self.usable()?;
         let fid = self.active_id;
         match value {
             Some(v) => {
@@ -1205,6 +1329,7 @@ impl Bitcask {
         &mut self,
         items: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
     ) -> Result<()> {
+        self.usable()?;
         for (key, value) in items {
             let fid = self.active_id;
             match value {
@@ -1233,6 +1358,7 @@ impl Bitcask {
 
     /// 硬删除版本键（rollback / vacuum / WAL UNDO）
     pub fn remove(&mut self, key: &[u8]) -> Result<()> {
+        self.usable()?;
         self.active.write_hard_delete(key)?;
         self.key_dir.remove(key);
         self.maybe_rotate()?;
@@ -1241,6 +1367,8 @@ impl Bitcask {
 
     /// `None` = 键不在索引；`Some(None)` = 软 tombstone；`Some(Some(v))` = 存活
     pub fn get_entry(&mut self, key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
+        // `None` 在门面里是"这版本没这一项"，不是错误 ⇒ 隔离期必须拦，否则等于宣称全库空了
+        self.usable()?;
         match self.key_dir.get(key).cloned() {
             None => Ok(None),
             Some(KeyLoc::SoftTombstone { .. }) => Ok(Some(None)),
@@ -1261,6 +1389,7 @@ impl Bitcask {
         low: Vec<u8>,
         high: Vec<u8>,
     ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        self.usable()?;
         self.active.flush_buf()?;
         let keys: Vec<(Vec<u8>, KeyLoc)> = self
             .key_dir
@@ -1299,6 +1428,7 @@ impl Bitcask {
 
     /// 全量扫描（含软 tombstone）
     pub fn iter(&mut self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+        self.usable()?;
         self.active.flush_buf()?;
         let keys: Vec<(Vec<u8>, KeyLoc)> = self
             .key_dir
@@ -1549,6 +1679,10 @@ mod tests {
     /// 尺子为什么是"单块抄出多少把键"而不是内存：与四家 vacuum 的 `vac_pending_max` 同一条理由
     /// —— `mem_probe` 的高水位是进程级的，并行用例互相污染。
     ///
+    /// **修订（M43）**：括号里那句"新索引不是瞬时账"当时是对的，但它把剩下的账留在了
+    /// `new_key_dir` 上 —— 那份表在走查全程和旧索引**同时活着**，600k 档分段 ④ 实测 +87.9 MB。
+    /// M43 已经不再抄它（索引改成重扫新日志得到），这条判据本身不变。
+    ///
     /// 变异验证：把 `MERGE_CHUNK_KEYS` 临时抬到一整库那么大 ⇒ 单块抄出 20 000 把 > 界 16 384，红。
     #[test]
     fn test_merge_walks_key_dir_in_bounded_chunks() {
@@ -1590,6 +1724,207 @@ mod tests {
         {
             let eng = Bitcask::new(path.clone()).unwrap();
             assert_eq!(eng.len(), KEYS, "重开之后活键数不对 ⇒ 分块 merge 写坏了日志");
+        }
+        cleanup(&path);
+    }
+
+    /// merge 之后那把索引必须是**重扫新日志**扫出来的，不是走查时一路抄出来的（M43）。
+    ///
+    /// 为什么钉"重扫"这个动作、不钉"全场只有一份索引"：`KeyDir` 只是 `BTreeMap` 的别名，
+    /// 要数"堆上同时活着几把索引"就得把它包成 newtype —— 那是破坏性 API 改动。
+    /// "这次 merge 折进索引多少行"是同一件事的可观测面，而且回归成 M40 及之前那份
+    /// `new_key_dir`（边抄边记位置、根本不重扫）时它直接掉回 **0**。
+    ///
+    /// 后半段钉的是**先腾掉旧索引**这半步：旧索引里那些 `pos` 说的是已经不存在的位置。
+    /// 如果跳过 `key_dir = KeyDir::new()` 直接在旧表上重扫，被硬删过的键不会从索引里消失，
+    /// 而它的 `file_id` 恰好等于新 active 的 0 ⇒ 读它会读到**别的键的字节**。这正是
+    /// [`Bitcask::usable`] 要拦的那一类静默错值。
+    #[test]
+    fn test_merge_rebuilds_index_by_rescanning_the_log() {
+        const KEYS: usize = 20_000;
+        let path = tmp_log("merge_rescan");
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            for i in 0..KEYS {
+                let k = format!("k{i:06}");
+                eng.set(k.as_bytes(), vec![b'v'; 16]).unwrap();
+                // 第二版：让日志里有一半以上是可回收的行，merge 才有东西要重写
+                eng.set(k.as_bytes(), vec![b'w'; 24]).unwrap();
+            }
+            // 硬删掉一部分 —— 这些键 merge 之后必须彻底不在索引里
+            for i in (0..KEYS).step_by(7) {
+                eng.delete(format!("k{i:06}").as_bytes()).unwrap();
+            }
+            let live_before = eng.len();
+            arm_merge_rescan_counter();
+            eng.merge().unwrap();
+            let rows = merge_rescan_rows();
+            eprintln!(
+                "[merge rescan] 活键 {live_before} 把 ⇒ 这次 merge 重扫折进索引 {rows} 行"
+            );
+            assert!(rows > 0, "重扫记账一次都没响 ⇒ 索引不是扫出来的（又抄回第二把了？）");
+            assert_eq!(
+                rows,
+                eng.len() as u64,
+                "重扫 {rows} 行 ≠ merge 之后索引里 {live_before} 条 ⇒ 索引不来自这次重扫"
+            );
+            assert_eq!(eng.len(), live_before, "merge 之后活键数变了");
+
+            for i in (0..KEYS).step_by(7) {
+                let k = format!("k{i:06}");
+                assert_eq!(
+                    eng.get(k.as_bytes()).unwrap(),
+                    None,
+                    "{k} 在 merge 之前就被硬删，之后还读得到 ⇒ 旧索引没腾掉，读到的是错位的数据"
+                );
+            }
+            let mut checked = 0usize;
+            for i in 0..KEYS {
+                if i % 7 == 0 {
+                    continue;
+                }
+                let k = format!("k{i:06}");
+                assert_eq!(
+                    eng.get(k.as_bytes()).unwrap(),
+                    Some(vec![b'w'; 24]),
+                    "第 {i} 把存活键在重扫之后读回来的不是最新版本"
+                );
+                checked += 1;
+                if checked >= 32 {
+                    break;
+                }
+            }
+        }
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            assert_eq!(eng.len(), KEYS - KEYS.div_ceil(7), "重开之后活键数不对");
+            assert_eq!(
+                eng.get(b"k000000").unwrap(),
+                None,
+                "重开之后硬删过的键复活了 ⇒ merge 写坏了日志"
+            );
+            assert_eq!(
+                eng.get(b"k000001").unwrap(),
+                Some(vec![b'w'; 24]),
+                "重开之后存活键读不回来"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// 重扫窗口里每一扇**能报错的门**都必须报错，而不是回「键不存在」（M43）。
+    ///
+    /// 这一条买的是 B1 的那笔代价：为了不把峰值抬到两份索引，旧索引必须在重扫之前丢掉，
+    /// 而丢掉的这段时间里磁盘上明明有全库、内存里却没人知道有哪些键。让它回 `Ok(None)`
+    /// 就是宣称「这些键不存在」—— 门面会当真是（`get_entry` 的 `None` 在上层是「这版本没
+    /// 这一项」）。宁可让调用方拿到一个错。
+    ///
+    /// hint 那一支单独钉：hint 是索引的**持久化副本**，空索引写成 hint 落盘，下次 open 就把它
+    /// 当真索引读回来 —— 那是把「一次失败」变成「整库看不见」。open 侧的 `hint_files_exist`
+    /// 兜不住（空表里挑不出指向缺失分片的条目）。
+    ///
+    /// 变异验证：① 去掉 `get` 里的 `usable()?` ⇒ 第一条断言红在「回了 Some」；
+    /// ② 去掉 `insert`/`set` 那两道 ⇒ 红在「被拒的写入还是落盘了」；
+    /// ③ 去掉 `dump_hint` 那道 ⇒ 红在「隔离期把 hint 落盘了」。
+    #[test]
+    fn test_quarantined_engine_errors_instead_of_claiming_keys_missing() {
+        let path = tmp_log("quarantine");
+        let hint = hint_path_for(&path);
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            eng.set(b"a", b"1".to_vec()).unwrap();
+            eng.merge().unwrap(); // 正常路径走完：此时索引完整、可读写
+            eng.flush().unwrap();
+            let len_before = std::fs::metadata(&path).unwrap().len();
+
+            eng.quarantine_index_for_test();
+
+            // ── 读侧：不许把「索引里没有」说成「键不存在」──
+            let g = eng.get(b"a");
+            assert!(
+                g.is_err(),
+                "隔离期 get 回了「{:?}」⇒ 空索引被当成「键都不存在」",
+                g.ok()
+            );
+            let ge = eng.get_entry(b"a");
+            assert!(
+                ge.is_err(),
+                "隔离期 get_entry 回了「{:?}」⇒ 上层会把它当成「这版本没有值」",
+                ge.ok()
+            );
+            assert!(
+                eng.range_scan(b"a".to_vec(), b"z".to_vec()).is_err(),
+                "隔离期 range_scan 回了 Ok(空)"
+            );
+            assert!(eng.iter().is_err(), "隔离期 iter 回了 Ok(空)");
+
+            // ── 写侧：一条都不许落盘 ──
+            assert!(eng.set(b"b", b"2".to_vec()).is_err(), "隔离期 set 竟然成功");
+            assert!(
+                eng.insert(b"c".to_vec(), Some(b"3".to_vec())).is_err(),
+                "隔离期 insert 竟然成功"
+            );
+            assert!(
+                eng.insert_batch(vec![(b"d".to_vec(), Some(b"4".to_vec()))])
+                    .is_err(),
+                "隔离期 insert_batch 竟然成功"
+            );
+            assert!(eng.delete(b"a").is_err(), "隔离期 delete 竟然成功");
+            assert!(eng.remove(b"a").is_err(), "隔离期 remove 竟然成功");
+
+            // ── hint：不许把空索引写下去 ──
+            let _ = std::fs::remove_file(&hint);
+            assert!(eng.dump_hint().is_err(), "隔离期 dump_hint 回了 Ok");
+            assert!(!hint.exists(), "隔离期把 hint 落盘了 ⇒ 下次 open 会当真索引读回来");
+
+            eng.flush().unwrap();
+            let len_after = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(
+                len_before,
+                len_after,
+                "被拒的写入还是落盘了（差 {} 字节）",
+                len_after.saturating_sub(len_before)
+            );
+
+            // ── 拦下来的是那个**状态**，不是把对象弄坏了 ──
+            eng.release_index_for_test();
+            eng.set(b"e", b"5".to_vec()).unwrap();
+            eng.flush().unwrap();
+            assert!(
+                std::fs::metadata(&path).unwrap().len() > len_after,
+                "解除隔离之后新写入没落盘 ⇒ 守卫动到了文件"
+            );
+            assert_eq!(
+                eng.get(b"e").unwrap(),
+                Some(b"5".to_vec()),
+                "解除隔离之后同一句柄的新写入读不回来"
+            );
+            // 旧键此时在内存里确实没有了 —— 窗口里索引本来就是空的，这正是每一扇门都要
+            // 拦下来的原因（让它悄悄回 `Ok(None)` 就等于宣称「这键不存在」）。
+            assert_eq!(eng.get(b"a").unwrap(), None, "解除隔离之后旧键不该凭空回来：出路只有重新 open");
+
+            // ── 退回隔离，然后让它出作用域：Drop 会 flush + dump_hint，后者必须写不下去 ──
+            eng.quarantine_index_for_test();
+            eng.flush().unwrap();
+        }
+        // ── 重新 open 是唯一出路，而它真的救得回来 ──
+        assert!(
+            !hint.exists(),
+            "带着隔离状态 drop 之后 hint 落盘了 ⇒ 下次 open 会把空索引当真"
+        );
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            assert_eq!(
+                eng.get(b"a").unwrap(),
+                Some(b"1".to_vec()),
+                "重新 open 读不回旧键 ⇒ 隔离期把日志写坏了"
+            );
+            assert_eq!(
+                eng.get(b"e").unwrap(),
+                Some(b"5".to_vec()),
+                "重新 open 读不回隔离解除后的新写入"
+            );
+            assert_eq!(eng.len(), 2);
         }
         cleanup(&path);
     }
