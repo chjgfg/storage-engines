@@ -495,6 +495,19 @@
     第一遍读数时我差点把"lsm 灌行 30.5、点读 11.6"当成自己引入的回归写进文档 —— 安静复跑三轮
     是 20.6~23.5 与 **6.2~6.9**（记录 9.6），而且**刚编译完那一轮**（编译器还没退出）量到的就是
     那个 11.6。所以：跨构建的 µs 列一律不作因果凭据，只作历史快照；凭据是同构建 A/B 的计数。
+- **lsm 的 `flush()` 改成流式吐 memtable：① 158.6 → 119.8 MB、② 18.6 → 0.0 MB（M41a）**：
+  `flush_one_immutable` 原来走 `mem_to_sorted_entries(&imm)` —— 把整张 memtable 连键带值**克隆**进
+  一个 `Vec` 再 `sort_by((键, seq))`。而 `MemMap = BTreeMap<键, BTreeMap<seq, 值>>` 两级本来就升序
+  ⇒ 那个序是白拿的（`SstBuilder::add` 里 `debug_assert(last_k <= key)` 核的就是它），那次排序与那份
+  暂存是 flush 不要的钱。现在按值进循环、条目一条条**搬**进 builder：每搬一条 memtable 当场少一条。
+  - ⚠️ ② 报 0.0 不是量不到，是算术：条目搬进 builder 的同时 memtable 在瘦 ⇒ `live()` 净值 ≈ 0；
+    改前那 18.6 MB 正是"整张 memtable 还活着 + 它的一份克隆 + builder"。
+  - ① 剩下的 119.8 MB 是 **memtable 自己攒到条数阈值 256k** 的账（不是 flush 的形状）⇒ 归 M41b。
+  - 守卫 `test_flush_moves_memtable_entries_without_cloning_them`：尺子 = `EntryValue` 的复制次数
+    （`sst::entry_value_clones`，手写 `Clone` 就为了数这一笔），判据 = 一次 flush 期间 **0 条**，
+    另加两条防自空转（flush 真发生：`mem_entries` 归零 + SST 数量涨；首/中/尾三把键读得回来 ——
+    去掉排序后 SST 稀疏索引靠的就是两级升序）。变异：换回 `mem_to_sorted_entries + sort_by`
+    ⇒ 红在"flush 复制了 5000 条值"。308 passed。
 - **给 lsm 的 `vacuum()` 也装分段标尺（M41 第一步，先量）**：M37b 的假设"剩下 45.5 MB 的嫌疑在
   `kv.flush()`"**被打回** —— 600k 键 × 2 版那档量出来 ① 走查+删除 **158.6 MB**、② `flush()` 18.6 MB、
   ③ xmin 过滤 + blob GC 0（本仓库第 5 次"最合理的那件事不是元凶"）。

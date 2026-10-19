@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 307 个单元测试 + 4 个集成测试
+- 308 个单元测试 + 4 个集成测试
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M40**(LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -1135,6 +1135,36 @@ bitcask 提到 `crate::mem_probe` 的那一把，门控 `VACUUM_STAGE_SPLIT` 照
 ⇒ 两刀：**M41a = flush 改成流式吐 memtable**（不暂存、不排序），**M41b = memtable 的触发判定改读
 真内存**（载荷 + 条数 × 实测结构开销）。耗时那列（7.23 / 9.50 / 7.00 s）在本机是噪声，不作因果凭据。
 
+**M41a —— lsm 的 `flush()` 改成流式吐 memtable：① 158.6 → 119.8 MB，② 18.6 → 0.0 MB**
+
+`flush_one_immutable` 原来是 `for (k, se) in Self::mem_to_sorted_entries(&imm)` —— 那个函数把**整张
+memtable 连键带值克隆**进一个 `Vec`，再 `sort_by((键, seq))`。而 `MemMap` 是
+`BTreeMap<键, BTreeMap<seq, 值>>`，**两级本来就是升序** ⇒ 要的那个序是白拿的（`SstBuilder::add` 里
+那句 `debug_assert(last_k <= key)` 核的就是它）。现在按值进循环，条目一条条搬进 builder：
+
+- 那次排序与那份暂存没了；
+- 每搬走一条，memtable 那一侧当场少一条（BTreeMap 的节点随消费释放）⇒ builder 涨多少，memtable 就
+  瘦多少，flush 的瞬时占用不再是"整张 memtable + 它的两份拷贝"。
+
+实测（同一段台架、默认 memtable 阈值 256k、600k 键 × 2 版）：
+
+| | 改前 | 改后 |
+|---|---|---|
+| ① 走查 + 删除 | 158.6 / 155.7 MB | **119.8 MB** |
+| ② `kv.flush()` | 18.6 / 18.8 MB | **0.0 MB** |
+
+⚠️ **② 报 0.0 不是"量不到"，是"搬而不是拷"的算术**：最后那次 flush 仍要把 memtable 里剩下的
+~7.5 万条写进 SST，但条目是**逐条搬**进 builder 的 ⇒ memtable 瘦多少，builder 就涨多少，
+`live()` 的净值 ≈ 0（改前那一档 18.6 MB 正是"整张 memtable 还活着 + 它的一份克隆 + builder"）。
+① 剩下的 119.8 MB 也不是 flush 的账，是 **memtable 自己攒到 25 万条**的账 ⇒ 那一半归 M41b。
+
+守卫 `test_flush_moves_memtable_entries_without_cloning_them`：尺子 = `EntryValue` 的**复制次数**
+（`sst::entry_value_clones` —— 手写 `Clone` 就为了在这一处能数出来），判据 = 一次 flush 期间必须
+**0 条**，另配两条防自空转（flush 真发生：`mem_entries` 归零 + SST 数量涨；首/中/尾三把键读得回来 ——
+去掉那次排序之后 SST 稀疏索引靠的就是 `MemMap` 的两级升序）。**为什么钉复制次数不钉内存**：分配计数
+是进程级的，并行用例会互相污染（M27/M36 各栽过一次）。变异验证：把那两个 `for` 换回
+`mem_to_sorted_entries(&imm) + sort_by` ⇒ 红在"flush 复制了 **5000** 条值"。
+
 ### 本轮全量复测（三档 20k / 200k / 600k × 四引擎 × 31 项，同一份构建，2026-10-19）
 
 判据：**单价倍数 = 原始比值 ÷ 期望量级**；`memory` 引擎那一列就是本机噪声地板（1.2~1.6×）。
@@ -1796,7 +1826,7 @@ cmp snap.bin rt.bin                                                  # 一致
 ## 测试
 
 ```bash
-cargo test                    # 全部:307 单元 + 4 集成 + 5 文档测试
+cargo test                    # 全部:308 单元 + 4 集成 + 5 文档测试
 cargo test --lib engine::     # 只跑门面层(32 个,含大库基线台架;四引擎全覆盖)
 cargo test --lib cache_auto_max   # 缓存自动档"顶"这一档的三条守卫(门面路由 + bplus 覆盖率 + lsm 覆盖率)
                               # 判据全是计数:bplus 那条量在**磁盘层**(一轮点读落盘几次),

@@ -21,10 +21,40 @@ const SST_MAGIC_V1: &[u8; 8] = b"LSMSST01";
 const SST_MAGIC_V2: &[u8; 8] = b"LSMSST02";
 
 /// 逻辑值类型
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum EntryValue {
     Put(Option<Vec<u8>>),
     Drop,
+}
+
+// M41a 的尺子：值被**复制**（而不是从 memtable 搬进 SST builder）了几次。
+//
+// 为什么钉这个而不是钉内存：memtable → SST 那条路本来一条都不用复制（`MemMap` 里的条目按值
+// 进循环、直接搬走），旧形状是"整张 memtable 连键带值克隆进一个 `Vec` 再 sort"。复制次数是
+// 从真实程序状态数出来的 ⇒ 退回旧形状它当场涨，不像进程级内存那样会被并行用例污染（M27/M36
+// 各栽过一次）。
+#[cfg(test)]
+thread_local! {
+    static ENTRY_VALUE_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程复制过的 `EntryValue` 条数（测试探针用）
+#[cfg(test)]
+pub(crate) fn entry_value_clones() -> u64 {
+    ENTRY_VALUE_CLONES.with(|c| c.get())
+}
+
+// `Clone` 手写而不是 `#[derive]`，就为了在这一个地方把上面那把尺子记上 ——
+// 派生实现照样会逐字段复制，只是数不出来。
+impl Clone for EntryValue {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        ENTRY_VALUE_CLONES.with(|c| c.set(c.get() + 1));
+        match self {
+            EntryValue::Put(v) => EntryValue::Put(v.clone()),
+            EntryValue::Drop => EntryValue::Drop,
+        }
+    }
 }
 
 impl EntryValue {

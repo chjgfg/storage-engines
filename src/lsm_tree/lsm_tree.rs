@@ -976,23 +976,6 @@ impl LSMTree {
         out
     }
 
-    fn mem_to_sorted_entries(map: &MemMap) -> Vec<(Vec<u8>, StoredEntry)> {
-        let mut out = Vec::new();
-        for (k, vers) in map {
-            for (seq, v) in vers {
-                out.push((
-                    k.clone(),
-                    StoredEntry {
-                        seq: *seq,
-                        value: v.clone(),
-                    },
-                ));
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.seq.cmp(&b.1.seq)));
-        out
-    }
-
     fn mem_view_at(map: &MemMap, snap_seq: u64) -> Vec<(Vec<u8>, StoredEntry)> {
         let mut out = Vec::new();
         for (k, vers) in map {
@@ -1561,8 +1544,17 @@ impl LSMTree {
             self.opts.sst_block_entries,
             self.opts.enable_bloom,
         );
-        for (k, se) in Self::mem_to_sorted_entries(&imm) {
-            builder.add(k, se);
+        // M41a：**流式**吐 memtable。旧形状是 `mem_to_sorted_entries(&imm)` —— 把整张表
+        // 连键带值**克隆**进一个 `Vec` 再 `sort_by((键, seq))`。那个排序是白付的：`MemMap` 是
+        // `BTreeMap<键, BTreeMap<seq, 值>>`，两级本来就升序 ⇒ 按值进循环出来的顺序与它排完
+        // 一模一样（`SstBuilder::add` 里那句 `debug_assert(last_k <= key)` 核的就是这个序）。
+        // 按值进循环还有第二层意义：每搬走一条，memtable 那一侧当场少一条（BTreeMap 的节点随
+        // 消费释放）⇒ flush 的瞬时占用是"一块条目 + builder"，不是"整张 memtable + 它的两份拷贝"。
+        for (k, vers) in imm {
+            // 编码键本身就带版本 ⇒ 一把键下有多条 seq 的情形极少，那种时候才多克隆一次键
+            for (seq, ev) in vers {
+                builder.add(k.clone(), StoredEntry { seq, value: ev });
+            }
         }
         let mut sst = builder.finish()?;
         sst.set_cache_ns(Self::dir_cache_ns(&self.dir));
@@ -2332,6 +2324,56 @@ mod tests {
         let p = crate::common::tmp_test_path("lsm", tag, "");
         let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    /// M41a：`flush()` 必须把 memtable **搬**进 SST，一条都不许复制值。
+    ///
+    /// 旧形状 `mem_to_sorted_entries(&imm)` 先把整张 memtable 连键带值克隆进一个 `Vec` 再
+    /// `sort_by` —— 那份暂存在 600k 档就是 flush 段实测斜率里的 ~0.6 KB/条。尺子 =
+    /// `EntryValue` 的复制次数（`sst::entry_value_clones`，手写 `Clone` 就为记这一笔）：
+    /// 一次 flush 之后必须是 **0**。
+    ///
+    /// ⚠️ 两条防自空转的断言：flush 真发生了（`mem_entries` 归零、SST 至少多出一个），
+    /// 以及数据还读得回来。
+    ///
+    /// 变异验证：把 `flush_one_immutable` 里那两个 `for` 换回
+    /// `for (k, se) in Self::mem_to_sorted_entries(&imm)` ⇒ 尺子变成 memtable 的条数，红。
+    #[test]
+    fn test_flush_moves_memtable_entries_without_cloning_them() {
+        use crate::lsm_tree::sst::entry_value_clones;
+        let dir = tmp_dir("flush_no_clone");
+        {
+            let mut db = LSMTree::open(&dir).unwrap();
+            // 载荷远不到 4 MB / 64k 条这两档 ⇒ 这 5000 条一直躺在 memtable 里，
+            // 下面那次 flush 才是"搬多少条"的那一次
+            for i in 0..5000usize {
+                db.put(format!("k{i:05}").into_bytes(), b"v".to_vec());
+            }
+            assert_eq!(db.stats().mem_entries, 5000, "写路自己先 flush 了 ⇒ 这次量的不是 flush");
+            let sst0 = db.stats().total_sst;
+            let base = entry_value_clones();
+            db.flush().unwrap();
+            let copied = entry_value_clones() - base;
+            assert_eq!(
+                db.stats().mem_entries,
+                0,
+                "flush 没把 memtable 清空 ⇒ 形状断言不成立"
+            );
+            assert!(
+                db.stats().total_sst > sst0,
+                "flush 没产出 SST ⇒ 这条判据量不到任何东西（空转）"
+            );
+            assert_eq!(
+                copied, 0,
+                "flush 复制了 {copied} 条值 ⇒ 又变回'整张 memtable 克隆进 Vec 再 sort'那个形状"
+            );
+            // 语义还得对：搬过去的行读得回来。**首/中/尾三把**都读 —— 那次 `sort_by` 没了之后，
+            // SST 稀疏索引靠的就是 `MemMap` 两级升序这件事，读错一段当场红
+            for k in [b"k00000".as_slice(), b"k02500".as_slice(), b"k04999".as_slice()] {
+                assert_eq!(db.get(k), Some(b"v".to_vec()), "搬进 SST 之后读不回来");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// M19 守卫①：增量计数器 `mem_entries` 的**口径**必须与慢算法一字不差。
