@@ -297,7 +297,10 @@ impl DiskFile {
         }
     }
 
-    /// 裸句柄（只给 `FileLock` 在 unix 上取 `as_raw_fd` 解锁用）。
+    /// 裸句柄（只给 `FileLock` 在 unix 上取 `as_raw_fd` 解锁用；Windows 关句柄即释放，
+    /// 所以这个方法在 Windows 构建里没人调 —— 用 `cfg(unix)` 而不是 `allow(dead_code)`，
+    /// 免得一个"看起来在用"的方法挂在公共门上）。
+    #[cfg(unix)]
     pub(crate) fn inner(&self) -> &File {
         &self.file
     }
