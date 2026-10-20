@@ -2098,6 +2098,9 @@ impl LSMTree {
                 writeln!(f)?;
             }
             if !self.bulk_mode {
+                // M53 记账：一次 open / 一次收口都要付的那一下 fsync
+                #[cfg(test)]
+                crate::common::disk::note_fsync(crate::common::disk::SITE_LSM_MANIFEST);
                 f.sync_all()?;
             } else {
                 f.flush()?;

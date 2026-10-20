@@ -6,6 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
+// M53 的站点账：blob 侧文件的 fsync 不认引擎，四家共用同一格
+use crate::common::disk::SITE_BLOB;
+
 pub use crate::common::disk::{crc32, DiskFile, FileLock};
 
 
@@ -79,7 +82,7 @@ impl BlobStore {
         if len == 0 {
             file.write_all_at(0, BLOB_MAGIC)?;
             // bulk 路径不每条 sync；open 时写一次 header
-            file.sync()?;
+            file.sync_at(SITE_BLOB)?;
             Ok(Self {
                 file,
                 end_pos: BLOB_MAGIC.len() as u64,
@@ -140,7 +143,7 @@ impl BlobStore {
 
     pub fn sync(&mut self) -> std::io::Result<()> {
         self.flush_buf()?;
-        self.file.sync()
+        self.file.sync_at(SITE_BLOB)
     }
 
     /// 按 offset 读取 blob 记录
@@ -178,7 +181,7 @@ impl BlobStore {
         self.buf.clear();
         self.file.set_len(0)?;
         self.file.write_all_at(0, BLOB_MAGIC)?;
-        self.file.sync()?;
+        self.file.sync_at(SITE_BLOB)?;
         self.end_pos = BLOB_MAGIC.len() as u64;
         Ok(())
     }
@@ -202,7 +205,7 @@ impl BlobStore {
             offset += rec.len() as u64;
         }
         self.file.set_len(offset)?;
-        self.file.sync()?;
+        self.file.sync_at(SITE_BLOB)?;
         self.end_pos = offset;
         Ok(offsets)
     }

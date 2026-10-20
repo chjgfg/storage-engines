@@ -1900,6 +1900,53 @@ E 把 `seen <= skip` 写成 `seen < skip` ⇒ 红在"末页起点跳错了（k00
 重放侧只把它当"从这里往后才要重放"的分界（`rposition(Flush)`）⇒ 抹掉它不丢信息。WAL 收口那四处不一样：
 **Checkpoint 是起点的唯一来源**。这一格写在这里是为了下次别再查一遍。
 
+**M53 —— `open 空库` 那笔"常数启动税"归因（只量不改）：它几乎就是 fsync 次数本身，而四家付的次数不一样多**
+
+复测点名的第三条以前只有毫秒。这一刀先把它换成**盘型无关的账**：本机 `C:` 裸测一次 fsync ≈ 2.6 ms、
+`D:`（5400 转）≈ 85.8 ms ⇒ "12 ms 还是 35 ms"换块盘就作废，而"**一次 open 付几次 fsync、落在哪几处**"
+可以直接乘下游自己的盘价。新装两把尺子在 `common/disk`：`fsync_counts()`（14 个**站点**分格，
+`sync_at(SITE_…)` 在生产代码里记账）与 `file_opens()`；台架 `open_startup_tax_by_site` 读三种形状。
+
+12 趟重开、两种形状、四家（`OPEN_TAX_ROWS=2000`，两趟读数一字不差）：
+
+| 引擎 | 全新库 open | **重开已有库 open** | 关闭(`Drop`) | 每次 fsync 摊到 |
+|---|---|---|---|---|
+| bitcask | 6 次 / 10.2 ms | **4 次 / 5.3 ms** = `lock_pid` + `wal_header(截断里重写)` + `wal_sync(收口)` + `bitcask_log_flush` | 2 次 / 3.2 ms | 1.34 ms |
+| bplus_tree | 21 次 / 28.4 ms | **3 次 / 4.6 ms** = `lock_pid` + `wal_header(截断里重写)` + `wal_sync(收口)` | 3 次 / 2.0 ms | 1.35 / 1.53 ms |
+| lsm_tree | 4 次 / 8.5 ms | **3 次 / 4.8 ms**（同 bplus 那三格） | 0 次 / 0.28 ms | 1.60 ms |
+| memory | **0 次** / 1.7 µs | **0 次** / 1.3 µs | 0 次 | — |
+
+**结论：这一格不是"启动做了很多事"，就是"启动付了几次 fsync"。** 每一家的
+`最快 µs ÷ fsync 次数` 都落在 **1.34~1.71 ms** 这一条窄带里（memory 那三档报 0 次 = 1.3 µs，
+正好是"一次 fsync 都不付"的对照组）⇒ 文件打开、目录发现、恢复扫描这些**都不在本机噪声之上**。
+bplus 全新库那 21 次里 13 次是双写缓冲，见下面第三条 —— 不是噪声，是撕裂页保护的既有设计。
+
+三条**通用**的可修点（判据：每一次 fsync 都得答得出"它保证什么"，答不出的那一格才可修）：
+
+1. `lock_pid` —— `FileLock::try_acquire_at` 结尾 `set_len(0) + write_all("pid=…") + sync_all()`。
+   它保证的只有"排障时看得见谁占着库"：**锁本身靠句柄存活**，进程一死内核自动释放，pid 落不落盘与崩溃安全无关。
+   四家每次 open 都付这一笔（bitcask/bplus/lsm 的重开账里都有它）。
+2. **一次 WAL 收口 = 两次 fsync** —— `Wal::truncate()` 内部要重写头部、而 `write_header` 自带一次 fsync；
+   紧接着 `seal_wal_checkpoint` 的 `wal.sync()` 又付一次。同一份文件、同一趟收口，**一次就够**
+   （后那一次的 `sync_all` 已经把截断与新的 `Checkpoint` 一起冲下去了）。
+   这一对在 `open` 收尾、`Drop` 收尾、提交阈值触发的 checkpoint 三处都付。
+3. bitcask `open` 末尾无条件 `tree.flush()` —— 写缓冲为空时仍 fsync 一次（"没有脏字节可持久"）。
+   ⚠️ 这条**别照抄到 LSM/bplus**：LSM 的 flush 末尾挂着无界压实（M28 那条悬崖），bplus 的 flush
+   还要落 `NVER` meta —— 那两家的"空 flush"不是同一条形状。
+
+⚠️ 明确**不该动**的那一格（写在这里免得下一轮把它当噪声整体砍掉）：bplus 双写缓冲每次
+`write_batch` 付的**三**次 fsync —— "count=0 预写 → 写页 → 写 count 发布"是撕裂页保护的骨架，
+少任何一次都会让崩溃后无法判断那批页是不是完整的一批。bplus 全新库 21 次里 13 次住在这里，
+那是"新建一份库要把 meta/根页/空闲表都落盘"的真实代价，不是启动税里的浪费。
+
+**证人两条**：① 12 趟重开的 fsync 总次数取值 = `[4]` / `[3]` / `[3]` / `[0]` —— **只有一个值**
+⇒ 这一档确实是常数税，不随重开次数漂；② 三个磁盘引擎各带一条 `assert(总次数 > 0)`：
+尺子没接在门上时它会当场红，而不是把"量不到"读成"这家启动不花钱"（M38/M48 那条老坑）。
+
+与旧表对得上（独立复算，不是同一个二进制）：README 那张三档表记的 `open 空库` bplus 31.8~35.6 ms、
+bitcask 12.7~15.0、lsm 9.1~11.2 —— 与这里"全新库"21/6/4 次 × ~1.4 ms = 28.4/10.2/8.5 ms **同阶**，
+差额正好是跨轮墙钟漂移带（±25%）。⇒ 归因用的仍是**次数**，毫秒只当历史快照。
+
 ### M49 之后的三档复测（2026-10-20，同一份 release 构建 × 每档两遍取最小 × 122 项三档齐全，数据在 `C:` SSD）
 
 为什么重跑：从 M10 改到 M49，那张 10-19 的表已经跨了十几个里程碑没整体复测。判据不变
@@ -2663,6 +2710,11 @@ SCALE_ROWS=600000 OPEN_STAGE_SPLIT=1 cargo test --release --lib -- --ignored --n
   --test-threads=1 scale_baseline
                               # M48 的冷启动八段耗时(门控 `OPEN_STAGE_SPLIT`,只有 bitcask 那家插了桩):
                               # 默认不设这个变量 ⇒ 插桩完全是 no-op,不会锯短外层 `timed()` 的读数
+OPEN_TAX_ROWS=2000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 open_startup_tax_by_site
+                              # M53 的启动税:一次 open 付几次 fsync、开几个文件、**分别落在哪 14 个站点**
+                              # (`common::disk::FSYNC_SITES`)。判据是次数不是毫秒——本机 C:/D: 的 fsync 差 33 倍
+                              # 读法要三种形状一起看:全新库 / 重开已有库 / 关闭(Drop);关闭那趟单独记,
+                              # 否则会把"进程退出的代价"冒充成"启动的代价"
 LSM_SEEK_SHAPE_AB_ROWS=600000 cargo test --release --lib -- --ignored --nocapture \
   --test-threads=1 lsm_seek_prev_shape_ab
                               # M50 的 seek_prev 量具:同一个动作量 2000 次 + 五把结构尺子(步/次、探文件/次、

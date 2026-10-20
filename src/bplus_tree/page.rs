@@ -11,6 +11,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::disk::{SITE_BPLUS_DBLWR, SITE_BPLUS_META, SITE_BPLUS_PAGE_FLUSH};
 use crate::bplus_tree::storage::{
     dblwr_path, freelist_path, lock_path, pack_page, read_freelist, unpack_page, write_freelist, DiskFile,
     PAGE_SIZE,
@@ -413,7 +414,7 @@ impl PageManager {
                 file.write_page(*page_id, raw)?;
             }
         }
-        file.sync()?;
+        file.sync_at(SITE_BPLUS_DBLWR)?;
         dblwr.clear()?;
         Ok(())
     }
@@ -539,12 +540,12 @@ impl PageManager {
         let packed = pack_page(META_PAGE_ID, &payload);
         if self.bulk_mode {
             self.file.write_page(META_PAGE_ID, &packed)?;
-            self.file.sync()?;
+            self.file.sync_at(SITE_BPLUS_META)?;
         } else {
             self.dblwr
                 .write_batch(&[(META_PAGE_ID, packed.clone())])?;
             self.file.write_page(META_PAGE_ID, &packed)?;
-            self.file.sync()?;
+            self.file.sync_at(SITE_BPLUS_META)?;
             self.dblwr.clear()?;
         }
         self.meta_dirty = false;
@@ -612,7 +613,7 @@ impl PageManager {
                 self.file.write_page(*pid, raw)?;
             }
             if do_sync {
-                self.file.sync()?;
+                self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
             }
         } else {
             for chunk in batch.chunks(crate::bplus_tree::storage::DBLWR_MAX_PAGES) {
@@ -622,7 +623,7 @@ impl PageManager {
                     self.file.write_page(*pid, raw)?;
                 }
                 if do_sync {
-                    self.file.sync()?;
+                    self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
                 }
                 self.dblwr.clear()?;
             }

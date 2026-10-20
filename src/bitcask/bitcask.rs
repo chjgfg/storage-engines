@@ -356,6 +356,9 @@ pub fn write_hint_file(
         w.into_inner()
             .map_err(|e| e.into_error())?
             .sync_all()?;
+// M53 记账
+        #[cfg(test)]
+        crate::common::disk::note_fsync(crate::common::disk::SITE_BITCASK_HINT);
     }
     if path.exists() {
         let _ = std::fs::remove_file(path);
@@ -1067,6 +1070,9 @@ impl Bitcask {
 
     fn rotate(&mut self) -> Result<()> {
         self.active.flush_buf()?;
+// M53 记账
+        #[cfg(test)]
+        crate::common::disk::note_fsync(crate::common::disk::SITE_BITCASK_LOG_FLUSH);
         let _ = self.active.file.sync_all();
 
         let sealed_path = segment_path(&self.base_path, self.active_id);
@@ -1177,6 +1183,9 @@ impl Bitcask {
             }
         }
         new_log.flush_buf()?;
+// M53 记账
+        #[cfg(test)]
+        crate::common::disk::note_fsync(crate::common::disk::SITE_BITCASK_LOG_FLUSH);
         new_log.file.sync_all()?;
         let new_path = new_log.path.clone();
         let new_end = new_log.end_pos;
@@ -1312,6 +1321,9 @@ impl Bitcask {
     /// flush 写缓冲 + fsync 数据文件
     pub fn flush(&mut self) -> Result<()> {
         self.active.flush_buf()?;
+// M53 记账
+        #[cfg(test)]
+        crate::common::disk::note_fsync(crate::common::disk::SITE_BITCASK_LOG_FLUSH);
         self.active.file.sync_all()?;
         Ok(())
     }

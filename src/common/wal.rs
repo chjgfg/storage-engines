@@ -16,7 +16,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::disk::{crc32, DiskFile};
+use crate::common::disk::{crc32, DiskFile, SITE_WAL_HEADER, SITE_WAL_SYNC, SITE_WAL_TRUNCATE};
 
 /// WAL 文件头魔数
 const WAL_MAGIC: &[u8; 8] = b"WAL00001";
@@ -66,7 +66,7 @@ impl Wal {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut file = DiskFile::open(path)?;
         let next_lsn = if file.len()? == 0 {
-            Self::write_header(&mut file, 1)?;
+            Self::write_header(&mut file, 1, SITE_WAL_HEADER)?;
             1
         } else {
             let mut hdr = vec![0u8; WAL_HEADER_SIZE];
@@ -87,12 +87,14 @@ impl Wal {
         })
     }
 
-    fn write_header(file: &mut DiskFile, next_lsn: u64) -> std::io::Result<()> {
+    /// 写 WAL 头部。**每次调用都带一次 fsync**，所以调用方必须说清是哪一格在付（M53 的尺子）：
+    /// 新建时（`open`）与截断时（`truncate`）是两处不同的代价，混在一个名字里就分不出来。
+    fn write_header(file: &mut DiskFile, next_lsn: u64, site: usize) -> std::io::Result<()> {
         let mut hdr = vec![0u8; WAL_HEADER_SIZE];
         hdr[0..8].copy_from_slice(WAL_MAGIC);
         hdr[8..16].copy_from_slice(&next_lsn.to_le_bytes());
         file.write_all_at(0, &hdr)?;
-        file.sync()?;
+        file.sync_at(site)?;
         Ok(())
     }
 
@@ -126,7 +128,7 @@ impl Wal {
         hdr[0..8].copy_from_slice(WAL_MAGIC);
         hdr[8..16].copy_from_slice(&self.next_lsn.to_le_bytes());
         self.file.write_all_at(0, &hdr)?;
-        self.file.sync()?;
+        self.file.sync_at(SITE_WAL_SYNC)?;
         Ok(())
     }
 
@@ -174,7 +176,8 @@ impl Wal {
     /// 检查点后截断 WAL（只保留 header）
     pub fn truncate(&mut self) -> std::io::Result<()> {
         self.file.set_len(WAL_HEADER_SIZE as u64)?;
-        Self::write_header(&mut self.file, self.next_lsn)?;
+        // ⚠️ 这一句自带一次 fsync ⇒ 一次"收口"（truncate + append + sync）其实是**两次**（M53 数出来的）
+        Self::write_header(&mut self.file, self.next_lsn, SITE_WAL_TRUNCATE)?;
         self.dirty = false;
         Ok(())
     }

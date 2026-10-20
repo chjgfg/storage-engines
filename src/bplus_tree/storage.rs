@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 pub use crate::common::disk::{crc32, DiskFile, FileLock};
 
+// M53 的站点账（不是公开 API，只在 crate 内用于记账）
+use crate::common::disk::{SITE_BLOB, SITE_BPLUS_DBLWR, SITE_BPLUS_FREELIST};
+
 /// 页大小（含页头）
 pub const PAGE_SIZE: usize = 4096;
 /// 页头大小
@@ -104,7 +107,7 @@ impl DoubleWriteBuffer {
             let mut hdr = vec![0u8; DBLWR_HEADER_SIZE];
             hdr[0..8].copy_from_slice(DBLWR_MAGIC);
             file.write_all_at(0, &hdr)?;
-            file.sync()?;
+            file.sync_at(SITE_BPLUS_DBLWR)?;
         }
         Ok(Self { file })
     }
@@ -124,7 +127,7 @@ impl DoubleWriteBuffer {
         let mut zero_hdr = hdr.clone();
         zero_hdr[8..12].copy_from_slice(&0u32.to_le_bytes());
         self.file.write_all_at(0, &zero_hdr)?;
-        self.file.sync()?;
+        self.file.sync_at(SITE_BPLUS_DBLWR)?;
 
         // 写各页：每槽 = page_id(8) + page(PAGE_SIZE)
         let slot_size = 8 + PAGE_SIZE;
@@ -135,11 +138,11 @@ impl DoubleWriteBuffer {
             slot[8..].copy_from_slice(page);
             self.file.write_all_at(offset, &slot)?;
         }
-        self.file.sync()?;
+        self.file.sync_at(SITE_BPLUS_DBLWR)?;
 
         // 最后写真实 count 并 fsync → 标志着 batch 完整
         self.file.write_all_at(0, &hdr)?;
-        self.file.sync()?;
+        self.file.sync_at(SITE_BPLUS_DBLWR)?;
         Ok(())
     }
 
@@ -184,7 +187,7 @@ impl DoubleWriteBuffer {
         hdr[0..8].copy_from_slice(DBLWR_MAGIC);
         // count = 0
         self.file.write_all_at(0, &hdr)?;
-        self.file.sync()?;
+        self.file.sync_at(SITE_BPLUS_DBLWR)?;
         Ok(())
     }
 }
@@ -258,7 +261,7 @@ impl BlobStore {
         let mut file = DiskFile::open(&path)?;
         if file.len()? == 0 {
             file.write_all_at(0, BLOB_MAGIC)?;
-            file.sync()?;
+            file.sync_at(SITE_BLOB)?;
         } else {
             let mut magic = [0u8; 8];
             file.read_exact_at(0, &mut magic)?;
@@ -285,7 +288,7 @@ impl BlobStore {
     }
 
     pub fn sync(&mut self) -> std::io::Result<()> {
-        self.file.sync()
+        self.file.sync_at(SITE_BLOB)
     }
 
     /// 按 offset 读取 blob 记录
@@ -335,7 +338,7 @@ impl BlobStore {
         }
         // 截断到实际长度（去掉旧文件尾部垃圾）
         self.file.set_len(offset)?;
-        self.file.sync()?;
+        self.file.sync_at(SITE_BLOB)?;
         Ok(offsets)
     }
 
@@ -370,7 +373,7 @@ impl BlobStore {
             file.write_all_at(offset, &rec)?;
             offsets.push(offset);
         }
-        file.sync()?;
+        file.sync_at(SITE_BLOB)?;
         drop(file);
         Ok((new_path, offsets))
     }
@@ -417,7 +420,7 @@ pub fn encode_stored_value(
     }
     let offset = blob.append(&value)?;
     if sync_blob {
-        blob.sync()?;
+        blob.sync()?; // BlobStore::sync 内部已经记 SITE_BLOB 这一格
     }
     let mut out = Vec::with_capacity(1 + 8 + 4);
     out.push(VAL_TAG_BLOB);
@@ -500,7 +503,7 @@ pub fn write_freelist(path: &Path, free_ids: &[u64]) -> std::io::Result<()> {
     // 先截断再写，避免旧文件更长时残留垃圾
     file.set_len(0)?;
     file.write_all_at(0, &buf)?;
-    file.sync()?;
+    file.sync_at(SITE_BPLUS_FREELIST)?;
     Ok(())
 }
 

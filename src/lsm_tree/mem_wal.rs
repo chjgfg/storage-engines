@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::common::disk::SITE_LSM_MEM_WAL;
 use crate::lsm_tree::storage::{crc32, mem_wal_path, DiskFile};
 
 const MAGIC_V1: &[u8; 8] = b"MEMWAL01";
@@ -68,7 +69,7 @@ impl MemWal {
         let mut hdr = vec![0u8; HEADER_SIZE];
         hdr[0..8].copy_from_slice(MAGIC_V2);
         file.write_all_at(0, &hdr)?;
-        file.sync()?;
+        file.sync_at(SITE_LSM_MEM_WAL)?;
         Ok(())
     }
 
@@ -86,7 +87,7 @@ impl MemWal {
     }
 
     pub fn sync(&mut self) -> std::io::Result<()> {
-        self.file.sync()
+        self.file.sync_at(SITE_LSM_MEM_WAL)
     }
 
     pub fn read_all(&mut self) -> std::io::Result<Vec<MemWalRecord>> {

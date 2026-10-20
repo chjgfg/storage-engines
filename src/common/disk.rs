@@ -133,6 +133,110 @@ pub(crate) fn disk_page_reads() -> u64 {
     DISK_PAGE_READS.with(|c| c.get())
 }
 
+// 测试专用尺子③（M53）：**fsync 落在哪几处**，按站点分格计数。
+//
+// 为什么拿"次数"而不是毫秒当判据：本机 `C:` 一次 fsync ≈ 2.6 ms、`D:` ≈ 85.8 ms ⇒ 同一行代码
+// 换个盘型就差 30 倍。"启动税是几毫秒"这句话没有可比性，"**一次 open 付几次 fsync、在哪几处**"
+// 才是盘型无关的账（下游那台单核机器上把次数 ×14 就是他的代价）。
+//
+// 站点表就是这一刀的读者最需要的东西：每一次 fsync 都得能回答"它保证什么"，答不出保证什么的
+// 那一格才是可修的（比如锁文件只为写个 pid 就 sync 一次）。
+#[cfg(test)]
+pub(crate) const FSYNC_SITES: &[&str] = &[
+    "lock_pid",
+    "wal_header(新建)",
+    "wal_header(截断里重写)",
+    "wal_sync(提交/收口)",
+    "bplus_meta",
+    "bplus_freelist",
+    "bplus_page_flush",
+    "bplus_dblwr",
+    "bitcask_log_flush",
+    "blob(新建/同步)",
+    "bitcask_hint",
+    "lsm_manifest",
+    "lsm_mem_wal",
+    "other",
+];
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_LOCK_PID: usize = 0;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_WAL_HEADER: usize = 1;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_WAL_TRUNCATE: usize = 2;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_WAL_SYNC: usize = 3;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_BPLUS_META: usize = 4;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_BPLUS_FREELIST: usize = 5;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_BPLUS_PAGE_FLUSH: usize = 6;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_BPLUS_DBLWR: usize = 7;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_BITCASK_LOG_FLUSH: usize = 8;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_BLOB: usize = 9;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_BITCASK_HINT: usize = 10;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_LSM_MANIFEST: usize = 11;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_LSM_MEM_WAL: usize = 12;
+#[allow(dead_code)] // 有些站点只在 `#[cfg(test)]` 的记账里被引用（发布构建不该带任何东西）
+pub(crate) const SITE_OTHER: usize = 13;
+
+#[cfg(test)]
+static FSYNC_COUNTS: [std::sync::atomic::AtomicU64; 14] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// 记一次 fsync。**用 `#[cfg(test)]` 的原子自增，不用墙钟分段**：M48 那条教训照旧 ——
+/// 常开的计时插桩会锯短外层 `timed()` 的读数，而一次原子加加减减在这条路径上是噪声级。
+#[cfg(test)]
+pub(crate) fn note_fsync(site: usize) {
+    if site < FSYNC_SITES.len() {
+        FSYNC_COUNTS[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fsync_counts() -> [u64; 14] {
+    let mut out = [0u64; 14];
+    for (i, c) in FSYNC_COUNTS.iter().enumerate() {
+        out[i] = c.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// ⚠️ 与 M48 那条"槽不会自己清"同一课：读之前必须清，否则第二家会把第一家原样复述一遍。
+#[cfg(test)]
+pub(crate) fn fsync_counts_clear() {
+    for c in FSYNC_COUNTS.iter() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// 测试专用尺子④（M53）：一次 open 打开了几个文件句柄（`create` 与 `open` 都算 ——
+// 每个句柄至少一次内核往返，且新建文件还要给目录项落盘）。
+#[cfg(test)]
+static FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn file_opens() -> u64 {
+    FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn file_opens_clear() {
+    FILE_OPENS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn note_file_open() {
+    FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 // ─── DiskFile ───────────────────────────────────────────────────────────────
 
 /// 定宽/变宽记录共用的文件句柄：定位读写 + 追加 + fsync。
@@ -170,6 +274,8 @@ impl DiskFile {
             .write(true)
             .create(true)
             .open(&path)?;
+        #[cfg(test)]
+        note_file_open();
         Ok(Self { file, path, block_size })
     }
 
@@ -180,6 +286,8 @@ impl DiskFile {
             return Ok(None);
         }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        #[cfg(test)]
+        note_file_open();
         Ok(Some(Self {
             file,
             path: path.to_path_buf(),
@@ -223,6 +331,17 @@ impl DiskFile {
 
     /// fsync：数据 + 元数据落盘
     pub fn sync(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        note_fsync(SITE_OTHER);
+        self.file.sync_all()
+    }
+
+    /// 同上，但把这一次记到**指定站点**的账上（测试尺子 M53；发布构建里除了 `sync_all` 什么都不多做的）。
+    pub fn sync_at(&mut self, site: usize) -> std::io::Result<()> {
+        #[cfg(test)]
+        note_fsync(site);
+        #[cfg(not(test))]
+        let _ = site;
         self.file.sync_all()
     }
 
@@ -365,6 +484,10 @@ impl FileLock {
         let mut f = file;
         let _ = f.set_len(0);
         let _ = f.write_all(format!("pid={}\n", std::process::id()).as_bytes());
+        // M53 记账（先量不改）：这一句是**每一次 open 都要付的一次 fsync**，而它保证的只有
+        // "排障时能看到谁占着库" —— 锁本身靠句柄存活，进程一死内核自动释放，pid 落不落盘与崩溃安全无关。
+        #[cfg(test)]
+        note_fsync(SITE_LOCK_PID);
         let _ = f.sync_all();
         Ok(Self { file: f, path })
     }
