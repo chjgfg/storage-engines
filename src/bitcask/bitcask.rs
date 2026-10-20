@@ -517,6 +517,11 @@ pub struct Log {
     end_pos: u64,
     /// 待落盘写缓冲
     buf: Vec<u8>,
+    /// 自上一次 fsync 之后，这个进程有没有**写过**（含已经 `flush_buf` 落进文件、但还没 fsync 的字节）。
+    /// M53：`flush()` 在账上是干净的时候不再付那一次 fsync —— 判据必须是这条账，不能只看
+    /// `buf.is_empty()`：写满 4 MiB 时 `append_entry` 会自己 `flush_buf`，那时缓冲是空的、
+    /// 文件里却躺着没 fsync 的字节。
+    dirty: bool,
 }
 
 impl Drop for Log {
@@ -545,6 +550,7 @@ impl Log {
             // 缓冲**首次写入时**才按目标大小分配：只读/空库不该一打开就留 4 MiB
             // （基线实测：两处各 4 MiB ⇒ `open 空库` 就"常驻 8.4 MB"）
             buf: Vec::new(),
+            dirty: false,
         })
     }
 
@@ -557,6 +563,8 @@ impl Log {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&self.buf)?;
         self.buf.clear();
+        // 字节进了文件、还没 fsync ⇒ 仍然欠一次
+        self.dirty = true;
         Ok(())
     }
 
@@ -695,6 +703,9 @@ impl Log {
             Self::encode_entry_to(&mut self.buf, base, key, value, hard_delete);
         let written = (self.buf.len() - before) as u64;
         self.end_pos += written;
+        if written > 0 {
+            self.dirty = true;
+        }
         if self.buf.len() >= WRITE_BUF_TARGET {
             self.flush_buf()?;
         }
@@ -1073,7 +1084,9 @@ impl Bitcask {
 // M53 记账
         #[cfg(test)]
         crate::common::disk::note_fsync(crate::common::disk::SITE_BITCASK_LOG_FLUSH);
-        let _ = self.active.file.sync_all();
+        if self.active.file.sync_all().is_ok() {
+            self.active.dirty = false;
+        }
 
         let sealed_path = segment_path(&self.base_path, self.active_id);
         // Windows：必须先 drop 句柄再 rename
@@ -1093,6 +1106,8 @@ impl Bitcask {
                 },
                 end_pos: 0,
                 buf: Vec::new(),
+                // M53：占位 ⇒ 账上没有未 fsync 的写入
+                dirty: false,
             },
         );
         let old_path = old.path.clone();
@@ -1210,6 +1225,8 @@ impl Bitcask {
                 },
                 end_pos: 0,
                 buf: Vec::new(),
+                // M53：占位 ⇒ 账上没有未 fsync 的写入
+                dirty: false,
             },
         );
         drop(old_active);
@@ -1240,6 +1257,8 @@ impl Bitcask {
             file,
             end_pos: new_end,
             buf: Vec::new(), // 同 `Log::open`：首次写入才分配
+            // M53：刚 fsync 过 ⇒ 账上没有未 fsync 的写入
+            dirty: false,
         };
         self.active_id = 0;
         // M43：索引不再"抄"出来，而是**重扫新日志**扫出来。三件事的顺序是死的：
@@ -1321,10 +1340,18 @@ impl Bitcask {
     /// flush 写缓冲 + fsync 数据文件
     pub fn flush(&mut self) -> Result<()> {
         self.active.flush_buf()?;
-// M53 记账
+        // M53：**账上干净就不付 fsync**（改前每次 open 末尾那一句 `tree.flush()` 都要白付一次——
+        // 干净重开一个没人写过的库，文件里没有任何未落盘的字节）。
+        // ⚠️ 反向的那半不能省：写过就必须 fsync，否则这条"优化"会把持久化点一起省掉
+        // （M8 的 `Wal::append` 是同一课）。守卫见 `test_flush_skips_fsync_only_when_nothing_was_written`。
+        if !self.active.dirty {
+            return Ok(());
+        }
+        // M53 记账
         #[cfg(test)]
         crate::common::disk::note_fsync(crate::common::disk::SITE_BITCASK_LOG_FLUSH);
         self.active.file.sync_all()?;
+        self.active.dirty = false;
         Ok(())
     }
 
@@ -2073,6 +2100,62 @@ mod tests {
             assert_eq!(eng.get(b"k010").unwrap(), Some(b"value-padding-010-xxxxxxxx".to_vec()));
         }
         cleanup(&path);
+    }
+
+    /// M53 的守卫：`flush()` 那一刀要**正反两面**都钉住。
+    ///
+    /// - 正面（省下来的）：账上没有未落盘的写入时不许付 fsync —— 改前每次 open 末尾那句
+    ///   无条件 `tree.flush()` 都要白付一次，干净重开一个没人动过的库也是。
+    /// - 反面（不许省过头）：**写过就必须 fsync**。M8 那一课是反方向的同一个错：
+    ///   一个"优化"把提交点的 fsync 一起省掉了。所以第三条断言钉 `dirty` 被正确清掉，
+    ///   第四条钉"只 `flush_buf` 不 fsync"之后 `flush()` 必须补上那一次
+    ///   （bulk 路径正是靠这个：字节已经在文件里、还没 fsync，此时 `buf.is_empty()` 是空的、
+    ///   账却不干净 —— 这就是判据用 `dirty` 而不是用 `buf.is_empty()` 的原因）。
+    #[test]
+    fn test_flush_fsyncs_only_when_something_was_written() {
+        use crate::common::disk::{fsync_counts, fsync_counts_clear};
+        let path = tmp_log("flush_fsync");
+        let mut kv = Bitcask::new(path.clone()).unwrap();
+
+        // ① 什么都没写 ⇒ flush 不付 fsync
+        fsync_counts_clear();
+        kv.flush().unwrap();
+        assert_eq!(
+            fsync_counts().iter().sum::<u64>(),
+            0,
+            "空账还 fsync ⇒ 每次 open 白付一次（M53 数出来的那一格）"
+        );
+
+        // ② 写过就必须付，而且只付一次
+        kv.insert(b"k1".to_vec(), Some(b"v1".to_vec())).unwrap();
+        fsync_counts_clear();
+        kv.flush().unwrap();
+        let after_write = fsync_counts();
+        assert!(
+            after_write.iter().sum::<u64>() >= 1,
+            "写过之后 flush 没有 fsync ⇒ 持久化点被这条\"优化\"省掉了（比慢更糟）"
+        );
+
+        // ③ 账已清 ⇒ 再 flush 不重复付
+        fsync_counts_clear();
+        kv.flush().unwrap();
+        assert_eq!(
+            fsync_counts().iter().sum::<u64>(),
+            0,
+            "dirty 没被清 ⇒ 每次 flush 都重付一遍 fsync"
+        );
+
+        // ④ 只把缓冲落盘（bulk 中途的做法）不等于 fsync 过：随后 flush() 必须补那一次
+        kv.insert(b"k2".to_vec(), Some(b"v2".to_vec())).unwrap();
+        kv.flush_buf().unwrap();
+        fsync_counts_clear();
+        kv.flush().unwrap();
+        assert!(
+            fsync_counts().iter().sum::<u64>() >= 1,
+            "`flush_buf` 写进文件的字节被当成\"已经 fsync\"了 ⇒ 崩溃会丢这批行"
+        );
+        drop(kv);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// M52 的守卫：hint 读侧从"逐条 `insert`"换成"攒有序 `Vec` 再一次 `collect`"之后，

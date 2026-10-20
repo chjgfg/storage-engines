@@ -145,7 +145,7 @@ pub(crate) fn disk_page_reads() -> u64 {
 pub(crate) const FSYNC_SITES: &[&str] = &[
     "lock_pid",
     "wal_header(新建)",
-    "wal_header(截断里重写)",
+    "wal_truncate(改后应为 0)",
     "wal_sync(提交/收口)",
     "bplus_meta",
     "bplus_freelist",
@@ -188,53 +188,59 @@ pub(crate) const SITE_LSM_MEM_WAL: usize = 12;
 pub(crate) const SITE_OTHER: usize = 13;
 
 #[cfg(test)]
-static FSYNC_COUNTS: [std::sync::atomic::AtomicU64; 14] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+thread_local! {
+    // ⚠️ **必须线程局部**（M27/M36 那条：并行用例里进程级计数会互相污染，别的用例正在收口 WAL
+    // 就会把这一档读高）。台架一律 `--test-threads=1`，单元守卫则在本线程里做完再读。
+    static FSYNC_COUNTS: std::cell::Cell<[u64; 14]> =
+        const { std::cell::Cell::new([0u64; 14]) };
+}
 
 /// 记一次 fsync。**用 `#[cfg(test)]` 的原子自增，不用墙钟分段**：M48 那条教训照旧 ——
 /// 常开的计时插桩会锯短外层 `timed()` 的读数，而一次原子加加减减在这条路径上是噪声级。
 #[cfg(test)]
 pub(crate) fn note_fsync(site: usize) {
-    if site < FSYNC_SITES.len() {
-        FSYNC_COUNTS[site].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if site >= FSYNC_SITES.len() {
+        return;
     }
+    FSYNC_COUNTS.with(|c| {
+        // `Cell<数组>` 没有内部可变性 ⇒ 取出、改一格、放回去（同一线程内没有并发）
+        let mut arr = c.get();
+        arr[site] += 1;
+        c.set(arr);
+    });
 }
 
 #[cfg(test)]
 pub(crate) fn fsync_counts() -> [u64; 14] {
-    let mut out = [0u64; 14];
-    for (i, c) in FSYNC_COUNTS.iter().enumerate() {
-        out[i] = c.load(std::sync::atomic::Ordering::Relaxed);
-    }
-    out
+    FSYNC_COUNTS.with(|c| c.get())
 }
 
 /// ⚠️ 与 M48 那条"槽不会自己清"同一课：读之前必须清，否则第二家会把第一家原样复述一遍。
 #[cfg(test)]
 pub(crate) fn fsync_counts_clear() {
-    for c in FSYNC_COUNTS.iter() {
-        c.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
+    FSYNC_COUNTS.with(|c| c.set([0u64; 14]));
 }
 
 // 测试专用尺子④（M53）：一次 open 打开了几个文件句柄（`create` 与 `open` 都算 ——
 // 每个句柄至少一次内核往返，且新建文件还要给目录项落盘）。
 #[cfg(test)]
-static FILE_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static FILE_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn file_opens() -> u64 {
-    FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed)
+    FILE_OPENS.with(|c| c.get())
 }
 
 #[cfg(test)]
 pub(crate) fn file_opens_clear() {
-    FILE_OPENS.store(0, std::sync::atomic::Ordering::Relaxed);
+    FILE_OPENS.with(|c| c.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn note_file_open() {
-    FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    FILE_OPENS.with(|c| c.set(c.get() + 1));
 }
 
 // ─── DiskFile ───────────────────────────────────────────────────────────────
@@ -277,6 +283,23 @@ impl DiskFile {
         #[cfg(test)]
         note_file_open();
         Ok(Self { file, path, block_size })
+    }
+
+    /// 接管一个**已经按平台专属方式打开**的句柄（锁文件：Windows 要 `share_mode(0)`、
+    /// unix 要 `flock`）。存在的意义就是把 fsync 拉回**唯一的门**上 —— `DiskFile::sync` 是记账点，
+    /// 裸 `File::sync_all()` 不是：锁这里要是退回"为了一行 pid 付一次 fsync"，
+    /// 只有包在同一只门里才数得到（守卫 `file_lock_hint_is_written_without_an_fsync` 判的是总次数为 0）。
+    pub(crate) fn from_opened(file: File, path: impl AsRef<Path>) -> Self {
+        Self {
+            file,
+            path: path.as_ref().to_path_buf(),
+            block_size: 0,
+        }
+    }
+
+    /// 裸句柄（只给 `FileLock` 在 unix 上取 `as_raw_fd` 解锁用）。
+    pub(crate) fn inner(&self) -> &File {
+        &self.file
     }
 
     /// 仅当文件已存在时打开（不存在返回 `None`）
@@ -412,7 +435,8 @@ impl DiskFile {
 /// 拿不到时统一返回 `ErrorKind::WouldBlock`，调用方（`MVCC::try_open`）据此区分
 /// "库被占用"与"磁盘坏了"。
 pub struct FileLock {
-    file: File,
+    /// ⚠️ 是 `DiskFile` 而不是裸 `File`：这样"锁文件上有没有 fsync"才是**数得到**的（见 `from_opened`）
+    file: DiskFile,
     path: PathBuf,
 }
 
@@ -480,15 +504,20 @@ impl FileLock {
             .create(true)
             .open(&path)?;
 
-        // 写入 pid 便于排查
-        let mut f = file;
-        let _ = f.set_len(0);
-        let _ = f.write_all(format!("pid={}\n", std::process::id()).as_bytes());
-        // M53 记账（先量不改）：这一句是**每一次 open 都要付的一次 fsync**，而它保证的只有
-        // "排障时能看到谁占着库" —— 锁本身靠句柄存活，进程一死内核自动释放，pid 落不落盘与崩溃安全无关。
         #[cfg(test)]
-        note_fsync(SITE_LOCK_PID);
-        let _ = f.sync_all();
+        note_file_open();
+        // 写入 pid 便于排查
+        // ⚠️ 包成 `DiskFile` 而不是留裸 `File`：fsync 的记账点只在 `DiskFile::sync*` 这一扇门上，
+        // 裸句柄偷偷 `sync_all()` 是数不到的 —— 而这一格恰恰是 M53 砍掉的那笔启动税，
+        // 守卫要能抓住"有人把 fsync 加回来"才算判据（见 `file_lock_hint_is_written_without_an_fsync`）。
+        let mut f = DiskFile::from_opened(file, &path);
+        let _ = f.set_len(0);
+        let _ = f.write_all_at(0, format!("pid={}\n", std::process::id()).as_bytes());
+        // M53：**这里不再 fsync**（改前每次 open 都要付一次，四家都付）。
+        // 这把锁的安全性来自句柄本身（Windows 的 `share_mode(0)` / unix 的 `flock`）：进程一死内核就释放，
+        // 与 pid 那行字落没落盘无关。所以落盘的只是"排障时看得见谁占着库"这一条提示 ——
+        // 它不崩数据、不崩锁，最多是掉电后那个提示文件是空的（`path()` 与错误消息照样能用）。
+        // ⚠️ 反向的那半不能一起省：`set_len`/`write_all` 留着，否则连活着的读者都看不见 pid。
         Ok(Self { file: f, path })
     }
 
@@ -504,7 +533,7 @@ impl Drop for FileLock {
             use std::os::unix::io::AsRawFd;
             // LOCK_UN = 8
             unsafe {
-                let _ = libc_flock(self.file.as_raw_fd(), 8);
+                let _ = libc_flock(self.file.inner().as_raw_fd(), 8);
             }
         }
         // Windows：关闭句柄即释放 share_mode=0 独占
@@ -523,6 +552,66 @@ unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M53 的守卫：**拿一把锁不许付 fsync**（改前每次 open 都要为"把 pid 写进锁文件"付一次）。
+    ///
+    /// 为什么这一格可以省：锁的安全性来自**句柄本身**（Windows 的 `share_mode(0)`、unix 的
+    /// `flock`）—— 进程一死内核就释放，与那行 pid 有没有落盘无关。省掉的只有 fsync，
+    /// `set_len` + `write_all` 留着：活着的读者仍然看得见 pid（那是这条存在的唯一理由）。
+    /// ⚠️ 反向那半也要钉：锁的语义不许被一起带走（第二个 `try_acquire` 必须还是 `WouldBlock`）。
+    /// 证人：同线程里主动 `DiskFile::sync()` 一次，尺子必须数得到。
+    #[test]
+    fn file_lock_hint_is_written_without_an_fsync() {
+        use crate::common::disk::{
+            fsync_counts, fsync_counts_clear, SITE_LOCK_PID, SITE_OTHER,
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("se_disk_lock_fsync_{}_{}", std::process::id(), nanos));
+        let lock_file = dir.join("db.lock");
+
+        fsync_counts_clear();
+        let _hold = FileLock::try_acquire_at(&lock_file).unwrap();
+        let c = fsync_counts();
+        assert_eq!(c[SITE_LOCK_PID], 0, "锁文件又自己 fsync 了 ⇒ 每次 open 多付一次（启动税那一格）");
+        assert_eq!(c.iter().sum::<u64>(), 0, "拿一把锁不该产生任何 fsync，现在 {:?}", c);
+
+        // 提示到底写没写进去，只能在**放开之后**读：Windows 这一侧的锁是 `share_mode(0)`，
+        // 握着句柄时连本进程都打不开这个文件（实测 error 32 共享冲突 —— 那正是锁的本意）。
+        let pid_line = format!("pid={}\n", std::process::id());
+
+        let second = FileLock::try_acquire_at(&lock_file);
+        let kind = match second {
+            // `FileLock` 没有 Debug（持着句柄，derive 不出来）⇒ 只能自己 match
+            Ok(_) => panic!("锁的语义被一起带走了 ⇒ 第二个持有者现在能同时开同一个库"),
+            Err(e) => e.kind(),
+        };
+        assert_eq!(
+            kind,
+            std::io::ErrorKind::WouldBlock,
+            "锁的语义被一起带走了 ⇒ 第二个进程现在能同时开同一个库"
+        );
+
+        drop(_hold);
+        let txt = std::fs::read_to_string(&lock_file).unwrap();
+        assert!(
+            txt.contains(&pid_line),
+            "pid 提示没写进锁文件（省的是 fsync，不是那次写）：{txt:?}"
+        );
+
+        // 证人：尺子在这条路上数得到 fsync
+        fsync_counts_clear();
+        let mut f = DiskFile::open(dir.join("witness.dat")).unwrap();
+        f.sync().unwrap();
+        assert_eq!(
+            fsync_counts()[SITE_OTHER],
+            1,
+            "证人失败：主动 sync 一次都没数到 ⇒ 上面那个 0 是量不到，不是不花钱"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// crc32 的已知值：`"123456789"` 的 IEEE CRC32 是 `0xCBF43926`。
     /// 三份复制实现合成一份之后，这个交叉校验只需要写一次。

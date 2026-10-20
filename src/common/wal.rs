@@ -16,7 +16,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::disk::{crc32, DiskFile, SITE_WAL_HEADER, SITE_WAL_SYNC, SITE_WAL_TRUNCATE};
+use crate::common::disk::{crc32, DiskFile, SITE_WAL_HEADER, SITE_WAL_SYNC};
 
 /// WAL 文件头魔数
 const WAL_MAGIC: &[u8; 8] = b"WAL00001";
@@ -87,15 +87,19 @@ impl Wal {
         })
     }
 
-    /// 写 WAL 头部。**每次调用都带一次 fsync**，所以调用方必须说清是哪一格在付（M53 的尺子）：
-    /// 新建时（`open`）与截断时（`truncate`）是两处不同的代价，混在一个名字里就分不出来。
+    /// 写 WAL 头部并 **fsync**。调用方要说清是哪一格在付（M53 的尺子）：新建时（`open`）是一格。
+    /// 收口那条路用 `write_header_bytes`（收缩与新记录由后面那一次 `sync` 一起冲下去）。
     fn write_header(file: &mut DiskFile, next_lsn: u64, site: usize) -> std::io::Result<()> {
+        Self::write_header_bytes(file, next_lsn)?;
+        file.sync_at(site)
+    }
+
+    /// 只写头部，不落盘（`sync` / `sync_at` 负责那一格）
+    fn write_header_bytes(file: &mut DiskFile, next_lsn: u64) -> std::io::Result<()> {
         let mut hdr = vec![0u8; WAL_HEADER_SIZE];
         hdr[0..8].copy_from_slice(WAL_MAGIC);
         hdr[8..16].copy_from_slice(&next_lsn.to_le_bytes());
-        file.write_all_at(0, &hdr)?;
-        file.sync_at(site)?;
-        Ok(())
+        file.write_all_at(0, &hdr)
     }
 
     fn scan_next_lsn(file: &mut DiskFile) -> std::io::Result<u64> {
@@ -173,11 +177,19 @@ impl Wal {
         Ok(out)
     }
 
-    /// 检查点后截断 WAL（只保留 header）
+    /// 检查点后截断 WAL（只保留 header）—— **不落盘**，调用方必须紧接着 `sync()`。
+    ///
+    /// ⚠️ M53：改前这里自带一次 fsync，而收口的下一步 `Wal::sync()` 又一次 ⇒ **同一趟收口付两遍**
+    /// （一次 open、一次 `Drop`、每次阈值 checkpoint 都付）。合成一次是安全的，理由写在下面这句里：
+    /// 收口只在**数据已经 flush 之后**发生（三家的 `run_checkpoint` 都把顺序钉死了）。所以"收缩晚一点
+    /// 才落盘"最坏的后果是掉电后 WAL 里还留着那批**已经落进数据文件**的旧记录，下次 open 把它们
+    /// 再重放一遍 —— MVCC 的键是 `raw ‖ version_be`，同一批记录重放出来的键与值一字不差 ⇒ 幂等；
+    /// 而起点取的是 `max(WAL 里的 Checkpoint, max_xid + 1)`，旧记录的 `xid ≤ Checkpoint.next_version`
+    /// ⇒ 起点不会被算低，不会复用版本号。**反过来说：没有"数据已落盘"这条前提就不许用这个口子。**
+    /// 需要"只截断、不写任何新记录"又要求持久的调用方，自己补一次 `sync()`。
     pub fn truncate(&mut self) -> std::io::Result<()> {
         self.file.set_len(WAL_HEADER_SIZE as u64)?;
-        // ⚠️ 这一句自带一次 fsync ⇒ 一次"收口"（truncate + append + sync）其实是**两次**（M53 数出来的）
-        Self::write_header(&mut self.file, self.next_lsn, SITE_WAL_TRUNCATE)?;
+        Self::write_header_bytes(&mut self.file, self.next_lsn)?;
         self.dirty = false;
         Ok(())
     }
@@ -278,6 +290,72 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// M53 的守卫：**一次收口只许付一次 fsync**。
+    ///
+    /// 洞：`Wal::truncate()` 改前在重写头部时自带一次 fsync，而收口的下一步 `sync()` 又一次
+    /// ⇒ 一次 open、一次 `Drop`、每次阈值 checkpoint 都白付一遍（大库台架是按站点数出来的：
+    /// `wal_header(截断里重写) 1 + wal_sync(收口) 1`）。
+    /// 判据是**计数**不是墙钟：本机 `C:`/`D:` 的 fsync 单价差 33 倍，毫秒没有可比性，次数有。
+    ///
+    /// 证人（尺子自己得先接得上）：同一条路上新建 WAL 必须数到一次 `wal_header` ——
+    /// 数不到的话下面那个 `wal_sync == 1` 就只是"量不到"（M38/M48：读数 0 有两种解释）。
+    #[test]
+    fn wal_seal_fsyncs_exactly_once() {
+        use crate::common::disk::{
+            fsync_counts, fsync_counts_clear, SITE_WAL_HEADER, SITE_WAL_SYNC, SITE_WAL_TRUNCATE,
+        };
+        let path = tmp_wal("seal_fsync");
+        fsync_counts_clear();
+        let mut wal = Wal::open(&path).unwrap();
+        let fresh = fsync_counts();
+        assert_eq!(
+            fresh[SITE_WAL_HEADER],
+            1,
+            "证人失败：新建 WAL 那一次 fsync 都没数到（{:?}）⇒ 尺子没接在门上",
+            fresh
+        );
+
+        // 收口的形状：三家的 `seal_wal_checkpoint` 都是这三步
+        fsync_counts_clear();
+        wal.truncate().unwrap();
+        wal.append(WalRecord::Checkpoint {
+            next_version: 7,
+            root_page_id: 0,
+            next_page_id: 0,
+        })
+        .unwrap();
+        wal.sync().unwrap();
+        let c = fsync_counts();
+        assert_eq!(
+            c[SITE_WAL_TRUNCATE],
+            0,
+            "truncate 又自己 fsync 了 ⇒ 同一趟收口付两遍（M53 改前的形状）"
+        );
+        assert_eq!(
+            c[SITE_WAL_SYNC],
+            1,
+            "收口那一次 fsync 是唯一的持久化点：现在读到 {} 次（0 = 把持久化点省掉了，比慢更糟）",
+            c[SITE_WAL_SYNC]
+        );
+        assert_eq!(c.iter().sum::<u64>(), 1, "这一趟收口总账：{:?}", c);
+
+        // 语义一字未动：截断之后 WAL 里就剩那条 Checkpoint
+        let entries = wal.read_all().unwrap();
+        assert_eq!(entries.len(), 1, "截断没生效：还剩 {} 条", entries.len());
+        assert!(
+            matches!(
+                entries[0].record,
+                WalRecord::Checkpoint {
+                    next_version: 7,
+                    ..
+                }
+            ),
+            "收口写进去的那条不是 Checkpoint：{:?}",
+            entries[0].record
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// M25 守卫：**恢复计划不许依赖 `Begin`**。
