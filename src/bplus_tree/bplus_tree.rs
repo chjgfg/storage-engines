@@ -974,10 +974,46 @@ impl BPlusTree {
     }
 }
 
+// 测试专用尺子（M54b）：删除的回溯段里"为刷新分隔键而往左下走一趟"做了几次。
+//
+// 为什么钉这一格：M54 用台架数出来"每删一行读 16 页（小库、全缓存命中）/ 64 页（600k 档）"，
+// 可修的那一半就是**无条件**去走这趟左下到底（`subtree_min_key` 逐页读 + 逐页反序列化）。
+//
+// 为什么是 thread_local：和 [`crate::bplus_tree::page`] 那几把尺子同一个理由 ——
+// `cargo test` 并行跑，全局原子量会把别人家的删除算进本用例的分母。
+#[cfg(test)]
+thread_local! {
+    static SEP_REFRESHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn sep_refreshes() -> u64 {
+    SEP_REFRESHES.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn sep_refreshes_clear() {
+    SEP_REFRESHES.with(|c| c.set(0));
+}
+
+/// 删除的返回值（M54b）。
+///
+/// `min_changed` 说的是"**本次删除可能改变了该子树的最小键**"—— 分隔键就是子树最小键，
+/// 所以父节点只有在这一格为真时才需要去把最小键重新找一遍（那趟要一路向左下走到叶子、逐页反序列化）。
+/// 判据：删掉的键若不是本子树最左那片叶子的最小键，子树下界不可能变；而**借位/合并**会挪下界，
+/// 所以只要做过重组就一律报真（保守方向是"多做一次刷新"，不是"漏做"）。
+enum Del {
+    NotFound,
+    Removed { min_changed: bool },
+}
+
 impl BPlusTree {
     /// 删除：移除指定 key，必要时借键/合并并处理根降层
     pub fn delete(&mut self, key: Key) -> bool {
-        let deleted = self.delete_recursive(self.root, key, None);
+        let deleted = matches!(
+            self.delete_recursive(self.root, key, None),
+            Del::Removed { .. }
+        );
 
         // 根是内部节点且只剩一个子节点时降层
         if deleted {
@@ -1532,20 +1568,29 @@ impl BPlusTree {
         }
     }
 
-    /// 递归删除；parent_page_id 在下降时传入，避免错误的父节点查找
+    /// 递归删除；`parent_page_id` 在下降时传入，避免错误的父节点查找。
+    ///
+    /// 返回 [`Del`]：M54b 起它多带一格 `min_changed`，**父节点只在这格为真时才去刷新分隔键**。
+    /// 改前是无条件刷新 —— 那件事是 `subtree_min_key(child)`：**从该子树一路向左下走到叶子**，
+    /// 逐页读、逐页 `bincode::deserialize`（这一支不走解析缓存），而且**每一层都走一遍**。
+    /// 600k 档实测"每删一行读 64.5 页、换出 39.2 页"里可修的那一半就是它
+    /// （台架 `bplus_vacuum_cost_attribution`：同一份库两趟 `vacuum()`，第一趟有得删 262 s、
+    /// 第二趟几乎无得删 6.08 s ⇒ 97.7% 在删除那一半；fsync 只占 4%）。
     fn delete_recursive(
         &mut self,
         node_page_id: PageId,
         key: Key,
         parent_page_id: Option<PageId>,
-    ) -> bool {
+    ) -> Del {
         let mut node = self.read_node(node_page_id);
 
         match &mut node {
             BTreeNode::Leaf { entries, .. } => {
                 let Ok(idx) = entries.binary_search_by(|(k, _)| k.cmp(&key)) else {
-                    return false;
+                    return Del::NotFound;
                 };
+                // 删的是本片最小键 ⇒ 本片所属子树的下界可能变了；删别的键一定没变
+                let mut min_changed = idx == 0;
                 entries.remove(idx);
                 self.write_node(node_page_id, &node);
 
@@ -1554,38 +1599,46 @@ impl BPlusTree {
                     if let Some(parent) = parent_page_id {
                         if self.is_underflow(&node) {
                             self.handle_underflow(node_page_id, parent);
+                            // 借位/合并会挪分隔键与本层下界 ⇒ 一律上报"可能变了"，让上层去核对
+                            min_changed = true;
                         }
                     }
                 }
-                true
+                Del::Removed { min_changed }
             }
             BTreeNode::Internal { keys, children } => {
                 let child_idx = Self::child_index(&keys, &key);
                 let child_page_id = children[child_idx];
-                let deleted = self.delete_recursive(child_page_id, key, Some(node_page_id));
-                if !deleted {
-                    return false;
-                }
+                let min_changed = match self.delete_recursive(child_page_id, key, Some(node_page_id))
+                {
+                    Del::NotFound => return Del::NotFound,
+                    Del::Removed { min_changed } => min_changed,
+                };
 
-                // 子树删除后，若分隔键对应子树最小键变化则更新
-                // keys[i] 是 children[i+1] 子树的下界 → 更新 keys[child_idx - 1]
-                if child_idx > 0 {
+                // 回溯段一次读就够：改前是"先 `read_page` 问一句还在不在、再 `read_node` 读一遍"，
+                // 下溢检查那里**又**同样两遍 ⇒ 每层 4 次页读、其中 3 次是重复读同一页。
+                // 页已被合并掉而读不到时按"可能变了"上报（保守：让上层去核对分隔键）。
+                let Some(mut cur) = self.try_read_node(node_page_id) else {
+                    return Del::Removed { min_changed: true };
+                };
+
+                // 只有"该子树的最小键可能变了"才去把它重新找出来写进分隔键
+                // `keys[i]` 是 `children[i+1]` 子树的下界 ⇒ 要更新的是 `keys[child_idx - 1]`
+                if min_changed && child_idx > 0 {
+                    #[cfg(test)]
+                    SEP_REFRESHES.with(|c| c.set(c.get() + 1));
                     if let Some(min_key) = self.subtree_min_key(child_page_id) {
-                        // 重新读取：子路径可能已合并/借键，本节点可能已变
-                        // 若本节点在合并中被释放则跳过
-                        if self.page_manager.read_page(node_page_id).is_some() {
-                            let mut cur = self.read_node(node_page_id);
-                            if let BTreeNode::Internal {
-                                keys: ks,
-                                children: ch,
-                            } = &mut cur
-                            {
-                                // child 可能已变下标，重新定位
-                                if let Some(new_idx) = ch.iter().position(|&c| c == child_page_id) {
-                                    if new_idx > 0 && new_idx - 1 < ks.len() {
-                                        ks[new_idx - 1] = min_key;
-                                        self.write_node(node_page_id, &cur);
-                                    }
+                        if let BTreeNode::Internal {
+                            keys: ks,
+                            children: ch,
+                        } = &mut cur
+                        {
+                            // child 可能已变下标（兄弟间挪过），重新定位
+                            if let Some(new_idx) = ch.iter().position(|&c| c == child_page_id) {
+                                if new_idx > 0 && new_idx - 1 < ks.len() && ks[new_idx - 1] != min_key
+                                {
+                                    ks[new_idx - 1] = min_key;
+                                    self.write_node(node_page_id, &cur);
                                 }
                             }
                         }
@@ -1593,22 +1646,31 @@ impl BPlusTree {
                 }
 
                 // 检查本节点是否下溢（合并子节点后）
+                let mut restructured = false;
                 if node_page_id != self.root {
                     if let Some(parent) = parent_page_id {
-                        if self.page_manager.read_page(node_page_id).is_some() {
-                            let cur = self.read_node(node_page_id);
-                            if self.is_underflow(&cur) {
-                                self.handle_underflow(node_page_id, parent);
-                            }
+                        if self.is_underflow(&cur) {
+                            self.handle_underflow(node_page_id, parent);
+                            restructured = true;
                         }
                     }
                 } else {
                     self.shrink_root_if_needed();
                 }
 
-                true
+                // 往上只报"本子树的下界可能变了"：动的是**最左那棵子树**、或本节点自己借/合并过。
+                // 删中间那片叶子的最小键不会改变整个子树的下界 ⇒ 上面各层都不必去走那趟左下到底。
+                Del::Removed {
+                    min_changed: (min_changed && child_idx == 0) || restructured,
+                }
             }
         }
+    }
+
+    /// `read_node` 的"页可能已经被合并掉"版本（M54b：把回溯段那两遍"先问在不在、再读一遍"合成一次）
+    fn try_read_node(&mut self, page_id: PageId) -> Option<BTreeNode> {
+        let data = self.page_manager.read_page(page_id)?;
+        bincode::deserialize(&data).ok()
     }
 
     /// 子树最小键（一直向左走到叶子）
@@ -2387,6 +2449,86 @@ mod tests {
                 Some(vec![n]),
                 "复用页之后读回的是上一个占用者的内容"
             );
+        }
+    }
+
+    /// 守卫（M54b）：删除回溯段只为"这棵子树的下界**可能**动了"去走那趟左下到底，
+    /// 而且每一层只读**一次**本页。
+    ///
+    /// 四臂各红在哪（界都是从这两臂的实测数中间定的）：
+    /// - 改后的形状：0.163 趟刷新/每次删除、9.33 页/每次删除 ⇒ 绿；
+    /// - μA（退回改前的"无条件刷新"）：**2.372** 趟、**13.58** 页 ⇒ 两条界一起红（这一格随树高涨，
+    ///   600k 档付的是磁盘）；
+    /// - μC（把"先 `read_page` 问一句还在不在、再 `read_node` 读一遍"的两遍读抄回来）：页读 **15.33** ⇒ 红；
+    /// - μB（**从不**刷新）：刷新数 0 ⇒ 只有空转哨兵红。**正确性扫抓不到它** —— 实测过：900 把键照样
+    ///   全读得回。μE（借位/合并**不**向父层上报）**同样绿，而且两把尺子与改后一字不差（21 趟 / 9.33 页）
+    ///   ⇒ 这个形状根本没触发过重组（order=12、只删 129/900 把键，叶子没下溢），**"重组也上报"这一半
+    ///   还没被任何形状检验过** —— 下一轮要先造一个真会合并的形状，别把这一半读成"已经守住"。
+    ///   这一格的"保守方向"只有**代价**证据、没有可达性证据：分隔键停在已被删掉的键上仍是合法分界
+    ///   （左子树全 < 它 < 右子树剩下的键）。⇒ 判据只能挂在代价尺子上，不许把它读成"刷新是可达性守卫"。
+    ///   扫自己不是装饰：μF（刷新时写一个越过右子树多数键的分隔键）在它这里红 —— 键走错子树，
+    ///   连"删掉第 49 个键"都做不成。
+    #[test]
+    fn separator_refresh_only_happens_when_the_subtree_minimum_moves() {
+        // order=12：叶子满约 11 条 ⇒ 900 键有 ~8 成在 3~4 层树上（两层的树每行最多刷 1 次，
+        // 那时无条件/有条件两臂的差被树高吃掉了，界就量不出东西）
+        const N: usize = 900;
+        const BOUND: f64 = 1.0;
+        const READ_BOUND: f64 = 12.0;
+        fn k(n: usize) -> Key {
+            format!("{n:08}").into_bytes()
+        }
+        fn r(n: usize) -> RowId {
+            RowId(Some((n as u32).to_le_bytes().to_vec()))
+        }
+
+        let mut tree = BPlusTree::new(12, 4096);
+        for i in 0..N {
+            assert!(tree.insert(k(i), r(i)), "插入第 {i} 个键失败");
+        }
+        // 先把页请进缓存，让下面量的是"结构上的重复刷新/重复读"而不是冷缓存
+        for i in 0..N {
+            assert!(tree.get(k(i)).is_some(), "第 {i} 个键写完读不回来");
+        }
+
+        sep_refreshes_clear();
+        let reads0 = crate::bplus_tree::page::page_reads();
+        let mut dels = 0usize;
+        for i in (0..N).step_by(7) {
+            assert!(tree.delete(k(i)), "删除第 {i} 个键失败");
+            dels += 1;
+        }
+        let refreshes = sep_refreshes() as usize;
+        let reads = crate::bplus_tree::page::page_reads() - reads0;
+        let per_del = refreshes as f64 / dels as f64;
+        let per_del_reads = reads as f64 / dels as f64;
+        eprintln!(
+            "[sep_refresh] {dels} 次删除 → {refreshes} 趟左下到底（{per_del:.3} 趟/次，界 {BOUND}）\
+             · 页读 {reads}（{per_del_reads:.2} 页/次，界 {READ_BOUND}）"
+        );
+
+        // 尺子不能空转：删的是最左键/触发过合并的那些必须刷到
+        assert!(
+            refreshes > 0,
+            "一趟分隔键刷新都没有 ⇒ 这条尺子在空转，界再低也守不住东西"
+        );
+        assert!(
+            per_del <= BOUND,
+            "每次删除走 {per_del:.3} 趟左下到底（界 {BOUND}）⇒ 回溯段又变成无条件刷新了：\
+             删中间叶子的非最小键不可能改变子树下界"
+        );
+        assert!(
+            per_del_reads <= READ_BOUND,
+            "每次删除读 {per_del_reads:.2} 页（界 {READ_BOUND}）⇒ 回溯段又付起\"先问在不在、再读一遍\"的两遍读"
+        );
+
+        // 正确性扫：幸存键全部读得回来，删掉的键全部读不到（"从不刷新"在这里红）
+        for i in 0..N {
+            if i % 7 == 0 {
+                assert!(tree.get(k(i)).is_none(), "第 {i} 个键已删，还能读到");
+            } else {
+                assert!(tree.get(k(i)).is_some(), "第 {i} 个幸存键读不回来 ⇒ 分隔键错了");
+            }
         }
     }
 }
