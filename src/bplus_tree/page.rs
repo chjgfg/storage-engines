@@ -238,6 +238,9 @@ pub(crate) const PHASE_DESCENT: u8 = 1;
 pub(crate) const PHASE_BACKTRACK: u8 = 2;
 pub(crate) const PHASE_SEP_REFRESH: u8 = 3;
 pub(crate) const PHASE_RESTRUCTURE: u8 = 4;
+// 这只桶**只有测试构建里有**：M56b 删掉那趟整树 DFS 之后，业务代码再没有一处会往里写，
+// 留着它是为了"DFS 回来了就读得见"（守卫断言它恒为 0，μG 变异臂往里写）。
+#[cfg(test)]
 pub(crate) const PHASE_GRANDPARENT: u8 = 5;
 pub(crate) const PHASE_ROOT_CHECK: u8 = 6;
 #[cfg(test)]

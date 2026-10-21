@@ -1688,7 +1688,7 @@ impl BPlusTree {
             BTreeNode::Internal { keys, children } => {
                 let child_idx = Self::child_index(&keys, &key);
                 let child_page_id = children[child_idx];
-                let (mut min_changed, mut merged) =
+                let (min_changed, mut merged) =
                     match self.delete_recursive(child_page_id, key, Some(node_page_id)) {
                         Del::NotFound => return Del::NotFound,
                         Del::Removed {
