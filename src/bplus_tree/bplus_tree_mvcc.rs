@@ -3323,6 +3323,47 @@ mod tests {
                     "刷出页".to_string(),
                     crate::bplus_tree::page::batch_flushed_pages(),
                 ),
+                // M56 的七桶：把"每删除行读几页"拆到具体哪一段在读
+                (
+                    "页·下降".to_string(),
+                    crate::bplus_tree::page::page_reads_by_phase()[crate::bplus_tree::page::PHASE_DESCENT as usize],
+                ),
+                (
+                    "页·回溯".to_string(),
+                    crate::bplus_tree::page::page_reads_by_phase()[crate::bplus_tree::page::PHASE_BACKTRACK as usize],
+                ),
+                (
+                    "页·分隔键".to_string(),
+                    crate::bplus_tree::page::page_reads_by_phase()[crate::bplus_tree::page::PHASE_SEP_REFRESH as usize],
+                ),
+                (
+                    "页·重组".to_string(),
+                    crate::bplus_tree::page::page_reads_by_phase()[crate::bplus_tree::page::PHASE_RESTRUCTURE as usize],
+                ),
+                (
+                    "页·找祖父".to_string(),
+                    crate::bplus_tree::page::page_reads_by_phase()[crate::bplus_tree::page::PHASE_GRANDPARENT as usize],
+                ),
+                (
+                    "页·问根".to_string(),
+                    crate::bplus_tree::page::page_reads_by_phase()[crate::bplus_tree::page::PHASE_ROOT_CHECK as usize],
+                ),
+                // 重组自己的账：不做这些就没人知道"页·重组"那一段是谁花的
+                (
+                    "真下溢".to_string(),
+                    crate::bplus_tree::bplus_tree::reorg_stats().0,
+                ),
+                ("借位".to_string(), crate::bplus_tree::bplus_tree::reorg_stats().1),
+                ("合并".to_string(), crate::bplus_tree::bplus_tree::reorg_stats().2),
+                (
+                    "找祖父趟".to_string(),
+                    crate::bplus_tree::bplus_tree::reorg_stats().3,
+                ),
+                ("问根次数".to_string(), crate::bplus_tree::bplus_tree::root_checks()),
+                (
+                    "分隔键刷新".to_string(),
+                    crate::bplus_tree::bplus_tree::sep_refreshes(),
+                ),
             ]
         };
         let phys = rows as f64 * 2.0;

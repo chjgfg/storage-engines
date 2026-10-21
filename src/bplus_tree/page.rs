@@ -222,6 +222,72 @@ pub(crate) fn page_reads() -> u64 {
     PAGE_READS.with(|c| c.get())
 }
 
+// 测试专用：页读**按阶段归桶**（M56）。
+//
+// 为什么需要它：M54b 之后 20k 档"每删除行仍读 9.37 页"，可 `PAGE_READS` 是一只总桶，
+// 它答不出这 9.37 页花在**下降**、**回溯**、**分隔键刷新**还是**重组（借位/合并）**上 ——
+// 而这五段的修法完全不同（下降=合批同叶多行、回溯=M54b 已做、分隔键=M54b 已做、重组=去掉对同一页的重复读、
+// 找祖父=那趟从根走的整树 DFS —— 它单独一只桶，因为它一发生就是 O(整树页数)，混在"重组"里就看不见它），
+// 不拆开就只能猜。阶段由删除路径自己用 [`set_page_phase`] 标注，读页的两扇门
+// （`read_page` / `read_page_for_walk`）都把"当前桶 +1" ⇒ **各桶之和应当等于 `PAGE_READS`**，
+// 这条本身由守卫对着（桶漏标注会立刻读出来，而不是静默少计）。
+// 阶段常量在**两边都存在**：这样删除路径里的标注不必撒 `#[cfg(test)]`，
+// 业务代码与量具在两种构建下同形（读桶只在 test 构建里存在）。
+pub(crate) const PHASE_OTHER: u8 = 0;
+pub(crate) const PHASE_DESCENT: u8 = 1;
+pub(crate) const PHASE_BACKTRACK: u8 = 2;
+pub(crate) const PHASE_SEP_REFRESH: u8 = 3;
+pub(crate) const PHASE_RESTRUCTURE: u8 = 4;
+pub(crate) const PHASE_GRANDPARENT: u8 = 5;
+pub(crate) const PHASE_ROOT_CHECK: u8 = 6;
+#[cfg(test)]
+pub(crate) const PHASE_BUCKETS: usize = 7;
+#[cfg(test)]
+thread_local! {
+    static PAGE_PHASE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static PAGE_READS_PHASE: [std::cell::Cell<u64>; PHASE_BUCKETS] = const {
+        [
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+        ]
+    };
+}
+
+/// 标注"接下来的页读属于哪一段"（只在删除路径里调；一趟删除结束要设回 [`PHASE_OTHER`]）。
+/// 非 test 构建里这个函数体是空的 ⇒ 标注留在业务代码里没有代价。
+#[inline(always)]
+pub(crate) fn set_page_phase(_phase: u8) {
+    #[cfg(test)]
+    PAGE_PHASE.with(|c| c.set(_phase));
+}
+
+/// 各阶段各读了多少页（长度 [`PHASE_BUCKETS`]）
+#[cfg(test)]
+pub(crate) fn page_reads_by_phase() -> [u64; PHASE_BUCKETS] {
+    PAGE_READS_PHASE.with(|a| {
+        let mut out = [0u64; PHASE_BUCKETS];
+        for (i, c) in a.iter().enumerate() {
+            out[i] = c.get();
+        }
+        out
+    })
+}
+
+/// 两扇读页门共用的记账：把当前阶段那只桶 +1
+#[cfg(test)]
+fn note_phase_read() {
+    let p = PAGE_PHASE.with(|c| c.get()) as usize;
+    PAGE_READS_PHASE.with(|a| {
+        let i = p.min(PHASE_BUCKETS - 1);
+        a[i].set(a[i].get() + 1);
+    });
+}
+
 // 本线程「试图写一个装不下的页」的次数。
 //
 // 这个计数存在的理由是**正确性**而不只是噪音：`write_page` 超限只打印并返回 false，
@@ -686,6 +752,8 @@ impl PageManager {
         // 测试专用：页访问次数（含页缓存命中）—— 用来断言点操作的代价不随版本链长度增长
         #[cfg(test)]
         PAGE_READS.with(|c| c.set(c.get() + 1));
+        #[cfg(test)]
+        note_phase_read();
         if !self.page_is_live(page_id) {
             return None;
         }
@@ -735,6 +803,8 @@ impl PageManager {
     pub fn read_page_for_walk(&mut self, page_id: PageId) -> Option<Vec<u8>> {
         #[cfg(test)]
         PAGE_READS.with(|c| c.set(c.get() + 1));
+        #[cfg(test)]
+        note_phase_read();
         if !self.page_is_live(page_id) {
             return None;
         }

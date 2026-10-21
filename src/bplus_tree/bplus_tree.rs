@@ -2,7 +2,10 @@ use std::{fmt, path::Path, write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bplus_tree::page::{MAX_PAYLOAD, PageId, PageManager};
+use crate::bplus_tree::page::{
+    MAX_PAYLOAD, PageId, PageManager, PHASE_BACKTRACK, PHASE_DESCENT, PHASE_OTHER,
+    PHASE_GRANDPARENT, PHASE_RESTRUCTURE, PHASE_ROOT_CHECK, PHASE_SEP_REFRESH, set_page_phase,
+};
 
 // 测试专用：本线程「把一页字节 bincode 解析成节点」的次数。
 //
@@ -996,6 +999,79 @@ pub(crate) fn sep_refreshes_clear() {
     SEP_REFRESHES.with(|c| c.set(0));
 }
 
+// 测试专用尺子（M56）：删除路径里**重组**那一段到底发生了多少次、走的哪一招。
+//
+// 为什么钉这一格：M54b 之后 20k 档"每删除行仍读 9.37 页"，而 `下降/删除行 = 2.04`（树高 2）
+// ⇒ 一次下降约 4.6 页，多出来的页不在下降里。候选就是 `handle_underflow` 这条路：它为了查一次
+// 下溢，会把**同一批页**（本页、父页、兄弟页）反复 `read_node` 好几遍，合并时还要 `find_parent_of`
+// 从根再走一趟。是这些重复读还是别的，得先数出来才能决定下一刀切哪。
+//
+// 四个数各自的意思：
+// - `underflow`：进到 `handle_underflow` 且**真的下溢**的次数（不是"调用次数"—— 每行删除都会问一句）
+// - `borrow`：借位成功的次数
+// - `merge`：整对重排并**真释放了一页**的次数（`PairReorg::Merged`）
+// - `grandparent_walks`：`find_parent_of` 被走的次数（合并后向上传播，每次都是从根重新走的一趟全树扫）
+#[cfg(test)]
+thread_local! {
+    static UNDERFLOW_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BORROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MERGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GRANDPARENT_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ROOT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `(真下溢次数, 借位, 合并, 找祖父走的趟数)`
+#[cfg(test)]
+pub(crate) fn reorg_stats() -> (u64, u64, u64, u64) {
+    UNDERFLOW_CALLS.with(|c| (c.get(), BORROWS.with(|b| b.get()), MERGES.with(|m| m.get()), GRANDPARENT_WALKS.with(|g| g.get())))
+}
+
+#[cfg(test)]
+pub(crate) fn reorg_stats_clear() {
+    UNDERFLOW_CALLS.with(|c| c.set(0));
+    BORROWS.with(|c| c.set(0));
+    MERGES.with(|c| c.set(0));
+    GRANDPARENT_WALKS.with(|c| c.set(0));
+    ROOT_CHECKS.with(|c| c.set(0));
+}
+
+/// 每行删除问了几次"根要不要降层"（每次都读一遍根页）
+#[cfg(test)]
+pub(crate) fn root_checks() -> u64 {
+    ROOT_CHECKS.with(|c| c.get())
+}
+
+#[cfg(test)]
+macro_rules! note_underflow {
+    () => {
+        UNDERFLOW_CALLS.with(|c| c.set(c.get() + 1))
+    };
+}
+#[cfg(test)]
+macro_rules! note_borrow {
+    () => {
+        BORROWS.with(|c| c.set(c.get() + 1))
+    };
+}
+#[cfg(test)]
+macro_rules! note_merge {
+    () => {
+        MERGES.with(|c| c.set(c.get() + 1))
+    };
+}
+#[cfg(test)]
+macro_rules! note_grandparent_walk {
+    () => {
+        GRANDPARENT_WALKS.with(|c| c.set(c.get() + 1))
+    };
+}
+#[cfg(test)]
+macro_rules! note_root_check {
+    () => {
+        ROOT_CHECKS.with(|c| c.set(c.get() + 1))
+    };
+}
+
 /// 删除的返回值（M54b）。
 ///
 /// `min_changed` 说的是"**本次删除可能改变了该子树的最小键**"—— 分隔键就是子树最小键，
@@ -1017,8 +1093,11 @@ impl BPlusTree {
 
         // 根是内部节点且只剩一个子节点时降层
         if deleted {
+            set_page_phase(PHASE_RESTRUCTURE);
             self.shrink_root_if_needed();
         }
+        // M56：一趟删除结束把阶段清空 ⇒ 下一趟的桶不会串到这一趟上
+        set_page_phase(PHASE_OTHER);
         deleted
     }
 
@@ -1094,7 +1173,12 @@ impl BPlusTree {
         if target == self.root {
             return None;
         }
-        self.find_parent_of_rec(self.root, target)
+        // 单独一只桶（M56）：这是**从根走的整树 DFS**，一发生就是 O(整树页数)；
+        // 混进"重组"桶里就看不出它占了每删除行多少页
+        set_page_phase(PHASE_GRANDPARENT);
+        let found = self.find_parent_of_rec(self.root, target);
+        set_page_phase(PHASE_RESTRUCTURE);
+        found
     }
 
     fn find_parent_of_rec(&mut self, current: PageId, target: PageId) -> Option<PageId> {
@@ -1116,6 +1200,11 @@ impl BPlusTree {
     }
 
     fn shrink_root_if_needed(&mut self) {
+        // 单独一只桶（M56）：这一句问的是"根要不要降层"—— 每行删除都会被叫到，而它每次都把根页
+        // 读一遍。这与"真的在做重组"不是一回事，所以单独记账、单独归段。
+        #[cfg(test)]
+        note_root_check!();
+        set_page_phase(PHASE_ROOT_CHECK);
         match self.read_node(self.root) {
             BTreeNode::Internal { children, .. } if children.len() == 1 => {
                 let old_root = self.root;
@@ -1124,6 +1213,7 @@ impl BPlusTree {
             }
             _ => {}
         }
+        set_page_phase(PHASE_BACKTRACK);
     }
 
     /// 叶子：向兄弟借一条记录；不改动 next_leaf 链表
@@ -1505,6 +1595,9 @@ impl BPlusTree {
         if !self.is_underflow(&node) {
             return;
         }
+        // 走到这里才是"真的要做一次重组"（M56 的数：每行删除都会问一句下溢，但只有这里动手）
+        #[cfg(test)]
+        note_underflow!();
 
         let Some(child_idx) = self.get_parent_index(parent_page_id, node_page_id) else {
             return;
@@ -1540,6 +1633,8 @@ impl BPlusTree {
             };
             // 借不释放页 ⇒ 父节点的子数不变 ⇒ 不会连锁下溢
             if borrowed {
+                #[cfg(test)]
+                note_borrow!();
                 return;
             }
         }
@@ -1558,7 +1653,11 @@ impl BPlusTree {
 
         // 只有真的**释放了一页**，父节点才可能因此下溢：用 DFS 找祖父，正确向上传播
         if reorg == PairReorg::Merged {
+            #[cfg(test)]
+            note_merge!();
             if parent_page_id != self.root {
+                #[cfg(test)]
+                note_grandparent_walk!();
                 if let Some(grandparent) = self.find_parent_of(parent_page_id) {
                     self.handle_underflow(parent_page_id, grandparent);
                 }
@@ -1582,6 +1681,8 @@ impl BPlusTree {
         key: Key,
         parent_page_id: Option<PageId>,
     ) -> Del {
+        // M56 的段标注：下降那一次读记到"下降"，返回之后本层的所有读记到"回溯"
+        set_page_phase(PHASE_DESCENT);
         let mut node = self.read_node(node_page_id);
 
         match &mut node {
@@ -1598,7 +1699,9 @@ impl BPlusTree {
                 if node_page_id != self.root {
                     if let Some(parent) = parent_page_id {
                         if self.is_underflow(&node) {
+                            set_page_phase(PHASE_RESTRUCTURE);
                             self.handle_underflow(node_page_id, parent);
+                            set_page_phase(PHASE_BACKTRACK);
                             // 借位/合并会挪分隔键与本层下界 ⇒ 一律上报"可能变了"，让上层去核对
                             min_changed = true;
                         }
@@ -1614,6 +1717,7 @@ impl BPlusTree {
                     Del::NotFound => return Del::NotFound,
                     Del::Removed { min_changed } => min_changed,
                 };
+                set_page_phase(PHASE_BACKTRACK);
 
                 // 回溯段一次读就够：改前是"先 `read_page` 问一句还在不在、再 `read_node` 读一遍"，
                 // 下溢检查那里**又**同样两遍 ⇒ 每层 4 次页读、其中 3 次是重复读同一页。
@@ -1627,7 +1731,11 @@ impl BPlusTree {
                 if min_changed && child_idx > 0 {
                     #[cfg(test)]
                     SEP_REFRESHES.with(|c| c.set(c.get() + 1));
-                    if let Some(min_key) = self.subtree_min_key(child_page_id) {
+                    // 这一趟要一路向左下走到叶子、逐页读 ⇒ 单独一个桶（M56），别混进"回溯"里
+                    set_page_phase(PHASE_SEP_REFRESH);
+                    let min_key = self.subtree_min_key(child_page_id);
+                    set_page_phase(PHASE_BACKTRACK);
+                    if let Some(min_key) = min_key {
                         if let BTreeNode::Internal {
                             keys: ks,
                             children: ch,
@@ -1650,12 +1758,16 @@ impl BPlusTree {
                 if node_page_id != self.root {
                     if let Some(parent) = parent_page_id {
                         if self.is_underflow(&cur) {
+                            set_page_phase(PHASE_RESTRUCTURE);
                             self.handle_underflow(node_page_id, parent);
+                            set_page_phase(PHASE_BACKTRACK);
                             restructured = true;
                         }
                     }
                 } else {
+                    set_page_phase(PHASE_RESTRUCTURE);
                     self.shrink_root_if_needed();
+                    set_page_phase(PHASE_BACKTRACK);
                 }
 
                 // 往上只报"本子树的下界可能变了"：动的是**最左那棵子树**、或本节点自己借/合并过。
@@ -2528,6 +2640,218 @@ mod tests {
                 assert!(tree.get(k(i)).is_none(), "第 {i} 个键已删，还能读到");
             } else {
                 assert!(tree.get(k(i)).is_some(), "第 {i} 个幸存键读不回来 ⇒ 分隔键错了");
+            }
+        }
+    }
+
+    /// 守卫（M56）：**成块删**的形状 —— 上一轮那条守卫用的形状根本没触发过重组（μE 与改后一字不差）。
+    ///
+    /// 三件事钉在一起：
+    /// - **证人先成立**：`借位 + 合并 > 0`。不然"重组也向父层上报"那一半仍然没被任何形状检验过；
+    /// - **量具自检**：四个阶段桶之和 == `page_reads()` 的增量 ⇒ 标注漏了一扇门就会当场读出来，
+    ///   不会静默少计（桶少算比桶读 0 更危险，它看着像证据）；
+    /// - **代价界**：每删除行的页读、以及 `页/次下降`（③ 的尺子：合批下降之前，先看清一次下降花几页）。
+    #[test]
+    fn batched_deletes_really_restructure_and_stay_correct() {
+        const N: usize = 1_200;
+        // 两条界都从**本形状 M56 的实测起点**定（起点：17.68 页/删除行、5.89 页/次下降），
+        // 留 ~8% 余量。M56b（去掉"每次合并从根 DFS 找祖父"）之后应当显著下降，届时再收紧。
+        const PAGE_BOUND: f64 = 19.0;
+        const PER_DESCENT_BOUND: f64 = 6.5;
+        fn k(n: usize) -> Key {
+            format!("{n:08}").into_bytes()
+        }
+        fn r(n: usize) -> RowId {
+            RowId(Some((n as u64).to_le_bytes().to_vec()))
+        }
+
+        // order=12 ⇒ 叶子满约 11 条；成块删一半 ⇒ 叶子成片空掉 ⇒ 必然走到借位/合并
+        let mut tree = BPlusTree::new(12, 4096);
+        for i in 0..N {
+            assert!(tree.insert(k(i), r(i)), "插入第 {i} 个键失败");
+        }
+        for i in 0..N {
+            assert!(tree.get(k(i)).is_some(), "第 {i} 个键写完读不回来");
+        }
+
+        let p0 = crate::bplus_tree::page::page_reads();
+        let b0 = crate::bplus_tree::page::page_reads_by_phase();
+        let (u0, bor0, mg0, gw0) = reorg_stats();
+        let d0 = descent_lookups();
+        let s0 = sep_refreshes();
+        reorg_stats_clear();
+        sep_refreshes_clear();
+
+        let mut dels = 0usize;
+        for i in (0..N).step_by(2) {
+            assert!(tree.delete(k(i)), "删除第 {i} 个键失败");
+            dels += 1;
+        }
+        let reads = crate::bplus_tree::page::page_reads() - p0;
+        let b1 = crate::bplus_tree::page::page_reads_by_phase();
+        let buckets: Vec<u64> = (0..b1.len()).map(|i| b1[i] - b0[i]).collect();
+        let (u, bor, m, g) = reorg_stats();
+        let (u, bor, m, g) = (u - u0, bor - bor0, m - mg0, g - gw0);
+        let descents = descent_lookups() - d0;
+        let refreshes = sep_refreshes() - s0;
+        let per_del = reads as f64 / dels as f64;
+        let per_descent = reads as f64 / descents.max(1) as f64;
+        let (b_other, b_descent, b_back, b_sep, b_reorg, b_gp, b_rc) = (
+            buckets[0],
+            buckets[1],
+            buckets[2],
+            buckets[3],
+            buckets[4],
+            buckets[5],
+            buckets[6],
+        );
+        let rc = root_checks();
+        let gp_per_walk = b_gp as f64 / g.max(1) as f64;
+        eprintln!(
+            "[del_guard] {dels} 次删除 · 页读 {reads}（{per_del:.2} 页/删除行）· 下降 {descents} · \
+             {per_descent:.2} 页/次下降\n  桶：其它 {b_other} 下降 {b_descent} 回溯 {b_back} \
+             分隔键 {b_sep} 重组 {b_reorg} 找祖父 {b_gp} 问根 {b_rc}\n\
+             重组：真下溢 {u} / 借位 {bor} / 合并 {m} / 找祖父走 {g} 趟（每趟 {gp_per_walk:.1} 页）\
+             / 问根 {rc} 次 / 分隔键刷新 {refreshes} 趟"
+        );
+
+        // ① 量具自检
+        assert_eq!(
+            buckets.iter().sum::<u64>(),
+            reads,
+            "阶段桶之和 {} != 页读 {reads} ⇒ 有一扇读页门没被标注，桶的读数全是漏的",
+            buckets.iter().sum::<u64>()
+        );
+        // ② 证人：这个形状必须真的做过重组
+        assert!(
+            bor + m > 0,
+            "借位与合并都是 0 ⇒ 这个形状还是没触发重组，证人失效（别把\"重组也上报\"读成已检验）"
+        );
+        // ③ 代价界
+        assert!(
+            per_del <= PAGE_BOUND,
+            "每次删除读 {per_del:.2} 页（界 {PAGE_BOUND}）⇒ 删除路径又长出重复读了；\
+             看桶里哪一段涨了就修哪一段（下降/回溯/分隔键/重组）"
+        );
+        assert!(
+            per_descent <= PER_DESCENT_BOUND,
+            "每次下降读 {per_descent:.2} 页（界 {PER_DESCENT_BOUND}）⇒ 一趟下降除了路上每层那一页还多读了页"
+        );
+        // ④ 正确性扫
+        for i in 0..N {
+            if i % 2 == 0 {
+                assert!(tree.get(k(i)).is_none(), "第 {i} 个键已删，还能读到");
+            } else {
+                assert!(tree.get(k(i)).is_some(), "第 {i} 个幸存键读不回来");
+            }
+        }
+    }
+
+    /// M56 的拆段台架（`#[ignore]`，手动 release 单线程跑）：把"每删除行读 9.37 页"**按阶段拆开**
+    ///
+    /// 两种删法必须一起读：M54 那份归因只给了一个总数。
+    /// - **每 3 把删 1 把**（稀疏）：叶子不会成片空 ⇒ 重组少，钱主要在下降 + 回溯；
+    /// - **成块删一半**：叶子成片空 ⇒ 借位/合并密集，看重组那只桶涨多少。
+    /// ③（同叶合批一次下降）只治"下降"那一段 ⇒ 哪一段占大头，决定下一刀切哪里。
+    ///
+    /// ```text
+    /// BPLUS_DEL_ROWS=20000 cargo test --release --lib -- --ignored --nocapture \
+    ///     --test-threads=1 bplus_delete_path_buckets
+    /// ```
+    #[test]
+    #[ignore = "bplus 删除路径按阶段拆段，手动 release 单线程跑：BPLUS_DEL_ROWS=20000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 bplus_delete_path_buckets"]
+    fn bplus_delete_path_buckets() {
+        let rows: usize = std::env::var("BPLUS_DEL_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        fn k(n: usize) -> Key {
+            format!("{n:08}").into_bytes()
+        }
+        fn r(n: usize) -> RowId {
+            RowId(Some((n as u64).to_le_bytes().to_vec()))
+        }
+
+        for (tag, step) in [("每3把删1把", 3usize), ("成块删一半", 2usize)] {
+            let mut tree = BPlusTree::new(64, 4096);
+            for i in 0..rows {
+                assert!(tree.insert(k(i), r(i)), "插入第 {i} 个键失败");
+            }
+            tree.flush_all();
+            // 焐热：先全库点读一遍，让量具读的是"页访问次数"而不是冷缓存的读盘
+            for i in 0..rows {
+                assert!(tree.get(k(i)).is_some(), "第 {i} 个键写完读不回来");
+            }
+
+            let p0 = crate::bplus_tree::page::page_reads();
+            let b0 = crate::bplus_tree::page::page_reads_by_phase();
+            let m0 = crate::bplus_tree::page::cache_misses();
+            let e0 = crate::bplus_tree::page::page_evictions();
+            let (u0, bor0, mg0, gw0) = reorg_stats();
+            let d0 = descent_lookups();
+            let s0 = sep_refreshes();
+            reorg_stats_clear();
+            sep_refreshes_clear();
+
+            let mut dels = 0usize;
+            for i in (0..rows).step_by(step) {
+                assert!(tree.delete(k(i)), "删除第 {i} 个键失败");
+                dels += 1;
+            }
+            let d = dels as f64;
+            let reads = crate::bplus_tree::page::page_reads() - p0;
+            let b1 = crate::bplus_tree::page::page_reads_by_phase();
+            let bk: Vec<u64> = (0..b1.len()).map(|i| b1[i] - b0[i]).collect();
+            let (pu, pb, pbt, ps, pr, pg, prc) = (
+                bk[0] as f64 / d,
+                bk[1] as f64 / d,
+                bk[2] as f64 / d,
+                bk[3] as f64 / d,
+                bk[4] as f64 / d,
+                bk[5] as f64 / d,
+                bk[6] as f64 / d,
+            );
+            let rc = root_checks();
+            let miss = crate::bplus_tree::page::cache_misses() - m0;
+            let evict = crate::bplus_tree::page::page_evictions() - e0;
+            let (u, bor, m, g) = reorg_stats();
+            let (u, bor, m, g) = (u - u0, bor - bor0, m - mg0, g - gw0);
+            let descents = descent_lookups() - d0;
+            let refreshes = sep_refreshes() - s0;
+            let per_del = reads as f64 / d;
+            let per_descent = reads as f64 / descents.max(1) as f64;
+            eprintln!(
+                "[del_buckets {tag}] rows={rows} 删 {dels} 行 · 页读 {reads}（{per_del:.2} 页/删除行）\
+                 · 下降 {descents}（{:.2} 次/删除行）· {per_descent:.2} 页/次下降\n\
+                 桶/删除行：其它 {pu:.2} 下降 {pb:.2} 回溯 {pbt:.2} 分隔键 {ps:.2} 重组 {pr:.2} 找祖父 {pg:.2} 问根 {prc:.2}\n\
+                 重组：真下溢 {u}（{:.2} 次/删除行）借位 {bor} 合并 {m} 找祖父 {g} 问根 {rc}（{:.2} 次/删除行）\
+                 ｜ 分隔键刷新 {refreshes}（{:.3} 趟/删除行）｜ 缺页 {:.2} 换出 {:.2}",
+                descents as f64 / d,
+                u as f64 / d,
+                rc as f64 / d,
+                refreshes as f64 / d,
+                miss as f64 / d,
+                evict as f64 / d,
+            );
+            assert_eq!(
+                bk.iter().sum::<u64>(),
+                reads,
+                "桶之和 != 页读 ⇒ 标注漏了一扇门，这一行读数全部作废"
+            );
+            // 只有"成块删一半"这一臂**要求**触发重组（证人）；稀疏那一臂读到 0 是**结论**不是失败 ——
+            // 它正是在说"稀疏删几乎不重组，所以 ③ 省下的钱不在重组段"
+            if step == 2 {
+                assert!(
+                    bor + m > 0,
+                    "这一档（{tag}, rows={rows}）没触发过重组 ⇒ 证人失效，别把重组段读成\"不花钱\""
+                );
+            }
+            for i in 0..rows {
+                if i % step == 0 {
+                    assert!(tree.get(k(i)).is_none(), "第 {i} 个键已删还能读到");
+                } else {
+                    assert!(tree.get(k(i)).is_some(), "第 {i} 个幸存键读不回来");
+                }
             }
         }
     }
