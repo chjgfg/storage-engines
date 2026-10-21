@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bplus_tree::page::{
     MAX_PAYLOAD, PageId, PageManager, PHASE_BACKTRACK, PHASE_DESCENT, PHASE_OTHER,
-    PHASE_GRANDPARENT, PHASE_RESTRUCTURE, PHASE_ROOT_CHECK, PHASE_SEP_REFRESH, set_page_phase,
+    PHASE_RESTRUCTURE, PHASE_ROOT_CHECK, PHASE_SEP_REFRESH, set_page_phase,
 };
 
 // 测试专用：本线程「把一页字节 bincode 解析成节点」的次数。
@@ -1003,27 +1003,31 @@ pub(crate) fn sep_refreshes_clear() {
 //
 // 为什么钉这一格：M54b 之后 20k 档"每删除行仍读 9.37 页"，而 `下降/删除行 = 2.04`（树高 2）
 // ⇒ 一次下降约 4.6 页，多出来的页不在下降里。候选就是 `handle_underflow` 这条路：它为了查一次
-// 下溢，会把**同一批页**（本页、父页、兄弟页）反复 `read_node` 好几遍，合并时还要 `find_parent_of`
-// 从根再走一趟。是这些重复读还是别的，得先数出来才能决定下一刀切哪。
+// 下溢，会把**同一批页**（本页、父页、兄弟页）反复 `read_node` 好几遍，合并时还要从根再走一趟整树 DFS
+// 去找祖父（那一条 M56b 已删，见 `页·找祖父` 桶）。是这些重复读还是别的，得先数出来才能决定下一刀切哪。
 //
-// 四个数各自的意思：
+// 三个数各自的意思：
 // - `underflow`：进到 `handle_underflow` 且**真的下溢**的次数（不是"调用次数"—— 每行删除都会问一句）
 // - `borrow`：借位成功的次数
-// - `merge`：整对重排并**真释放了一页**的次数（`PairReorg::Merged`）
-// - `grandparent_walks`：`find_parent_of` 被走的次数（合并后向上传播，每次都是从根重新走的一趟全树扫）
+// - `merge`：整对重排并**真释放了一页**的次数（`PairReorg::Merged`）—— M56b 起它还是"要不要问根降层"的唯一触发条件
 #[cfg(test)]
 thread_local! {
     static UNDERFLOW_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BORROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static MERGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static GRANDPARENT_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ROOT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// `(真下溢次数, 借位, 合并, 找祖父走的趟数)`
+/// `(真下溢次数, 借位, 合并)`
 #[cfg(test)]
-pub(crate) fn reorg_stats() -> (u64, u64, u64, u64) {
-    UNDERFLOW_CALLS.with(|c| (c.get(), BORROWS.with(|b| b.get()), MERGES.with(|m| m.get()), GRANDPARENT_WALKS.with(|g| g.get())))
+pub(crate) fn reorg_stats() -> (u64, u64, u64) {
+    UNDERFLOW_CALLS.with(|c| {
+        (
+            c.get(),
+            BORROWS.with(|b| b.get()),
+            MERGES.with(|m| m.get()),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1031,7 +1035,6 @@ pub(crate) fn reorg_stats_clear() {
     UNDERFLOW_CALLS.with(|c| c.set(0));
     BORROWS.with(|c| c.set(0));
     MERGES.with(|c| c.set(0));
-    GRANDPARENT_WALKS.with(|c| c.set(0));
     ROOT_CHECKS.with(|c| c.set(0));
 }
 
@@ -1060,41 +1063,39 @@ macro_rules! note_merge {
     };
 }
 #[cfg(test)]
-macro_rules! note_grandparent_walk {
-    () => {
-        GRANDPARENT_WALKS.with(|c| c.set(c.get() + 1))
-    };
-}
-#[cfg(test)]
 macro_rules! note_root_check {
     () => {
         ROOT_CHECKS.with(|c| c.set(c.get() + 1))
     };
 }
 
-/// 删除的返回值（M54b）。
+/// 删除的返回值（M54b / M56b）。
 ///
-/// `min_changed` 说的是"**本次删除可能改变了该子树的最小键**"—— 分隔键就是子树最小键，
-/// 所以父节点只有在这一格为真时才需要去把最小键重新找一遍（那趟要一路向左下走到叶子、逐页反序列化）。
-/// 判据：删掉的键若不是本子树最左那片叶子的最小键，子树下界不可能变；而**借位/合并**会挪下界，
-/// 所以只要做过重组就一律报真（保守方向是"多做一次刷新"，不是"漏做"）。
+/// - `min_changed`：**本次删除可能改变了该子树的最小键** —— 分隔键就是子树最小键，所以父节点只有在这一格
+///   为真时才需要把最小键重新找一遍（那趟要一路向左下走到叶子、逐页反序列化）。判据：删掉的键若不是本子树
+///   最左那片叶子的最小键，子树下界不可能变；而**借位/合并**会挪下界，所以只要做过重组就一律报真
+///   （保守方向是"多做一次刷新"，不是"漏做"）。
+/// - `merged`（M56b）：**这一趟删除里真释放过一页**。父节点少了一个孩子 ⇒ 上层只需把这个事实报给
+///   `delete()` 收尾用一次（根要不要降层）。改前 `delete()` 与回溯段每行删除各问一次"根要不要降层"，
+///   每次都要把根页读一遍并重解析 ⇒ 200k 档固定 2.00 页/删除行；现在只有合并过的那几行问一次。
 enum Del {
     NotFound,
-    Removed { min_changed: bool },
+    Removed { min_changed: bool, merged: bool },
 }
 
 impl BPlusTree {
     /// 删除：移除指定 key，必要时借键/合并并处理根降层
     pub fn delete(&mut self, key: Key) -> bool {
-        let deleted = matches!(
-            self.delete_recursive(self.root, key, None),
-            Del::Removed { .. }
-        );
+        let res = self.delete_recursive(self.root, key, None);
+        let deleted = matches!(res, Del::Removed { .. });
 
-        // 根是内部节点且只剩一个子节点时降层
-        if deleted {
-            set_page_phase(PHASE_RESTRUCTURE);
-            self.shrink_root_if_needed();
+        // 根是内部节点且只剩一个子节点时降层 —— **只在本次删除真合并过一页时才问**（M56b）。
+        // 没合并过 ⇒ 根的孩子数不可能变 ⇒ 那一次根页读与解析纯属白付。
+        if let Del::Removed { merged, .. } = res {
+            if merged {
+                set_page_phase(PHASE_RESTRUCTURE);
+                self.shrink_root_if_needed();
+            }
         }
         // M56：一趟删除结束把阶段清空 ⇒ 下一趟的桶不会串到这一趟上
         set_page_phase(PHASE_OTHER);
@@ -1169,35 +1170,10 @@ impl BPlusTree {
     }
 
     /// DFS 查找 target 的父节点（正确性优先，教学实现）
-    fn find_parent_of(&mut self, target: PageId) -> Option<PageId> {
-        if target == self.root {
-            return None;
-        }
-        // 单独一只桶（M56）：这是**从根走的整树 DFS**，一发生就是 O(整树页数)；
-        // 混进"重组"桶里就看不出它占了每删除行多少页
-        set_page_phase(PHASE_GRANDPARENT);
-        let found = self.find_parent_of_rec(self.root, target);
-        set_page_phase(PHASE_RESTRUCTURE);
-        found
-    }
-
-    fn find_parent_of_rec(&mut self, current: PageId, target: PageId) -> Option<PageId> {
-        match self.read_node(current) {
-            BTreeNode::Leaf { .. } => None,
-            BTreeNode::Internal { children, .. } => {
-                if children.iter().any(|&c| c == target) {
-                    return Some(current);
-                }
-                // 克隆 children 避免与后续递归的可变借用冲突
-                for child in children {
-                    if let Some(p) = self.find_parent_of_rec(child, target) {
-                        return Some(p);
-                    }
-                }
-                None
-            }
-        }
-    }
+    // M56b：**这里原本有一个 `find_parent_of` / `find_parent_of_rec`** —— 从根开始、把整棵树
+    // 逐页读一遍去找"某个节点的父节点"。200k 档实测它每次合并都要扫 2820 页、占每删除行页读的 77%，
+    // 而合并只让"回溯栈上的下一帧"少一个孩子 ⇒ 那一帧自己就会查下溢，`delete()` 收尾管根降层。
+    // 删掉它 ⇒ `页·找祖父` 那一只桶从此恒为 0（台架与守卫都对着这一格）。
 
     fn shrink_root_if_needed(&mut self) {
         // 单独一只桶（M56）：这一句问的是"根要不要降层"—— 每行删除都会被叫到，而它每次都把根页
@@ -1585,26 +1561,33 @@ impl BPlusTree {
         PairReorg::Resplit
     }
 
-    /// 处理下溢：能借则借，否则整对重排（合并或按字节重切）；只有释放了页才递归处理父节点下溢
-    fn handle_underflow(&mut self, node_page_id: PageId, parent_page_id: PageId) {
+    /// 处理下溢：能借则借，否则整对重排（合并或按字节重切）。
+    ///
+    /// 返回**是否真释放了一页**（`PairReorg::Merged`）。M56b 起这件事只往上"报告"，不再自己往上处理：
+    /// - 改前它合并完会 `find_parent_of(parent)` —— **从根走一趟整棵树的 DFS** —— 再对父节点做下溢处理。
+    ///   200k 档实测这一格占**每删除行 39.69 页（77%）**，每趟 DFS 扫 2820 页，而该档的缺页(38.76)就是它扫出来的；
+    /// - 而那是冗余的：合并只让"**这一层的父节点**"少一个孩子，而那个父节点正是 `delete_recursive`
+    ///   回溯栈上的下一帧 —— 它紧接着就做自己那一层的下溢检查（`is_underflow(&cur)`），
+    ///   一路到根；根降层由 `delete()` 收尾。⇒ DFS 归零，`真下溢/借位/合并` 三个计数一字不差。
+    fn handle_underflow(&mut self, node_page_id: PageId, parent_page_id: PageId) -> bool {
         if node_page_id == self.root {
-            return;
+            return false;
         }
 
         let node = self.read_node(node_page_id);
         if !self.is_underflow(&node) {
-            return;
+            return false;
         }
         // 走到这里才是"真的要做一次重组"（M56 的数：每行删除都会问一句下溢，但只有这里动手）
         #[cfg(test)]
         note_underflow!();
 
         let Some(child_idx) = self.get_parent_index(parent_page_id, node_page_id) else {
-            return;
+            return false;
         };
         let (sibling_opt, is_left_sibling) = self.get_sibling(parent_page_id, child_idx);
         let Some(sibling_page_id) = sibling_opt else {
-            return;
+            return false;
         };
 
         let sibling = self.read_node(sibling_page_id);
@@ -1635,7 +1618,7 @@ impl BPlusTree {
             if borrowed {
                 #[cfg(test)]
                 note_borrow!();
-                return;
+                return false;
             }
         }
 
@@ -1650,21 +1633,13 @@ impl BPlusTree {
         } else {
             self.rebalance_internal_pair(left_page, right_page, parent_page_id, sep_idx)
         };
-
-        // 只有真的**释放了一页**，父节点才可能因此下溢：用 DFS 找祖父，正确向上传播
-        if reorg == PairReorg::Merged {
-            #[cfg(test)]
+        let merged = reorg == PairReorg::Merged;
+        #[cfg(test)]
+        if merged {
             note_merge!();
-            if parent_page_id != self.root {
-                #[cfg(test)]
-                note_grandparent_walk!();
-                if let Some(grandparent) = self.find_parent_of(parent_page_id) {
-                    self.handle_underflow(parent_page_id, grandparent);
-                }
-            } else {
-                self.shrink_root_if_needed();
-            }
         }
+        // 合并过 ⇒ 父节点少了一个孩子：往上**报告**，由父节点自己那一帧去查下溢、由 `delete()` 收尾降根
+        merged
     }
 
     /// 递归删除；`parent_page_id` 在下降时传入，避免错误的父节点查找。
@@ -1696,34 +1671,41 @@ impl BPlusTree {
                 self.write_node(node_page_id, &node);
 
                 // 非根叶子下溢 → 再平衡
+                let mut merged = false;
                 if node_page_id != self.root {
                     if let Some(parent) = parent_page_id {
                         if self.is_underflow(&node) {
                             set_page_phase(PHASE_RESTRUCTURE);
-                            self.handle_underflow(node_page_id, parent);
+                            merged = self.handle_underflow(node_page_id, parent);
                             set_page_phase(PHASE_BACKTRACK);
                             // 借位/合并会挪分隔键与本层下界 ⇒ 一律上报"可能变了"，让上层去核对
                             min_changed = true;
                         }
                     }
                 }
-                Del::Removed { min_changed }
+                Del::Removed { min_changed, merged }
             }
             BTreeNode::Internal { keys, children } => {
                 let child_idx = Self::child_index(&keys, &key);
                 let child_page_id = children[child_idx];
-                let min_changed = match self.delete_recursive(child_page_id, key, Some(node_page_id))
-                {
-                    Del::NotFound => return Del::NotFound,
-                    Del::Removed { min_changed } => min_changed,
-                };
+                let (mut min_changed, mut merged) =
+                    match self.delete_recursive(child_page_id, key, Some(node_page_id)) {
+                        Del::NotFound => return Del::NotFound,
+                        Del::Removed {
+                            min_changed,
+                            merged,
+                        } => (min_changed, merged),
+                    };
                 set_page_phase(PHASE_BACKTRACK);
 
                 // 回溯段一次读就够：改前是"先 `read_page` 问一句还在不在、再 `read_node` 读一遍"，
                 // 下溢检查那里**又**同样两遍 ⇒ 每层 4 次页读、其中 3 次是重复读同一页。
                 // 页已被合并掉而读不到时按"可能变了"上报（保守：让上层去核对分隔键）。
                 let Some(mut cur) = self.try_read_node(node_page_id) else {
-                    return Del::Removed { min_changed: true };
+                    return Del::Removed {
+                        min_changed: true,
+                        merged: true,
+                    };
                 };
 
                 // 只有"该子树的最小键可能变了"才去把它重新找出来写进分隔键
@@ -1759,21 +1741,20 @@ impl BPlusTree {
                     if let Some(parent) = parent_page_id {
                         if self.is_underflow(&cur) {
                             set_page_phase(PHASE_RESTRUCTURE);
-                            self.handle_underflow(node_page_id, parent);
+                            merged |= self.handle_underflow(node_page_id, parent);
                             set_page_phase(PHASE_BACKTRACK);
                             restructured = true;
                         }
                     }
-                } else {
-                    set_page_phase(PHASE_RESTRUCTURE);
-                    self.shrink_root_if_needed();
-                    set_page_phase(PHASE_BACKTRACK);
                 }
+                // 本层是根时**不在这里**问"要不要降层"（M56b）：`delete()` 收尾会按 `merged` 问一次，
+                // 而根的孩子数只有在合并过一页时才会变。改前后这里各问一次 ⇒ 每行删除固定 2 页根页读。
 
                 // 往上只报"本子树的下界可能变了"：动的是**最左那棵子树**、或本节点自己借/合并过。
                 // 删中间那片叶子的最小键不会改变整个子树的下界 ⇒ 上面各层都不必去走那趟左下到底。
                 Del::Removed {
                     min_changed: (min_changed && child_idx == 0) || restructured,
+                    merged,
                 }
             }
         }
@@ -2646,18 +2627,25 @@ mod tests {
 
     /// 守卫（M56）：**成块删**的形状 —— 上一轮那条守卫用的形状根本没触发过重组（μE 与改后一字不差）。
     ///
-    /// 三件事钉在一起：
-    /// - **证人先成立**：`借位 + 合并 > 0`。不然"重组也向父层上报"那一半仍然没被任何形状检验过；
+    /// 四件事钉在一起：
+    /// - **证人先成立**：`借位 + 合并 > 0`（实测 借位 122 / 合并 116）。不然"重组也向父层上报"那一半
+    ///   仍然没被任何形状检验过；
+    /// - **`页·找祖父` 必须为 0**（M56b）：那趟"每次合并从根走一趟整棵树 DFS"在 200k 档占**每删除行
+    ///   39.69 页（77%）**、每趟扫 2820 页，而该档 `缺页 38.76` 就是它造成的 ⇒ 谁把它抄回来这一格就不为 0
+    ///   （μG 实测：抄回来 ⇒ 本断言红，页读 10.63 → 15.85 页/删除行）；
+    /// - **`问根` 次数 ≤ 合并次数 + 每次删除 1/8**（M56b）：根的孩子数只在真合并过一页时才会变。
+    ///   改前每行删除无条件问两次（`delete()` 与回溯段的根分支各一次，每次读+解析一遍根页）
+    ///   ⇒ 固定 2.00 页/删除行；μI 把无条件问抄回来 ⇒ 本断言红（600 次 > 界 191）；
     /// - **量具自检**：四个阶段桶之和 == `page_reads()` 的增量 ⇒ 标注漏了一扇门就会当场读出来，
     ///   不会静默少计（桶少算比桶读 0 更危险，它看着像证据）；
     /// - **代价界**：每删除行的页读、以及 `页/次下降`（③ 的尺子：合批下降之前，先看清一次下降花几页）。
     #[test]
     fn batched_deletes_really_restructure_and_stay_correct() {
         const N: usize = 1_200;
-        // 两条界都从**本形状 M56 的实测起点**定（起点：17.68 页/删除行、5.89 页/次下降），
-        // 留 ~8% 余量。M56b（去掉"每次合并从根 DFS 找祖父"）之后应当显著下降，届时再收紧。
-        const PAGE_BOUND: f64 = 19.0;
-        const PER_DESCENT_BOUND: f64 = 6.5;
+        // 三条界都从**两臂实测数中间**定（本形状：改后 10.63 页/删除行、3.54 页/次下降；
+        // μG 把整树 DFS 抄回来 15.85 / 5.28；μI 把无条件问根抄回来 11.46 且问根 600 次 > 191 的界）
+        const PAGE_BOUND: f64 = 12.5;
+        const PER_DESCENT_BOUND: f64 = 4.2;
         fn k(n: usize) -> Key {
             format!("{n:08}").into_bytes()
         }
@@ -2676,7 +2664,7 @@ mod tests {
 
         let p0 = crate::bplus_tree::page::page_reads();
         let b0 = crate::bplus_tree::page::page_reads_by_phase();
-        let (u0, bor0, mg0, gw0) = reorg_stats();
+        let (u0, bor0, mg0) = reorg_stats();
         let d0 = descent_lookups();
         let s0 = sep_refreshes();
         reorg_stats_clear();
@@ -2690,8 +2678,8 @@ mod tests {
         let reads = crate::bplus_tree::page::page_reads() - p0;
         let b1 = crate::bplus_tree::page::page_reads_by_phase();
         let buckets: Vec<u64> = (0..b1.len()).map(|i| b1[i] - b0[i]).collect();
-        let (u, bor, m, g) = reorg_stats();
-        let (u, bor, m, g) = (u - u0, bor - bor0, m - mg0, g - gw0);
+        let (u, bor, m) = reorg_stats();
+        let (u, bor, m) = (u - u0, bor - bor0, m - mg0);
         let descents = descent_lookups() - d0;
         let refreshes = sep_refreshes() - s0;
         let per_del = reads as f64 / dels as f64;
@@ -2706,13 +2694,11 @@ mod tests {
             buckets[6],
         );
         let rc = root_checks();
-        let gp_per_walk = b_gp as f64 / g.max(1) as f64;
         eprintln!(
             "[del_guard] {dels} 次删除 · 页读 {reads}（{per_del:.2} 页/删除行）· 下降 {descents} · \
              {per_descent:.2} 页/次下降\n  桶：其它 {b_other} 下降 {b_descent} 回溯 {b_back} \
              分隔键 {b_sep} 重组 {b_reorg} 找祖父 {b_gp} 问根 {b_rc}\n\
-             重组：真下溢 {u} / 借位 {bor} / 合并 {m} / 找祖父走 {g} 趟（每趟 {gp_per_walk:.1} 页）\
-             / 问根 {rc} 次 / 分隔键刷新 {refreshes} 趟"
+             重组：真下溢 {u} / 借位 {bor} / 合并 {m} / 问根 {rc} 次 / 分隔键刷新 {refreshes} 趟"
         );
 
         // ① 量具自检
@@ -2721,6 +2707,15 @@ mod tests {
             reads,
             "阶段桶之和 {} != 页读 {reads} ⇒ 有一扇读页门没被标注，桶的读数全是漏的",
             buckets.iter().sum::<u64>()
+        );
+        // ②' M56b 的两条硬判据：整树 DFS 不许回来；问根只许在真合并过一页时发生
+        assert_eq!(
+            b_gp, 0,
+            "找祖父桶读出 {b_gp} 页 ⇒ 那趟从根走的整树 DFS 回来了（200k 档它占每删除行 39.69 页 = 77%）"
+        );
+        assert!(
+            rc <= m + dels as u64 / 8,
+            "问根 {rc} 次（删除 {dels} 次、合并 {m} 次）⇒ `shrink_root_if_needed` 又变成每行无条件问了：             根的孩子数只在合并过时才会变"
         );
         // ② 证人：这个形状必须真的做过重组
         assert!(
@@ -2787,7 +2782,7 @@ mod tests {
             let b0 = crate::bplus_tree::page::page_reads_by_phase();
             let m0 = crate::bplus_tree::page::cache_misses();
             let e0 = crate::bplus_tree::page::page_evictions();
-            let (u0, bor0, mg0, gw0) = reorg_stats();
+            let (u0, bor0, mg0) = reorg_stats();
             let d0 = descent_lookups();
             let s0 = sep_refreshes();
             reorg_stats_clear();
@@ -2814,8 +2809,8 @@ mod tests {
             let rc = root_checks();
             let miss = crate::bplus_tree::page::cache_misses() - m0;
             let evict = crate::bplus_tree::page::page_evictions() - e0;
-            let (u, bor, m, g) = reorg_stats();
-            let (u, bor, m, g) = (u - u0, bor - bor0, m - mg0, g - gw0);
+            let (u, bor, m) = reorg_stats();
+            let (u, bor, m) = (u - u0, bor - bor0, m - mg0);
             let descents = descent_lookups() - d0;
             let refreshes = sep_refreshes() - s0;
             let per_del = reads as f64 / d;
@@ -2824,7 +2819,7 @@ mod tests {
                 "[del_buckets {tag}] rows={rows} 删 {dels} 行 · 页读 {reads}（{per_del:.2} 页/删除行）\
                  · 下降 {descents}（{:.2} 次/删除行）· {per_descent:.2} 页/次下降\n\
                  桶/删除行：其它 {pu:.2} 下降 {pb:.2} 回溯 {pbt:.2} 分隔键 {ps:.2} 重组 {pr:.2} 找祖父 {pg:.2} 问根 {prc:.2}\n\
-                 重组：真下溢 {u}（{:.2} 次/删除行）借位 {bor} 合并 {m} 找祖父 {g} 问根 {rc}（{:.2} 次/删除行）\
+                 重组：真下溢 {u}（{:.2} 次/删除行）借位 {bor} 合并 {m} 问根 {rc}（{:.2} 次/删除行）\
                  ｜ 分隔键刷新 {refreshes}（{:.3} 趟/删除行）｜ 缺页 {:.2} 换出 {:.2}",
                 descents as f64 / d,
                 u as f64 / d,

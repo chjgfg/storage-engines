@@ -3355,10 +3355,6 @@ mod tests {
                 ),
                 ("借位".to_string(), crate::bplus_tree::bplus_tree::reorg_stats().1),
                 ("合并".to_string(), crate::bplus_tree::bplus_tree::reorg_stats().2),
-                (
-                    "找祖父趟".to_string(),
-                    crate::bplus_tree::bplus_tree::reorg_stats().3,
-                ),
                 ("问根次数".to_string(), crate::bplus_tree::bplus_tree::root_checks()),
                 (
                     "分隔键刷新".to_string(),
