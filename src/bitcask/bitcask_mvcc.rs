@@ -2238,6 +2238,128 @@ mod tests {
         cleanup(&path);
     }
 
+    /// M55：**同一份库连做两趟 `vacuum()`**，分开"瞬时峰值"与"做完还住着的字节"（`#[ignore]`）。
+    ///
+    /// 为什么要这一格：三档复测读到 bitcask `vacuum() 全库` 这一行 **常驻 +15.3 / 峰值 +15.6 MB**，
+    /// 而上一轮同一格记的是 **+8.0**，且**两遍各读各的都一字不差** ⇒ 不是量具。
+    /// 分段标尺（`bitcask_vacuum_stage_split`）说这笔钱全在 ④ `merge` 段（12.6 MB，正好是 M43 发布的那个数），
+    /// 但那只回答"哪一段"，不回答**"做完之后还剩下多少"**。
+    /// `mem_probe::live()` 是**跟踪分配器**统计的活字节（不是 RSS）⇒ "常驻"涨就是真有人没释放，
+    /// 不能推给"分配器没把页还给操作系统"。所以第二趟是关键对照：**第二趟什么都裁不到**（垃圾已在第一趟裁完），
+    /// 若第二趟的 `live` 差 ≈ 0 ⇒ 那 15 MB 是**一次性**的（重建出来的东西留在库里，不随每轮累积）；
+    /// 若第二趟同样留下十几 MB ⇒ 每裁一轮就多住十几 MB，那是**累积泄漏**，性质完全不同。
+    ///
+    /// 第三个旋钮 `BITCASK_VAC2_REOPEN=1`（M55c 的因果 A/B）：两趟之前先**冷重开**一次，
+    /// 让第一趟开始时的索引是"hint 有序 collect 建出来的满节点"而不是"灌行时逐条 insert 的半满节点"
+    /// —— 复测台架那 +15.3 读的就是这种前置状态（它在 `vacuum()` 之前重开过库）。
+    ///
+    /// ```text
+    /// BITCASK_VAC2_ROWS=600000 BITCASK_VAC2_SHAPE=big BITCASK_VAC2_REOPEN=1 \
+    ///   cargo test --release --lib -- --ignored --nocapture --test-threads=1 bitcask_vacuum_retained_two_passes
+    /// ```
+    #[test]
+    #[ignore = "bitcask vacuum 两趟：瞬时峰值 vs 做完还住的字节，手动 release 单线程跑：BITCASK_VAC2_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 bitcask_vacuum_retained_two_passes"]
+    fn bitcask_vacuum_retained_two_passes() {
+        use std::time::Instant;
+        let rows: u64 = std::env::var("BITCASK_VAC2_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600_000);
+        // 两种形状：`half` = 每把键写两遍（一半行可裁）；`big` = **照大库台架**：灌一遍 + 更新 10% 的键
+        // ⇒ 只有 ~5.6% 行可裁。复测那条 +15.6 读的就是 `big` 形状，两趟对照必须在同一形状上做。
+        let shape = std::env::var("BITCASK_VAC2_SHAPE").unwrap_or_else(|_| "big".to_string());
+        let mb = |b: i64| b as f64 / 1024.0 / 1024.0;
+        let key = |i: u64| format!("{i:08}#/worldquant/datafields/x.json");
+        let path = tmp_db("vac_retained");
+        {
+            let mvcc = MVCC::open(&path);
+            if shape == "half" {
+                for round in 0..2u64 {
+                    let tx = mvcc.begin_transaction();
+                    for i in 0..rows {
+                        assert!(
+                            tx.set(key(i).as_bytes(), format!("round{round}").into_bytes()),
+                            "第 {i} 把键写失败"
+                        );
+                    }
+                    tx.commit();
+                }
+            } else {
+                // 照 `scale_baseline`：1000 行一个事务灌全库，再把前 10% 的键更新一遍
+                for base in (0..rows).step_by(1000) {
+                    let end = (base + 1000).min(rows);
+                    let tx = mvcc.begin_transaction();
+                    for i in base..end {
+                        assert!(
+                            tx.set(key(i).as_bytes(), format!("v{i}").into_bytes()),
+                            "第 {i} 把键写失败"
+                        );
+                    }
+                    tx.commit();
+                }
+                let updates = (rows / 10).max(1);
+                for base in (0..updates).step_by(500) {
+                    let end = (base + 500).min(updates);
+                    let tx = mvcc.begin_transaction();
+                    for i in base..end {
+                        assert!(
+                            tx.set(key(i).as_bytes(), format!("u{i}").into_bytes()),
+                            "第 {i} 把键更新失败"
+                        );
+                    }
+                    tx.commit();
+                }
+            }
+            mvcc.flush();
+            mvcc.checkpoint();
+
+            // M55c 的**因果 A/B**：`BITCASK_VAC2_REOPEN=1` ⇒ 两趟之前先冷重开一次。
+            // 为什么要这一格：`big` 形状不重开时第一趟读到的是**负的**（裁掉的条目比建回来的多），
+            // 而复测台架同一格读 **+15.3** —— 两边唯一的形状差别就是台架在 `vacuum()` 之前**重开过**：
+            // 重开的索引是 hint **有序 collect** 建出来的（满节点，M52 实测 600k 键 57.7 MB），
+            // 而 merge 的重扫是升序逐条 `insert` 建出来的（半满节点，同一把尺子 83.4 MB）。
+            // ⇒ 若这一格把符号翻回 +15，那条"常驻"就**不是泄漏**，而是**重建索引时又付一次半满节点的税**；
+            // 顺带这里打印的"重开一趟"那一行就是这笔税的反向读数（胖 → 瘦）。
+            let reopen = std::env::var("BITCASK_VAC2_REOPEN").is_ok();
+            let before_open = crate::mem_probe::live() as i64;
+            let mvcc = if reopen {
+                drop(mvcc);
+                MVCC::open(&path)
+            } else {
+                mvcc
+            };
+            println!(
+                "  [{shape}]{} 冷重开一趟：live {:+.1} MB（索引从{}建回来）",
+                if reopen { "/reopen=1" } else { "" },
+                mb(crate::mem_probe::live() as i64 - before_open),
+                if reopen { " hint 有序 collect" } else { "（没重开）" }
+            );
+
+            let base_live = crate::mem_probe::live() as i64;
+            let arm = format!("{shape}{}", if reopen { "/reopen" } else { "" });
+            for pass in 1..=2u8 {
+                let l0 = crate::mem_probe::live() as i64;
+                let p0 = crate::mem_probe::reset_peak();
+                let t = Instant::now();
+                let st = mvcc.vacuum().unwrap();
+                let d = t.elapsed();
+                let l1 = crate::mem_probe::live() as i64;
+                let peak = crate::mem_probe::peak() as i64;
+                println!(
+                    "  [{arm}] 第{pass} 趟：裁掉 {} 行 / 扫 {} 行 ｜ 墙钟 {:.2} s ｜ 瞬时峰值 +{:.1} MB ｜ \
+                     做完还住 +{:.1} MB（累计 +{:.1} MB）",
+                    st.versions_removed,
+                    st.rows_scanned,
+                    d.as_secs_f64(),
+                    mb((peak - p0 as i64).max(0)),
+                    mb(l1 - l0),
+                    mb(l1 - base_live),
+                );
+            }
+        }
+        cleanup(&path);
+    }
+
     /// 每笔"单行事务"在 WAL 里到底留下多少字节、几条记录（`#[ignore]`，手动 release 跑）。
     ///
     /// 存在的理由有两个：
