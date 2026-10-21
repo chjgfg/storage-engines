@@ -220,7 +220,9 @@ pub enum KeyMatchMode {
 pub struct SearchQuery {
     /// 匹配模式用的字节串；**空切片表示不过滤（列出全部可见 key）**
     pub pattern: Vec<u8>,
-    /// 页码，**从 0 开始**
+    /// 页码，**从 0 开始**。⚠️ 这是 **offset 式**页码：第 N 页要跳过 `N × page_size` 行
+    /// ⇒ 单价 ∝ N，连翻 K 页是 O(K²)。连续翻页请走 `KvTxn::scan_page`（游标），实测连翻 50 页
+    /// 贵 29~43 倍、而跳到同一页两条门同价 —— 见 [`crate::engine::KvTxn::search_keys`] 那段。
     pub page: usize,
     /// 每页条数，至少为 1（若传入 0 会按 1 处理）
     pub page_size: usize,

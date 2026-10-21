@@ -296,6 +296,17 @@ pub trait KvTxn: Send {
     /// 导出这类场景请用它，别拿 `scan` 的全量返回值切片。
     fn scan_page(&self, after: Option<&[u8]>, limit: usize) -> (Vec<ExportRecord>, Option<Vec<u8>>);
 
+    /// 分页搜索。⚠️ `query.page` 是 **offset 式页码**：第 N 页要从库头**跳过 `N × page_size` 行**
+    /// ⇒ 单页单价 ∝ 页码，连翻 K 页是 **O(K²)**。
+    ///
+    /// 所以**"翻页 / 深翻"的默认姿势是 [`KvTxn::scan_page`]（游标），不是这里**。实测两条门
+    /// （台架 `deep_paging_posture_ab`，release，页宽 100，四家 × 200k/600k）：
+    /// - **跳到同一页，两条门同价**：游标 ÷ offset = **0.93 ~ 1.35×** ⇒ 换成游标不收学费；
+    /// - **连翻 50 页，offset 贵 29 ~ 43 倍**（600k 档 bplus 42.6×、memory 41.6×、lsm 32.2×、bitcask 29.0×）。
+    ///
+    /// 那为什么还留着 offset：随机跳页（用户点"第 87 页"）只有这里能做，游标给不了 —— 这一条是
+    /// **能力**不是便利，删不掉。M51 已把"深翻末页"的瞬时内存从 188 MB 削到 0.6~0.8 MB，
+    /// 但**时间那半属于 offset 的语义**，不是实现浪费 ⇒ 要快就换门。
     fn search_keys(&self, query: &SearchQuery) -> SearchPage;
 
     fn key_count(&self, prefix: &[u8]) -> usize;
@@ -3661,6 +3672,168 @@ mod tests {
         eprintln!(
             "换算参考：本机 `C:` 一次 fsync ≈ 2.6 ms、`D:`（5400 转机械）≈ 85.8 ms ⇒ 次数 × 盘价才是现场代价"
         );
+    }
+
+    /// M58 的证据台架：**深翻到同一页，两条门差多少**（`#[ignore]`，手动 release 跑）。
+    ///
+    /// 为什么要这一格：门面这边有两条翻页门 —— `search_keys` 是 **offset** 分页
+    /// （`SearchQuery::contains(.., offset, len)`），`scan_page` 是**游标**分页。
+    /// M15/M21/M51 已经把 offset 那条路的三笔浪费砍掉了（不为 total 走全库、游标下推到起点、末页不物化），
+    /// 但**剩下那一笔是结构性的**：offset 的第 D 页必须从库头**跳过 D×len 行** ⇒ 单价 ∝ D，
+    /// 连翻 K 页是 **O(K²)**；游标每页只付"上一页之后那 len 行" ⇒ 连翻 K 页是 **O(K)**。
+    /// ⇒ "深翻慢"的正解不在库里，在**调用方选哪条门**上。这一格就是把那两条门的价当场读出来，
+    ///   用来支撑"默认姿势 = 游标翻页"那句写进文档的建议。
+    ///
+    /// 三段读数（同一份库、同一深度）：
+    /// ① 单页到末页：`A(offset, 免 total)` vs `B(游标从库头走到同一页)` —— 这两条**应当差不多**，
+    ///    它们钉的是"换成游标不会更贵"这一半（如果 B 明显更贵，那句建议就不该写）；
+    /// ② 连翻 K 页：`A = K 次 search_keys(各自跳过)` vs `B = 一次游标走 K 页` —— 这才是二次方与线性的差，
+    ///    报总耗时与 **µs/页**；两臂各跑两遍取最小（本机墙钟跨轮漂 1.3~1.9×，比值才可信）。
+    /// ③ 硬判据一条：**两条门交出的必须是同一页**（键序列逐条相等）—— 不等就说明"同一深度"这个前提没立住，
+    ///    那上面两个比值全都无意义。
+    ///
+    /// ```text
+    /// DEEP_PAGE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture \
+    ///     --test-threads=1 deep_paging_posture_ab
+    /// ```
+    #[test]
+    #[ignore = "深翻两条门的价：手动 release 单线程跑：DEEP_PAGE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 deep_paging_posture_ab"]
+    fn deep_paging_posture_ab() {
+        let rows: usize = std::env::var("DEEP_PAGE_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+        let page_size: usize = std::env::var("DEEP_PAGE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let k: usize = std::env::var("DEEP_PAGE_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+        let pages_total = rows / page_size;
+        let last = pages_total - 1;
+        eprintln!(
+            "=== M58 深翻两条门 rows={rows} 页宽={page_size} 总页数={pages_total} 连翻 K={k} ==="
+        );
+
+        for kind in [
+            EngineKind::Bitcask,
+            EngineKind::BPlusTree,
+            EngineKind::LsmTree,
+            EngineKind::Memory,
+        ] {
+            let label = kind.as_str();
+            let dir = tmp_dir(&format!("deep_page_{label}"));
+            let arg = match kind {
+                EngineKind::Memory => None,
+                EngineKind::BPlusTree => Some(dir.join("bplus.db")),
+                _ => Some(dir.clone()),
+            };
+            let arg = arg.as_deref();
+            let db = open_engine(kind, arg).unwrap();
+            for base in (0..rows).step_by(1000) {
+                let end = (base + 1000).min(rows);
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end).map(|i| (key(i), val(i))).collect();
+                let tx = db.begin();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("{label}: batch_set 冲突 {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            db.flush().unwrap();
+            db.checkpoint().unwrap();
+
+            // ① 单页到末页：A = offset，B = 游标从库头走到同一页
+            let (d_a, _, pk_a, pa) = timed(|| {
+                let tx = db.begin();
+                tx.search_keys(&crate::common::SearchQuery::contains(
+                    b"",
+                    last,
+                    page_size,
+                )
+                .without_total())
+            });
+            let (d_b, _, pk_b, pb) = timed(|| {
+                let tx = db.begin();
+                let mut cursor: Option<Vec<u8>> = None;
+                let mut chunk: Vec<crate::common::ExportRecord> = Vec::new();
+                for _ in 0..=last {
+                    let (c, next) = tx.scan_page(cursor.as_deref(), page_size);
+                    chunk = c;
+                    let Some(n) = next else { break };
+                    cursor = Some(n);
+                }
+                chunk
+            });
+            // 硬判据：两条门必须交出**同一页**（不然下面那个比值没有意义）
+            let ka: Vec<Vec<u8>> = pa.items.iter().map(|r| r.key.clone()).collect();
+            let kb: Vec<Vec<u8>> = pb.iter().map(|r| r.key.clone()).collect();
+            assert_eq!(ka, kb, "{label}: offset 末页与游标末页不是同一页");
+
+            // ② 连翻 K 页：A = K 次 offset 翻页（每次各自从头跳过），B = 一次游标走 K 页
+            let mut best_a = f64::MAX;
+            let mut best_b = f64::MAX;
+            for _ in 0..2u8 {
+                let (d, _, _, got) = timed(|| {
+                    let tx = db.begin();
+                    let mut n = 0usize;
+                    for j in 0..k {
+                        n += tx
+                            .search_keys(&crate::common::SearchQuery::contains(
+                                b"",
+                                j,
+                                page_size,
+                            )
+                            .without_total())
+                            .items
+                            .len();
+                    }
+                    n
+                });
+                best_a = best_a.min(d.as_secs_f64() * 1e6);
+                let (d, _, _, n) = timed(|| {
+                    let tx = db.begin();
+                    let mut cursor: Option<Vec<u8>> = None;
+                    let mut n = 0usize;
+                    for _ in 0..k {
+                        let (chunk, next) = tx.scan_page(cursor.as_deref(), page_size);
+                        n += chunk.len();
+                        let Some(x) = next else { break };
+                        cursor = Some(x);
+                    }
+                    n
+                });
+                best_b = best_b.min(d.as_secs_f64() * 1e6);
+                assert_eq!(got, k * page_size, "{label}: offset 连翻 K 页行数不对");
+                assert_eq!(n, k * page_size, "{label}: 游标连翻 K 页行数不对");
+            }
+            eprintln!(
+                "{label:<10} 单页到末页(第 {last} 页) A(offset) {:>9.1} ms 峰值+{:.1} MB ｜ B(游标走到同一页) {:>9.1} ms 峰值+{:.1} MB ｜ B/A = {:.2}×\n\
+                 {:<10} 连翻 K={k} 页        A 总 {:>9.1} ms（{:.0} µs/页）｜ B 总 {:>9.1} ms（{:.0} µs/页）⇒ **A/B = {:.1}×**",
+                d_a.as_secs_f64() * 1e3,
+                pk_a as f64 / 1e6,
+                d_b.as_secs_f64() * 1e3,
+                pk_b as f64 / 1e6,
+                d_b.as_secs_f64() / d_a.as_secs_f64(),
+                "",
+                best_a / 1e3,
+                best_a / k as f64,
+                best_b / 1e3,
+                best_b / k as f64,
+                best_a / best_b,
+            );
+            if kind != EngineKind::Memory {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        eprintln!("⚠️ 墙钟只当量级（本机跨轮漂 1.3~1.9×、且 twosync 那条 `cargo bench` 今晚也在跑），要用的数是 A/B 比值。");
     }
 
     /// M57 的**价签尺子**：一个缓存槽到底住多少字节（`#[ignore]`，手动 release 跑）。
