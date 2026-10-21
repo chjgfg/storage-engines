@@ -3663,6 +3663,157 @@ mod tests {
         );
     }
 
+    /// M57 的**价签尺子**：一个缓存槽到底住多少字节（`#[ignore]`，手动 release 跑）。
+    ///
+    /// 存在的理由：README 里那句"bplus 全驻留 ≈ 47 MB / 143 MB"是 `页数 × 4 KiB` 的**算术**，
+    /// 而 bplus 每个槽其实住着**两样东西** —— 页缓存里那份原始 4 KiB，加解析缓存里那个
+    /// `Arc<BTreeNode>`（`bplus_tree.rs:541`：它的上限直接取 `page_manager.cache_capacity()`，
+    /// 同一个数、两份内存）⇒ 拿 4 KiB 当单价去反推"6 GB 的机器能给多少页"会**系统性低估**。
+    /// lsm 那一侧的单价也不该抄 README 的 7.4 KB：块大小随值变（5002 键那档均值 7 403 B，
+    /// 600k 小值那档 ≈ 2 KB）⇒ 要按"预算 → 块数"给建议，单价必须**当场读**，不能引用常数。
+    ///
+    /// **实测（release，600k 档，M57）**：bplus 每页 走查 **4 264 B** / 乱序点读 **6 838 B**
+    /// （全驻留总账 151.2 MB vs **237.2 MB**）；lsm 每块 **10.1 KB**，两种姿势一字不差（全驻留 **90.8 MB**）
+    /// ⇒ README 里那句"lsm 600k 全驻留 ≈ 18.7 MB"是**拿错了档**（那是 M23 里 40 000 键 / 2 681 块那一档）。
+    ///
+    /// 读数用 `mem_probe::live()`（跟踪分配器的净活字节，不是 RSS）：先用**默认档**把整库焐一遍
+    /// （填满 cap 个槽），再把顶抬掉焐第二遍（补剩下的槽），两趟各除各的槽数 ⇒ 每槽真实字节。
+    ///
+    /// ⚠️ **两种姿势的单价不一样，必须分开读**（`CACHE_PRICE_POSTURE=walk|point`）：
+    /// 走查（`scan_page`）按设计**只填页缓存**——`bplus_tree.rs:1931` 那句"每片叶子只碰一次，回填它不会有下一次命中"
+    /// ⇒ 它不进解析缓存；而**乱序点读**两把都填（`node_of` → `memoize_node`，上限与页缓存同源）。
+    /// 所以拿"走查姿势"的每槽字节去给点读型下游算预算会**系统性低估**（最多差一倍）。
+    /// ⚠️ 墙钟不作凭据（本机跨轮漂 1.3~1.9×），这一格只卖字节。
+    ///
+    /// ```text
+    /// CACHE_PRICE_ROWS=600000 CACHE_PRICE_POSTURE=point cargo test --release --lib -- --ignored --nocapture \
+    ///     --test-threads=1 cache_slot_resident_price
+    /// ```
+    #[test]
+    #[ignore = "缓存槽价签：手动 release 单线程跑：CACHE_PRICE_ROWS=200000 CACHE_PRICE_POSTURE=point cargo test --release --lib -- --ignored --nocapture --test-threads=1 cache_slot_resident_price"]
+    fn cache_slot_resident_price() {
+        let rows: usize = std::env::var("CACHE_PRICE_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+        let mb = |b: i64| b as f64 / 1024.0 / 1024.0;
+
+        for kind in [EngineKind::BPlusTree, EngineKind::LsmTree] {
+            let label = kind.as_str();
+            let dir = tmp_dir(&format!("cache_price_{label}"));
+            let arg = match kind {
+                EngineKind::BPlusTree => Some(dir.join("bplus.db")),
+                _ => Some(dir.clone()),
+            };
+            let arg = arg.as_deref();
+            {
+                let db = open_engine(kind, arg).unwrap();
+                for base in (0..rows).step_by(1000) {
+                    let end = (base + 1000).min(rows);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), val(i))).collect();
+                    let tx = db.begin();
+                    if let Err(bad) = tx.batch_set(&items) {
+                        panic!("{label}: batch_set 冲突 {}", String::from_utf8_lossy(&bad));
+                    }
+                    tx.commit();
+                }
+                db.flush().unwrap();
+                db.checkpoint().unwrap();
+            }
+            // 冷重开 ⇒ 缓存是空的（焐之前一个槽都没有）
+            let db = open_engine(kind, arg).unwrap();
+            let t = db.tuning();
+            let (cap, denom) = match kind {
+                EngineKind::BPlusTree => (
+                    t.get("max_cache_pages").unwrap_or("0").to_string(),
+                    t.get("total_pages").unwrap_or("0").to_string(),
+                ),
+                _ => (
+                    t.get("block_cache_capacity").unwrap_or("0").to_string(),
+                    t.get("sst_blocks").unwrap_or("0").to_string(),
+                ),
+            };
+            let cap_n: usize = cap.parse().unwrap_or(0);
+            let denom_n: usize = denom.parse().unwrap_or(0);
+            // ⚠️ `order` 必须**在取 `l0` 之前**分配：它是 600k × 8 B = 4.8 MB 的活字节，
+            // 晚分配就把它算进每一趟的差值里（默认档那趟 4.8 MB ÷ 2048 槽 ⇒ 每槽虚高 2.3 KB，
+            // 正好足够把"要不要抬顶"的结论推翻）。
+            let order = shuffled(rows);
+            let posture = std::env::var("CACHE_PRICE_POSTURE").unwrap_or_else(|_| "walk".to_string());
+            let l0 = crate::mem_probe::live() as i64;
+            // 一次焐满：走查姿势只填页缓存，点读姿势两把都填（见上面那段）
+            let do_fill = |db: &dyn KvEngine, count: bool| -> usize {
+                let mut touched = 0usize;
+                if posture == "point" {
+                    let tx = db.begin();
+                    for &i in &order {
+                        if tx.get(&key(i)).is_some() {
+                            touched += 1;
+                        }
+                    }
+                } else {
+                    let mut after: Option<Vec<u8>> = None;
+                    loop {
+                        let tx = db.begin();
+                        let (page, next) = tx.scan_page(after.as_deref(), 512);
+                        if count {
+                            touched += page.len();
+                        }
+                        drop(page);
+                        match next {
+                            Some(n) => after = Some(n),
+                            None => break,
+                        }
+                    }
+                }
+                touched
+            };
+            // 第一趟：默认档焐满 cap 个槽
+            let seen = do_fill(db.as_ref(), true);
+            let l1 = crate::mem_probe::live() as i64;
+            // 第二趟：把顶抬掉再焐一遍 ⇒ 增量就是"补上的那些槽"的字节
+            db.set_cache_auto_max(usize::MAX).unwrap();
+            let _ = do_fill(db.as_ref(), false);
+            let l2 = crate::mem_probe::live() as i64;
+            let t2 = db.tuning();
+            let cap2: usize = match kind {
+                EngineKind::BPlusTree => t2.get("max_cache_pages"),
+                _ => t2.get("block_cache_capacity"),
+            }
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+            let filled_a = cap_n.min(denom_n).max(1);
+            let filled_b = cap2.saturating_sub(filled_a);
+            eprintln!(
+                "{label:<10} [{posture}] 默认档 cap={cap_n} 分母={denom_n} 走 {seen} 行 ｜ 焐满 cap 个槽：live {:+.1} MB ⇒ \
+                 **每槽 {:.0} B**（抬顶后共住 {cap2} 槽、再多 {filled_b} 个槽花 {:+.1} MB ⇒ 每槽 {:.0} B ｜ 全驻留共 {:+.1} MB）",
+                mb(l1 - l0),
+                (l1 - l0) as f64 / filled_a as f64,
+                mb(l2 - l1),
+                if filled_b > 0 {
+                    (l2 - l1) as f64 / filled_b as f64
+                } else {
+                    0.0
+                },
+                mb(l2 - l0),
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        eprintln!(
+            "⚠️ 姿势不同、价就不同：走查只填**页缓存**（`bplus_tree.rs:1931` 那句\"回填它不会有下一次命中\"），\
+             点读两把都填 ⇒ 实测 bplus 每页 走查 4.2 KB / 点读 6.8 KB（lsm 10.1 KB，姿势无关）。\
+             给点读型下游定预算要用 point 那一读数，别按 4 KiB 估。"
+        );
+    }
+
     #[test]
     #[ignore = "大库基线，手动 release 单线程跑：SCALE_ROWS=50000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline"]
     fn scale_baseline_all_engines() {
