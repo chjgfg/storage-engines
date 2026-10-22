@@ -2413,6 +2413,15 @@ mod tests {
         let mut a_over = 0i64;
         let mut e_over = 0i64;
         let mut d_over = 0i64;
+        // M59（#67 的归因臂）：F = 精确预留那份清单，G = 什么都不预留（靠翻倍扩容）
+        let mut f_best = std::time::Duration::MAX;
+        let mut g_best = std::time::Duration::MAX;
+        let mut f_s1 = 0i64; // 清单建好时的净活字节
+        let mut f_s2 = 0i64; // 树建好时的净活字节
+        let mut f_over = 0i64;
+        let mut g_s1 = 0i64;
+        let mut g_s2 = 0i64;
+        let mut g_over = 0i64;
         let mut seen = 0usize;
 
         // ⚠️ **四轮、每轮两种顺序交替、每臂取最小**（M52 补的方法，理由有两条，都是本机踩过的）：
@@ -2528,15 +2537,57 @@ mod tests {
             }};
         }
 
+        // ── 臂 F / G（M59，为 #67 那笔 21.5 MB）：与 A 同一个流式解码、同一条建树门，
+        //    只差"那份中间清单怎么攒"，并且**把窗口内部分成三段读数**：
+        //      s1 = 清单建好（键载荷 + `Vec` 骨架），s2 = 树建好，over = 全程峰值 − s2。
+        //    ⚠️ 单靠 A(50.3) 与 D(28.8) 的差判不出那 21.5 住在哪 —— 三个嫌疑：
+        //      ① `Vec` 翻倍扩容留下的空槽（capacity 可以高到 len 的 ~2 倍）；
+        //      ② std 的 `BTreeMap::from_iter` 自己怎么攒那份 `Vec`；
+        //      ③ 有序批量填充时节点本身的攒法。
+        //    F（`with_capacity(rows)`）与 G（`Vec::new()`，只靠翻倍）**除预留外一字不差**
+        //    ⇒ F/G 的 over 差 = 嫌疑①；F 的 over 若仍 ≈ A ⇒ 与预留无关（嫌疑在②③）。
+        macro_rules! arm_list {
+            ($reserve:expr, $best:ident, $s1:ident, $s2:ident, $over:ident) => {{
+                let l0 = crate::mem_probe::live() as i64;
+                let pbase = crate::mem_probe::reset_peak();
+                let t = std::time::Instant::now();
+                let mut acc: Vec<(Vec<u8>, KeyLoc)> = $reserve;
+                walk(&hint, |k, _f, id, p, l| {
+                    acc.push((k.to_vec(), KeyLoc::Live {
+                        file_id: id,
+                        pos: p,
+                        len: l,
+                    }));
+                });
+                let a1 = crate::mem_probe::live() as i64 - l0;
+                let built: KeyDir = acc.into_iter().collect();
+                let a2 = crate::mem_probe::live() as i64 - l0;
+                let d = t.elapsed();
+                assert_eq!(built.len(), rows, "清单臂少折了条目");
+                let pk = crate::mem_probe::peak();
+                drop(built);
+                if d < $best {
+                    $best = d;
+                    $s1 = a1;
+                    $s2 = a2;
+                    $over = pk.saturating_sub(pbase) as i64 - a2;
+                }
+            }};
+        }
+
         for round in 0..4 {
             if round % 2 == 0 {
                 arm_b!();
                 arm_c!();
                 arm_a!();
                 arm_d!();
+                arm_list!(Vec::with_capacity(rows), f_best, f_s1, f_s2, f_over);
+                arm_list!(Vec::new(), g_best, g_s1, g_s2, g_over);
                 arm_e!();
             } else {
                 arm_e!();
+                arm_list!(Vec::new(), g_best, g_s1, g_s2, g_over);
+                arm_list!(Vec::with_capacity(rows), f_best, f_s1, f_s2, f_over);
                 arm_d!();
                 arm_a!();
                 arm_c!();
@@ -2602,6 +2653,29 @@ mod tests {
             a_over as f64 / 1e6,
             d_over as f64 / 1e6,
             e_over as f64 / 1e6
+        );
+        // M59：把 A 与 D 那 21.5 的差**拆开读**，而不是继续猜
+        let mb = |b: i64| b as f64 / 1e6;
+        eprintln!(
+            "  M59 归因臂：F 精确预留 over {:>5.1}（清单 s1 {:>5.1} ⇒ 建树净增 {:>5.1} = 终态 {:>5.1}）\
+             ｜ G 不预留（靠翻倍扩容）over {:>5.1}（s1 {:>5.1}、终态 {:>5.1}）",
+            mb(f_over),
+            mb(f_s1),
+            mb(f_s2 - f_s1),
+            mb(f_s2),
+            mb(g_over),
+            mb(g_s1),
+            mb(g_s2),
+        );
+        eprintln!(
+            "    ⇒ F/G 只差\"有没有预留\"这一件事 ⇒ over 差 {:>5.1} MB = 嫌疑①（翻倍扩容留下的空槽）",
+            mb(g_over - f_over)
+        );
+        eprintln!(
+            "    ⇒ A({:>5.1}) − F({:>5.1}) = {:>5.1} MB 才是剩下的嫌疑②③（std 内部怎么攒那份 Vec / 节点攒法）",
+            mb(a_over),
+            mb(f_over),
+            mb(a_over - f_over),
         );
         assert!(
             e_live > a_live,
