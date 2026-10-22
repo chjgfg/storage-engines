@@ -1116,28 +1116,73 @@ pub(crate) fn delete_leaf_runs() -> (u64, u64) {
 /// - `merged`（M56b）：**这一趟删除里真释放过一页**。父节点少了一个孩子 ⇒ 上层只需把这个事实报给
 ///   `delete()` 收尾用一次（根要不要降层）。改前 `delete()` 与回溯段每行删除各问一次"根要不要降层"，
 ///   每次都要把根页读一遍并重解析 ⇒ 200k 档固定 2.00 页/删除行；现在只有合并过的那几行问一次。
-enum Del {
-    NotFound,
-    Removed { min_changed: bool, merged: bool },
+///
+/// M61b 起它多带一格 `removed`，并且**不再有 `NotFound` 变体**：批量删除一段键里可能只有几把在树里，
+/// "整段什么都没动"用 `removed == 0 && !min_changed && !merged` 表达（[`Del::NOOP`]），
+/// 上层看到这格就跳过回溯 —— 与改前 `Del::NotFound` 一路直接返回**花的页读完全相同**（守卫钉着）。
+#[derive(Clone, Copy)]
+struct Del {
+    /// 这一次（批）里**真删掉的行数**。0 且另两格也假 ⇒ 整条路径什么都没动。
+    removed: usize,
+    min_changed: bool,
+    merged: bool,
+}
+
+impl Del {
+    const NOOP: Del = Del {
+        removed: 0,
+        min_changed: false,
+        merged: false,
+    };
+
+    /// 什么都没动 ⇒ 祖先各层都不必回溯、也不必问根降层
+    fn is_noop(&self) -> bool {
+        self.removed == 0 && !self.min_changed && !self.merged
+    }
 }
 
 impl BPlusTree {
     /// 删除：移除指定 key，必要时借键/合并并处理根降层
     pub fn delete(&mut self, key: Key) -> bool {
-        let res = self.delete_recursive(self.root, key, None);
-        let deleted = matches!(res, Del::Removed { .. });
+        let (res, _) = self.delete_recursive(self.root, std::slice::from_ref(&key), None);
 
         // 根是内部节点且只剩一个子节点时降层 —— **只在本次删除真合并过一页时才问**（M56b）。
         // 没合并过 ⇒ 根的孩子数不可能变 ⇒ 那一次根页读与解析纯属白付。
-        if let Del::Removed { merged, .. } = res {
-            if merged {
-                set_page_phase(PHASE_RESTRUCTURE);
-                self.shrink_root_if_needed();
-            }
+        if res.merged {
+            set_page_phase(PHASE_RESTRUCTURE);
+            self.shrink_root_if_needed();
         }
         // M56：一趟删除结束把阶段清空 ⇒ 下一趟的桶不会串到这一趟上
         set_page_phase(PHASE_OTHER);
-        deleted
+        res.removed > 0
+    }
+
+    /// 批量删除（M61b）：`keys` **必须按升序给出**，同一叶子里的连续多行共用一趟下降。
+    ///
+    /// 为什么只在 vacuum 那条路上用：M61 读到的上限是 **k = 16.5~17.9 行/叶子**（可删行是"被更新过的
+    /// 那段连续键"留下的旧版本，天然成块），而日常随机删除 k = 1 ⇒ 一行都省不到。
+    /// 所以这一刀的收益**只在成块删除的形状里**，单键 [`Self::delete`] 走的是同一条递归
+    /// （`run` 只有一个元素）⇒ 行为与页读账与改前一字不差。
+    ///
+    /// 返回真删掉的行数；不存在的键不计、也不报错（与 `delete` 返回 `false` 同口径）。
+    /// ⚠️ 乱序输入不会损坏数据（每片叶子里都按序二分），但会退化成"每行一趟下降"—— 白跑一趟树，
+    ///   所以顺序是调用方的义务；这里不 assert（release 里 assert 也要钱），由守卫 `delete_leaf_runs` 的 k 读数盯住。
+    pub fn delete_batch(&mut self, keys: &[Key]) -> usize {
+        let mut i = 0usize;
+        let mut removed = 0usize;
+        while i < keys.len() {
+            let (res, used) = self.delete_recursive(self.root, &keys[i..], None);
+            removed += res.removed;
+            // 合并过 ⇒ 根的孩子数可能变：**每片叶子问一次**，不是每行问一次
+            if res.merged {
+                set_page_phase(PHASE_RESTRUCTURE);
+                self.shrink_root_if_needed();
+            }
+            // 递归承诺 `used ≥ 1`（哪怕整段都不在树里也会推进），所以这里不可能死循环
+            i += used.max(1);
+        }
+        set_page_phase(PHASE_OTHER);
+        removed
     }
 
     /// 最小填充数（⌈order/2⌉ - 1）；order=4 → min=1
@@ -1680,37 +1725,52 @@ impl BPlusTree {
         merged
     }
 
-    /// 递归删除；`parent_page_id` 在下降时传入，避免错误的父节点查找。
+    /// 递归删除**一段升序键**；`parent_page_id` 在下降时传入，避免错误的父节点查找。
     ///
-    /// 返回 [`Del`]：M54b 起它多带一格 `min_changed`，**父节点只在这格为真时才去刷新分隔键**。
-    /// 改前是无条件刷新 —— 那件事是 `subtree_min_key(child)`：**从该子树一路向左下走到叶子**，
-    /// 逐页读、逐页 `bincode::deserialize`（这一支不走解析缓存），而且**每一层都走一遍**。
-    /// 600k 档实测"每删一行读 64.5 页、换出 39.2 页"里可修的那一半就是它
-    /// （台架 `bplus_vacuum_cost_attribution`：同一份库两趟 `vacuum()`，第一趟有得删 262 s、
-    /// 第二趟几乎无得删 6.08 s ⇒ 97.7% 在删除那一半；fsync 只占 4%）。
+    /// 返回 `(Del, 这一段里被本层处理掉的键数)`：
+    /// - M54b 起 `Del.min_changed` 让父节点**只在这格为真时**才去刷新分隔键。改前是无条件刷新 ——
+    ///   那件事是 `subtree_min_key(child)`：**从该子树一路向左下走到叶子**，逐页读、逐页
+    ///   `bincode::deserialize`（这一支不走解析缓存），而且**每一层都走一遍**。600k 档实测
+    ///   "每删一行读 64.5 页"里可修的那一半就是它（台架 `bplus_vacuum_cost_attribution`）。
+    /// - M56b 起 `Del.merged` 是"要不要问根降层"的唯一触发条件。
+    /// - M61b 起入参从"一把键"变成"一段升序键"：**同一片叶子里的连续多行共用一趟下降**，
+    ///   返回值多带 `removed` 与该层实际处理的键数（用于上层继续推进 / 提前收尾）。
+    ///
+    /// ⚠️ 两条不变量（守卫 `batched_deletes_really_restructure_and_stay_correct` 对着）：
+    /// ① 返回的 `used ≥ 1` —— 一段里第一把键一定会被这一层处理掉（哪怕它不在树里），否则调用方死循环；
+    /// ② 本层一旦做过借位/合并（结构变了），**剩下的键交回调用方从根重下一趟**，绝不拿旧的 `children` 快照继续路由。
     fn delete_recursive(
         &mut self,
         node_page_id: PageId,
-        key: Key,
+        run: &[Key],
         parent_page_id: Option<PageId>,
-    ) -> Del {
+    ) -> (Del, usize) {
         // M56 的段标注：下降那一次读记到"下降"，返回之后本层的所有读记到"回溯"
         set_page_phase(PHASE_DESCENT);
         let mut node = self.read_node(node_page_id);
 
         match &mut node {
             BTreeNode::Leaf { entries, .. } => {
-                let Ok(idx) = entries.binary_search_by(|(k, _)| k.cmp(&key)) else {
-                    return Del::NotFound;
-                };
-                // 删的是本片最小键 ⇒ 本片所属子树的下界可能变了；删别的键一定没变
-                let mut min_changed = idx == 0;
-                entries.remove(idx);
-                #[cfg(test)]
-                note_delete_leaf(node_page_id);
+                // 父层已经按分隔键把这一段切到"只可能在这片叶子里" ⇒ 这里一定把整段吃掉，used = run.len()
+                let mut removed = 0usize;
+                let mut touched_min = false;
+                for key in run {
+                    if let Ok(idx) = entries.binary_search_by(|(k, _)| k.cmp(key)) {
+                        // 删的是本片最小键 ⇒ 本片所属子树的下界可能变了；删别的键一定没变
+                        touched_min |= idx == 0;
+                        entries.remove(idx);
+                        removed += 1;
+                        #[cfg(test)]
+                        note_delete_leaf(node_page_id);
+                    }
+                }
+                if removed == 0 {
+                    return (Del::NOOP, run.len());
+                }
+                let mut min_changed = touched_min;
                 self.write_node(node_page_id, &node);
 
-                // 非根叶子下溢 → 再平衡
+                // 非根叶子下溢 → 再平衡（**一片叶子一次**，不是每行一次）
                 let mut merged = false;
                 if node_page_id != self.root {
                     if let Some(parent) = parent_page_id {
@@ -1723,79 +1783,140 @@ impl BPlusTree {
                         }
                     }
                 }
-                Del::Removed { min_changed, merged }
+                (
+                    Del {
+                        removed,
+                        min_changed,
+                        merged,
+                    },
+                    run.len(),
+                )
             }
             BTreeNode::Internal { keys, children } => {
-                let child_idx = Self::child_index(&keys, &key);
-                let child_page_id = children[child_idx];
-                let (min_changed, mut merged) =
-                    match self.delete_recursive(child_page_id, key, Some(node_page_id)) {
-                        Del::NotFound => return Del::NotFound,
-                        Del::Removed {
-                            min_changed,
-                            merged,
-                        } => (min_changed, merged),
-                    };
-                set_page_phase(PHASE_BACKTRACK);
+                // ⚠️ 路由用的分隔键/孩子表**每轮都刷新**：上一个孩子可能已经把自己合并进兄弟
+                // （本层的孩子表就少了一格，`chs` 里那一页也已被释放）—— 拿旧表继续路由就会去读
+                // 已释放的页。第一次用下降那一趟读到的内容（不再多读一次），之后每轮从
+                // "回溯那一趟读"的结果里拿 ⇒ 每层每孩子的页读次数与改前"每行一趟"同量级，
+                // 省下来的还是**下降**那一段（一趟下降带一整片叶子）。
+                let mut snap = (keys.clone(), children.clone());
+                let mut i = 0usize;
+                let mut removed = 0usize;
+                let mut merged = false;
+                let mut min_changed_left = false;
+                while i < run.len() {
+                    let (ks, chs) = &snap;
+                    let child_idx = Self::child_index(ks, &run[i]);
+                    // 孩子 `c` 的键区间是 [keys[c-1], keys[c])；最后一个孩子无上界
+                    let hi = ks.get(child_idx).cloned();
+                    let mut j = i + 1;
+                    while j < run.len() && hi.as_ref().map_or(true, |h| run[j].as_slice() < h.as_slice()) {
+                        j += 1;
+                    }
+                    let child_page_id = chs[child_idx];
+                    let (res, used) =
+                        self.delete_recursive(child_page_id, &run[i..j], Some(node_page_id));
+                    // 递归承诺 `used ≥ 1` ⇒ 一定推进，不会死循环
+                    i += used.max(1).min(j - i);
+                    if res.is_noop() {
+                        // 那一片子里一把键都不在（真空区间）⇒ 本层什么都没变，继续下一个孩子
+                        continue;
+                    }
+                    removed += res.removed;
+                    merged |= res.merged;
+                    min_changed_left |= res.min_changed && child_idx == 0;
 
-                // 回溯段一次读就够：改前是"先 `read_page` 问一句还在不在、再 `read_node` 读一遍"，
-                // 下溢检查那里**又**同样两遍 ⇒ 每层 4 次页读、其中 3 次是重复读同一页。
-                // 页已被合并掉而读不到时按"可能变了"上报（保守：让上层去核对分隔键）。
-                let Some(mut cur) = self.try_read_node(node_page_id) else {
-                    return Del::Removed {
-                        min_changed: true,
-                        merged: true,
-                    };
-                };
-
-                // 只有"该子树的最小键可能变了"才去把它重新找出来写进分隔键
-                // `keys[i]` 是 `children[i+1]` 子树的下界 ⇒ 要更新的是 `keys[child_idx - 1]`
-                if min_changed && child_idx > 0 {
-                    #[cfg(test)]
-                    SEP_REFRESHES.with(|c| c.set(c.get() + 1));
-                    // 这一趟要一路向左下走到叶子、逐页读 ⇒ 单独一个桶（M56），别混进"回溯"里
-                    set_page_phase(PHASE_SEP_REFRESH);
-                    let min_key = self.subtree_min_key(child_page_id);
                     set_page_phase(PHASE_BACKTRACK);
-                    if let Some(min_key) = min_key {
-                        if let BTreeNode::Internal {
-                            keys: ks,
-                            children: ch,
-                        } = &mut cur
-                        {
-                            // child 可能已变下标（兄弟间挪过），重新定位
-                            if let Some(new_idx) = ch.iter().position(|&c| c == child_page_id) {
-                                if new_idx > 0 && new_idx - 1 < ks.len() && ks[new_idx - 1] != min_key
-                                {
-                                    ks[new_idx - 1] = min_key;
-                                    self.write_node(node_page_id, &cur);
+                    // 回溯段一次读就够（M54b：改前是"先 `read_page` 问在不在、再 `read_node` 读一遍"，
+                    // 下溢检查那里**又**两遍 ⇒ 每层 4 次页读、3 次重复）。页已被合掉而读不到 ⇒ 保守上报。
+                    let Some(mut cur) = self.try_read_node(node_page_id) else {
+                        return (
+                            Del {
+                                removed,
+                                min_changed: true,
+                                merged: true,
+                            },
+                            i,
+                        );
+                    };
+
+                    // 只有"该子树的最小键可能变了"才去把它重新找出来写进分隔键
+                    if res.min_changed && child_idx > 0 {
+                        #[cfg(test)]
+                        SEP_REFRESHES.with(|c| c.set(c.get() + 1));
+                        // 这一趟要一路向左下走到叶子 ⇒ 单独一个桶（M56），别混进"回溯"里
+                        set_page_phase(PHASE_SEP_REFRESH);
+                        let min_key = self.subtree_min_key(child_page_id);
+                        set_page_phase(PHASE_BACKTRACK);
+                        if let Some(min_key) = min_key {
+                            if let BTreeNode::Internal {
+                                keys: ks2,
+                                children: ch2,
+                            } = &mut cur
+                            {
+                                // child 可能已变下标（兄弟间挪过），重新定位
+                                if let Some(new_idx) = ch2.iter().position(|&c| c == child_page_id) {
+                                    if new_idx > 0 && new_idx - 1 < ks2.len() && ks2[new_idx - 1] != min_key
+                                    {
+                                        ks2[new_idx - 1] = min_key;
+                                        self.write_node(node_page_id, &cur);
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // 检查本节点是否下溢（合并子节点后）
-                let mut restructured = false;
-                if node_page_id != self.root {
-                    if let Some(parent) = parent_page_id {
-                        if self.is_underflow(&cur) {
-                            set_page_phase(PHASE_RESTRUCTURE);
-                            merged |= self.handle_underflow(node_page_id, parent);
-                            set_page_phase(PHASE_BACKTRACK);
-                            restructured = true;
+                    // 检查本节点是否下溢（合并子节点后）
+                    let mut restructured = false;
+                    if node_page_id != self.root {
+                        if let Some(parent) = parent_page_id {
+                            if self.is_underflow(&cur) {
+                                set_page_phase(PHASE_RESTRUCTURE);
+                                merged |= self.handle_underflow(node_page_id, parent);
+                                set_page_phase(PHASE_BACKTRACK);
+                                restructured = true;
+                            }
                         }
                     }
+                    if restructured {
+                        // 本层被借/合并过 ⇒ 连"这一层是谁"都可能不再是手里这一页（父层的孩子表也变了）
+                        // ⇒ 剩下的键交回上层从根重下一趟，绝不拿旧快照继续路由。
+                        return (
+                            Del {
+                                removed,
+                                min_changed: true,
+                                merged,
+                            },
+                            i,
+                        );
+                    }
+                    // 用回溯那一趟读到的新鲜内容继续路由下一个孩子（不再多读一次页）
+                    let BTreeNode::Internal {
+                        keys: ks3,
+                        children: ch3,
+                    } = &cur
+                    else {
+                        // 本层变成了叶子 ⇒ 结构变了，同上：交回上层重下
+                        return (
+                            Del {
+                                removed,
+                                min_changed: true,
+                                merged: true,
+                            },
+                            i,
+                        );
+                    };
+                    snap = (ks3.clone(), ch3.clone());
+                    // 本层是根时**不在这里**问"要不要降层"（M56b）：`delete()`/`delete_batch()` 收尾按 `merged` 问一次。
                 }
-                // 本层是根时**不在这里**问"要不要降层"（M56b）：`delete()` 收尾会按 `merged` 问一次，
-                // 而根的孩子数只有在合并过一页时才会变。改前后这里各问一次 ⇒ 每行删除固定 2 页根页读。
-
                 // 往上只报"本子树的下界可能变了"：动的是**最左那棵子树**、或本节点自己借/合并过。
-                // 删中间那片叶子的最小键不会改变整个子树的下界 ⇒ 上面各层都不必去走那趟左下到底。
-                Del::Removed {
-                    min_changed: (min_changed && child_idx == 0) || restructured,
-                    merged,
-                }
+                (
+                    Del {
+                        removed,
+                        min_changed: min_changed_left,
+                        merged,
+                    },
+                    i,
+                )
             }
         }
     }
@@ -2780,6 +2901,117 @@ mod tests {
                 assert!(tree.get(k(i)).is_some(), "第 {i} 个幸存键读不回来");
             }
         }
+    }
+
+    /// M61b：**批量门真的把同一片叶子里的连续行合成一趟下降**，而且结果与逐行删除逐键一致。
+    ///
+    /// 为什么是"两臂都在同一个测试里跑"而不是"钉一个绝对界"：界会随形状漂（这片叶子能装几行由
+    /// `order` 定），而**比值**是这一刀的定性结论（M61 读到的上限 k = 行数/叶子游程）。
+    /// 三件事各自钉住：
+    /// ① `k` 两臂必须**完全相同** —— 行数与游程数都由"哪些键被删"决定，与怎么删无关；
+    ///    批量臂的 k 若掉到 1，说明它退化成了逐行（那就是变异臂，不需要另写）；
+    /// ② 批量臂的 `页·下降/删除行` 必须 ≤ 逐行臂的 1/3（本形状每片叶子有 5~6 行可删 ⇒ 理论 1/5.5，
+    ///    留 1/3 是防"批了但每行还是重下一趟"这种假批量）；
+    /// ③ 删完之后两臂的**可读性逐键相同**（该没了的读不到、该留的读得到），且桶之和 == 页读照旧。
+    #[test]
+    fn batch_door_really_shares_one_descent_per_leaf() {
+        const N: usize = 1_200;
+        fn k(n: usize) -> Key {
+            format!("{n:08}").into_bytes()
+        }
+        fn r(n: usize) -> RowId {
+            RowId(Some((n as u64).to_le_bytes().to_vec()))
+        }
+        // order=12 ⇒ 一片叶子约 11 条；每 2 把删 1 把 ⇒ 同一片叶子里平均 5~6 行连续可删（k ≈ 5.5）
+        let build = || {
+            let mut t = BPlusTree::new(12, 4096);
+            for i in 0..N {
+                assert!(t.insert(k(i), r(i)), "插入第 {i} 个键失败");
+            }
+            t
+        };
+        let victims: Vec<Key> = (0..N).step_by(2).map(k).collect();
+
+        let arm = |tree: &mut BPlusTree, batch: bool| -> (f64, f64, u64, u64, usize) {
+            let p0 = crate::bplus_tree::page::page_reads();
+            let b0 = crate::bplus_tree::page::page_reads_by_phase();
+            let (r0, g0) = delete_leaf_runs();
+            let removed = if batch {
+                tree.delete_batch(&victims)
+            } else {
+                victims
+                    .iter()
+                    .filter(|key| tree.delete((*key).clone()))
+                    .count()
+            };
+            let reads = crate::bplus_tree::page::page_reads() - p0;
+            let b1 = crate::bplus_tree::page::page_reads_by_phase();
+            let buckets: Vec<u64> = (0..b1.len()).map(|i| b1[i] - b0[i]).collect();
+            let (r1, g1) = delete_leaf_runs();
+            let n = removed.max(1) as f64;
+            assert_eq!(
+                buckets.iter().sum::<u64>(),
+                reads,
+                "阶段桶之和 {} != 页读 {reads} ⇒ 批量门里有一扇读页门没被标注",
+                buckets.iter().sum::<u64>()
+            );
+            assert_eq!(
+                buckets[crate::bplus_tree::page::PHASE_GRANDPARENT as usize],
+                0,
+                "找祖父桶回来了"
+            );
+            (
+                buckets[PHASE_DESCENT as usize] as f64 / n,
+                reads as f64 / n,
+                r1 - r0,
+                g1 - g0,
+                removed,
+            )
+        };
+        let check_readable = |tree: &mut BPlusTree, who: &str| {
+            for i in 0..N {
+                let got = tree.get(k(i)).is_some();
+                assert_eq!(
+                    got,
+                    i % 2 == 1,
+                    "{who}：第 {i} 把键的可读性不对（偶数该被删、奇数该留下）"
+                );
+            }
+        };
+
+        let mut per_row = build();
+        let (d_per_row, all_per_row, rows_a, runs_a, removed_a) = arm(&mut per_row, false);
+        check_readable(&mut per_row, "逐行臂");
+
+        let mut batched = build();
+        let (d_batch, all_batch, rows_b, runs_b, removed_b) = arm(&mut batched, true);
+        check_readable(&mut batched, "批量臂");
+
+        eprintln!(
+            "[batch door] 逐行臂 下降 {d_per_row:.2} 页/删除行、总 {all_per_row:.2} 页/删除行（{rows_a} 行 / {runs_a} 游程）"
+        );
+        eprintln!(
+            "           批量臂 下降 {d_batch:.2} 页/删除行、总 {all_batch:.2} 页/删除行（{rows_b} 行 / {runs_b} 游程）"
+        );
+        assert_eq!(rows_a, rows_b, "两臂删的行数不同 ⇒ 有一臂漏删了键");
+        // ⚠️ 游程数**允许小幅不同**：合批把"查下溢/借位/合并"的时机从每行一次改成每片叶子一次
+        // ⇒ 叶子的划分随之漂移（600k 档实测 20 018 vs 19 419，差 3%）。所以这里钉"同一量级"，
+        // 不钉"逐个相等" —— 后者会在别的形状上无故发红（大档 A/B 抓出来的这条就是预警）。
+        assert!(
+            runs_a > 0 && (runs_a as i64 - runs_b as i64).abs() * 4 <= runs_a as i64,
+            "两臂的叶子游程差太多：{runs_a} vs {runs_b} ⇒ 有一臂走错了叶子/路由"
+        );
+        assert_eq!(removed_a, removed_b, "两臂实删行数不同 ⇒ 有一臂漏删了键");
+        assert!(
+            runs_a > 0 && rows_a > runs_a * 3,
+            "这个形状的 k = {}/{} 本来就不大于 3 ⇒ 证人失效：换不到收益是因为没合批，还是因为没得合批？",
+            rows_a,
+            runs_a
+        );
+        assert!(
+            d_batch <= d_per_row / 3.0,
+            "批量臂每删除行仍读 {d_batch:.2} 页下降（逐行臂 {d_per_row:.2}）⇒ 没合上批：每行还在重下一趟"
+        );
     }
 
     /// M56 的拆段台架（`#[ignore]`，手动 release 单线程跑）：把"每删除行读 9.37 页"**按阶段拆开**

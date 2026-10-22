@@ -600,9 +600,26 @@ impl MVCC {
             }
             #[cfg(test)]
             note_vac_pending(to_delete.len());
-            for enc in to_delete.drain(..) {
-                let _ = kv.delete(enc);
-                removed += 1;
+            // M61b：`to_delete` 是**升序**的（走查顺序就是编码键顺序：先按 raw_key 升序、组内按版本升序），
+            // 而可删行天然成块（M61 实测 k = 16.5~17.9 行/叶子）⇒ 交给批量门，一趟下降带一整片叶子。
+            // ⚠️ 对照臂（门控 `BPLUS_BATCH_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）逐行删除，
+            //   同一份库、同一批键 ⇒ 比值只归因于"合批 vs 不合批"这一件事。
+            if !to_delete.is_empty() {
+                let planned = to_delete.len();
+                #[cfg(test)]
+                let per_row = std::env::var("BPLUS_BATCH_OLD_SHAPE").is_ok();
+                #[cfg(not(test))]
+                let per_row = false;
+                if per_row {
+                    for enc in to_delete.drain(..) {
+                        let _ = kv.delete(enc);
+                    }
+                } else {
+                    let _ = kv.delete_batch(&to_delete);
+                    to_delete.clear();
+                }
+                // 口径与改前一字不差：按"计划删除的行数"计（不是按门返回的实删数）
+                removed += planned;
             }
             match next_lower {
                 Some(l) if !done => lower = Some(l),
