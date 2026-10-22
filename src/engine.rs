@@ -4339,6 +4339,157 @@ mod tests {
             eprintln!();
         }
     }
+
+    /// M62b：两条"单次调用"的跨档比值，把**结构计数**摆在一起看（`#[ignore]`，手动 release 单线程跑）。
+    ///
+    /// 为什么要单独一把尺子：复测表里 memory `seek_prev` 读 2.52×（17.8 → 44.8 µs/次）、
+    /// lsm `vacuum_bounded 一片` 读 2.21×（2.08 → 4.61 ms/片），而这两格在 `scale_baseline` 里都是
+    /// `timed()` 里的**一次调用** ⇒ 按 M50 那条规矩（µs 级单次采样在本机不作 A/B 凭据）它们只能算"登记"。
+    /// 这里把同一次动作量 **2000 次**、并把计数尺一起交出来：
+    /// - **memory**：`seek_prev` 往回退过几把键（`common::seek_prev_steps`）。memory 不落盘、没有"缓存容量"
+    ///   那一格 ⇒ 若步数平而 µs 涨，涨的只能是库变大之后的**内存局部性**（BTreeMap 更高、更散），不是新通道。
+    /// - **lsm**：一片实际交出/访问多少行（`sst::light_visits`）、读了几块（`sst::block_reads`）、
+    ///   开了几个文件（`common::disk::file_opens`）+ 盘上有几篇 SST。M29 那句"一片的预算行数是常数"要在这里当场可见，
+    ///   而"每多一篇文件就多一次冷启动"那笔（M15b）必须落在**文件数/块数**上才算归因完成。
+    ///
+    /// 判据只看计数；µs 两轮取最小只用来把数字摆在一起（本机跨轮漂 1.3~1.9×）。
+    ///
+    /// ```text
+    /// SINGLE_SHAPE_ROWS=20000,600000 cargo test --release --lib -- --ignored --nocapture \
+    ///   --test-threads=1 single_call_shape_attribution
+    /// ```
+    #[test]
+    #[ignore = "单次调用的结构归因，手动 release 单线程跑：SINGLE_SHAPE_ROWS=20000,600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 single_call_shape_attribution"]
+    fn single_call_shape_attribution() {
+        let tiers: Vec<usize> = std::env::var("SINGLE_SHAPE_ROWS")
+            .unwrap_or_else(|_| "20000,600000".to_string())
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+        // 形状照抄 scale_baseline：键 ≈35 B、值 ≈60 B、1000 行一事务、再更新前 10% 的键（⇒ 版本链长 2）
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+        const CALLS: usize = 2000;
+        const SLICES: usize = 3;
+        eprintln!("=== 单次调用的结构归因 tiers={tiers:?}（seek_prev {CALLS} 次 × 2 轮；一片 × {SLICES} 次）===");
+        for &rows in &tiers {
+            let updates = (rows / 10).max(1);
+            // ---------------- memory：seek_prev ----------------
+            {
+                let db = open_engine(EngineKind::Memory, None).unwrap();
+                for base in (0..rows).step_by(1000) {
+                    let end = (base + 1000).min(rows);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), val(i))).collect();
+                    let tx = db.begin();
+                    tx.batch_set(&items).unwrap();
+                    tx.commit();
+                }
+                for base in (0..updates).step_by(500) {
+                    let end = (base + 500).min(updates);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), format!("u{i}").into_bytes())).collect();
+                    let tx = db.begin();
+                    tx.batch_set(&items).unwrap();
+                    tx.commit();
+                }
+                let mid = key(rows / 2);
+                // 焐一次：第一次要把那一带的页/节点摸进缓存，与台架里"冷单次"不同形状
+                {
+                    let tx = db.begin();
+                    assert!(tx.seek_prev(&mid).is_some(), "seek_prev 必须命中中间那把键");
+                }
+                let s0 = crate::common::store::seek_prev_steps();
+                let mut best = f64::MAX;
+                let mut last = f64::MAX;
+                for _ in 0..2 {
+                    let t = std::time::Instant::now();
+                    for _ in 0..CALLS {
+                        let tx = db.begin();
+                        assert!(tx.seek_prev(&mid).is_some());
+                    }
+                    last = t.elapsed().as_secs_f64() * 1e6 / CALLS as f64;
+                    best = best.min(last);
+                }
+                let steps = crate::common::store::seek_prev_steps() - s0;
+                eprintln!(
+                    "[memory rows={rows}] seek_prev：{best:.1} µs/次（另一轮 {last:.1}）｜ 步/次 = {:.2} \
+                     （累计 {steps} ÷ {}）",
+                    steps as f64 / (CALLS as f64 * 2.0),
+                    CALLS * 2,
+                );
+            }
+            // ---------------- lsm：vacuum_bounded 一片 ----------------
+            {
+                let dir = tmp_dir("shape_lsm");
+                let db = open_engine(EngineKind::LsmTree, Some(&dir)).unwrap();
+                for base in (0..rows).step_by(1000) {
+                    let end = (base + 1000).min(rows);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), val(i))).collect();
+                    let tx = db.begin();
+                    tx.batch_set(&items).unwrap();
+                    tx.commit();
+                }
+                for base in (0..updates).step_by(500) {
+                    let end = (base + 500).min(updates);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), format!("u{i}").into_bytes())).collect();
+                    let tx = db.begin();
+                    tx.batch_set(&items).unwrap();
+                    tx.commit();
+                }
+                db.flush().unwrap();
+                // 照台架的顺序：先做一次全库 vacuum（所以后面那片"裁 0 行"），再切有界的一片
+                let st = db.vacuum().unwrap();
+                let ssts = std::fs::read_dir(dir.join("sst"))
+                    .map(|rd| rd.filter_map(|e| e.ok()).count())
+                    .unwrap_or(0);
+                let h = db.health();
+                eprintln!(
+                    "[lsm rows={rows}] 先全库 vacuum：裁 {} 行 ｜ 库 health rows={} live_keys={} ｜ 盘上 {ssts} 篇 SST",
+                    st.versions_removed, h.total_rows, h.live_keys
+                );
+                let mut best = f64::MAX;
+                let mut shown = None;
+                for n in 1..=SLICES {
+                    crate::common::disk::file_opens_clear();
+                    let lv0 = crate::lsm_tree::sst::light_visits();
+                    let br0 = crate::lsm_tree::sst::block_reads();
+                    let t = std::time::Instant::now();
+                    let vr = db.vacuum_bounded(None, 2048).unwrap();
+                    let us = t.elapsed().as_secs_f64() * 1e6;
+                    let visits = crate::lsm_tree::sst::light_visits() - lv0;
+                    let blocks = crate::lsm_tree::sst::block_reads() - br0;
+                    let opens = crate::common::disk::file_opens();
+                    best = best.min(us);
+                    eprintln!(
+                        "  第{n} 片：{us:.1} µs ｜ 扫 {} 行、裁 {} 行 ｜ 归并吐出 {visits} 把键 \
+                         ｜ 读块 {blocks} ｜ 开文件 {opens}",
+                        vr.stats.rows_scanned, vr.stats.versions_removed
+                    );
+                    shown = Some((visits, blocks, opens, vr.stats.rows_scanned));
+                }
+                if let Some((visits, blocks, opens, scanned)) = shown {
+                    eprintln!(
+                        "[lsm rows={rows}] 一片的最小 {best:.1} µs ｜ 每行 = {:.2} µs ｜ 键/行 = {:.2} \
+                         ｜ 块/行 = {:.3} ｜ 开文件/行 = {:.4}",
+                        best / scanned.max(1) as f64,
+                        visits as f64 / scanned.max(1) as f64,
+                        blocks as f64 / scanned.max(1) as f64,
+                        opens as f64 / scanned.max(1) as f64,
+                    );
+                }
+                drop(db);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            eprintln!();
+        }
+    }
 }
 
 /// 一次搬运的账。
