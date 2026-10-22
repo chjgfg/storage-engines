@@ -1069,6 +1069,44 @@ macro_rules! note_root_check {
     };
 }
 
+// 测试专用尺子（M61 的**先量**）：删除路径**落到的叶子游程数**，也就是"每行都重下一趟全树"这件事的理论上限。
+//
+// 为什么钉这一格才动代码：M56b 之后 200k 档每删除行仍读 下降 4.00 + 回溯 3.00 + 重组 2.43 页，
+// 而"合批同叶多行"这一刀的收益**完全取决于一次删除之后,下一行还在不在同一片叶子里** ——
+// 比值 1（每行一片新叶子）⇒ 这一刀一分钱买不到，比值 k ⇒ 下降次数能降到 1/k。
+// 这个 k 不读就只能猜，而 M56 那一轮已经证明"猜哪一段花钱"会把因果读反。
+//
+// 为什么数**游程**而不是"不同叶子数"：删除按升序走 ⇒ 同一叶子的连续行必然连着来（键序就是叶子序），
+// 所以游程数 == 不同叶子数，而游程只要留"上一页号"一个格子、不用维护集合。
+// ⚠️ 乱序删除时这个等式不成立（游程会大于不同叶子数）—— 那一支不是合批的现场，读数里会照实报。
+#[cfg(test)]
+thread_local! {
+    static DELETE_LEAF_LAST: std::cell::Cell<Option<PageId>> = const { std::cell::Cell::new(None) };
+    static DELETE_LEAF_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DELETE_ROWS_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_delete_leaf(leaf: PageId) {
+    DELETE_ROWS_SEEN.with(|r| r.set(r.get() + 1));
+    DELETE_LEAF_LAST.with(|last| {
+        if last.get() != Some(leaf) {
+            last.set(Some(leaf));
+            DELETE_LEAF_RUNS.with(|c| c.set(c.get() + 1));
+        }
+    });
+}
+
+/// `(累计删除行数, 累计叶子游程数)` ⇒ 两者之比 = 合批后"每几行共用一趟下降"的上限。
+/// ⚠️ 读数用**差值**（台架与守卫都按 `p1 − p0` 取，跟 `reorg_stats` 同一口径，不就地清零）。
+#[cfg(test)]
+pub(crate) fn delete_leaf_runs() -> (u64, u64) {
+    (
+        DELETE_ROWS_SEEN.with(|c| c.get()),
+        DELETE_LEAF_RUNS.with(|c| c.get()),
+    )
+}
+
 /// 删除的返回值（M54b / M56b）。
 ///
 /// - `min_changed`：**本次删除可能改变了该子树的最小键** —— 分隔键就是子树最小键，所以父节点只有在这一格
@@ -1668,6 +1706,8 @@ impl BPlusTree {
                 // 删的是本片最小键 ⇒ 本片所属子树的下界可能变了；删别的键一定没变
                 let mut min_changed = idx == 0;
                 entries.remove(idx);
+                #[cfg(test)]
+                note_delete_leaf(node_page_id);
                 self.write_node(node_page_id, &node);
 
                 // 非根叶子下溢 → 再平衡

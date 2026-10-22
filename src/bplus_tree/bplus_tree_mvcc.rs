@@ -3360,6 +3360,15 @@ mod tests {
                     "分隔键刷新".to_string(),
                     crate::bplus_tree::bplus_tree::sep_refreshes(),
                 ),
+                // M61 的先量：合批这一刀的收益 = 删除行数 ÷ 落到的叶子游程数（升序删除时游程 == 不同叶子）
+                (
+                    "删除行(尺子)".to_string(),
+                    crate::bplus_tree::bplus_tree::delete_leaf_runs().0,
+                ),
+                (
+                    "叶子游程".to_string(),
+                    crate::bplus_tree::bplus_tree::delete_leaf_runs().1,
+                ),
             ]
         };
         let phys = rows as f64 * 2.0;
@@ -3388,6 +3397,31 @@ mod tests {
                     d,
                     d as f64 / phys,
                     per_del(d)
+                );
+            }
+            // M61 的先量：k = 删除行数 ÷ 叶子游程数 = "一趟下降平均能带几行"的**上限**。
+            // k≈1 ⇒ 每行本来就落在不同叶子里，合批这一刀一分钱买不到；k=4 ⇒ 下降次数最多能降到 1/4。
+            let delta = |name: &str| -> u64 {
+                let a = p0
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0);
+                let b = p1
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0);
+                b.saturating_sub(a)
+            };
+            let dr = delta("删除行(尺子)");
+            let runs = delta("叶子游程");
+            if dr > 0 {
+                eprintln!(
+                    "        [合批上限 k] 这次删除尺子看到 {dr} 行、落到 {runs} 片叶子游程 ⇒ k = {:.2} 行/游程\
+                     （合批之后下降次数最多降到 1/{:.2}；k≈1 就说明这一刀买不到东西）",
+                    dr as f64 / runs.max(1) as f64,
+                    dr as f64 / runs.max(1) as f64
                 );
             }
             let mut parts = Vec::new();
