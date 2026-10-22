@@ -2355,9 +2355,71 @@ mod tests {
                     mb(l1 - l0),
                     mb(l1 - base_live),
                 );
+                // ⚠️ 门控开着时这一格的"瞬时峰值"不可比：分段尺子每次都把高水位压回当前活字节
+                // ⇒ 它读到的是"最后一段的尖峰"而不是整段的高水位（M37 那条教训的反向应用）。
+                if merge_stage_on() && st.versions_removed > 0 {
+                    print_merge_stages(&format!("{arm} 门V/vacuum 内第{pass}趟"));
+                }
+            }
+
+            // M62 的**门 M**：复测里紧接着 `vacuum()` 的那一格 `flush+merge` —— 无条件再走一遍 merge。
+            // 为什么要在同一个进程里连着跑两扇门：两格的读数差 3 倍（+5.8 vs +18.4），而"差在哪"只有
+            // 在同一份库、同一个二进制、按现场顺序排下去才答得出来（M55 第六条：对照臂必须真经过被测那一步）。
+            {
+                let l0 = crate::mem_probe::live() as i64;
+                let p0 = crate::mem_probe::reset_peak();
+                let t = Instant::now();
+                mvcc.flush();
+                mvcc.merge().unwrap();
+                let d = t.elapsed();
+                let l1 = crate::mem_probe::live() as i64;
+                let peak = crate::mem_probe::peak() as i64;
+                println!(
+                    "  [{arm}] 门M/flush+merge：墙钟 {:.2} s ｜ 瞬时峰值 {}{:.1} MB ｜ 做完还住 {:+.1} MB",
+                    d.as_secs_f64(),
+                    if merge_stage_on() { "（门控开着⇒此格不可比）" } else { "" },
+                    mb((peak - p0 as i64).max(0)),
+                    mb(l1 - l0),
+                );
+                if merge_stage_on() {
+                    print_merge_stages(&format!("{arm} 门M/flush+merge"));
+                }
             }
         }
         cleanup(&path);
+    }
+
+    /// M62：分段尺子开没开（与 `bitcask::merge_stage_gated` 同一个环境变量，读一次不缓存 —— 台架里改不了它）
+    fn merge_stage_on() -> bool {
+        std::env::var("MERGE_STAGE_SPLIT").is_ok()
+    }
+
+    /// M62：把 `merge()` 内部四段的读数打出来（`净增` = 段末还活着多少 vs 进门时；`尖峰` = 段内最多涨到多少）
+    fn print_merge_stages(tag: &str) {
+        const MB: f64 = 1024.0 * 1024.0;
+        const NAMES: [&str; 4] = [
+            "写新日志+腾掉旧索引后",
+            "清单攒满（还没成树）",
+            "成树完成并换上",
+            "终态（hint 也落完）",
+        ];
+        let st = crate::bitcask::bitcask::merge_probe_read();
+        println!(
+            "    {tag}：清单 {} 条（≈{:.1} MB 格位）",
+            crate::bitcask::bitcask::merge_bulk_len(),
+            crate::bitcask::bitcask::merge_bulk_len() as f64 * 48.0 / MB
+        );
+        for (i, (live, peak)) in st.iter().enumerate() {
+            println!(
+                "      段{i} {:<22} 净增 {:+7.1} MB ｜ 段内尖峰 +{:6.1} MB",
+                NAMES[i],
+                *live as f64 / MB,
+                *peak as f64 / MB
+            );
+        }
+        if st.iter().all(|(l, p)| *l == 0 && *p == 0) {
+            println!("      ⚠️ 四段全 0 ⇒ 这一趟压根没走进 merge（或门控没开），别读成\"不花钱\"");
+        }
     }
 
     /// 每笔"单行事务"在 WAL 里到底留下多少字节、几条记录（`#[ignore]`，手动 release 跑）。

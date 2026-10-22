@@ -245,8 +245,100 @@ pub(crate) fn merge_bulk_fallbacks() -> u64 {
     })
 }
 
-/// 批量成树时一次多预留多少条清单格子（M60）。
-///
+// ── M62：`merge()` **内部**的分段账（门控 `MERGE_STAGE_SPLIT`，`#[cfg(test)]` ⇒ 不随 crate 发布）──
+//
+// 要回答的问题：复测里同一句 `merge()` 从两扇门进来读出两个瞬时峰值（vacuum 那扇 +5.8 MB /
+// `flush+merge` 那扇 +18.4 MB）。外层那把尺子只能看到"这一整段涨了多少" ⇒ 看不见**什么时候腾掉旧的、
+// 什么时候清单攒满、什么时候树建完** ⇒ 按 M56 那一课（一把总桶 + 猜哪段花钱 = 会把因果读反），先拆段。
+//
+// 每段记两个数，都是**相对 merge 进门那一刻**的活字节：
+//   live[slot] = 段末还活着多少（净账，会随"腾掉旧索引"变成负的）
+//   peak[slot] = 这一段内部相对段首最多涨到多少（瞬时账，段末就 reset 回去）
+// ⇒ 两栏分开才分得清"这一段的净增"与"这一段中途的尖峰"（M38/M59 那条：净增 0 不代表没花过）。
+//
+// ⚠️ 门控必须严：`reset_peak()` 是把水位**压低**，常开会锯短外层 `timed()` 对同一段的读数
+// （M37 那条教训，实测 171.4 → 47.2）。不设这个环境变量时这里完全是 no-op，一把尺子都不动。
+#[cfg(test)]
+static MERGE_LIVE: [std::sync::atomic::AtomicI64; 4] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; 4];
+#[cfg(test)]
+static MERGE_PEAK: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+#[cfg(test)]
+static MERGE_ENTRY_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static MERGE_SEG_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn merge_stage_gated() -> bool {
+    std::env::var("MERGE_STAGE_SPLIT").is_ok()
+}
+
+/// merge 进门：清槽、记住进门时的活字节、把高水位压到当前值（第一段从这里开始量）。
+#[cfg(test)]
+pub(crate) fn merge_probe_start() {
+    if !merge_stage_gated() {
+        return;
+    }
+    for s in &MERGE_LIVE {
+        s.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    for s in &MERGE_PEAK {
+        s.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    let l = crate::mem_probe::live();
+    MERGE_ENTRY_LIVE.store(l, std::sync::atomic::Ordering::Relaxed);
+    MERGE_SEG_BASE.store(crate::mem_probe::reset_peak(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 走完一段：记下"段末净增"与"段内尖峰"，然后把高水位压回当前值，下一段自己从头算。
+#[cfg(test)]
+pub(crate) fn merge_probe_mark(slot: usize) {
+    if !merge_stage_gated() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let net = crate::mem_probe::live() as i64 - MERGE_ENTRY_LIVE.load(Relaxed) as i64;
+    MERGE_LIVE[slot].store(net, Relaxed);
+    MERGE_PEAK[slot].store(
+        crate::mem_probe::peak().saturating_sub(MERGE_SEG_BASE.load(Relaxed)),
+        Relaxed,
+    );
+    MERGE_SEG_BASE.store(crate::mem_probe::reset_peak(), Relaxed);
+}
+
+/// 出门：把高水位恢复成"进程语义"（不然外层台架读到的是被本尺子压过的水位）。
+#[cfg(test)]
+pub(crate) fn merge_probe_stop() {
+    if !merge_stage_gated() {
+        return;
+    }
+    crate::mem_probe::reset_peak();
+}
+
+/// 四段读数 `(净增, 段内尖峰)`，单位字节。⚠️ 读到全 0 先确认门控开没开、这一趟有没有真走进 merge。
+#[cfg(test)]
+pub(crate) fn merge_probe_read() -> [(i64, u64); 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = [(0i64, 0u64); 4];
+    for (o, (l, p)) in out.iter_mut().zip(MERGE_LIVE.iter().zip(&MERGE_PEAK)) {
+        *o = (l.load(Relaxed), p.load(Relaxed));
+    }
+    out
+}
+
+/// 清单攒到多少条（M62：两扇门的清单必须**条数相同**才允许比瞬时峰值，否则差的是形状不是账）。
+#[cfg(test)]
+pub(crate) fn merge_bulk_len() -> usize {
+    MERGE_BULK_LEN.with(|c| c.get())
+}
+
+#[cfg(test)]
+thread_local! {
+    static MERGE_BULK_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 批量成树时一次多预留多少条清单格子（M60）。///
 /// 为什么不是 `with_capacity(声明的条数)`：那个数从文件头/调用方来，**不可信** ⇒ 信它就等于
 /// "读到一个大数就先做一次巨大分配"（M59 那句）。分步 `reserve_exact` 把最坏过冲夹在一个步长里：
 /// 65 536 条 × 骨架 48 B ≈ **3 MB**。
@@ -769,6 +861,11 @@ impl Log {
             self.scan_log_into(&mut key_dir, file_id, 0, file_len)?;
             return Ok(key_dir);
         }
+        // M62：清单攒满 = 这一段最贵的那个形状在此刻成形（还没开始成树）
+        #[cfg(test)]
+        MERGE_BULK_LEN.with(|c| c.set(bulk.0.len()));
+        #[cfg(test)]
+        merge_probe_mark(1);
         #[cfg(test)]
         note_merge_bulk_rebuild();
         Ok(bulk.into_keydir())
@@ -1285,6 +1382,9 @@ impl Bitcask {
 
     /// 压缩：把 KeyDir 中存活 + 软 tomb 重写到新 data.log（active_id=0），删除所有密封分片
     pub fn merge(&mut self) -> Result<()> {
+        // M62：分段账的进门（门控 `MERGE_STAGE_SPLIT`，默认 no-op ⇒ 不动外层台架的水位）
+        #[cfg(test)]
+        merge_probe_start();
         self.active.flush_buf()?;
 
         let target = self.base_path.clone();
@@ -1431,6 +1531,9 @@ impl Bitcask {
         // 免掉 M55 实测那笔 30.5 MiB 的半满税；上面那三步的顺序一字未动，失败仍然保持隔离。
         let _ = std::fs::remove_file(self.hint_path());
         self.key_dir = KeyDir::new();
+        // M62 段 0：走到这里 = 新日志已写出、旧索引已腾掉 ⇒ 净增应当是**负的**（腾掉的那份）
+        #[cfg(test)]
+        merge_probe_mark(0);
         self.index_rebuilding = true;
         #[cfg(test)]
         arm_merge_rescan_counter();
@@ -1455,14 +1558,24 @@ impl Bitcask {
                     self.base_path.display(),
                     e
                 );
+                #[cfg(test)]
+                merge_probe_stop();
                 return Err(e);
             }
         };
+        // M62 段 2：树已建完并换上 ⇒ 这里的净增就是**终态索引**相对进门时旧索引的差
+        #[cfg(test)]
+        merge_probe_mark(2);
         self.index_rebuilding = false;
 
         let _ = std::fs::remove_file(&hold_path);
 
         let _ = self.dump_hint();
+        // M62 段 3：终态（hint 也落完）—— 净增应当与段 2 一样或更小（hint 的序列化缓冲已释放）
+        #[cfg(test)]
+        merge_probe_mark(3);
+        #[cfg(test)]
+        merge_probe_stop();
         Ok(())
     }
 
