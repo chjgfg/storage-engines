@@ -204,6 +204,102 @@ pub(crate) fn note_merge_rescan_row() {
     });
 }
 
+// ── M60 的尺子：merge 之后重建索引**走没走批量那一扇门** ──
+//
+// 为什么钉这个而不是钉"常驻少了 30 MiB"：后者要跑大库（`bitcask_vacuum_retained_two_passes` 那把
+// release 台架量的就是它），CI 里跑不动；而"走了批量门"是形状成立的**前提** —— 回归成逐条 `insert`
+// （把 `MERGE_BULK_OLD_SHAPE` 打开，或者把门拆掉）这个数就掉回 0。
+#[cfg(test)]
+thread_local! {
+    static MERGE_BULK_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MERGE_BULK_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn note_merge_bulk_rebuild() {
+    MERGE_BULK_REBUILDS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn note_merge_bulk_fallback() {
+    MERGE_BULK_FALLBACKS.with(|c| c.set(c.get() + 1));
+}
+
+/// 本线程到目前为止有几次 merge 走了批量成树（读一次清一次）
+#[cfg(test)]
+pub(crate) fn merge_bulk_rebuilds() -> u64 {
+    MERGE_BULK_REBUILDS.with(|c| {
+        let n = c.get();
+        c.set(0);
+        n
+    })
+}
+
+/// ……其中又有几次因为扫到硬删除而整份退回逐条施加（读一次清一次）
+#[cfg(test)]
+pub(crate) fn merge_bulk_fallbacks() -> u64 {
+    MERGE_BULK_FALLBACKS.with(|c| {
+        let n = c.get();
+        c.set(0);
+        n
+    })
+}
+
+/// 批量成树时一次多预留多少条清单格子（M60）。
+///
+/// 为什么不是 `with_capacity(声明的条数)`：那个数从文件头/调用方来，**不可信** ⇒ 信它就等于
+/// "读到一个大数就先做一次巨大分配"（M59 那句）。分步 `reserve_exact` 把最坏过冲夹在一个步长里：
+/// 65 536 条 × 骨架 48 B ≈ **3 MB**。
+///
+/// 为什么不是直接 `.collect()`：M59 实测流式 `collect` 的瞬时超出 = 清单骨架 + **`Vec` 翻倍扩容留下的空槽**
+/// （600k 档 `over` 50.3 MB，其中 **21.5 MB 是空槽** —— `Vec::from_iter` 拿不到 `size_hint` 就只会翻倍）。
+const KEYDIR_BULK_STEP: usize = 65_536;
+
+/// 一份**按键升序**的 `(键, 位置)` 清单，攒完再一次成树 ⇒ 满节点。
+///
+/// 存在的理由是 M55 那笔税：升序逐条 `insert` 把沿途每个节点劈成半满（600k 档实测 **30.5 MiB 常驻**），
+/// 而 `BTreeMap` 的有序批量填充给的是满节点。两个用户共用它：hint 载入（[`hint_entries_to_keydir`]）
+/// 与 merge 之后的索引重扫（[`Log::load_keydir_sorted`]）—— **一份格式不该有两种攒法**。
+///
+/// ⚠️ 只在输入升序**且不含硬删除**时才有资格用："后到者胜"要能对上"删除按顺序施加"，
+/// 所以调用方一扫到硬删除必须整份退回逐条施加（见 [`Log::load_keydir_sorted`]）。
+struct KeyDirBulk(Vec<(Vec<u8>, KeyLoc)>);
+
+impl KeyDirBulk {
+    fn new() -> Self {
+        KeyDirBulk(Vec::new())
+    }
+
+    fn push(&mut self, entry: (Vec<u8>, KeyLoc)) {
+        if self.0.len() == self.0.capacity() {
+            self.0.reserve_exact(KEYDIR_BULK_STEP);
+        }
+        self.0.push(entry);
+    }
+
+    /// 交出树。⚠️ `into_iter().collect()` 会**复用**原来那块缓冲（M59 实测建树净增只有 1.3 MB）
+    /// ⇒ 全程只有一份清单；中间插一个 `.map(..)` 就会多要一份（`spec_from_iter` 那条捷径失效）。
+    fn into_keydir(self) -> KeyDir {
+        self.0.into_iter().collect()
+    }
+}
+
+/// 把一条**升序**流攒成清单再一次成树；`Err` 原样交出（hint 解码失败要回退全量扫，不许在这里吞）。
+///
+/// 与 [`KeyDirBulk`] 分开写，是因为 hint 那侧的流吐的是 `Result<Option<..>>`（坏一条 ≠ 读不出来，
+/// M25 那条纪律），而 merge 那侧是命令式的扫描回调 —— 两边共用的是**攒法与成树**，不是迭代器形状。
+fn keydir_from_ordered_stream<E>(
+    iter: impl Iterator<Item = std::result::Result<Option<(Vec<u8>, KeyLoc)>, E>>,
+) -> std::result::Result<KeyDir, E> {
+    let mut bulk = KeyDirBulk::new();
+    for item in iter {
+        if let Some(kv) = item? {
+            bulk.push(kv);
+        }
+    }
+    Ok(bulk.into_keydir())
+}
+
 /// 当前线程折候选时检查过的编码键数（测试探针用）
 #[cfg(test)]
 pub(crate) fn keydir_visits() -> u64 {
@@ -454,6 +550,10 @@ impl<R: std::io::Read> Iterator for HintEntries<'_, R> {
 /// 建好之后**还活着** 65.4 → 39.7 MB —— 差的 **25.7 MB** 与大库台架那一格
 /// `冷重开 常驻 83.4 → 57.7 MB` **一字不差**，而两臂解出的键数相同 ⇒
 /// 那 25.7 MB 纯粹是**半满节点**，不是内容。重复键的取舍与逐条 `insert` 相同（后者胜）。
+///
+/// ⚠️ M60 起这一趟不再直接 `.collect()`：改走 [`KeyDirBulk`]（**分步 `reserve_exact`**）。
+/// 原因是 M59 量到流式 `collect` 的瞬时超出里有一大块是 `Vec` 翻倍扩容留下的空槽
+/// （600k 档 `over` 50.3，其中 21.5 是空槽）⇒ 现在读到的 `over` 是 31.5（= 骨架 28.8 + 一个步长的过冲）。
 fn hint_entries_to_keydir<R: std::io::Read>(
     r: &mut R,
     entry_count: u64,
@@ -473,10 +573,7 @@ fn hint_entries_to_keydir<R: std::io::Read>(
         }
         return Ok(key_dir);
     }
-    HintEntries::new(r, entry_count, with_file_id)
-        .map(std::result::Result::transpose)
-        .flatten()
-        .collect()
+    keydir_from_ordered_stream(HintEntries::new(r, entry_count, with_file_id))
 }
 
 /// 读取 hint。成功返回 `(KeyDir, active_id, active_log_size)`
@@ -568,13 +665,17 @@ impl Log {
         Ok(())
     }
 
-    /// 从 `from` 扫到 `to`，把记录合并进 `key_dir`（后写覆盖先写）
-    fn scan_log_into(
+    /// 从 `from` 扫到 `to`，把每条记录交给 `on_record`。
+    ///
+    /// **解日志格式的地方全仓库只有这一处**（M60 抽出来的）：逐条施加（open 时的全量扫、hint 增量扫）
+    /// 与批量成树（merge 之后的重扫）必须共用同一份解码 —— 两份解码器迟早有一份漏掉某类记录，
+    /// 而"漏掉"在这条路上不是慢，是**静默少一把键**。
+    /// 记录游标（`pos`）的推进也在这里：活值跳过载荷、墓碑不跳，两份用户都不会再各写一遍。
+    fn for_each_record(
         &mut self,
-        key_dir: &mut KeyDir,
-        file_id: u32,
         from: u64,
         to: u64,
+        mut on_record: impl FnMut(Vec<u8>, u64, i32, u32),
     ) -> Result<()> {
         if from >= to {
             return Ok(());
@@ -605,7 +706,7 @@ impl Log {
                 Ok((key, value_pos, flag, value_len)) => {
                     #[cfg(test)]
                     note_merge_rescan_row();
-                    apply_log_record(key_dir, file_id, key, value_pos, flag, value_len);
+                    on_record(key, value_pos, flag, value_len);
                     if flag >= 0 {
                         pos = value_pos + value_len as u64;
                     } else {
@@ -616,6 +717,61 @@ impl Log {
             }
         }
         Ok(())
+    }
+
+    /// 从 `from` 扫到 `to`，把记录合并进 `key_dir`（后写覆盖先写）
+    fn scan_log_into(
+        &mut self,
+        key_dir: &mut KeyDir,
+        file_id: u32,
+        from: u64,
+        to: u64,
+    ) -> Result<()> {
+        self.for_each_record(from, to, |key, value_pos, flag, value_len| {
+            apply_log_record(key_dir, file_id, key, value_pos, flag, value_len)
+        })
+    }
+
+    /// **升序日志 → 索引，一次成树**（M60，merge 重扫专用）：满节点，免掉 M55 那笔半满税。
+    ///
+    /// ⚠️ 扫到硬删除（`flag` 既不是活值也不是软墓碑 —— 与 [`apply_log_record`] 的判据一字不差）就
+    /// **整份退回**逐条施加：批量那一侧只认"后到者胜"，删除必须按顺序施加。退回的代价是多扫一遍日志，
+    /// 而 merge 的产物本来就写不出硬删除（`merge()` 只写活值与软墓碑）⇒ 这一支是保险，不是常规路径。
+    ///
+    /// 对照臂（门控 `MERGE_BULK_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）由调用方 `Bitcask::merge`
+    /// 走老路，这样"批量 vs 逐条"两臂共用同一个 merge、同一份日志 ⇒ 比值只归因于形状。
+    pub fn load_keydir_sorted(&mut self, file_id: u32) -> Result<KeyDir> {
+        self.flush_buf()?;
+        let file_len = self.file.metadata()?.len();
+        self.end_pos = file_len;
+
+        let mut bulk = KeyDirBulk::new();
+        let mut saw_delete = false;
+        self.for_each_record(0, file_len, |key, value_pos, flag, value_len| {
+            let loc = if flag >= 0 {
+                KeyLoc::Live {
+                    file_id,
+                    pos: value_pos,
+                    len: value_len,
+                }
+            } else if flag == FLAG_SOFT_TOMBSTONE {
+                KeyLoc::SoftTombstone { file_id }
+            } else {
+                saw_delete = true;
+                return;
+            };
+            bulk.push((key, loc));
+        })?;
+        if saw_delete {
+            #[cfg(test)]
+            note_merge_bulk_fallback();
+            let mut key_dir = KeyDir::new();
+            self.scan_log_into(&mut key_dir, file_id, 0, file_len)?;
+            return Ok(key_dir);
+        }
+        #[cfg(test)]
+        note_merge_bulk_rebuild();
+        Ok(bulk.into_keydir())
     }
 
     /// 扫描整文件构建 KeyDir（先 flush 缓冲）
@@ -1270,22 +1426,38 @@ impl Bitcask {
         // 2. 再腾掉旧索引 —— 这一步才把"两份索引同时在"变成"一份"，是这一刀的收益本身。
         // 3. 置标志 → 原地重扫 → 成功才放标志。重扫失败就带着 Err 返回并保持隔离：
         //    此时磁盘上的日志是完整的，只是内存里没人知道有哪些键 ⇒ 除了重新 open 没有第二条路。
+        //
+        // M60 改的只有"重扫怎么成树"这一件事：输入是刚写出的**按键升序**日志 ⇒ 走批量成树（满节点），
+        // 免掉 M55 实测那笔 30.5 MiB 的半满税；上面那三步的顺序一字未动，失败仍然保持隔离。
         let _ = std::fs::remove_file(self.hint_path());
         self.key_dir = KeyDir::new();
         self.index_rebuilding = true;
         #[cfg(test)]
         arm_merge_rescan_counter();
-        let rebuilt = self.active.load_index_from(&mut self.key_dir, 0, 0);
+        // ⚠️ 对照臂（门控 `MERGE_BULK_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）：退回逐条 `insert`。
+        //    同一个 merge、同一份日志、同一个解码器（`for_each_record`）⇒ 两臂只差"攒法"这一件事。
+        #[cfg(test)]
+        let rebuilt = if std::env::var("MERGE_BULK_OLD_SHAPE").is_ok() {
+            let mut kd = KeyDir::new();
+            self.active.load_index_from(&mut kd, 0, 0).map(|_| kd)
+        } else {
+            self.active.load_keydir_sorted(0)
+        };
+        #[cfg(not(test))]
+        let rebuilt = self.active.load_keydir_sorted(0);
         #[cfg(test)]
         disarm_merge_rescan_counter();
-        if let Err(e) = rebuilt {
-            log::error!(
-                "bitcask: merge 后的索引重扫失败（{}），引擎隔离中：{}",
-                self.base_path.display(),
-                e
-            );
-            return Err(e);
-        }
+        self.key_dir = match rebuilt {
+            Ok(kd) => kd,
+            Err(e) => {
+                log::error!(
+                    "bitcask: merge 后的索引重扫失败（{}），引擎隔离中：{}",
+                    self.base_path.display(),
+                    e
+                );
+                return Err(e);
+            }
+        };
         self.index_rebuilding = false;
 
         let _ = std::fs::remove_file(&hold_path);
@@ -1901,6 +2073,126 @@ mod tests {
             );
         }
         cleanup(&path);
+    }
+
+    /// M60：merge 之后重建索引必须走"批量成树"那一扇门（满节点），而且**不许**退回逐条施加。
+    ///
+    /// 判据为什么钉"门走没走 + 有没有退回"，不钉"常驻少了 30 MiB"：后者要跑大库才能读出来
+    /// （release 台架 `bitcask_vacuum_retained_two_passes` 量的就是它），CI 里跑不动；
+    /// 而**形状账只在门里才成立** ⇒ 门是它的充分条件，钉门就够，代价归代价那一段去量。
+    ///
+    /// ⚠️ 对照臂（`MERGE_BULK_OLD_SHAPE=1` 重跑这一条）必须**红** —— 第一版守卫如果只断言"键还在"，
+    /// 那退回老路也照样绿，等于没有守卫（M43 那一轮同一课）。
+    #[test]
+    fn merge_rebuild_goes_through_the_bulk_door() {
+        const KEYS: usize = 4_000;
+        let path = tmp_log("merge_bulk_door");
+        {
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            for i in 0..KEYS {
+                eng.set(format!("k{i:06}").as_bytes(), vec![b'v'; 16])
+                    .unwrap();
+            }
+            eng.merge().unwrap();
+            let bulk = merge_bulk_rebuilds();
+            let fallbacks = merge_bulk_fallbacks();
+            eprintln!("[bulk door] 走批量成树 {bulk} 次 · 退回逐条 {fallbacks} 次");
+            assert_eq!(
+                bulk,
+                1,
+                "merge 之后重建索引没走批量成树那一扇门 ⇒ M60 这一刀根本没生效（或对照臂开着）"
+            );
+            assert_eq!(
+                fallbacks,
+                0,
+                "merge 的产物里居然有硬删除 ⇒ 批量那一侧的升序前提被破坏，退回说明写入形状变了"
+            );
+            assert_eq!(eng.len(), KEYS, "merge 之后活键数变了");
+        }
+        {
+            // 重开一遍核对：批量建出来的索引落进 hint、再读回来，必须与内存里那一把一致
+            let mut eng = Bitcask::new(path.clone()).unwrap();
+            assert_eq!(eng.len(), KEYS, "重开之后活键数不对");
+            assert_eq!(
+                eng.get(b"k000001").unwrap(),
+                Some(vec![b'v'; 16]),
+                "重开之后存活键读不回来"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// M60：批量成树与逐条施加**必须给出同一把索引**（含重复键"后到者胜"、软墓碑、以及硬删除的退回支）。
+    ///
+    /// 为什么单独钉这一条：`BTreeMap` 的有序批量填充走的是"排序 + 去重"那条内部路，
+    /// 而 `apply_log_record` 是"后写覆盖先写 + 硬删就 remove"。两条路等价**不是显然的**，
+    /// 而 merge 每次都要靠它 ⇒ 一旦不等价，症状是"某把键在 merge 之后静默换成旧版本"。
+    /// 对照对象选 `load_index`（同一条日志、逐条施加的那扇门）⇒ 两把索引逐键逐字节比。
+    ///
+    /// ⚠️ 退回那一支（扫到硬删除）也得有形状能跑到它 —— 不然它就是死代码，下次改坏没人知道。
+    #[test]
+    fn bulk_sorted_rebuild_agrees_with_the_insert_rebuild() {
+        // ① 干净形状：升序、中间夹一把重复键（后到者胜）与一把软墓碑
+        let path = tmp_log("bulk_agree");
+        {
+            let mut log = Log::new(path.clone()).unwrap();
+            for i in 0..600u32 {
+                let k = format!("k{i:04}");
+                log.write_entry(k.as_bytes(), Some(b"first")).unwrap();
+                if i % 5 == 0 {
+                    // 同一把键再写一版：批量那一侧必须认"后到者胜"
+                    log.write_entry(k.as_bytes(), Some(b"second-longer")).unwrap();
+                }
+                if i % 11 == 0 {
+                    log.write_soft_tombstone(k.as_bytes()).unwrap();
+                }
+            }
+            log.flush_buf().unwrap();
+            let by_bulk = log.load_keydir_sorted(0).unwrap();
+            let by_insert = log.load_index(0).unwrap();
+            assert_eq!(
+                by_bulk, by_insert,
+                "同一份升序日志：批量成树与逐条施加给出的索引不一样 ⇒ 后到者胜/软墓碑有一条对不上"
+            );
+            assert!(
+                by_bulk.contains_key(&b"k0000"[..]),
+                "对照对象本身是空的 ⇒ 这份台架什么都没比"
+            );
+            assert_eq!(
+                merge_bulk_fallbacks(),
+                0,
+                "干净形状不该退回逐条施加"
+            );
+        }
+        cleanup(&path);
+
+        // ② 带硬删除的形状：必须整份退回逐条施加，并且结果与逐条那扇门一致
+        let path2 = tmp_log("bulk_fallback");
+        {
+            let mut log = Log::new(path2.clone()).unwrap();
+            for i in 0..200u32 {
+                let k = format!("k{i:04}");
+                log.write_entry(k.as_bytes(), Some(b"v")).unwrap();
+            }
+            log.write_hard_delete(b"k00100").unwrap();
+            log.flush_buf().unwrap();
+            let by_bulk = log.load_keydir_sorted(0).unwrap();
+            let by_insert = log.load_index(0).unwrap();
+            assert_eq!(
+                by_bulk, by_insert,
+                "扫到硬删除之后，退回那一支给出的索引与逐条施加不一样 ⇒ 那一步丢掉了一次删除"
+            );
+            assert!(
+                !by_bulk.contains_key(&b"k00100"[..]),
+                "硬删过的那把键还在索引里 ⇒ 退回时丢了 remove"
+            );
+            assert_eq!(
+                merge_bulk_fallbacks(),
+                1,
+                "有硬删除却没退回逐条施加 ⇒ 批量那一侧的升序前提被静默违反了"
+            );
+        }
+        cleanup(&path2);
     }
 
     /// 重扫窗口里每一扇**能报错的门**都必须报错，而不是回「键不存在」（M43）。
