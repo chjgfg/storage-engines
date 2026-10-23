@@ -7,7 +7,7 @@
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 332 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M63**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M63b**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -488,6 +488,57 @@ fn main() -> Result<(), String> {
   ⇒ 写回必须补一层 `pack_plain`,这一步在 `tools` 里只做一份。M63 之前三个 `*-import-kv` 漏了这一层
   (`0x00` 打头少一字节、`0x01` 打头被判成 TTL 行),细节见上面 M63 那一节。
 - `memory` 不能当源也不能当目标(它不落盘,"重开"就是空库),`tools` 两侧都直接拒绝。
+
+### 9b. 下游删掉自己那份 `src/storage` 时,要留下的**那一层缝**(M63b 实测过)
+
+下游(`trading-system`)的两个入口文件是**一字未改**抄来编的：`src/bin/migrate_storage.rs` 直接编译通过，
+`tests/storage_migrate.rs` 只差**一个拼写**（它的 `StorageEngine::BplusTree` vs 本库的 `EngineKind::BPlusTree`，全文 4 处）。
+把那条拼写对上之后 **3 条测试全绿**（含 bitcask→lsm→bplus→bitcask 的真实三跳）。剩下的就是这一层胶：
+
+```rust
+// src/storage/mod.rs —— 删掉引擎副本之后,下游只需要留这一个文件
+pub mod storage {
+    use std::path::PathBuf;
+    use storage_engines::engine::{EngineConfig, KvEngine, KvTxn};
+    use storage_engines::EngineKind;
+
+    pub use storage_engines::common::pack_plain;
+    pub use storage_engines::{bitcask, bplus_tree, lsm_tree, memory, tools};
+
+    pub mod config {                              // 它原本那份是应用侧的 .env 策略
+        pub use storage_engines::EngineKind as StorageEngine;
+    }
+
+    #[derive(Debug, Clone)]                      // 下游的形状是 {engine, data_dir}；本库那份字段叫 kind
+    pub struct StorageConfig { pub engine: EngineKind, pub data_dir: PathBuf }
+
+    fn engine_config() -> EngineConfig {         // 与下游主进程同一组 bplus 参数
+        EngineConfig { order: 16, max_cache_pages: 64, ..EngineConfig::default() }
+    }
+
+    pub struct MVCC(Box<dyn KvEngine>);           // 下游那份是个具体类型,本库交的是 trait object
+    impl MVCC {
+        pub fn open_with(cfg: StorageConfig) -> Self {
+            let dir = cfg.data_dir.join(cfg.engine.as_str());
+            let path = match cfg.engine {
+                EngineKind::Memory => None,
+                EngineKind::BPlusTree => {
+                    std::fs::create_dir_all(&dir).unwrap();
+                    Some(tools::bplus_db_path(&cfg.data_dir))   // 先认已存在的库文件名
+                }
+                _ => { std::fs::create_dir_all(&dir).unwrap(); Some(dir) }
+            };
+            Self(storage_engines::open_engine_with(cfg.engine, path.as_deref(), &engine_config()).unwrap())
+        }
+        pub fn engine(&self) -> EngineKind { EngineKind::parse(self.0.name()).unwrap() }
+        pub fn begin_transaction(&self) -> Box<dyn KvTxn + '_> { self.0.begin() }
+    }
+}
+```
+
+三格差别都是**下游侧**能一处改完的：`StorageEngine` 的变体拼写、`StorageConfig` 的字段名、以及要不要保留 `MVCC` 这层壳
+（本库交 `Box<dyn KvEngine>`，方法名是 `begin()` 不是 `begin_transaction()`）。⚠️ 刻意**没有**为了对上拼写去改
+`EngineKind::BPlusTree` —— 那是公开 API 的破坏性重命名（会把下一次发布从 0.4.1 抬成 0.5.0），值不值 4 个 token 由他定。
 
 ## 项目结构
 

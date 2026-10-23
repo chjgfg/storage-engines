@@ -673,7 +673,8 @@
   - 动机：下游 `trading-system/src/storage` 要整份删掉、改成依赖本 crate。它的应用代码只认
     `tools::{migrate, export_to_file, import_from_file, parse_arrow, SnapshotFormat, MigrateStats}` 与 `tools::kv_snapshot::*`
     ⇒ 这一层把函数名、参数顺序、`MigrateStats` 的字段名、连 eprintln 的日志形状都对齐，让 `bin/migrate_storage.rs` 与
-    `tests/storage_migrate.rs` **一行都不用改**。目录布局 `{root}/{engine}/`，bplus 是 `{root}/bplus_tree/data.db`。
+    `tests/storage_migrate.rs` 只差**一个拼写**（4 处，实测见下面 M63b——第一版这里写的是"一行都不用改"，被自己的编译打回，就地改判）。
+    目录布局 `{root}/{engine}/`，bplus 是 `{root}/bplus_tree/data.db`。
   - **实现只有一份**：走 `KvEngine` 门面（不再有"每家一份 import 主体"），导出走 M44 的流式出口 ⇒ 不物化整库
     （下游那份 `export_records` 先折一个 `Vec`，本仓库实测 600k 档峰值 +123.7 MB）；`verify_live` 也改成只数不物化（M35/M47 同一条纪律）。
   - ⚠️ **实测翻案：`KvBulk::put*` 收的是"已打过值信封"的 logical 字节，不是用户字节**。四家各自探针实测同一个结果
@@ -692,6 +693,23 @@
     `read_bin`/`read_jsonl` 改成 `read_bin_with`/`read_jsonl_with` 的**收集壳**（非破坏，口径逐条对齐）。**346 passed**。
   - 还剩：八个 bin 的命令行外壳与导出侧重复体还没并到 `tools`（M64）；`KvBulk::put` 没有返回值通道 ⇒ 超一页载荷的行仍只能
     `log::error!` 喊、不会让 `import` 失败（在"已知局限"里，未动）。
+- **M63b（没动本库代码，只把上面那句承诺拿去真编真跑）—— 那条缝实测到"差一个拼写"，并把下游要留的那层胶写清楚了**：
+  - 做法：`%TEMP%` 里搭一个 crate（包名 `trading_system`、path 依赖本库），把下游那两个文件
+    **一字未改**抄进去（`src/bin/migrate_storage.rs` 253 行、`tests/storage_migrate.rs` 149 行），只另写一份候选的
+    `src/storage/mod.rs`（≈40 行胶：整模块转发 + `config::StorageEngine` 别名 + `{engine, data_dir}` 形状的 `StorageConfig`
+    + `MVCC(Box<dyn KvEngine>)` 壳）。
+  - 结果：**bin 直接编译通过**（本库无 `dotenvy` 那类应用侧依赖，它自己那句 `dotenvy::dotenv()` 由它自己的 Cargo.toml 提供）；
+    test 只报**同一条**错 4 次：`no variant named BplusTree`（本库叫 `BPlusTree`）。把 4 处拼写对齐后 **3 条测试全绿**
+    （`parse_arrow_ok` / `migrate_bitcask_to_lsm_to_bplus` 真实三跳 / `facade_still_open_after_migrate_layout`，0.29 s）。
+  - ⇒ 三格差别**全部落在下游侧、一处一行**：变体拼写、`StorageConfig` 字段名（`kind` vs `engine`）、要不要保留 `MVCC` 那层壳
+    （本库交 `Box<dyn KvEngine>`，方法名 `begin()` 而非 `begin_transaction()`）。胶的形状已抄进 README「9b」。
+  - ⚠️ 刻意**没有**为本库改 `EngineKind::BPlusTree` 的拼写：那是公开 API 的破坏性重命名 ⇒ 下一次发布从 0.4.1 抬成 0.5.0，
+    为 4 个 token 抬一个次版本号不值，决定权在他（登记为待决策）。
+  - **方法学第二十二**：交付"无缝"这类承诺，判据只能是**把对方的文件抄过来真编真跑**，不是把自己的函数名逐个对一遍；
+    对完名字就说"一行不用改"，第一次编译就打回 4 处。
+  - 顺带清场：本仓库在台架上漏下的临时物按 19 位纳秒签名（测试目录名）认出 2 620 条 + `se_*` 3 478 条 + 台架本体，
+    共约 **1.16 GB**；M15~M46 那批源码备份（157 条）**一条没动**（仓库里没有副本）。
+
 - **M62b（只量，新增一把 `#[ignore]` 台架 `single_call_shape_attribution`）—— 复测那两条"单次调用"的比值：一条撤销、一条并回两块旧账**：
   - 存在的理由就是 M50 那条规矩：`scale_baseline` 里 `seek_prev`/`vacuum_bounded 一片` 这两格都是 `timed()` 里的**一次调用**，
     跨档比它 = 拿单样本当凭据。新台架把同一个动作量 **2000 次 × 2 轮取最小**，结构计数并排交出来（三档 20k/200k/600k 同一进程）。
