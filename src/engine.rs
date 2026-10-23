@@ -4004,6 +4004,147 @@ mod tests {
         );
     }
 
+    /// M75 第一步：**只量不改** —— 标准表里 `search 末页(深翻)` 那 7.46 s 到底花在哪几段。
+    ///
+    /// 那一格的写法是 `contains(b"", last_page, 100)` 且**要精确 total** ⇒ 它一次付三笔：
+    /// ① 数全库要 total；② offset 跳过 `last_page × 页宽` 行；③ 取那一页。
+    /// 分开量才知道该修哪一段（M51 治的是"把前面每一页都攒在堆上"的**内存**，没动时间；
+    /// M58 只是把默认姿势写成游标，没让 offset 变便宜）。
+    ///
+    /// 每段两遍取最小（本机单样本 µs 不可信，M50/M62b 那条规矩）；内存列不看这里，标准表有。
+    ///
+    /// 跑法：`SCALE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 deep_page_stage_split`
+    #[test]
+    #[ignore = "深翻分段归因，手动 release 单线程跑：SCALE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 deep_page_stage_split"]
+    fn deep_page_stage_split() {
+        let rows: usize = std::env::var("SCALE_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600_000);
+        let page_size = 100usize;
+        let last_page = rows / page_size;
+
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+        /// 跑 n 遍取最小；返回 (最快耗时, 最后一次的结果)
+        fn min_of<T>(n: usize, mut f: impl FnMut() -> T) -> (f64, T) {
+            let mut best = f64::MAX;
+            let mut last = None;
+            for _ in 0..n {
+                let t = std::time::Instant::now();
+                let out = f();
+                let us = t.elapsed().as_secs_f64() * 1e6;
+                if us < best {
+                    best = us;
+                }
+                last = Some(out);
+            }
+            (best, last.unwrap())
+        }
+
+        eprintln!(
+            "=== 深翻分段归因 rows={rows} 页宽={page_size} 末页号={last_page}（每段两遍取最小，µs）==="
+        );
+        for kind in [
+            EngineKind::Bitcask,
+            EngineKind::BPlusTree,
+            EngineKind::LsmTree,
+            EngineKind::Memory,
+        ] {
+            let label = kind.as_str();
+            let dir = tmp_dir(&format!("deep_page_{label}"));
+            let arg = match kind {
+                EngineKind::Memory => None,
+                EngineKind::BPlusTree => Some(dir.join("bplus.db")),
+                _ => Some(dir.clone()),
+            };
+            let db = open_engine(kind, arg.as_deref()).unwrap();
+            for base in (0..rows).step_by(1000) {
+                let end = (base + 1000).min(rows);
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    (base..end).map(|i| (key(i), val(i))).collect();
+                let tx = db.begin();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("{label}: batch_set 冲突 {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            db.flush().unwrap();
+            db.checkpoint().unwrap();
+
+            // ① 只要 total，不翻页（页宽 1、第 0 页）⇒ 这一格 ≈ 数全库的净代价
+            let (t_total, one_row) = min_of(2, || {
+                let tx = db.begin();
+                let p = tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, 1));
+                tx.commit();
+                p
+            });
+            // ② 免 total、翻到末页 ⇒ 这一格 ≈ offset 跳过的净代价（+ 取 100 条）
+            let (t_skip, _) = min_of(2, || {
+                let tx = db.begin();
+                let p = tx.search_keys(
+                    &crate::common::SearchQuery::contains(b"", last_page, page_size).without_total(),
+                );
+                tx.commit();
+                p
+            });
+            // ③ 两笔都要 = 标准表里那一格
+            let (t_both, deep) = min_of(2, || {
+                let tx = db.begin();
+                let p = tx.search_keys(&crate::common::SearchQuery::contains(b"", last_page, page_size));
+                tx.commit();
+                p
+            });
+            // ④ 游标一跳（拿到末页起点的游标之后，只量**一跳**）
+            let (_warm, next) = {
+                let tx = db.begin();
+                let out = tx.scan_page(None, last_page * page_size);
+                tx.commit();
+                out
+            };
+            let (t_hop, hopped) = min_of(2, || {
+                let tx = db.begin();
+                let out = tx.scan_page(next.as_deref(), page_size);
+                tx.commit();
+                out
+            });
+            // ⑤ 对照：纯数一遍（不取任何键值）
+            let (t_count, n_keys) = min_of(2, || {
+                let tx = db.begin();
+                let c = tx.key_count(&key(0)[..2]);
+                tx.commit();
+                c
+            });
+
+            eprintln!(
+                "{label:<10} ①total(页宽1) {t_total:>11.1}  ②offset免total {t_skip:>11.1}  \
+                 ③两者都要(表里那格) {t_both:>11.1}  ④游标一跳 {t_hop:>9.1}  ⑤key_count {t_count:>11.1}"
+            );
+            eprintln!(
+                "{:<10}   折算：①每键 {:.3} µs  ②每跳过行 {:.3} µs  ③=①+②? 差 {:.1}%  \
+                 ④单页 {} 条(命中末页={})  ⑤数到 {} 键",
+                "",
+                (t_total - one_row.items.len() as f64 * 0.0) / rows as f64,
+                t_skip / (last_page * page_size) as f64,
+                if t_both > 0.0 {
+                    (t_both - (t_total + t_skip)) / t_both * 100.0
+                } else {
+                    0.0
+                },
+                hopped.0.len(),
+                deep.items.len(),
+                n_keys,
+            );
+            drop(db);
+            cleanup(vec![Some(dir)]);
+        }
+        eprintln!("DEEP PAGE DONE");
+    }
+
     #[test]
     #[ignore = "大库基线，手动 release 单线程跑：SCALE_ROWS=50000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline"]
     fn scale_baseline_all_engines() {
