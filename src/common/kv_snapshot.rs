@@ -356,7 +356,16 @@ impl ExportWriter {
 
 // ─── 读 ─────────────────────────────────────────────────────────────────────
 
-pub fn read_bin(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
+/// **流式**读二进制快照：解出一条就交给 `on`，`on` 返回 `false` 当场收手（不等读完）。
+///
+/// 存在的理由与 [`crate::KvEngine::export_latest_visible_for_each`] 同一件事的两端：
+/// `import_kv` 那侧要的是"边读边写进引擎"，把整份文件先摆进 `Vec` 只是为等着被逐条丢掉
+/// （600k 档实测那笔 `Vec` 是 123 MB 的瞬时）。[`read_bin`] 从这一条改成收集壳，
+/// **口径一字不变**：同一种截断处理（尾部不完整就停，不报错）、同一套魔数判定。
+pub fn read_bin_with(
+    path: &Path,
+    on: &mut dyn FnMut(KvRecord) -> bool,
+) -> std::io::Result<IoStats> {
     let data = std::fs::read(path)?;
     if data.len() < 8 {
         return Err(std::io::Error::new(
@@ -372,7 +381,6 @@ pub fn read_bin(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
         ));
     }
     let mut off = 8usize;
-    let mut out = Vec::new();
     let mut stats = IoStats::default();
     while off + 4 <= data.len() {
         let key_len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
@@ -406,15 +414,21 @@ pub fn read_bin(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
             None
         };
         stats.push(&value);
-        out.push(KvRecord { key, value, seq });
+        if !on(KvRecord { key, value, seq }) {
+            break;
+        }
     }
-    Ok((out, stats))
+    Ok(stats)
 }
 
-pub fn read_jsonl(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
+/// **流式**读 JSONL：与 [`read_jsonl`] 同一份行解析（`parse_jsonl_line` + `b64_decode`），
+/// 只是不再攒 `Vec`。空行跳过、字段缺失/非法 base64 ⇒ `InvalidData`，两条路一致。
+pub fn read_jsonl_with(
+    path: &Path,
+    on: &mut dyn FnMut(KvRecord) -> bool,
+) -> std::io::Result<IoStats> {
     let f = File::open(path)?;
     let reader = BufReader::new(f);
-    let mut out = Vec::new();
     let mut stats = IoStats::default();
     for line in reader.lines() {
         let line = line?;
@@ -422,20 +436,46 @@ pub fn read_jsonl(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
         if line.is_empty() {
             continue;
         }
-        let (key_b64, val_part) = parse_jsonl_line(line)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let key = b64_decode(&key_b64)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let value = match val_part {
-            None => None,
-            Some(vb64) => Some(
-                b64_decode(&vb64)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-            ),
-        };
-        stats.push(&value);
-        out.push(KvRecord { key, value, seq: None });
+        let rec = parse_jsonl_record(line)?;
+        stats.push(&rec.value);
+        if !on(rec) {
+            break;
+        }
     }
+    Ok(stats)
+}
+
+/// 一行 JSONL → 一条记录（解码失败带 `InvalidData`，两条读路共用同一个错形）
+fn parse_jsonl_record(line: &str) -> std::io::Result<KvRecord> {
+    let (key_b64, val_part) = parse_jsonl_line(line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let key = b64_decode(&key_b64)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let value = match val_part {
+        None => None,
+        Some(vb64) => Some(
+            b64_decode(&vb64)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        ),
+    };
+    Ok(KvRecord { key, value, seq: None })
+}
+
+pub fn read_bin(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
+    let mut out = Vec::new();
+    let stats = read_bin_with(path, &mut |rec| {
+        out.push(rec);
+        true
+    })?;
+    Ok((out, stats))
+}
+
+pub fn read_jsonl(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
+    let mut out = Vec::new();
+    let stats = read_jsonl_with(path, &mut |rec| {
+        out.push(rec);
+        true
+    })?;
     Ok((out, stats))
 }
 

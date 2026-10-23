@@ -669,6 +669,29 @@
     那两格量的**不是同一份库**（台架自己在两格之间跑 `bulk 灌 rows/10 行`）：条目 600 000 → 661 001（+10.2%）而常驻 +10.2%，
     单价两边都是 **96.2 B/条目**（两把读数互相印证）。⇒ 撤销登记，改名"台架同名不同量"，别再拿这两格互比。
   - 337 passed（插桩默认 no-op，未新增判据）。
+- **搬运数据收成一层：新增 `storage_engines::tools`，合同照下游那份；顺带修掉三个 `*-import-kv` 的一处静默吃字节（M63）**：
+  - 动机：下游 `trading-system/src/storage` 要整份删掉、改成依赖本 crate。它的应用代码只认
+    `tools::{migrate, export_to_file, import_from_file, parse_arrow, SnapshotFormat, MigrateStats}` 与 `tools::kv_snapshot::*`
+    ⇒ 这一层把函数名、参数顺序、`MigrateStats` 的字段名、连 eprintln 的日志形状都对齐，让 `bin/migrate_storage.rs` 与
+    `tests/storage_migrate.rs` **一行都不用改**。目录布局 `{root}/{engine}/`，bplus 是 `{root}/bplus_tree/data.db`。
+  - **实现只有一份**：走 `KvEngine` 门面（不再有"每家一份 import 主体"），导出走 M44 的流式出口 ⇒ 不物化整库
+    （下游那份 `export_records` 先折一个 `Vec`，本仓库实测 600k 档峰值 +123.7 MB）；`verify_live` 也改成只数不物化（M35/M47 同一条纪律）。
+  - ⚠️ **实测翻案：`KvBulk::put*` 收的是"已打过值信封"的 logical 字节，不是用户字节**。四家各自探针实测同一个结果
+    （`put(k, user)` ⇒ `get` 少一个首字节；`put(k, pack_plain(user))` ⇒ 逐字节回来），与 `tx.set` 的口径本来一致；
+    不一致的是**快照文件**（按定义存"已剥 TTL 的用户字节"）⇒ 写侧必须补 `pack_plain`，而这一步只能有一份。
+    **M44 当初写的"bulk 的 put 要已打信封"是对的，M45 把它"推翻"成"put 自己打信封"是错的**（两处文档就地加修订，原文不删）。
+  - ⇒ **修掉一处静默数据损坏**：`bitcask-import-kv`/`bplus-import-kv`/`memory-import-kv` 把文件里的用户字节直接喂给 bulk
+    ⇒ 值以 `0x00` 打头会少一字节、以 `0x01` 打头会被当 TTL 行判读（判过期就读成 `None`）；普通值走 `decode_value_meta`
+    的"不认识就当旧数据裸值"退路 ⇒ 一直不发作，**所以从没被测试抓到**。`lsm-import-kv` 走的是裸引擎 + seq 那条路，语义成对，未动。
+  - **bplus 库文件两个历史名字**：`data.db`（下游与运维脚本）与 `bplus.db`（本仓库 `StorageConfig`）。`tools::bplus_db_path`
+    先认已存在的那个，两个都不存在才建 `data.db` ⇒ 不会凭空开一个空库（那正是"迁移报成功、数据没了"的形状）。
+  - `EngineKind::parse` 补 `b+tree` 别名（原来只把 `-`→`_`；那一份认 `b+tree` ⇒ 同一个字符串两边一边认一边不认）。
+  - 新增 9 条守卫（逐字节搬运含 `0x00`/`0x01` 打头、双信封那一格、`data.db`/`bplus.db` 各一条、`wipe`（断的是"垃圾内容不在了"，
+    不是"文件不存在"——引擎会自己重建 `.wal`/`.dblwr`，第一版断错被自己打回）、箭头三种 + 四条拒绝、
+    **`BPEXP001` 字节 golden**（手拼下游那份输出：读要认、写要一模一样）、流式读与收集壳同口径、墓碑往返）。
+    `read_bin`/`read_jsonl` 改成 `read_bin_with`/`read_jsonl_with` 的**收集壳**（非破坏，口径逐条对齐）。**346 passed**。
+  - 还剩：八个 bin 的命令行外壳与导出侧重复体还没并到 `tools`（M64）；`KvBulk::put` 没有返回值通道 ⇒ 超一页载荷的行仍只能
+    `log::error!` 喊、不会让 `import` 失败（在"已知局限"里，未动）。
 - **M62b（只量，新增一把 `#[ignore]` 台架 `single_call_shape_attribution`）—— 复测那两条"单次调用"的比值：一条撤销、一条并回两块旧账**：
   - 存在的理由就是 M50 那条规矩：`scale_baseline` 里 `seek_prev`/`vacuum_bounded 一片` 这两格都是 `timed()` 里的**一次调用**，
     跨档比它 = 拿单样本当凭据。新台架把同一个动作量 **2000 次 × 2 轮取最小**，结构计数并排交出来（三档 20k/200k/600k 同一进程）。
@@ -1047,6 +1070,10 @@
   **那条嫌疑被自己的复现推翻**（原文在 M44 条目里就地加了修订，不删）：
   `begin_bulk().put()` 四家各灌 300 行裸用户字节 ⇒ `total_rows=300 live_keys=300 导出=300 点读命中=300`
   一字不差，而且 `BulkLoader::put` 自己就调 `encode_stored_value(...)` 打信封（与 `set_raw` 同类）。
+  ⚠️ **（修订（M63）：这一句里只有"灌 300 行裸用户字节 ⇒ 条数全对"成立，"put 自己打值信封"不成立。**
+  `encode_stored_value` 打的是存储层 blob/inline 标签，与值信封（`VAL_META_PLAIN`/`VAL_META_TTL`）同名不同物；
+  那次复现用的 `demo:%06d`/`val-N` 首字节既非 `0x00` 也非 `0x01`，读侧退路把错吞了 ⇒ "没坏"被读成"合同不要打包"。
+  下面的 base64 真因不受影响。）**
   - 真因一句话：`common::kv_snapshot::b64_decode` 把 `=` 剥掉之后**已经按尾组字符数出过字节**，
     又按 `=` 的个数回头裁一次 ⇒ 二次修正 ⇒ 凡长度不是 3 的倍数就少 1~2 字节
     （`len%3==2` 少 1、`len%3==1` 少 2，只有 `len%3==0` 恰好没事）。
@@ -1117,7 +1144,10 @@
   - ~~**顺手抓到一条先前就存在的缺陷**（同一份现场在改动前的提交 `6b4461d` 上复现过；本轮只诊断，没动码）~~
     **（修订（M45）：下面这段里"嫌疑"那两句是错的，真因与修法见 M45 那条 ——** bulk 灌 300 行裸用户字节四家全对
     （`live_keys=300 导出=300 点读命中=300`），而且 `BulkLoader::put` 自己就打信封（`encode_stored_value`），
-    **不要求调用方先打包**；真因是 `b64_decode` 在非 3 倍数长度上掉 1~2 字节。）** 原文保留如下：**
+    **不要求调用方先打包**；真因是 `b64_decode` 在非 3 倍数长度上掉 1~2 字节。）**
+    ⚠️ **（再修订（M63）：M45 这段里"put 自己打信封/不要求先打包"不成立 —— 它把存储层 blob/inline 标签**
+    当成了值信封；那次复现用的是 ASCII 值，读侧退路把错吞了。原 M44 那句"bulk 的 `put` 要已打信封的字节"才是对的，
+    三个 `*-import-kv` 的静默损坏即由此而来（M63 已在写侧补 `pack_plain`）。base64 真因照旧。）** 原文保留如下：**
     `import_kv` 往返对不上 —— `memory-export-kv --demo 300` 造一份 301 行 jsonl，`bitcask-import-kv` /
     `bplus-import-kv` 都报 `IMPORT records=301`，可再导出只有 **32 行**，且那 32 行的键与值是**错位**的
     （`demo:000001 → val-1` 变成 `demo:00000 → val-`）；`--include-deleted` 也只有 32 行 ⇒ 不是"被当成过期"，

@@ -746,7 +746,15 @@ pub fn open_engine_with<N: EngineName>(
 
 /// 把别名归一到规范名
 fn canonical_name(name: &str) -> Option<&'static str> {
-    match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+    // `+` 也归一掉：下游 `StorageEngine::parse` 认 `b+tree` 这种写法（运维脚本里真出现过），
+    // 而这里原先只把 `-` 换成 `_` ⇒ 同一个字符串在两边一边认、一边不认，换库就等于悄悄换引擎。
+    match name
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace('+', "_")
+        .as_str()
+    {
         "bitcask" => Some("bitcask"),
         "bplus_tree" | "bplus" | "b_plus_tree" | "btree" | "b_tree" => Some("bplus_tree"),
         "lsm_tree" | "lsm" => Some("lsm_tree"),

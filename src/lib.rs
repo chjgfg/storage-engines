@@ -25,6 +25,8 @@ pub mod bitcask;
 pub mod bplus_tree;
 pub mod lsm_tree;
 pub mod memory;
+/// 搬运数据层（跨引擎 migrate / 快照 import-export）。不属于任何引擎核心。
+pub mod tools;
 
 pub use common::{
     DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,

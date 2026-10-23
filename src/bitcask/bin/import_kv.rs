@@ -6,6 +6,7 @@
 //! ```
 
 use storage_engines::bitcask::MVCC;
+use storage_engines::common::codec::pack_plain;
 use storage_engines::common::kv_snapshot::{read_bin, read_jsonl, IoStats, KvRecord};
 use std::env;
 use std::path::PathBuf;
@@ -72,7 +73,11 @@ fn apply_to_db(mvcc: &MVCC, records: &[KvRecord]) -> IoStats {
     for rec in records {
         match &rec.value {
             Some(v) => {
-                batch.push((rec.key.clone(), v.clone()));
+                // ⚠️ 快照文件里放的是**用户字节**（导出侧已剥信封），而 `bulk.put*` 的合同是
+                //   "已打过值信封的 logical 字节"（与 `tx.set` 同一口径）。少这一步 ⇒ 首字节被
+                //   当成信封标签吃掉：`[00,..]` 少一字节、`[01,..]` 会被当成 TTL 行（甚至判过期→读成 None）。
+                //   守卫在 `tools::migrate::tests::tools_import_leaves_no_double_envelope`（同一条合同的另一侧）。
+                batch.push((rec.key.clone(), pack_plain(v)));
                 if batch.len() >= 4096 {
                     bulk.put_batch_owned(std::mem::take(&mut batch));
                     batch = Vec::with_capacity(4096);

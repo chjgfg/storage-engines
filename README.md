@@ -7,7 +7,7 @@
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 332 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M62b**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M63**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -456,6 +456,38 @@ println!("{profile}");                     // 只报缺口:少了 WAL / 校验�
 精确 total 才需要默认那条(它会走一遍全库)。
 
 ---
+
+### 9. 换引擎搬家:`tools` 那一层(库 API,不是只有 CLI)
+
+```text
+cargo run --release --bin migrate_storage   # 那是下游的形状;本库给的是同一组函数:
+```
+
+```rust
+use storage_engines::tools::{migrate, parse_arrow, export_to_file, import_from_file, SnapshotFormat};
+
+fn main() -> Result<(), String> {
+    // "bitcask->bplus_tree" 这种写法直接解析,三种箭头都吃(-> / → / =>)
+    let (from, to) = parse_arrow("bitcask->bplus_tree")?;
+    // (源, 目标, 数据根目录, 含墓碑, 先清空目标)
+    let st = migrate(from, to, "./data", false, true)?;
+    println!("搬了 {} 条,存活 {},墓碑 {},回读校验 {}", st.records, st.live, st.deleted, st.verify_live);
+
+    export_to_file(from, "./data", "./snap.jsonl", SnapshotFormat::Jsonl, false)?;
+    import_from_file(to, "./data", "./snap.jsonl", SnapshotFormat::Jsonl, true)?;
+    Ok(())
+}
+```
+
+四条要知道的:
+- **先停交易进程**:每个引擎目录一把自己的文件锁,进程没释放就打不开源。⚠️ 源与目标**在这里是同时开着的**
+  (不同子目录、各持各的锁,不互踩),换到的是"边折边灌"而不是"先物化整库再关源"。
+- **bplus 的库文件先认已存在的名字**:`data.db`(下游与运维脚本用的)与 `bplus.db`(本库 `StorageConfig` 早先用的)
+  都能被认出来;两个都不存在才新建 `data.db`。这条不是挑剔,是"选错 = 凭空一个空库 = 迁移报成功而数据没了"。
+- **快照文件里是用户字节**(导出侧已剥 TTL 信封),而两个写门(`tx.set` / `bulk.put`)收的都是**已打信封的 logical 字节**
+  ⇒ 写回必须补一层 `pack_plain`,这一步在 `tools` 里只做一份。M63 之前三个 `*-import-kv` 漏了这一层
+  (`0x00` 打头少一字节、`0x01` 打头被判成 TTL 行),细节见上面 M63 那一节。
+- `memory` 不能当源也不能当目标(它不落盘,"重开"就是空库),`tools` 两侧都直接拒绝。
 
 ## 项目结构
 
@@ -1559,6 +1591,15 @@ M40 之后 `merge()` 剩的那一笔不是快照，是**产物**：走查时每�
 事故形状 `demo:%06d` = 11 字节 ⇒ 全部截成 `demo:00000` 同一把键 ⇒ 后写覆盖前写，301 行只剩 32 把键。
 修法与三条守卫见下面 **M45** 那一节；修完端到端 **301 → 301 → 301**。
 
+**（修订（M63）：上面 ① 里"bulk 会自己打信封"那一半又翻回去了 —— bulk 确实要求调用方先打值信封。）**
+`encode_stored_value` 打的是**存储层的 blob/inline 标签**（`VAL_TAG_INLINE`/`VAL_TAG_BLOB`），
+**不是值信封**（`VAL_META_PLAIN`/`VAL_META_TTL`，那是 `pack_plain`/`set_raw` 那一层的事）—— M45 把两个都叫"信封"的东西认成了一个。
+而"灌 300 行裸字节四家全对"那个复现之所以看着对：`demo:%06d` / `val-N` 的首字节既不是 `0x00` 也不是 `0x01`，
+读侧走"不认识标签 ⇒ 当旧数据裸值"的退路，**恰好把那格的错吞了**，于是"没坏"被读成"合同不要打包"。
+M63 换首字节 `0x00`/`0x01` 的值重灌，四家 `put(k, user)` 一律少 1 字节或判成过期 ⇒ 三个 `*-import-kv` CLI 的静默损坏就是这条路
+（已修：写侧补 `pack_plain`，见 M63 那一节与守卫 `tools_import_leaves_no_double_envelope`）。
+⚠️ ② 那条 base64 真因**照旧成立**（它解释的是"301 行只剩 32 把键"），被推翻的只有"bulk 会自己打值信封"这个附加结论。
+
 **M45 —— `b64_decode` 在非 3 倍数的长度上掉字节（JSONL 导入静默丢数据）：端到端从「301 行进、32 行出」修到 301 → 301 → 301**
 
 M44 的往返台架抓到一条**先前就存在**的缺陷，而 M44 当时写的"嫌疑"（bulk 的 `put` 要已打信封的字节）
@@ -1568,6 +1609,13 @@ M44 的往返台架抓到一条**先前就存在**的缺陷，而 M44 当时写�
 |---|---|
 | 怀疑 bulk 写路径与值信封合同不一致 | 四家各灌 300 行裸用户字节走 `begin_bulk().put()` ⇒ `total_rows=300 live_keys=300 导出=300 点读命中=300`，值一字不差 |
 | 以为"要调用方自己先打包"是 bulk 的合同 | `src/bitcask/bitcask_mvcc.rs:788` 的 `BulkLoader::put` 自己就调 `encode_stored_value(...)` 打信封（与 `set_raw` 同类） |
+
+⚠️ **（修订（M63）：这张表的第二行不成立，第一行的"值一字不差"只在 ASCII 值上成立。）**
+`encode_stored_value` 打的是**存储层 blob/inline 标签**，与**值信封**（`VAL_META_PLAIN`/`VAL_META_TTL`，`pack_plain`/`set_raw` 那一层）
+是两件事，M45 把两个同名不同物的编码认成了一个 —— 所以 bulk 的 `put` **并不**替调用方打值信封。
+第一行那个复现之所以看着全对：`demo:%06d` / `val-N` 首字节既非 `0x00` 也非 `0x01`，读侧"不认识标签就当旧数据裸值"的退路
+把错吞掉了。M63 换 `0x00`/`0x01` 打头的值重灌 ⇒ 四家一律少 1 字节或判成过期 ⇒ 三个 `*-import-kv` 的静默损坏即此（写侧已补 `pack_plain`）。
+**下面的 base64 真因一字不改地成立**（它解释的是"301 行只剩 32 把键"），要修订的只是"bulk 会自己打值信封"那句附加结论。
 
 真因一句话：**`b64_decode` 把 `=` 剥掉之后已经按尾组字符数出过字节了，又按 `=` 的个数回头裁一次** ⇒ 二次修正
 ⇒ 凡长度不是 3 的倍数就少 1~2 字节（`len%3==2` 少 1、`len%3==1` 少 2，只有 `len%3==0` 恰好没事）。
@@ -2835,6 +2883,52 @@ lsm `vacuum_bounded 一片` 那条**并回两块旧账**（块/行 × 每块价 
 **方法学第二十一条："单次调用"那一类格（µs/次）在跨档比较之前，必须先有一把 2000 次重复的焐热版**。
 冷版与焐热版的差本身也是有用的一格（它 = 该引擎"驻留总量 × 首触"的价），但**不能拿它当超线性的证据**。
 
+### M63 —— 搬运数据收成**一层**：`tools::{migrate, export_to_file, import_from_file, parse_arrow, SnapshotFormat}`，合同照下游那份，顺带修掉 CLI 一处静默吃字节
+
+动机很具体：`D:\develop\workspace\rust_workspace\trading-system\src\storage` 要把整个 `src/storage` 删掉、改成依赖本 crate。
+它的应用代码（`src/bin/migrate_storage.rs`、`tests/storage_migrate.rs`）只认这些名字：
+`tools::{migrate, export_to_file, import_from_file, parse_arrow, SnapshotFormat, MigrateStats}` + `tools::kv_snapshot::*`。
+所以这一节做的事是"**把本仓库的搬运层摆成那个形状**"，顺带在过程中量到三件事。
+
+**新增 `src/tools/`（`pub mod tools`）**，走门面、四家共用一份实现：
+
+| 项 | 合同 |
+|---|---|
+| `migrate(from, to, data_root, include_deleted, wipe_target) -> Result<MigrateStats, String>` | 目录布局 `{root}/{engine}/`，bplus 是 `{root}/bplus_tree/data.db`；`memory` 两侧都拒；同源/同路径拒 |
+| `export_to_file(engine, root, out, SnapshotFormat, include_deleted)` / `import_from_file(engine, root, in, SnapshotFormat, wipe)` | 同一份编解码与写侧胶；另有 `export_to_dir`/`import_from_dir` 给 CLI 那种"直接给引擎目录"的形状 |
+| `parse_arrow("a->b")` | `->` / `→` / `=>` 三种箭头都吃 |
+| `MigrateStats{from,to,records,live,deleted,verify_live,export_secs,import_secs,source_path,target_path}` | 字段名逐个照那份（下游直接打印它们） |
+| `EngineKind::parse` | 补 `b+tree` 这个别名（原来只把 `-`→`_`，那一份认 `b+tree` ⇒ 同一个字符串两边一边认一边不认） |
+
+**三处口径差别（都是"更严"）**：
+1. **不物化整库**：那份 `export_records` 先把全库折成 `Vec`（本仓库实测那一形状 600k 档峰值 **+123.7 MB**，M44 就是为它装的流式出口）；这里走 `export_latest_visible_for_each`。
+   `verify_live` 也改成只数不物化（M35/M47 同一条纪律的第四次应用）。
+2. **`bulk` 收 logical 字节**（见下面的翻案）。
+3. **迁移开 bplus 用树阶 16 / 缓存 64 页** —— 与下游主进程同一组数，否则同一份 `data.db` 被两个阶数来回打开。
+
+**⚠️ 实测翻案（本仓库自己写反过一次的那条）**：`KvBulk::put*` **收的是"已打过值信封"的 logical 字节**，不是用户字节。
+四家一起探针实测（bitcask / bplus_tree / lsm_tree / memory 四行结果一模一样）：
+`put(k, user)` ⇒ `get` 少一个首字节；`put(k, pack_plain(user))` ⇒ 逐字节回来。
+这与 `tx.set` 的口径**本来就一致**（README 那条"值信封不对称"讲的就是 `set` 要已打信封）——不一致的是**快照文件**，
+它按定义存的是"已剥 TTL 的用户字节"。所以搬运层必须在写侧补 `pack_plain`，这一步只能有一份。
+
+**由此抓到并已修一处 CLI 静默数据损坏**：`bitcask-import-kv` / `bplus-import-kv` / `memory-import-kv` 三个 bin
+把文件里的用户字节直接喂给 `bulk.put*` ⇒ **凡值以 `0x00` 打头就少一字节、以 `0x01` 打头会被当 TTL 行判读（判过期就读成 `None`）**；
+普通值不发作，因为 `decode_value_meta` 对不认识的标签字节走"当作旧数据裸值"那条退路 —— **所以它从来没被测试抓到过**。
+（M44 当时写的"bulk 的 put 要已打信封"是对的，M45 把它"推翻"成"put 自己打信封"是错的；本轮探针站回 M44 那边，两处文档都已就地修订。）
+
+**bplus 的库文件名有两个历史名字**：下游/运维脚本用 `{root}/bplus_tree/data.db`，本仓库 `StorageConfig::open` 用 `bplus.db`。
+`bplus_db_path` 先认**已存在**的那个，两个都不存在才建 `data.db`；守卫两条：新建必须落 `data.db` 且不留 `bplus.db`，
+而只有 `bplus.db` 的旧库必须还能被当源读到（不然迁移会把它当空库 ⇒ "搬成功、数据没了"）。
+
+**守卫 9 条**（`cargo test --lib` **346 passed** = 337 + 这 9 条）：逐字节搬运（含 `0x00`/`0x01` 打头的值）、
+双信封那一格、`data.db` 与 `bplus.db` 两条、`wipe` 清干净（**断的是"那份垃圾内容不在了"，不是"文件不存在"** —— 引擎会自己重建 `.wal`/`.dblwr`，
+第一版断错被自己打回）、箭头三种 + 四条拒绝、`BPEXP001` **字节 golden**（手拼下游那份的输出，读要认、写要一模一样）、
+流式读与收集壳同口径（含"提前收手不多读一条"）、墓碑往返。
+
+**还剩两件（登记，没做）**：① 八个 bin 的命令行外壳仍在各自解析参数，导出侧的重复体还没并到 `tools`（M64）；
+② `KvBulk::put` 没有返回值通道 ⇒ 超出一页载荷的行仍然只能 `log::error!` 喊、不会让 `import` 失败（这条在"已知局限"里，未动）。
+
 ### M54b 之后的三档复测（2026-10-20 夜，同一份 release 构建 3f7eeda × 每档两遍取最小 × 122 项三档齐全，数据在 C: SSD）
 
 为什么重跑：从 M10 改到 M49，那张 10-19 的表已经跨了十几个里程碑没整体复测。判据不变
@@ -3429,6 +3523,13 @@ data.db.lock       单写者锁(内含 pid)
   ⚠️ 刻意**没有**加 `get_raw`:`get` 本来就是它的读侧对应物,再造一个同名不同义的口只会让人问"该用哪个";
   真要"不经剥壳的存储字节"那是另一个能力(目前只有引擎内部的 `latest_visible_raw`),未对外承诺。
   仍留的坑:`set` 本身还是要求调用方自己打过信封(现有调用点按这个约定写,改它是破坏性变更)
+  ⚠️ **`bulk.put*` 与 `set` 同一口径**(M63 实测钉死的,推翻 M45 那句"put 自己打信封"):四家的批量门收的也是 logical 字节,不做 `pack_plain`。
+  于是**任何"从外面拿用户字节灌进来"的路径都必须自己补一层** —— 快照文件按定义存的是"已剥 TTL 的用户字节",
+  所以搬运层(`tools::migrate` / `import_from_file` / `import_from_dir`)是唯一那份补的地方。
+  ⇒ **M63 之前三个 `*-import-kv` 就踩了这一格**(它们把文件里的用户字节直接给 bulk):`0x00` 打头的值少一字节、
+  `0x01` 打头的值被当 TTL 行判读(判过期就读成 `None`);普通值走"不认识标签就当旧数据裸值"的退路 ⇒ 长期不发作、没被测试抓到。
+  **已修**(三个 bin 各补 `pack_plain`;守卫 `tools_import_leaves_no_double_envelope`)。
+  ⚠️ **用那三个 CLI 导入过 JSONL/bin 快照的人要复核那批库**:受影响面恰好只在"值首字节是 0x00/0x01"这一类(比如自己序列化过 protobuf/msgpack 的裸字节)。
 - ✅ ~~同一条不对称在自家工具里也成立（M44 的往返台架抓到）~~ **已修（M45），而且 M44 那条"嫌疑"是错的**：
   现场是 `memory-export-kv --demo 300` 造 301 行 jsonl，`bitcask-import-kv` 报 `IMPORT records=301` 而库里
   只剩 **32 把键**。M44 当时写成"bulk 的 `put` 要已打信封的字节"—— 复现推翻了两点：bulk 灌 300 行裸字节
@@ -3437,6 +3538,13 @@ data.db.lock       单写者锁(内含 pid)
   字节了，又按 `=` 的个数回头裁一次），于是 `demo:%06d`（11 字节）全被截成同一把键 ⇒ 互相覆盖。
   修完端到端 **301 → 301 → 301**。**影响面**：只伤 JSONL 这条路（`--format jsonl` 的导入 / 任何自己调
   `read_jsonl` 的下游）；**bin 格式（BPEXP001/002）不过 base64，从来没中过**，`migrate` 也不受影响。
+  ⚠️ **M63 修订（就地，不删原文）**：上面那句"且 `BulkLoader::put` 自己就打信封"**是错的**，而它同一句里
+  的"bulk 灌 300 行裸字节四家全对"**也是错的** —— 两边的原因相同：`demo:%06d` 的键值都是**短 ASCII**，
+  首字节既不是 `0x00` 也不是 `0x01`，走的是"不认识标签 ⇒ 当旧数据裸值"那条退路，所以**看着像全对**。
+  M63 用首字节 `0x00`/`0x01` 打头的值重灌一遍，四家的 bulk 门**一律按 logical 字节存**（不补 `pack_plain`），
+  读回来少 1 字节或判成过期 ⇒ 三个 `*-import-kv` CLI 就是踩在这格上（见上一条）。
+  ⇒ 那条 base64 真因**照旧成立**（它解释的是"301 行只剩 32 把键"），被推翻的只是"bulk 会自己打信封"这个附加结论。
+  守卫：`tools_import_leaves_no_double_envelope`（灌裸字节必须一字不差读回）+ 上面那条 `set`/`set_raw` 对照断言。
 - ~~⚠️ **`seek_prev` 是"整段物化再挑一条"**~~ **已修(M20)**：四家原先各一份
   `scan(None, Some(key‖0x00))` + `retain` + `pop` ⇒ 一次调用 = O(库大小) 的时间**和内存**
   （200k 实测单次 **140~610 ms**，同库一次点读 2.9~57 µs）。现在循环只有
