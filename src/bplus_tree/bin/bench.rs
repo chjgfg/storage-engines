@@ -8,6 +8,10 @@
 //! cargo run --release --bin bench -- --n 10000000 --order 256 --cache 8192 --bulk --value-size 16
 //! ```
 
+use std::assert;
+use std::panic;
+use std::println;
+use std::eprintln;
 use std::format;
 use storage_engines::bplus_tree::MVCC;
 use std::env;

@@ -47,6 +47,8 @@
 //! 每搬一家都当场证明它没改语义 —— 靠的是 `txn_kernel_agrees_across_engines`（同一段事务脚本
 //! 在四家跑出同一个终态），各家原有测试只测自家那一份副本，跨引擎对拍才看得见"内核写歪了"。
 
+#[cfg(test)]
+use std::thread_local;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

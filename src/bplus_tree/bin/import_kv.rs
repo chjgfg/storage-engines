@@ -5,6 +5,8 @@
 //!   --input ../lsm-tree/snap.bin --format bin --db ./from_lsm.db
 //! ```
 
+use std::println;
+use std::eprintln;
 use storage_engines::bplus_tree::MVCC;
 use storage_engines::common::codec::pack_plain;
 use storage_engines::common::kv_snapshot::{read_bin, read_jsonl, IoStats, KvRecord};
@@ -155,6 +157,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_eq;
     use std::format;
     use storage_engines::common::kv_snapshot::{write_bin, KvRecord};
     use std::path::Path;

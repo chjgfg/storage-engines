@@ -8,6 +8,8 @@
 //!
 //! 存储落到 [`crate::mem_store::MemStore`]。
 
+#[cfg(test)]
+use std::thread_local;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -745,6 +747,11 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::assert_ne;
+    use std::panic;
+    use std::eprintln;
     use std::vec;
     use std::format;
 

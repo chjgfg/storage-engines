@@ -116,6 +116,7 @@ impl Bloom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
 
     #[test]
     fn test_bloom_basic() {

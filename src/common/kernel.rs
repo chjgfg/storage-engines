@@ -5,6 +5,8 @@
 //! `swap` 当成取账写进了四份代码里，四家一起坏。所以这里把它们收成一份，
 //! 各引擎仍然保留自己的遍历原语和自己的守卫（合并的是判定与记账，不是扫描）。
 
+#[cfg(test)]
+use std::thread_local;
 use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -611,6 +613,8 @@ mod tests {
     }
 
     use super::*;
+    use std::assert;
+    use std::assert_eq;
     use std::vec;
     use std::format;
 

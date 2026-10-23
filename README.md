@@ -7,7 +7,7 @@
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
 - 332 个单元测试 + 4 个集成测试
-- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M65**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
+- 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M66**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
 ---
@@ -542,12 +542,17 @@ pub mod storage {
 
 ### 10. 写文件的规矩：prelude 宏**显式导入**
 
-本仓库四个宏一律写全导入路径,不靠隐式 prelude:`vec!` / `format!` / `matches!` / `write!`(+ `writeln!`)。
+本仓库这批宏一律写全导入路径,不靠隐式 prelude(14 个,M65 四把 + M66 十把):
+`vec!` `format!` `matches!` `write!` `writeln!` `assert!` `assert_eq!` `assert_ne!` `debug_assert!` `panic!` `unreachable!` `println!` `eprintln!` `thread_local!`。
 - **编译器认隐式 prelude,所以漏了不报错;rust-analyzer 会报红** ⇒ 拿 IDE 当判据的人会一直看见假红。
-- **落在哪**:`mod tests` 里才用的,导在 `mod tests` 里面;文件体里用的,导在文件顶部的导入块。
+- **落在哪**:某个作用域里才用的,导进那个作用域(含 `mod tests`);文件体里用的,导在文件顶部的导入块。
+  ⚠️ 锚点要连 `pub use` 一起认 —— 只认 `^use` 会扎进**函数体里第一个 `use`**,把导入插进 `fn` 里去(M66 在 `src/common/mod.rs` 撞上,手工归位)。
+- **住在文件作用域 `#[cfg(test)]` 块里的那些**(本仓库一批 `thread_local!` 探针计数就是):导入要跟着加门 ——
+  `#[cfg(test)]` + `use std::thread_local;`。不加就变成"非测试构建里的多余导入",`cargo check` 直接喊 unused(M66 一抓 17 条)。
 - ⚠️ 别插进 `//!` 模块文档与第一个 `use` 之间,更**别插在 `///` 与被注释的项之间** —— 那样文档注释会改挂到 `use` 上(rustdoc 静默丢一段说明,编译与警告都看不出)。M65 第一版就踩过这一格,`src/common/types.rs` 两处。
 - 已导入过就不要重复:`use std::{..., vec};` 这种组里已经带了,再补一行 `use std::vec;` 会撞 E0252。
-- 这一族**不含** `assert!/println!/panic!` 等(本仓库仍靠隐式 prelude);要一起钉再说。
+- **收尾判据 = `cargo check --all-targets` 0 warning**(不是 0 error)：`unused_imports` 正好量"这行导入多余不多余"。
+- 这一族**不含** `log::warn!`/`log::error!`(本来就带路径写)与本仓库自己的 `impl_engine!`/`arm_list!` 等 `macro_rules!`(同 crate,IDE 认)。
 
 ## 项目结构
 

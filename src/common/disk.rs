@@ -11,6 +11,8 @@
 //! 引擎侧仍然各留自己的**路径规则**（`lock_path` / `data.log` / `<stem>.lock` 各家不同），
 //! 所以 `FileLock::try_acquire_at` 收的是锁文件的完整路径，由各引擎自己算。
 
+#[cfg(test)]
+use std::thread_local;
 use std::vec;
 use std::format;
 use std::fs::{File, OpenOptions};
@@ -557,6 +559,10 @@ unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::assert_ne;
+    use std::panic;
 
     /// M53 的守卫：**拿一把锁不许付 fsync**（改前每次 open 都要为"把 pid 写进锁文件"付一次）。
     ///

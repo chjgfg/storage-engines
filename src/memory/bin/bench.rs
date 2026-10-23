@@ -5,6 +5,10 @@
 //! cargo run --release --bin bench -- --n 100000 --bulk
 //! ```
 
+use std::assert;
+use std::assert_eq;
+use std::println;
+use std::eprintln;
 use std::format;
 use storage_engines::memory::MVCC;
 use std::env;

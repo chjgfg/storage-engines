@@ -8,6 +8,9 @@
 //! 读：bloom → index → block（mmap 或 pread + LRU cache）
 //! compact：[`SstEntryIter`] 流式 + [`merge_to_builder`]
 
+use std::debug_assert;
+#[cfg(test)]
+use std::thread_local;
 use std::{
     cmp::Ordering as CmpOrdering, collections::{BinaryHeap, HashMap}, fs::File, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex}, vec,
 };
@@ -2030,6 +2033,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::panic;
+    use std::eprintln;
     use std::format;
     use std::matches;
 

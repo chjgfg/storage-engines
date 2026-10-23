@@ -8,6 +8,10 @@
 //! 唯一和引擎绑在一起的是**布局**：主数据文件用 `DiskFile::open_paged(path, PAGE_SIZE)`
 //! 声明定宽页，`read_page` / `write_page` 才算得对偏移。
 
+use std::assert;
+use std::assert_eq;
+#[cfg(test)]
+use std::thread_local;
 use std::vec;
 use std::format;
 use std::path::{Path, PathBuf};

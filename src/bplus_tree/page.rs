@@ -4,6 +4,8 @@
 //! - 页头 CRC：[`crate::storage::pack_page`] / [`unpack_page`]
 //! - 双写缓冲：刷盘前先写 dblwr 再写主文件，防 torn page
 
+use std::eprintln;
+use std::thread_local;
 use std::vec;
 use std::format;
 use std::{
@@ -1083,6 +1085,8 @@ impl Drop for PageManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
 
     fn temp_db(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

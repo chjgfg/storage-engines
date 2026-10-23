@@ -27,6 +27,9 @@
 //! - Checkpoint 的 `root_page_id` / `next_page_id` 固定写 0
 //! - 数据目录：`dir/CURRENT.snap` + `dir/lsm.wal` + `dir/lsm.lock`
 
+use std::eprintln;
+#[cfg(test)]
+use std::thread_local;
 use std::format;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -1314,6 +1317,11 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::assert_ne;
+    use std::panic;
+    use std::println;
     use std::vec;
     use std::matches;
     use crate::lsm_tree::storage::lock_path;

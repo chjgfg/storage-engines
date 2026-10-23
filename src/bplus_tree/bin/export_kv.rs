@@ -7,6 +7,9 @@
 //! cargo run --release --bin export_kv -- --db data.db --out snapshot.jsonl --format jsonl
 //! ```
 
+use std::assert_eq;
+use std::println;
+use std::eprintln;
 use storage_engines::bplus_tree::MVCC;
 use storage_engines::common::kv_snapshot::{ExportWriter, IoStats};
 use std::env;
@@ -148,6 +151,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
     use std::format;
     use storage_engines::common::kv_snapshot::{read_bin, write_bin, write_jsonl, KvRecord};
 

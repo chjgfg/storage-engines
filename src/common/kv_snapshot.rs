@@ -514,6 +514,9 @@ fn parse_jsonl_line(line: &str) -> Result<(String, Option<String>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::panic;
     use std::vec;
 
     #[test]

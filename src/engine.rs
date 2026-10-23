@@ -31,6 +31,7 @@
 //!     [`EngineConfig`]
 //!   - 只有 `bitcask` 有 `merge` → 默认实现返回 [`EngineError::Unsupported`]
 
+use std::unreachable;
 use std::{fmt, write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1242,6 +1243,11 @@ impl_engine! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::assert_ne;
+    use std::panic;
+    use std::eprintln;
     use std::vec;
     use std::format;
     use std::matches;

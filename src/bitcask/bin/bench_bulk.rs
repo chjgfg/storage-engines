@@ -9,6 +9,9 @@
 //! - `--vlen 16`      value 长度；`>256` 会走 blob 外置
 //! - `--flush-every N`  每 N 条 flush 写缓冲（0=不主动 flush）
 
+use std::assert;
+use std::println;
+use std::eprintln;
 use std::vec;
 use std::format;
 use storage_engines::bitcask::MVCC;

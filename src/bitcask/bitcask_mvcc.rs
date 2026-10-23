@@ -18,6 +18,9 @@
 //! - 版本行 tombstone 用 Bitcask **软 tombstone**（KeyDir 保留）；rollback/vacuum 用 **硬删除**
 //! - bulk 路径：无 WAL + 4MB 写缓冲 + insert_batch，目标 10M / 10min
 
+use std::eprintln;
+#[cfg(test)]
+use std::thread_local;
 use std::format;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1368,6 +1371,11 @@ impl WalTail for WalOnly<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::assert_ne;
+    use std::panic;
+    use std::println;
     use std::vec;
     use std::matches;
     use crate::bitcask::storage::{blob_path, data_path, hint_path, lock_path};

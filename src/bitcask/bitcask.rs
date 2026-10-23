@@ -20,6 +20,8 @@
 //! - **Hint 文件**（`*.hint`）：merge / [`Bitcask::dump_hint`] 写出 KeyDir 快照；
 //!   open 优先读 hint，再只扫 `log_size..end` 增量补索引，避免全量扫 value
 
+#[cfg(test)]
+use std::thread_local;
 use std::vec;
 use std::format;
 use fs4::FileExt;
@@ -1861,6 +1863,10 @@ impl Bitcask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::panic;
+    use std::eprintln;
 
     fn tmp_log(tag: &str) -> PathBuf {
         crate::common::tmp_test_path("bitcask_hint", tag, ".log")

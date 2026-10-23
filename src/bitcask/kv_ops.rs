@@ -409,6 +409,10 @@ impl MVCC {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::panic;
+    use std::eprintln;
     use std::vec;
     use std::format;
     use std::matches;

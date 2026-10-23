@@ -5,6 +5,8 @@
 //!   --input snapshot.bin --format bin --dir ./imported
 //! ```
 
+use std::println;
+use std::eprintln;
 use storage_engines::bitcask::MVCC;
 use storage_engines::common::codec::pack_plain;
 use storage_engines::common::kv_snapshot::{read_bin, read_jsonl, IoStats, KvRecord};

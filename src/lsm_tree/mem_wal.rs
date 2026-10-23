@@ -141,6 +141,8 @@ impl MemWal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_eq;
+    use std::panic;
     use std::format;
     use std::fs;
 

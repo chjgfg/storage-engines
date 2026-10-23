@@ -11,6 +11,8 @@
 //!
 //! 旧数据无 tag 时按「永久裸 value」兼容。
 
+#[cfg(test)]
+use std::thread_local;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::types::{IncrError, KeyMatchMode, ValueMeta};

@@ -10,6 +10,9 @@
 //! - 页换出跳过双写与频繁 fsync
 //! - 结束时 [`BulkLoader::finish`] → flush_all + checkpoint
 
+use std::eprintln;
+#[cfg(test)]
+use std::thread_local;
 use std::format;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1277,6 +1280,11 @@ impl WalTail for WalOnly<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
+    use std::assert_ne;
+    use std::panic;
+    use std::println;
     use std::vec;
     use std::matches;
     use crate::bplus_tree::storage::{dblwr_path, wal_path};

@@ -1,5 +1,7 @@
 //! 导入 bplus / 通用 JSONL·BPEXP001 到 LSM 目录（迁移工具，非引擎核心）。
 
+use std::println;
+use std::eprintln;
 use storage_engines::common::kv_snapshot::{read_bin, read_jsonl};
 use storage_engines::lsm_tree::LSMTree;
 use std::env;

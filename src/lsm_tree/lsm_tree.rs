@@ -5,6 +5,10 @@
 //!
 //! 版本 GC 由上层 `MVCC::vacuum` 负责；compact 只做空间合并（丢弃 Drop）。
 
+#[cfg(test)]
+use std::assert;
+#[cfg(test)]
+use std::thread_local;
 use std::format;
 use std::matches;
 use std::write;
@@ -2477,6 +2481,10 @@ impl Drop for LSMTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_eq;
+    use std::panic;
+    use std::println;
+    use std::eprintln;
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let p = crate::common::tmp_test_path("lsm", tag, "");

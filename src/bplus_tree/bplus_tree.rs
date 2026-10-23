@@ -1,3 +1,6 @@
+use std::assert;
+#[cfg(test)]
+use std::thread_local;
 use std::vec;
 use std::format;
 use std::matches;
@@ -2266,6 +2269,8 @@ mod tests {
     use std::vec;
 
     use super::*;
+    use std::assert_eq;
+    use std::eprintln;
 
     fn rid(v: u8) -> RowId {
         RowId(Some(vec![v]))

@@ -10,6 +10,8 @@
 //! - `Some(bytes)`：逻辑 value（可能含 TTL 信封，由 kv_ops 解析）
 //! - `None`：tombstone（逻辑删除）
 
+#[cfg(test)]
+use std::thread_local;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
@@ -206,6 +208,8 @@ impl MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
 
     #[test]
     fn test_insert_get_delete() {

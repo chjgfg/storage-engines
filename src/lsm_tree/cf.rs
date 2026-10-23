@@ -201,6 +201,8 @@ fn load_current(path: &Path) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
     use std::format;
 
     #[test]

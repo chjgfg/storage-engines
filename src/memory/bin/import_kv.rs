@@ -11,6 +11,8 @@
 //!   --input snapshot.bin --format bin --export roundtrip.bin
 //! ```
 
+use std::println;
+use std::eprintln;
 use storage_engines::common::codec::pack_plain;
 use storage_engines::common::kv_snapshot::{read_bin, read_jsonl, write_bin, write_jsonl, IoStats, KvRecord};
 use storage_engines::memory::MVCC;
@@ -189,6 +191,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_eq;
     use std::format;
     use storage_engines::common::kv_snapshot::{write_bin, KvRecord};
 

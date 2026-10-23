@@ -10,6 +10,8 @@
 //! 搬完之后新增一个引擎只要写这两个方法，折叠/窗口/分页/界下推不用重写 —— 那正是
 //! "基座"与"四份复制"的分界。
 
+#[cfg(test)]
+use std::thread_local;
 use std::matches;
 use crate::common::codec::{
     decode_value_meta, key_matches, logical_to_user, now_unix_secs, prefix_upper_bound,

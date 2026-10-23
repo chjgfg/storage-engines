@@ -720,6 +720,18 @@
   - 顺带清掉 M63 留下的一条真警告：`bplus`/`memory` 两个 `import-kv` 的 `mod tests` 里重复导入 `pack_plain`（`use super::*` 已经带进来）。
   - 判据：`cargo check --all-targets` **0 warning**（`unused_imports` 正好是"导入是否多余"的尺子）+ `cargo test --lib` **346 passed**（前后同数）。
   - ⚠️ **这一族不含** `assert!` / `println!` / `panic!` 等 —— 那些仍靠隐式 prelude；要不要一起钉，等用户点头（同一手法，全仓库一次扫）。
+- **M66（用户回「1」＝一起钉）：显式导入扩到 14 个 prelude 宏，再 +41 文件 / +147 行**：
+  - 先枚举本仓库真正用到的宏（`grep` 出 27 种 `xxx!` 形态）⇒ 补进来 9 个：`assert` / `assert_eq` / `assert_ne` / `debug_assert` / `panic` / `unreachable` / `println` / `eprintln` / `thread_local`；
+    跳过不算的：`log::warn!` / `log::error!`（**本来就带路径写**，17 处全是 `log::` 前缀）与本仓库自己的 `impl_engine!` / `arm_list!` / `note_*!`（同 crate 的 `macro_rules!`，IDE 认）。
+  - 九个路径先各自探针编过（`use std::assert;` … `use std::thread_local;` 全部合法）再上仓库。
+  - ⚠️ **`cargo check` 的 `unused_imports` 这一刀抓到 17 条真多余**，机制值得记：本仓库一批 `thread_local!` 探针计数住在
+    **文件作用域的 `#[cfg(test)]` 块**里（不在 `mod tests` 内），M65 那把"按行号分 体 / tests"的尺子把它们判成了"体里用的"
+    ⇒ 顶部裸导入在非测试构建里就是废话。⇒ 修法是给这些导入**跟着加 cfg 门**（18 条：`#[cfg(test)]` + `use std::thread_local;` 等），
+    而不是删掉 —— 测试构建仍然要用它。**这把尺子（unused_imports）本身就是"这条导入多余不多余"的判据**，不是只有编译过就行。
+  - ⚠️ 第二个锚点 bug：只认 `^use` 不认 `^pub use` ⇒ `src/common/mod.rs` 的 `use std::format;` 被插进了 `fn tmp_test_path` **函数体里**
+    （能编、能用，但作用域错了）。⇒ 新增一条审计"顶格导入而花括号深度 >0"（现值 0 处），并手工归位。
+  - 判据同 M65：`cargo check --all-targets` **0 error / 0 warning** + `cargo test --lib` **346 passed**（27 ignored，前后同数）。
+    形状反查三项全 0：插在 `///` 与其项之间／组导入重复(E0252)／顶格导入落在嵌套作用域。
 
 - **M62b（只量，新增一把 `#[ignore]` 台架 `single_call_shape_attribution`）—— 复测那两条"单次调用"的比值：一条撤销、一条并回两块旧账**：
   - 存在的理由就是 M50 那条规矩：`scale_baseline` 里 `seek_prev`/`vacuum_bounded 一片` 这两格都是 `timed()` 里的**一次调用**，

@@ -5,6 +5,8 @@
 //! 三家不一样）。编解码和保留规则都是**纯逻辑**，不涉及存储结构，所以先抽出来；
 //! 各引擎仍然保留自己的遍历原语和自己的守卫测试 —— 合并的是判定，不是扫描。
 
+#[cfg(test)]
+use std::thread_local;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -196,6 +198,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert;
+    use std::assert_eq;
     use std::vec;
 
     /// 大端编码 ⇒ 版本递增即字节序递增，链尾就是最新版

@@ -6,6 +6,9 @@
 //! cargo run --release --bin bench_bulk -- --n 10000000 --dir ./bench_data
 //! ```
 
+use std::assert;
+use std::println;
+use std::eprintln;
 use std::vec;
 use std::format;
 use storage_engines::lsm_tree::MVCC;

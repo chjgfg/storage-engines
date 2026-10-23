@@ -5,6 +5,9 @@
 //! cargo run --release --bin export_kv -- --dir ./data --out snapshot.jsonl --format jsonl
 //! ```
 
+use std::assert_eq;
+use std::println;
+use std::eprintln;
 use storage_engines::bitcask::MVCC;
 use storage_engines::common::kv_snapshot::{ExportWriter, IoStats};
 use std::env;

@@ -1,5 +1,8 @@
 //! 导出 lsm-tree 为 JSONL / BPEXP001|002（可选带 seq）。
 
+use std::assert_eq;
+use std::println;
+use std::eprintln;
 use storage_engines::common::kv_snapshot::{ExportWriter, KvRecord};
 use storage_engines::lsm_tree::LSMTree;
 use std::env;
