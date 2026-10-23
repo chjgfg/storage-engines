@@ -5,6 +5,10 @@
 //!
 //! 版本 GC 由上层 `MVCC::vacuum` 负责；compact 只做空间合并（丢弃 Drop）。
 
+use std::format;
+use std::matches;
+use std::write;
+use std::writeln;
 use std::{
     collections::{BTreeMap, BinaryHeap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{
         Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering},

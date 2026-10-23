@@ -2,6 +2,7 @@
 //!
 //! 不追求最优误判率；固定 ~10 bits/key，适合 SST 点查短路。
 
+use std::vec;
 use crate::lsm_tree::storage::crc32;
 
 /// 可序列化的 bloom

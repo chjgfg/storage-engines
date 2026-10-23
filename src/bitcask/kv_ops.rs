@@ -409,6 +409,9 @@ impl MVCC {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::format;
+    use std::matches;
     use std::path::PathBuf;
 
     fn tmp(tag: &str) -> PathBuf {

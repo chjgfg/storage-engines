@@ -10,6 +10,8 @@
 //! 可用引擎名（大小写无所谓，`-` / `_` 等价）：
 //! `bitcask` / `bplus_tree`(bplus, btree) / `lsm_tree`(lsm) / `memory`(mem)
 
+use std::vec;
+use std::format;
 use std::path::PathBuf;
 use std::time::Duration;
 

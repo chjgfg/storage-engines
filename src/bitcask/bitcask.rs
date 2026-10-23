@@ -20,6 +20,8 @@
 //! - **Hint 文件**（`*.hint`）：merge / [`Bitcask::dump_hint`] 写出 KeyDir 快照；
 //!   open 优先读 hint，再只扫 `log_size..end` 增量补索引，避免全量扫 value
 
+use std::vec;
+use std::format;
 use fs4::FileExt;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};

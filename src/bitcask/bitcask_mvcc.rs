@@ -18,6 +18,7 @@
 //! - 版本行 tombstone 用 Bitcask **软 tombstone**（KeyDir 保留）；rollback/vacuum 用 **硬删除**
 //! - bulk 路径：无 WAL + 4MB 写缓冲 + insert_batch，目标 10M / 10min
 
+use std::format;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -1367,6 +1368,8 @@ impl WalTail for WalOnly<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::matches;
     use crate::bitcask::storage::{blob_path, data_path, hint_path, lock_path};
 
     fn tmp_db(tag: &str) -> PathBuf {

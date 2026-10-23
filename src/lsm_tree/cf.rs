@@ -8,6 +8,8 @@
 //!   cf/<name>/       # 其它 CF
 //! ```
 
+use std::vec;
+use std::writeln;
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -199,6 +201,7 @@ fn load_current(path: &Path) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
 
     #[test]
     fn test_multi_cf() {

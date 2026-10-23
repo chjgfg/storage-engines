@@ -196,6 +196,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
 
     /// 大端编码 ⇒ 版本递增即字节序递增，链尾就是最新版
     #[test]

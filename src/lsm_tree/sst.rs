@@ -2030,6 +2030,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
+    use std::matches;
 
     fn tmp(tag: &str) -> PathBuf {
         crate::common::tmp_test_path("sst", tag, ".sst")

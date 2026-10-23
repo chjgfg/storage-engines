@@ -745,6 +745,8 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::format;
 
     #[test]
     fn test_encode_order() {

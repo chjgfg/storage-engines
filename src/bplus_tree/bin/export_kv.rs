@@ -148,6 +148,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
     use storage_engines::common::kv_snapshot::{read_bin, write_bin, write_jsonl, KvRecord};
 
     fn tmp(tag: &str) -> PathBuf {

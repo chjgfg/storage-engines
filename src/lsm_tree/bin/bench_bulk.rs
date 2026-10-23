@@ -6,6 +6,8 @@
 //! cargo run --release --bin bench_bulk -- --n 10000000 --dir ./bench_data
 //! ```
 
+use std::vec;
+use std::format;
 use storage_engines::lsm_tree::MVCC;
 use std::env;
 use std::time::Instant;

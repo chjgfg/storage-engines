@@ -9,6 +9,7 @@
 //! - `MEMWAL01`：旧格式无 seq（读时 seq=0）
 //! - `MEMWAL02`：Put/Drop 含 seq；Flush 含 next_sst_id + next_write_seq
 
+use std::vec;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -140,6 +141,7 @@ impl MemWal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
     use std::fs;
 
     #[test]

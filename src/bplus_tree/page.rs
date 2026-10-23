@@ -4,6 +4,8 @@
 //! - 页头 CRC：[`crate::storage::pack_page`] / [`unpack_page`]
 //! - 双写缓冲：刷盘前先写 dblwr 再写主文件，防 torn page
 
+use std::vec;
+use std::format;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},

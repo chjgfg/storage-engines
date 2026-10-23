@@ -10,6 +10,7 @@
 //! - 页换出跳过双写与频繁 fsync
 //! - 结束时 [`BulkLoader::finish`] → flush_all + checkpoint
 
+use std::format;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -1276,6 +1277,8 @@ impl WalTail for WalOnly<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::matches;
     use crate::bplus_tree::storage::{dblwr_path, wal_path};
 
     fn tmp_db(tag: &str) -> PathBuf {

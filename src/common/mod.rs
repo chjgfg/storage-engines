@@ -45,6 +45,7 @@ pub use version::{
 /// 现在收敛成一个函数（每份复制都要自己的守卫 —— 但守卫之外，路径规则不该复制）。
 #[cfg(test)]
 pub(crate) fn tmp_test_path(prefix: &str, tag: &str, suffix: &str) -> std::path::PathBuf {
+use std::format;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()

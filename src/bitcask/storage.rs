@@ -4,6 +4,8 @@
 //! 的实现正是崩溃语义修一处漏两处的来源，已收进 [`crate::common::disk`]，这里 re-export
 //! 以保持 `crate::bitcask::storage::DiskFile` 这类既有路径不断。
 
+use std::vec;
+use std::format;
 use std::path::{Path, PathBuf};
 
 // M53 的站点账：blob 侧文件的 fsync 不认引擎，四家共用同一格

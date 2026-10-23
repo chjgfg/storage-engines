@@ -611,6 +611,8 @@ mod tests {
     }
 
     use super::*;
+    use std::vec;
+    use std::format;
 
     #[test]
     fn visible_at_requires_committed_and_not_newer() {

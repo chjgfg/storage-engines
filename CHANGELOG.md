@@ -709,6 +709,17 @@
     对完名字就说"一行不用改"，第一次编译就打回 4 处。
   - 顺带清场：本仓库在台架上漏下的临时物按 19 位纳秒签名（测试目录名）认出 2 620 条 + `se_*` 3 478 条 + 台架本体，
     共约 **1.16 GB**；M15~M46 那批源码备份（157 条）**一条没动**（仓库里没有副本）。
+- **prelude 宏改成显式导入：`vec!` / `format!` / `matches!` / `write!`（含 `writeln!`），38 个文件 +79 行（M65）**：
+  - 起因：编译器认隐式 prelude 所以**不报错**，但 rust-analyzer 在用户环境里报红 ⇒ 拿 IDE 当判据就一直看见假红。
+    规矩落到 README「10. 写文件的规矩」：**只在 `mod tests` 里用的导进 `mod tests`，文件体里用的导在顶部导入块**。
+  - 三处自己踩到又被自己的核查打回的格子（都记下来，因为它们都是"编译过了但错着"的）：
+    ① 两个文件（`lsm_tree.rs`/`sst.rs`）的组导入 `use std::{..., vec};` 里已经带了 `vec` ⇒ 再补一行撞 **E0252**；
+    ② 插进 `mod tests` 的行落在列 0 ⇒ 按该模块基准缩进重排 35 行；
+    ③ ⚠️ **`src/common/types.rs` 把导入插到了 `///` 与它描述的 `struct ExportRecord` 之间** ⇒ 文档注释改挂到 `use` 上，
+      **rustdoc 静默丢一段说明，而编译与警告一条都不报**（挪回 `///` 之前；这类"落在注释与项之间"的用 grep 反查=0 处）。
+  - 顺带清掉 M63 留下的一条真警告：`bplus`/`memory` 两个 `import-kv` 的 `mod tests` 里重复导入 `pack_plain`（`use super::*` 已经带进来）。
+  - 判据：`cargo check --all-targets` **0 warning**（`unused_imports` 正好是"导入是否多余"的尺子）+ `cargo test --lib` **346 passed**（前后同数）。
+  - ⚠️ **这一族不含** `assert!` / `println!` / `panic!` 等 —— 那些仍靠隐式 prelude；要不要一起钉，等用户点头（同一手法，全仓库一次扫）。
 
 - **M62b（只量，新增一把 `#[ignore]` 台架 `single_call_shape_attribution`）—— 复测那两条"单次调用"的比值：一条撤销、一条并回两块旧账**：
   - 存在的理由就是 M50 那条规矩：`scale_baseline` 里 `seek_prev`/`vacuum_bounded 一片` 这两格都是 `timed()` 里的**一次调用**，

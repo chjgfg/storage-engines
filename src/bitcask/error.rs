@@ -1,5 +1,6 @@
 //! 统一错误类型
 
+use std::write;
 use std::fmt;
 use std::io;
 

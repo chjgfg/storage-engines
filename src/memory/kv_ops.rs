@@ -371,6 +371,8 @@ impl MVCC {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::format;
     use crate::memory::memory_mvcc::fold_keys;
 
     #[test]

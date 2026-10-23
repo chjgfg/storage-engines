@@ -12,6 +12,7 @@
 //! Checkpoint 记录里的 `root_page_id` / `next_page_id` 只有 B+ 树用得上，
 //! Bitcask / LSM 恒写 0 —— 保留同一个布局，不为这个再开一个记录类型。
 
+use std::vec;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -280,6 +281,8 @@ pub fn analyze_recovery(entries: &[WalEntry]) -> RecoveryPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
+    use std::matches;
 
     fn tmp_wal(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

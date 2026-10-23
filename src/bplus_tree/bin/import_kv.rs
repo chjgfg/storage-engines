@@ -155,8 +155,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storage_engines::common::codec::pack_plain;
-use storage_engines::common::kv_snapshot::{write_bin, KvRecord};
+    use std::format;
+    use storage_engines::common::kv_snapshot::{write_bin, KvRecord};
     use std::path::Path;
 
     fn tmp(tag: &str) -> PathBuf {

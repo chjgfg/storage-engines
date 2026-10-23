@@ -2,6 +2,9 @@
 //!
 //! derive 与字段语义严格沿用原 bitcask 版本，保证现有 `assert_eq!` 调用点不受影响。
 
+use std::write;
+use std::writeln;
+
 /// 导出用的一条逻辑记录（已解码 blob，无 version 后缀）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportRecord {

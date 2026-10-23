@@ -1242,6 +1242,9 @@ impl_engine! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::format;
+    use std::matches;
 
     /// 在临时目录里跑一遍所有磁盘引擎 + memory
     ///

@@ -27,6 +27,7 @@
 //! - Checkpoint 的 `root_page_id` / `next_page_id` 固定写 0
 //! - 数据目录：`dir/CURRENT.snap` + `dir/lsm.wal` + `dir/lsm.lock`
 
+use std::format;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -1313,6 +1314,8 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
+    use std::matches;
     use crate::lsm_tree::storage::lock_path;
 
     fn tmp_db(tag: &str) -> PathBuf {

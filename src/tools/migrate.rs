@@ -28,6 +28,7 @@
 //! - ⚠️ 继承的一条已知局限：`KvBulk::put` **没有返回值通道**，所以超出一页载荷的行（bplus）只能
 //!   `log::error!` 喊出来、不会让 `import` 失败。要"当场失败"得先给 bulk 加通道（未做）。
 
+use std::format;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -527,6 +528,7 @@ fn pump_file_in(dst: &dyn KvEngine, input: &Path, format: SnapshotFormat) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
     use crate::common::kv_snapshot::{b64_encode, read_bin, read_jsonl, write_bin, write_jsonl};
 
     fn root(tag: &str) -> PathBuf {

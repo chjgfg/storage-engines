@@ -9,6 +9,8 @@
 //! [`write_bin`] 按记录里是否有 `seq` 自动选择，所以不带 seq 的导出与
 //! 旧版 `BPEXP001` **逐字节一致**；[`read_bin`] 两种都认。
 
+use std::format;
+use std::writeln;
 use crate::common::types::ExportRecord;
 use std::{
     fs::File,
@@ -512,6 +514,7 @@ fn parse_jsonl_line(line: &str) -> Result<(String, Option<String>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
 
     #[test]
     fn test_b64_known() {

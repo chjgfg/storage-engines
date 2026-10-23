@@ -11,6 +11,8 @@
 //! 引擎侧仍然各留自己的**路径规则**（`lock_path` / `data.log` / `<stem>.lock` 各家不同），
 //! 所以 `FileLock::try_acquire_at` 收的是锁文件的完整路径，由各引擎自己算。
 
+use std::vec;
+use std::format;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
