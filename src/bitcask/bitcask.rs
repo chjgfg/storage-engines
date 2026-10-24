@@ -342,6 +342,30 @@ thread_local! {
     static MERGE_BULK_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// 测试专用（M77 的尺子）：hint 门**这一次给清单预留了几条**。
+//
+// 为什么钉这个数而不是钉时间：省下来的那 110 ms 是墙钟（本机跨轮漂 1.3~1.9×），
+// 而"门到底有没有用上那条界"是个纯计数 —— 谁把 `with_capacity(界)` 换回 `new()`（或换成步长值），
+// 这里立刻读到不一样的数。光有 [`hint_reserve_bound`] 的算术守卫不够：那只证明函数算得对，
+// 不证明**有人调用它**（M35/M44 那条"尺子必须钉在旧形状真正流过的那扇门"）。
+#[cfg(test)]
+thread_local! {
+    static HINT_RESERVE_NOTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 本线程 hint 门最后一次预留的条数（测试探针用；`0` = 没走过这道门）
+#[cfg(test)]
+pub(crate) fn hint_reserve_noted() -> usize {
+    HINT_RESERVE_NOTED.with(|c| c.get())
+}
+
+/// 清槽：读一份新 hint 之前必须调一次 —— 不然上一条留下的数会让这一条的断言**看着像过了**
+/// （M48 那条"槽不会自己清"，比读 0 更危险）
+#[cfg(test)]
+pub(crate) fn hint_reserve_reset() {
+    HINT_RESERVE_NOTED.with(|c| c.set(0));
+}
+
 /// 批量成树时一次多预留多少条清单格子（M60）。///
 /// 为什么不是 `with_capacity(声明的条数)`：那个数从文件头/调用方来，**不可信** ⇒ 信它就等于
 /// "读到一个大数就先做一次巨大分配"（M59 那句）。分步 `reserve_exact` 把最坏过冲夹在一个步长里：
@@ -350,6 +374,34 @@ thread_local! {
 /// 为什么不是直接 `.collect()`：M59 实测流式 `collect` 的瞬时超出 = 清单骨架 + **`Vec` 翻倍扩容留下的空槽**
 /// （600k 档 `over` 50.3 MB，其中 **21.5 MB 是空槽** —— `Vec::from_iter` 拿不到 `size_hint` 就只会翻倍）。
 const KEYDIR_BULK_STEP: usize = 65_536;
+
+/// 一条 hint 记录里**定长字段**的字节数。键长可以为 0 ⇒ 这是**每条的最小占用**：
+/// v2 = `key_len` 4 + `flag` 4 + `file_id` 4 + `pos` 8 + `len` 4；v1 少一个 `file_id`。
+const HINT_RECORD_FIXED_BYTES_V2: u64 = 24;
+const HINT_RECORD_FIXED_BYTES_V1: u64 = 20;
+
+/// hint 门能**一次性预留**多少条（M77）：声明的条数 与 "这份文件物理上装得下多少条" 取小。
+///
+/// 为什么 hint 这一侧敢用声明值、而 merge 那一侧不敢（M60 立的规矩是"不可信声明值一律分步预留"）：
+/// 声明值旁边就躺着它的凭据 —— 文件字节数。一条记录至少 `record_fixed` 字节（键长 0 时取等），
+/// 所以文件里**不可能**装下 `(字节数 − 头部) ÷ record_fixed` 条以上 ⇒ 界内预留不会比文件本身能装的更多，
+/// 一个坏掉/被人改大的 `entry_count` 换不来一次超大分配。
+///
+/// 为什么值得动：M60 那版分步 `reserve_exact(65_536)` 在 600k 档要 realloc **9 次**、每次把整份清单搬一遍。
+/// 同一构建、同一形状、同一个二进制里的两臂实测（`bitcask_hint_load_stage_split`，四轮两种顺序取最小）：
+/// 真门 **284.2 ms** vs "一次攒够再成树"那臂 **173.5 ms**（1.64×），而瞬时超出反而**更小**
+/// （`over` 31.5 → 28.8 MB）⇒ 两笔都是净赚，没有取舍。
+fn hint_reserve_bound(
+    file_bytes: u64,
+    header_bytes: usize,
+    record_fixed: u64,
+    entry_count: u64,
+) -> usize {
+    let body = file_bytes.saturating_sub(header_bytes as u64);
+    let can_fit = body / record_fixed;
+    // 32 位平台上 `can_fit` 可能超出 `usize` ⇒ 夹一下，别让它变成 `as usize` 的静默截断
+    usize::try_from(entry_count.min(can_fit)).unwrap_or(usize::MAX)
+}
 
 /// 一份**按键升序**的 `(键, 位置)` 清单，攒完再一次成树 ⇒ 满节点。
 ///
@@ -362,8 +414,21 @@ const KEYDIR_BULK_STEP: usize = 65_536;
 struct KeyDirBulk(Vec<(Vec<u8>, KeyLoc)>);
 
 impl KeyDirBulk {
+    /// 攒法一：**不知道会有多少条**（merge 重扫那侧）⇒ 分步 `reserve_exact`，最坏过冲夹在一个步长里。
     fn new() -> Self {
         KeyDirBulk(Vec::new())
+    }
+
+    /// 攒法二（M77，hint 门专用）：**有一条被文件字节数验过的界** ⇒ 一次预留到位，不分步。
+    ///
+    /// ⚠️ 探针就记在这里（不是记在调用方）：要钉的是"**门拿到界之后真的预留了这么多**"，
+    /// 记在调用方就变成"有人把 `with_capacity(界)` 换回 `new()` 也照样绿"（M77 的 μA 变异试的就是这个）。
+    fn with_capacity(bounded: usize) -> Self {
+        #[cfg(test)]
+        HINT_RESERVE_NOTED.with(|c| c.set(bounded));
+        let mut v = Vec::new();
+        v.reserve_exact(bounded);
+        KeyDirBulk(v)
     }
 
     fn push(&mut self, entry: (Vec<u8>, KeyLoc)) {
@@ -385,9 +450,9 @@ impl KeyDirBulk {
 /// 与 [`KeyDirBulk`] 分开写，是因为 hint 那侧的流吐的是 `Result<Option<..>>`（坏一条 ≠ 读不出来，
 /// M25 那条纪律），而 merge 那侧是命令式的扫描回调 —— 两边共用的是**攒法与成树**，不是迭代器形状。
 fn keydir_from_ordered_stream<E>(
+    mut bulk: KeyDirBulk,
     iter: impl Iterator<Item = std::result::Result<Option<(Vec<u8>, KeyLoc)>, E>>,
 ) -> std::result::Result<KeyDir, E> {
-    let mut bulk = KeyDirBulk::new();
     for item in iter {
         if let Some(kv) = item? {
             bulk.push(kv);
@@ -647,13 +712,18 @@ impl<R: std::io::Read> Iterator for HintEntries<'_, R> {
 /// `冷重开 常驻 83.4 → 57.7 MB` **一字不差**，而两臂解出的键数相同 ⇒
 /// 那 25.7 MB 纯粹是**半满节点**，不是内容。重复键的取舍与逐条 `insert` 相同（后者胜）。
 ///
-/// ⚠️ M60 起这一趟不再直接 `.collect()`：改走 [`KeyDirBulk`]（**分步 `reserve_exact`**）。
-/// 原因是 M59 量到流式 `collect` 的瞬时超出里有一大块是 `Vec` 翻倍扩容留下的空槽
-/// （600k 档 `over` 50.3，其中 21.5 是空槽）⇒ 现在读到的 `over` 是 31.5（= 骨架 28.8 + 一个步长的过冲）。
+/// ⚠️ M60 起这一趟不再直接 `.collect()`，改走 [`KeyDirBulk`]；M77 起 hint 这一侧的攒法是
+/// **一次预留到位**（界由 [`hint_reserve_bound`] 用文件字节数算出来），不再分步 ——
+/// 分步那版在 600k 档要 realloc 9 次、每次搬整份清单，实测比"一次攒够"慢 1.64×（284.2 vs 173.5 ms），
+/// 而瞬时超出反而更大（`over` 31.5 vs 28.8 MB）⇒ 两笔都是净赚。
+/// M59 那句仍然成立且是这条界的理由：**不能凭声明值** 直接 `with_capacity(声明的条数)`
+/// （读到一个大数就先做一次巨大分配），所以要拿"文件物理上装得下多少条"夹一道。
+/// merge 那一侧没有这种凭据 ⇒ 继续用分步 `reserve_exact`（最坏过冲夹在一个步长里）。
 fn hint_entries_to_keydir<R: std::io::Read>(
     r: &mut R,
     entry_count: u64,
     with_file_id: bool,
+    reserve_bounded: usize,
 ) -> Result<KeyDir> {
     // 台架对照臂（门控 `HINT_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）：**同一个解码器**，
     // 只把折树那一步退回逐条 `insert`。共用解码器是故意的 —— 两臂只差一件事，
@@ -669,12 +739,17 @@ fn hint_entries_to_keydir<R: std::io::Read>(
         }
         return Ok(key_dir);
     }
-    keydir_from_ordered_stream(HintEntries::new(r, entry_count, with_file_id))
+    keydir_from_ordered_stream(
+        KeyDirBulk::with_capacity(reserve_bounded),
+        HintEntries::new(r, entry_count, with_file_id),
+    )
 }
 
 /// 读取 hint。成功返回 `(KeyDir, active_id, active_log_size)`
 pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
     let mut f = std::fs::File::open(path)?;
+    // 预留的界要用**开文件时**的字节数：`BufReader` 一旦接管 `f`，元信息就只能再走一次路径查询了
+    let file_bytes = f.metadata().map(|m| m.len()).unwrap_or(0);
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     if &magic == HINT_MAGIC_V2 {
@@ -684,7 +759,17 @@ pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
         let active_log_size = u64::from_le_bytes(rest[8..16].try_into().unwrap());
         let entry_count = u64::from_le_bytes(rest[16..24].try_into().unwrap());
         let mut r = BufReader::new(f);
-        let key_dir = hint_entries_to_keydir(&mut r, entry_count, true)?;
+        let key_dir = hint_entries_to_keydir(
+            &mut r,
+            entry_count,
+            true,
+            hint_reserve_bound(
+                file_bytes,
+                HINT_HEADER_SIZE_V2,
+                HINT_RECORD_FIXED_BYTES_V2,
+                entry_count,
+            ),
+        )?;
         Ok((key_dir, active_id, active_log_size))
     } else if &magic == HINT_MAGIC_V1 {
         // 兼容旧 hint：file_id 全 0，header 剩余 24 字节
@@ -693,7 +778,17 @@ pub fn read_hint_file(path: &Path) -> Result<(KeyDir, u32, u64)> {
         let log_size = u64::from_le_bytes(rest[0..8].try_into().unwrap());
         let entry_count = u64::from_le_bytes(rest[8..16].try_into().unwrap());
         let mut r = BufReader::new(f);
-        let key_dir = hint_entries_to_keydir(&mut r, entry_count, false)?;
+        let key_dir = hint_entries_to_keydir(
+            &mut r,
+            entry_count,
+            false,
+            hint_reserve_bound(
+                file_bytes,
+                HINT_HEADER_SIZE_V1,
+                HINT_RECORD_FIXED_BYTES_V1,
+                entry_count,
+            ),
+        )?;
         Ok((key_dir, 0, log_size))
     } else {
         Err(std::io::Error::new(
@@ -2691,6 +2786,133 @@ mod tests {
             bytes.extend_from_slice(k);
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// M77 的守卫：hint 门"一次预留多少条"这条界必须由**文件字节数**说了算，不是头部那个声明值。
+    ///
+    /// 判据落在"没有这条界就不成立"的一侧：把声明值改成 `u64::MAX`，界仍然只能是"文件装得下的条数"
+    /// —— 否则就是"读到一个大数 ⇒ 先做一次巨大分配"，那正是 M60 立"不可信声明值一律分步预留"要挡的形状。
+    /// 另一侧也要钉：声明值在界内时**照声明值**（一次到位才省掉 realloc —— 省掉的那笔实测 284.2 → 173.5 ms），
+    /// 只钉"别太大"而不钉"别太小"会退化成"永远不分步也永远不省"。
+    ///
+    /// 五格：① 界内照声明；② 声明超界 ⇒ 夹到界；③ 文件比头部还短 ⇒ 0（`saturating_sub`，不许下溢）；
+    /// ④ **全长度扫** `claimed = 0..=64`（M45 那条：抽样断言等于没测）；
+    /// ⑤ 真文件三份（v2 长键 / v1 长键 / **零长键**）各自 `min(声明, 文件容量) == 真实条数`
+    ///   —— 零长键是**每条占得最少**的情形，也就是这条界最松的一格，它要是还能精确，别的情形只会更保守
+    ///   （保守 = 少留 = 顶多多一次 realloc，不会超发内存）。
+    #[test]
+    fn hint_reserve_bound_is_the_file_not_the_header_claim() {
+        let bound = |file: u64, header: usize, rec: u64, claimed: u64| {
+            hint_reserve_bound(file, header, rec, claimed)
+        };
+        // ① 声明值在界内 ⇒ 照声明值（一次到位）
+        assert_eq!(bound(40 + 24 * 1000, 40, 24, 1_000), 1_000);
+        // ② 声明值吹到天上 ⇒ 夹到"文件物理上装得下的条数"
+        assert_eq!(bound(40 + 24 * 1000, 40, 24, u64::MAX), 1_000);
+        assert_eq!(bound(40 + 24 * 1000, 40, 24, 1 << 40), 1_000);
+        // ③ 空正文 / 文件比头部还短 ⇒ 0，不许下溢成天文数字
+        assert_eq!(bound(40, 40, 24, 10), 0);
+        assert_eq!(bound(39, 40, 24, 10), 0);
+        assert_eq!(bound(0, 40, 24, 10), 0);
+        // ④ 全长度扫：正文只装得下 24 条 ⇒ 界 = `min(claimed, 24)`，一格都不许差
+        for claimed in 0u64..=64 {
+            assert_eq!(
+                bound(40 + 24 * 24, 40, 24, claimed),
+                (claimed as usize).min(24),
+                "claimed={claimed} 这一格界算错了"
+            );
+        }
+        // ⑤ 真文件：三种形状都要"一次到位"（界 == 真实条数）
+        //   `(v2, 键长)`：v2 每条 24+键长、v1 每条 20+键长；**零长键是每条占得最少的情形**，
+        //   也就是这条界最松的一格 —— 它还能精确，别的情形只会更保守（保守 = 少留 = 顶多多一次 realloc，
+        //   不会超发内存）。
+        let n = 500usize;
+        for (v2, key_len) in [(true, 16usize), (false, 16), (true, 0), (false, 0)] {
+            let path = tmp_log("hint_bound");
+            let hint = hint_path_for(&path);
+            let rows: Vec<(Vec<u8>, i32, u32, u64, u32)> = (0..n)
+                .map(|i| {
+                    let mut k = vec![0u8; key_len];
+                    if key_len >= 8 {
+                        k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    }
+                    (k, HINT_FLAG_LIVE, 0u32, i as u64, 1u32)
+                })
+                .collect();
+            // 零长键全同 ⇒ 树里只会有一条，`write_hint_file` 那条路要的是"树的条数"；
+            // 这里走手工搭文件那条路，条数就是写进去的记录数
+            let rows = if key_len == 0 {
+                vec![(Vec::new(), HINT_FLAG_LIVE, 0u32, 0u64, 1u32)]
+            } else {
+                rows
+            };
+            build_hint_file(&hint, v2, &rows, None);
+            let file_bytes = std::fs::metadata(&hint).unwrap().len();
+            let (header, rec) = if v2 {
+                (HINT_HEADER_SIZE_V2, HINT_RECORD_FIXED_BYTES_V2)
+            } else {
+                (HINT_HEADER_SIZE_V1, HINT_RECORD_FIXED_BYTES_V1)
+            };
+            // 自证分母：文件字节 = 头部 + 条数 × (定长 + 键长)，量具与文件对不上就说明搭错了
+            assert_eq!(
+                file_bytes as usize,
+                header + rows.len() * (rec as usize + key_len),
+                "v2={v2} 键长={key_len}：搭出来的 hint 形状与常数对不上"
+            );
+            assert_eq!(
+                bound(file_bytes, header, rec, rows.len() as u64),
+                rows.len(),
+                "v2={v2} 键长={key_len}：界应当正好 = 真实条数（少一格就多一次 realloc），文件 {file_bytes} B"
+            );
+            // 真门读一遍必须**读得回来**（界只是预留，不许改变能不能读）
+            hint_reserve_reset();
+            let (got, _, _) = read_hint_file(&hint).expect("真 hint 要读得回来");
+            assert_eq!(got.len(), rows.len(), "v2={v2} 键长={key_len}：读回来的条数不对");
+            // ⚠️ 这一条才是"门真的用了这条界"的证据（上面那些只证明**函数**算得对）
+            assert_eq!(
+                hint_reserve_noted(),
+                rows.len(),
+                "v2={v2} 键长={key_len}：门给自己预留了 {} 条，而界算出来是 {} 条 ⇒ 预留没接上这条界",
+                hint_reserve_noted(),
+                rows.len()
+            );
+            drop(got);
+            let _ = std::fs::remove_file(&hint);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // ⑥ 端到端：把头部那个声明值改成 `u64::MAX` 的坏 hint —— 读它必须**报错**，
+        //    而不是按声明值先做一次巨大分配（这条就是那条界在真实路径上的样子）
+        let path = tmp_log("hint_bound_lie");
+        let hint = hint_path_for(&path);
+        let rows: Vec<(Vec<u8>, i32, u32, u64, u32)> = (0..3)
+            .map(|i| (format!("k{i}").into_bytes(), HINT_FLAG_LIVE, 0u32, i as u64, 1u32))
+            .collect();
+        build_hint_file(&hint, true, &rows, None);
+        let mut raw = std::fs::read(&hint).unwrap();
+        // 头部布局：magic(8) | active_id(4) | 预留(4) | active_log_size(8) | **entry_count(8)** | 预留(8)
+        // ⇒ 声明值在 `[头部大小−16, 头部大小−8)`；最后那 8 字节是空着的 `reserved`
+        let off = HINT_HEADER_SIZE_V2 - 16;
+        raw[off..off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&hint, &raw).unwrap();
+        let before = crate::mem_probe::live() as i64;
+        hint_reserve_reset();
+        let bad = read_hint_file(&hint).err().expect("条目数被吹大的 hint 要报错");
+        let grew = crate::mem_probe::live() as i64 - before;
+        assert!(
+            grew < 1 << 16,
+            "坏 hint 读失败前多占了 {grew} B ⇒ 预留没被文件字节数夹住"
+        );
+        // 端到端那一半：门自己承认它预留了几条 —— 声明是 `u64::MAX`，界只能是"这文件装得下的 3 条"
+        assert!(
+            hint_reserve_noted() <= rows.len(),
+            "坏 hint 让门预留了 {} 条，而文件只装得下 {} 条 ⇒ 那条界没接上",
+            hint_reserve_noted(),
+            rows.len()
+        );
+        let _ = bad;
+        let _ = std::fs::remove_file(&hint);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 写缓冲必须是**懒分配**：打开一个空库不该先占 4 MiB。
