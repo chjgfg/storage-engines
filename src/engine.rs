@@ -4849,6 +4849,187 @@ mod tests {
         }
     }
 
+    /// M68 —— 把 `tools` 搬运层量进标准表：**三跳每跳跑两臂**（流式 vs 先物化整库），同一进程同一构建 ⇒ 比值即因果。
+    ///
+    /// 为什么这条存在：M63 交了 `storage_engines::tools`，而 122 项标准表里**没有它一格**
+    /// （M67 记的那条"空白"）⇒ 用户问"各个功能有没有进步"时，唯一的新功能恰好没被量到；
+    /// 而它"不物化整库"此前只是照 `export 流式` 那一行**推**出来的，不是实测。
+    ///
+    /// 台架形状 = 下游的用法：一份 root 下每个引擎一个子目录，逐跳搬
+    /// ① bitcask→lsm ② lsm→bplus ③ bplus→bitcask（`wipe_target = true`，就是 M63b 真编真跑那条三跳），
+    /// 再单独量第四格：文件往返（`export_to_file` bin → `import_from_file` bin）—— 这一格只有流式一条臂，
+    /// 因为"物化整库再写文件"不是任何人的用法，硬造一个对照臂 = 给自己造一个不会被读的数字。
+    ///
+    /// **两臂只差读侧**：老形状 = M44 之前的 `export_latest_visible`（一次把整库做成 `Vec`），
+    /// 写侧与 `tools` 一字不差（同一份 `begin_bulk` + 同一批 `pack_plain` + 同样的批宽）⇒
+    /// 差值只归"读侧中间那份 `Vec`"。每跳都硬对拍：目标回读条数必须 == 行数（少一行就是 M45 那次静默丢数据）。
+    /// ⚠️ 三跳两臂的**先后顺序交替**（①新→老、②老→新、③新→老）：M52 那条"排位会冒充形状"。
+    ///
+    /// 跑法：`SCALE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 tools_migrate_scale`
+    #[test]
+    #[ignore = "tools 搬运层的规模台架，手动 release 单线程跑：SCALE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 tools_migrate_scale"]
+    fn tools_migrate_scale() {
+        let rows: usize = std::env::var("SCALE_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            // 默认档给 200k 而不是 600k：这一格要跑**七次搬运**，600k 那档留给标准复测那一轮起环境变量
+            .unwrap_or(200_000);
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+        /// 路径**必须**从 `tools` 公开的那两个函数拿：它俩就是 `migrate` 自己用的那一份，
+        /// 自己拼一遍就会在 bplus 那个"先认已存在的库文件名"上选错 ⇒ 凭空造一个空库当目标。
+        fn path_for(engine: EngineKind, root: &std::path::Path) -> std::path::PathBuf {
+            match engine {
+                EngineKind::BPlusTree => crate::tools::bplus_db_path(root),
+                other => crate::tools::engine_data_path(root, other),
+            }
+        }
+        /// 老形状那一臂：读侧整库 `Vec` ⇒ 写侧与 `tools::pump_*` 同一份逻辑（批宽也对齐）。
+        fn old_shape_hop(
+            from: EngineKind,
+            to: EngineKind,
+            root: &std::path::Path,
+        ) -> usize {
+            const BATCH: usize = 8192;
+            let src = open_engine(from, Some(&path_for(from, root))).expect("开源库");
+            let recs = src.begin().export_latest_visible(false);
+            drop(src);
+            let dst_path = path_for(to, root);
+            let _ = std::fs::remove_dir_all(&dst_path);
+            let _ = std::fs::remove_file(&dst_path);
+            let dst = open_engine(to, Some(&dst_path)).expect("开目标库");
+            let mut bulk = dst.begin_bulk();
+            let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(BATCH);
+            for rec in recs {
+                let v = rec.value.expect("include_deleted=false 不该交出 tombstone 行");
+                buf.push((rec.key, crate::common::pack_plain(&v)));
+                if buf.len() >= BATCH {
+                    bulk.put_batch_owned(std::mem::take(&mut buf));
+                    buf = Vec::with_capacity(BATCH);
+                }
+            }
+            if !buf.is_empty() {
+                bulk.put_batch_owned(buf);
+            }
+            bulk.finish();
+            let n = dst.begin().key_count(b"");
+            drop(dst);
+            n
+        }
+        fn hop_new(from: EngineKind, to: EngineKind, root: &std::path::Path) -> usize {
+            crate::tools::migrate(from, to, root, false, true)
+                .unwrap_or_else(|e| panic!("{}→{} 流式搬失败: {e}", from.as_str(), to.as_str()))
+                .verify_live
+        }
+
+        let root = tmp_dir("tools_migrate");
+        eprintln!("=== tools 搬运台架 rows={rows}（µs/行 + 常驻/峰值 MB）===");
+        {
+            let src = open_engine(EngineKind::Bitcask, Some(&path_for(EngineKind::Bitcask, &root)))
+                .expect("开源库");
+            for base in (0..rows).step_by(1000) {
+                let end = (base + 1000).min(rows);
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    (base..end).map(|i| (key(i), val(i))).collect();
+                let tx = src.begin();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("灌源库 batch_set 冲突 {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+            }
+            src.flush().unwrap();
+            src.checkpoint().unwrap();
+        }
+
+        let hops = [
+            (EngineKind::Bitcask, EngineKind::LsmTree),
+            (EngineKind::LsmTree, EngineKind::BPlusTree),
+            (EngineKind::BPlusTree, EngineKind::Bitcask),
+        ];
+        for (idx, (from, to)) in hops.into_iter().enumerate() {
+            let tag = format!("{}→{}", from.as_str(), to.as_str());
+            // 两臂交替在前：跳 0/2 先跑流式，跳 1 先跑老形状
+            let order: [&str; 2] = if idx % 2 == 0 {
+                ["流式", "物化Vec"]
+            } else {
+                ["物化Vec", "流式"]
+            };
+            for arm in order {
+                let streaming = arm == "流式";
+                let (d, live, peak, got) = timed(|| {
+                    if streaming {
+                        hop_new(from, to, &root)
+                    } else {
+                        old_shape_hop(from, to, &root)
+                    }
+                });
+                line(
+                    "tools",
+                    &format!("{tag} {arm}"),
+                    d.as_secs_f64() * 1e6 / rows as f64,
+                    "µs/行",
+                    live,
+                    peak,
+                    &format!("回读 {got} 行"),
+                );
+                assert_eq!(
+                    got, rows,
+                    "{tag} {arm}：目标回读 {got} 行 ≠ 源 {rows} 行 ⇒ 搬运少/多了行"
+                );
+            }
+        }
+
+        // 第四格：文件往返（生产走的那条：导出 bin → 导入 bin），只有流式一条臂
+        let file = root.join("snap.bin");
+        let (d, live, peak, ()) = timed(|| {
+            crate::tools::export_to_file(
+                EngineKind::Bitcask,
+                &root,
+                &file,
+                crate::tools::SnapshotFormat::Bin,
+                false,
+            )
+            .expect("导出 bin 失败");
+        });
+        line(
+            "tools",
+            "export bin(源=bitcask)",
+            d.as_secs_f64() * 1e6 / rows as f64,
+            "µs/行",
+            live,
+            peak,
+            &format!("文件 {:.1} MB", disk_bytes(&file) as f64 / 1e6),
+        );
+        let (d, live, peak, got) = timed(|| {
+            crate::tools::import_from_file(
+                EngineKind::LsmTree,
+                &root,
+                &file,
+                crate::tools::SnapshotFormat::Bin,
+                true,
+            )
+            .expect("导入 bin 失败")
+            .live
+        });
+        line(
+            "tools",
+            "import bin(目标=lsm)",
+            d.as_secs_f64() * 1e6 / rows as f64,
+            "µs/行",
+            live,
+            peak,
+            &format!("回读 {got} 行"),
+        );
+        assert_eq!(got, rows, "文件往返少/多了行：{got} ≠ {rows}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        eprintln!("TOOLS MIGRATE DONE");
+    }
+
     /// M62b：两条"单次调用"的跨档比值，把**结构计数**摆在一起看（`#[ignore]`，手动 release 单线程跑）。
     ///
     /// 为什么要单独一把尺子：复测表里 memory `seek_prev` 读 2.52×（17.8 → 44.8 µs/次）、
