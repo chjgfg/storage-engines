@@ -5030,7 +5030,7 @@ mod tests {
         eprintln!("TOOLS MIGRATE DONE");
     }
 
-    /// M62b：两条"单次调用"的跨档比值，把**结构计数**摆在一起看（`#[ignore]`，手动 release 单线程跑）。
+    /// M62b：**单次调用**的跨档比值，把**结构计数**摆在一起看（`#[ignore]`，手动 release 单线程跑）。
     ///
     /// 为什么要单独一把尺子：复测表里 memory `seek_prev` 读 2.52×（17.8 → 44.8 µs/次）、
     /// lsm `vacuum_bounded 一片` 读 2.21×（2.08 → 4.61 ms/片），而这两格在 `scale_baseline` 里都是
@@ -5041,6 +5041,9 @@ mod tests {
     /// - **lsm**：一片实际交出/访问多少行（`sst::light_visits`）、读了几块（`sst::block_reads`）、
     ///   开了几个文件（`common::disk::file_opens`）+ 盘上有几篇 SST。M29 那句"一片的预算行数是常数"要在这里当场可见，
     ///   而"每多一篇文件就多一次冷启动"那笔（M15b）必须落在**文件数/块数**上才算归因完成。
+    /// - **lsm `seek_prev`**（M78 阶梯加的那条臂）：大档阶梯里这一格 60 万 → 1000 万读 **28.5×**（391.5 →
+    ///   11150.2 µs/次）而行数只涨 16.7×，是四家里唯一"单次调用的钱自己在超线性涨"的格子 ⇒ 必须当场看
+    ///   步数/块数/开文件数有没有跟着涨，才能分清"结构（文件/层数）"还是"局部性"。
     ///
     /// 判据只看计数；µs 两轮取最小只用来把数字摆在一起（本机跨轮漂 1.3~1.9×）。
     ///
@@ -5134,6 +5137,48 @@ mod tests {
                     tx.commit();
                 }
                 db.flush().unwrap();
+                // lsm 的 seek_prev：阶梯里这一格从 391.5 µs/次（60 万）涨到 11150.2 µs/次（1000 万）= 28.5×，
+                // 而行数只涨 16.7× ⇒ 单次调用的钱自己在超线性涨。时间和"退了几把键 / 几次轻访问 / 读几块 /
+                // 开几个文件"钉在同一行，判据只看计数（本机跨轮墙钟漂 1.3~2.2×，µs 只用来把数字摆一起）。
+                {
+                    let mid = key(rows / 2);
+                    {
+                        let tx = db.begin();
+                        assert!(tx.seek_prev(&mid).is_some(), "seek_prev 必须命中中间那把键");
+                    }
+                    crate::common::disk::file_opens_clear();
+                    let st0 = crate::common::store::seek_prev_steps();
+                    let lv0 = crate::lsm_tree::sst::light_visits();
+                    let br0 = crate::lsm_tree::sst::block_reads();
+                    let bm0 = crate::lsm_tree::sst::block_misses();
+                    // 篇数要在**做这次 seek 之前**数：后面那次全库 vacuum 会重排文件，
+                    // 用它的读数归因这次的块数就是拿两把尺子相减。
+                    let files = std::fs::read_dir(dir.join("sst"))
+                        .map(|rd| rd.filter_map(|e| e.ok()).count())
+                        .unwrap_or(0);
+                    let mut best = f64::MAX;
+                    let mut last = f64::MAX;
+                    for _ in 0..2 {
+                        let t = std::time::Instant::now();
+                        for _ in 0..CALLS {
+                            let tx = db.begin();
+                            assert!(tx.seek_prev(&mid).is_some());
+                        }
+                        last = t.elapsed().as_secs_f64() * 1e6 / CALLS as f64;
+                        best = best.min(last);
+                    }
+                    let n = (CALLS * 2) as f64;
+                    let per = |v: u64| v as f64 / n;
+                    eprintln!(
+                        "[lsm rows={rows}] seek_prev：{best:.1} µs/次（另一轮 {last:.1}）｜ 盘上 {files} 篇 SST ｜ \
+                         步/次 = {:.2} ｜ 轻访问/次 = {:.2} ｜ 块/次 = {:.2}（其中未命中 {:.2}）｜ 开文件/次 = {:.2}",
+                        per(crate::common::store::seek_prev_steps() - st0),
+                        per(crate::lsm_tree::sst::light_visits() - lv0),
+                        per(crate::lsm_tree::sst::block_reads() - br0),
+                        per(crate::lsm_tree::sst::block_misses() - bm0),
+                        per(crate::common::disk::file_opens()),
+                    );
+                }
                 // 照台架的顺序：先做一次全库 vacuum（所以后面那片"裁 0 行"），再切有界的一片
                 let st = db.vacuum().unwrap();
                 let ssts = std::fs::read_dir(dir.join("sst"))
