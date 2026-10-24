@@ -327,6 +327,9 @@ pub fn search_window<S: VersionedStore>(
 
 /// 分页要的**那一页**：跳过 `skip` 行、留 `page_size` 行，外加"还有没有下一条"这一格证据。
 ///
+/// 只要窗口 ⇒ 走到第 `page_size + 1` 条就收手。**不要精确 `total` 的话别数它**（M75b：
+/// 要 total 就走 [`search_page_walk`] 的 `want_total = true`，一趟同时给数与页）。
+///
 /// 存在的理由（M51，复测抓到的一格）：`search_page` 以前是
 /// `search_window(limit = skip + page_size + 1)` 再切片 ⇒ **翻到末页要先把前面每一页都攒在堆上**。
 /// 600k 键的库翻到第 1200 页，瞬时峰值实测 **188 MB**（四家同形，比"一次全量 scan"的 123.7 MB 还高）。
@@ -340,6 +343,38 @@ pub fn search_page_rows<S: VersionedStore>(
     skip: usize,
     page_size: usize,
 ) -> (Vec<ExportRecord>, bool) {
+    let (items, has_more, _) =
+        search_page_walk(store, include_deleted, pattern, mode, skip, page_size, false);
+    (items, has_more)
+}
+
+/// **唯一一份**分页折叠：跳 `skip` 行、留 `page_size` 行，`want_total` 决定要不要顺手数完全界。
+///
+/// 判定口径与 [`count_window`] **一字不差**：`Missing` 不算；墓碑与过期行同待，只在
+/// `include_deleted` 时算一条。所以同一份库上 `total` 与旧的两步必然同数（有守卫对拍）。
+///
+/// 两条合同合成一条的理由（M75b）：以前 `need_total` 那格是"先取窗口、再 `count_window` 数全库"
+/// 两趟，实测 600k 档 ①只数 + ②只翻页 ≈ ③表里那一格（差 −3.7%~+5.3%）⇒ 同一次调用**走了两遍全库**。
+/// 合成一趟除了省掉一遍，还顺带没掉一条瑕疵：两趟之间库被别的线程写过，`total` 与 `items`
+/// 就来自两个瞬间。
+///
+/// ⚠️ 跳过的行**一次都不拷用户字节**：`keep` 只判"算不算一条"并把逻辑字节原样带下去，
+/// 只有落进这一页的那些才过 `logical_to_user`（断这个数的尺子是 `user_value_copies`）。
+///
+/// 返回 `(那一页, 还有没有下一条, 精确命中数)`；`want_total = false` 时第三个数**无意义**
+/// （提前收手了，只是"到目前为止交出的条数"）。
+///
+/// 为什么两支合成一个函数而不是两份：`page_size` 那一段判定（含"多一条当证据"）在两支里
+/// 必须永远一致，分两处写就是本仓库一路在防的那件事（M5a/M5b 的做法）。
+pub fn search_page_walk<S: VersionedStore>(
+    store: &S,
+    include_deleted: bool,
+    pattern: Option<&[u8]>,
+    mode: KeyMatchMode,
+    skip: usize,
+    page_size: usize,
+    want_total: bool,
+) -> (Vec<ExportRecord>, bool, usize) {
     let (lo, hi) = search_bounds(pattern, mode);
     let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
     let mut items: Vec<ExportRecord> =
@@ -348,25 +383,40 @@ pub fn search_page_rows<S: VersionedStore>(
     let mut has_more = false;
     // ⚠️ `wanted` 给 **`None`** 而不是 `skip + page_size + 1`：那才是"每轮固定一片候选"的门
     // （`fold_window_emit` 里 `budget` 的起点就是 `wanted`，给了它就是把整段前缀的候选
-    // 一次装进 `Vec` ⇒ 省下的留存又被候选买回来）。收手由 `emit` 返回 `false` 负责。
-    fold_window_emit(
+    // 一次装进 `Vec` ⇒ 省下的留存又被候选买回来）。收手由 `emit` 决定。
+    let total = fold_window_emit(
         None,
         |after, budget| store.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
-        |c| record_of(store, c.key, c.row, include_deleted),
-        |rec| {
+        // 这一层只判"算不算一条"，把逻辑字节原样带下去（不拷值）
+        |c| match store.materialize(c.row) {
+            RowValue::Missing => None,
+            RowValue::Tombstone => include_deleted.then_some((c.key, None)),
+            RowValue::Value(logical) => {
+                if crate::common::codec::logical_is_live(&logical) {
+                    Some((c.key, Some(logical)))
+                } else {
+                    // 过期与墓碑同待
+                    include_deleted.then_some((c.key, None))
+                }
+            }
+        },
+        |(key, logical)| {
             seen += 1;
             if seen <= skip {
-                return true; // 前面的页：**当场丢掉**，一行都不留
+                return true; // 前面的页：**当场丢掉**，一行都不留，更一次都不拷
             }
             if items.len() < page_size {
-                items.push(rec);
+                items.push(ExportRecord {
+                    key,
+                    value: logical.and_then(logical_to_user),
+                });
                 return true;
             }
-            has_more = true; // 第 `page_size + 1` 条 = 还有下一页
-            false
+            has_more = true; // 第 `page_size + 1` 条 = 还有下一页（要 total 时以 total 为准）
+            want_total // emit 返回 `false` 才收手：不要 total 就停，要 total 必须走完全界
         },
     );
-    (items, has_more)
+    (items, has_more, total)
 }
 
 /// 游标式有界扫描：`after`（**不含**）之后最多 `limit` 行可见记录，返回 `(行, 下一页游标)`；
@@ -503,32 +553,33 @@ pub fn count_window<S: VersionedStore>(
 
 /// 模式搜索 + 分页的**唯一一份实现**（M35：四家原先各抄一遍同形的 15 行）。
 ///
-/// `need_total` 那一条分支是全部的差别：
-/// - **不要 total**：只折窗口宽（`skip + page_size + 1`，多一条用来探"还有下一页"）。
-/// - **要 total**：改前是"把界内命中全部物化再 `len()`"⇒ 一次调用 O(库) 的堆占用。
-///   现在拆成两步：先 [`count_window`] 只数不物化拿到 `total`，再按窗口宽取那一页。
-///   取值那一段没省（过期判据住在 value 的信封里，不读值就判不了），省的是
-///   **整库的结果 `Vec` 与每行的用户字节拷贝** ⇒ 峰值从 O(库) 变成 O(页)。
+/// `need_total` 那一条分支是全部的差别，两支都走 [`search_page_walk`]（M75b 起只有一趟折叠）：
+/// - **不要 total**：`want_total = false` ⇒ 走到第 `page_size + 1` 条就收手。
+/// - **要 total**：`want_total = true` ⇒ 同一趟走完全界，`total` 与那一页来自**同一个瞬间**。
 ///
-/// ⚠️ 代价的一条：要 total 时"数"与"取页"是**两次折叠**。同一份库正被别的线程写时，`total` 与
-/// `items` 可能来自两个瞬间（旧形状一次折叠，两者必然同时）。事务视图不受影响 —— 它按快照读。
+/// ⚠️ 这一格以前是"两步"（先取窗口、再 `count_window` 数全库），实测 600k 档
+/// ①只数 + ②只翻页 ≈ ③表里那一格（差 −3.7%~+5.3%）⇒ 同一次调用**走了两遍全库**。
 pub fn search_page<S: VersionedStore>(store: &S, query: &SearchQuery) -> SearchPage {
     let page_size = query.page_size.max(1);
     let skip = query.page.saturating_mul(page_size);
     // M51：取那一页走**流式**（只留 `page_size` 行 + 一条"还有下一页"的证据），
-    // 不再把前面每一页都攒进 `Vec`。窗口那条"多要一条"的合同原样保留，只是-holder 的人换成了这里。
-    let (items, has_more) = search_page_rows(
+    // 不再把前面每一页都攒进 `Vec`。窗口那条"多要一条"的合同原样保留。
+    let (items, has_more, total) = search_page_walk(
         store,
         query.include_deleted,
         Some(query.pattern.as_slice()),
         query.mode,
         skip,
         page_size,
+        query.need_total,
     );
-    let total = query.need_total.then(|| {
-        count_window(store, query.include_deleted, Some(query.pattern.as_slice()), query.mode)
-    });
-    crate::common::search_page_build(items, query.page, page_size, total, has_more)
+    crate::common::search_page_build(
+        items,
+        query.page,
+        page_size,
+        query.need_total.then_some(total),
+        has_more,
+    )
 }
 
 // 测试专用：`seek_prev_with` 为了返回一行，往回退过几把键。

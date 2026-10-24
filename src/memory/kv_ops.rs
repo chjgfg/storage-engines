@@ -693,6 +693,15 @@ mod tests {
         let full = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE));
         let full_keys = fold_keys() - base;
 
+        // 尺子的对照臂（M75b）：`key_count` 走 [`crate::common::count_window`] = **一趟全界**，
+        // 是"数一个数最少要付多少"的现成基线。旧判据 `window_keys * 2 <= full_keys` 把这个
+        // 守卫要钉的东西写成了"**两趟**"（窗口一趟 + 计数一趟 = 2N），合成一趟之后它必然红 ⇒
+        // 换成"要 total 的成本 ≤ 那一趟全界 + 一页"。改回两步会读到 2 倍，这条就红。
+        let yard = mvcc.begin_transaction();
+        let base = fold_keys();
+        let counted = yard.key_count(b"user");
+        let count_keys = fold_keys() - base;
+
         assert_eq!(full.total, Some(N), "要 total 时语义与改前完全一致");
         assert_eq!(w.total, None, "没数就不许报一个数出来");
         assert_eq!(w.total_pages, None);
@@ -702,12 +711,15 @@ mod tests {
             "窗口必须是全量结果的前缀：分页语义一个字节都不许变"
         );
         assert!(w.has_next(), "后面还有 {} 条，必须报得出来", N - PAGE);
+        assert_eq!(counted, N, "对照臂数出来的条数不对 ⇒ 对照没建立，下面那条不算数");
         eprintln!(
-            "[search 窗口] 折了 {window_keys} 把键就拿回首页；要精确 total 折了 {full_keys} 把（N={N}）"
+            "[search 窗口] 折了 {window_keys} 把键就拿回首页；要精确 total 折了 {full_keys} 把；\
+             对照臂 `key_count` 一趟全界折 {count_keys} 把（N={N}）"
         );
         assert!(
-            window_keys * 2 <= full_keys,
-            "首页折了 {window_keys} 把 / 全量 {full_keys} 把 ⇒ 还在走全库"
+            full_keys <= count_keys + (2 * PAGE) as u64,
+            "要 total 折了 {full_keys} 把键，而『只数不取』那一趟全界只折 {count_keys} 把 ⇒ \
+             取页与数数还是各走一趟（M75b 合成一趟后这两个数应当同量）"
         );
 
         // 最后一面：探不到"多出来的那一条"就必须如实报"没有下一页"（既不许把"没数"

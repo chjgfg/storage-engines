@@ -618,19 +618,31 @@ mod tests {
             let full_cost = crate::lsm_tree::sst::light_visits() - vb;
             let full_blocks = crate::lsm_tree::sst::block_reads() - bb;
 
+            // 尺子的对照臂（M75b）：`key_count` 走 [`crate::common::count_window`] = **一趟全界**，
+            // 是"数一个数最少要付多少"的现成基线。旧判据 `window_cost * 2 <= full_cost` 把这个
+            // 守卫要钉的东西写成了"**两趟**"（窗口一趟 + 计数一趟），合成一趟之后它必然红 ⇒
+            // 换成"要 total 的成本 ≤ 那一趟全界 + 一页"。改回两步会读到近 2 倍，这条就红。
+            let yard = mvcc.begin_transaction();
+            let vb = crate::lsm_tree::sst::light_visits();
+            let counted = yard.key_count(b"user");
+            let count_cost = crate::lsm_tree::sst::light_visits() - vb;
+
             assert_eq!(full.total, Some(N), "要 total 时语义与改前完全一致");
             assert_eq!(w.total, None, "没数就不许报一个数出来");
             assert_eq!(w.total_pages, None);
             assert_eq!(w.items.len(), PAGE);
             assert_eq!(w.items, full.items, "窗口必须是同一页的全量结果：分页语义一个字节都不许变");
             assert!(w.has_next(), "后面还有 {} 条，必须报得出来", N - PAGE);
+            assert_eq!(counted, N, "对照臂数出来的条数不对 ⇒ 对照没建立，下面那条不算数");
             eprintln!(
-                "[search 窗口] 首页 {window_cost} 把键 / {window_blocks} 块；全量 {full_cost} 把 / {full_blocks} 块（N={N}）"
+                "[search 窗口] 首页 {window_cost} 把键 / {window_blocks} 块；全量 {full_cost} 把 / {full_blocks} 块；\
+                 对照臂 `key_count` 一趟全界 {count_cost} 把（N={N}）"
             );
 
             assert!(
-                full_cost > 0 && window_cost * 2 <= full_cost,
-                "首页付了 {window_cost} / 全量 {full_cost} ⇒ 还在走全库"
+                full_cost > 0 && full_cost <= count_cost + (2 * PAGE) as u64,
+                "要 total 走了 {full_cost} 把键，而『只数不取』那一趟全界只走 {count_cost} 把 ⇒ \
+                 取页与数数还是各走一趟（M75b 合成一趟后这两个数应当同量）"
             );
             // 块读也要跟着窗口走。**这条才是 M15b 的守卫**：上一行只数"归并吐出多少键",
             // 而旧的 `scan_latest_light_range` 先把每个源整篇物化 ⇒ 键数看着对了,块却读满全库

@@ -3058,6 +3058,16 @@ mod tests {
     /// 先给尺子作证：同一趟里 `scan_page(None, ROWS)`（真走收集门）必须读到 ≈ 全库 ——
     /// ⚠️ 我第一版的对照臂错用了 `prefix_scan`，它 M27 之后就逐片走了 ⇒ 读到 0，
     /// 看着像"没攒"其实是"门不在这条路上"（读数 0 有两种解释，M38/M44 就是这个坑）。
+    ///
+    /// **M75b 在这条守卫上加的两格**（`need_total` 从"两步"合成"一趟"之后）：
+    /// ① 用户字节只在这一页里才拷：末页读 `user_value_copies` 必须 ≤ 页宽+1。
+    ///    对照臂换成**同一扇门**的"一页装得下全库"那一格（读到 8000），⚠️ 我第一版又踩了一次
+    ///    同一个坑：拿 `scan_page` 作证 —— 它自己 `decode_value_meta` + `to_vec`，不经过
+    ///    `logical_to_user` ⇒ 读数 0 是"门不在这条路上"。
+    ///    变异：把 `seen <= skip` 那一支改成"照样剥壳" ⇒ 四家全红在 8000（＝这就是旧形状的量）。
+    /// ② 口径没分家：`total` 与 `key_count`（另一条只数不取的路）同数；`items`/`has_next`
+    ///    与 `without_total()` 同数；删 3 把之后末页行数必须与 `total − skip` 自洽
+    ///    （旧的两步里 `total` 与 `items` 来自两个瞬间，这种自洽是碰运气）。
     #[test]
     fn deep_search_pages_do_not_materialize_earlier_pages() {
         const ROWS: usize = 8000;
@@ -3115,6 +3125,59 @@ mod tests {
             assert_eq!(
                 held_p0, 0,
                 "{name}: 第 0 页也攒了 {held_p0} 行 ⇒ 流式门根本没生效"
+            );
+
+            // ---- M75b：要 total 的那条路现在是**一趟**折叠 ⇒ 用户字节只在这一页里才拷 ----
+            // 先给尺子作证：对照臂必须走**同一扇门**（`search_page_walk` 里那支 `logical_to_user`），
+            // 且形状要能读出大数 ⇒ 用"一页装得下全库"那一格。
+            // ⚠️ 第一版的对照臂错用了 `scan_page` —— 它自己解信封（`decode_value_meta` + `to_vec`），
+            // 根本不经过 `logical_to_user` ⇒ 读数 0 的解释是"门不在这条路上"而不是"没拷"
+            // （M38/M44 那个坑，读数 0 有两种解释）。
+            let base_probe = crate::common::user_value_copies();
+            let wide = tx.search_keys(&SearchQuery::prefix(b"k", 0, ROWS));
+            let probe_copies = crate::common::user_value_copies() - base_probe;
+            assert_eq!(wide.items.len(), ROWS, "{name}: 对照臂那一页没装下全库 ⇒ 对照没建立");
+            assert!(
+                probe_copies >= ROWS as u64,
+                "{name}: 拷值尺子在取页那扇门上只读到 {probe_copies} ⇒ 尺子没接上，下面的数不算"
+            );
+
+            let base_copies = crate::common::user_value_copies();
+            let pd_deep = tx.search_keys(&SearchQuery::prefix(b"k", last, PAGE));
+            let copies = crate::common::user_value_copies() - base_copies;
+            eprintln!(
+                "[深翻拷值] {name}: 末页(第 {last} 页)拷 {copies} 条；对照臂(一页装全库)拷 {probe_copies} 条\
+                 ＝跳过的行也剥壳那一臂的量（变异实测读回 {probe_copies}）"
+            );
+            assert_eq!(pd_deep.items, pd.items, "{name}: 同一份库两次取末页内容不一致");
+            assert!(
+                copies <= (PAGE + 1) as u64,
+                "{name}: 深翻末页拷了 {copies} 条用户值 ⇒ 又走回\"两趟全库\"或把跳过的行也拷了\
+                 （一趟折叠只该拷 ≤ 页宽+1 = {}）",
+                PAGE + 1
+            );
+            // 口径没分家：total 必须与"另一条只数不取的路"(`key_count` 走 `count_window`) 同数，
+            // 而 items 必须与"免 total"那条同数
+            assert_eq!(
+                pd.total,
+                Some(tx.key_count(b"k")),
+                "{name}: search 的 total 与 key_count 不同数 ⇒ 两条可见性判定分家了"
+            );
+            let nt = tx.search_keys(&SearchQuery::prefix(b"k", last, PAGE).without_total());
+            assert_eq!(nt.items, pd.items, "{name}: 要不要 total 取到了不同的页");
+            assert_eq!(nt.has_next, pd.has_next, "{name}: 两条路 has_next 分家");
+
+            // 墓碑也在同一条路上判：删 3 把之后 total 必须跟着掉（不是"数完再取"那两个瞬间的和）
+            for i in [0usize, PAGE, last * PAGE] {
+                assert!(tx.delete(format!("k{i:06}").as_bytes()), "{name}: 删 k{i} 失败");
+            }
+            let after = tx.search_keys(&SearchQuery::prefix(b"k", last, PAGE));
+            let tot = after.total.unwrap();
+            assert_eq!(tot, ROWS - 3, "{name}: 删 3 把后 total 没跟着掉");
+            assert_eq!(
+                after.items.len(),
+                tot - last * PAGE,
+                "{name}: 末页行数与 total 不自洽 ⇒ skip 与 total 不是同一趟算出来的"
             );
             tx.commit();
         }
@@ -4013,6 +4076,10 @@ mod tests {
     ///
     /// 每段两遍取最小（本机单样本 µs 不可信，M50/M62b 那条规矩）；内存列不看这里，标准表有。
     ///
+    /// **M75b 之后这张表怎么读**（改的是判据，不是台架）：①②③在同一次进程里跑 ⇒ 是**同构建 A/B**。
+    /// 旧形状 `③ ≈ ① + ②`（实测差 −3.7%~+5.3%，即"一次调用走两遍全库"）；合成一趟之后判据换成
+    /// **`③/① ≈ 1×`** —— 这一列打在哪一臂上，一眼就能看出是不是又分家成两趟了。
+    ///
     /// 跑法：`SCALE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 deep_page_stage_split`
     #[test]
     #[ignore = "深翻分段归因，手动 release 单线程跑：SCALE_ROWS=600000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 deep_page_stage_split"]
@@ -4125,11 +4192,12 @@ mod tests {
                  ③两者都要(表里那格) {t_both:>11.1}  ④游标一跳 {t_hop:>9.1}  ⑤key_count {t_count:>11.1}"
             );
             eprintln!(
-                "{:<10}   折算：①每键 {:.3} µs  ②每跳过行 {:.3} µs  ③=①+②? 差 {:.1}%  \
+                "{:<10}   折算：①每键 {:.3} µs  ②每跳过行 {:.3} µs  ③/① {:.2}×  ③=①+②? 差 {:.1}%  \
                  ④单页 {} 条(命中末页={})  ⑤数到 {} 键",
                 "",
                 (t_total - one_row.items.len() as f64 * 0.0) / rows as f64,
                 t_skip / (last_page * page_size) as f64,
+                if t_total > 0.0 { t_both / t_total } else { 0.0 },
                 if t_both > 0.0 {
                     (t_both - (t_total + t_skip)) / t_both * 100.0
                 } else {
