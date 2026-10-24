@@ -186,6 +186,16 @@ pub struct EngineConfig {
     /// 只有 `bplus` / `lsm` 有这个概念，给另外两家会在**打开时就失败**（不静默忽略）。
     /// 读回与覆盖率分母见 [`KvEngine::tuning`]。
     pub cache_auto_max: Option<usize>,
+    /// 缓存的**内存预算**（字节）；`None`/`Some(0)` = 不设，走各家默认。只有 `bplus`/`lsm`
+    /// 有这一档，给另外两家会在**打开时就失败**（不静默忽略）。
+    ///
+    /// 与 [`Self::cache_auto_max`] 的关系：**设了预算，自动档那道 `clamp(槽数, 地板, 顶)` 就不再参与** ——
+    /// 生效容量 = `min(库的槽数, 预算 ÷ 每槽真实常驻)`。预算既允许低于地板、也允许高于那道顶
+    /// （"给我 64 MB"不该被默认的 2048 页顶夹回 8 MB）。
+    /// ⚠️ 调用方**显式**给过容量（`max_cache_pages != 0` / `block_cache_auto_max == 0`）时预算只当天花板：
+    /// 两个数都是他定的，库不拿预算去抬他显式要的那一档。
+    /// 换算价签与"别买中间档"那条实测在 README 的缓存价签一节。
+    pub cache_budget_bytes: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -201,6 +211,7 @@ impl Default for EngineConfig {
             wal_checkpoint_bytes: None,
             vacuum_auto_slice_rows: None,
             cache_auto_max: None,
+            cache_budget_bytes: None,
         }
     }
 }
@@ -494,6 +505,39 @@ pub trait KvEngine: Send + Sync {
     /// 读回当前的自动档上限；语义同上，两家之外返回 [`EngineError::Unsupported`]。
     fn cache_auto_max(&self) -> Result<usize>;
 
+    /// 按**内存预算**给缓存档（M76，新增，带默认实现 ⇒ 非破坏）：
+    /// 引擎自己把字节换算成槽数（bplus 一页缓存槽实测 ≈ 6.8 KB、lsm 一块 ≈ 10.1 KB，
+    /// 都是**真实常驻**而不是名义块大小），返回换算后的**生效槽数**。
+    ///
+    /// 为什么要有这条：那两颗旧旋钮都以槽数计，而下游给的约束从来是字节
+    /// （"这进程还能住 32 MB"）。让他自己乘价签就会踩两种错：拿页的 4 KiB 去乘（⇒ 实际买到
+    /// 1.66 倍常驻），或忘了"抬顶之后覆盖率还不够就说不上省钱"。换算收进库里，
+    /// 并把"给的字节 / 生效槽数 / 分母"三格一起从 [`Self::tuning`] 报回去。
+    ///
+    /// - `bytes = 0` ⇒ **撤掉预算档**，回到自动档/显式档那条（默认行为，与不设一字不差）。
+    /// - 设了预算 ⇒ 自动档那道 `clamp(槽数, 地板, 顶)` 不再参与，生效容量 =
+    ///   `min(库的槽数, 预算 ÷ 每槽真实常驻)`；flush / compact / checkpoint 之后的重估继续按预算封顶。
+    ///   显式容量（`max_cache_pages != 0`）那条路上预算只当天花板，不拿它去抬调用方要过的数。
+    /// - `bitcask` / `memory` 没有这一档 ⇒ [`EngineError::Unsupported`]（默认实现，不静默"设置成功"）。
+    ///
+    /// ⚠️ 它不是"把缓存做大"的另一条路，而是**给上限定价**：要全库驻留就直接给够字节，
+    /// 中间那几档不买账（实测 8.4%→16.9% 覆盖率只换 −3% 单价，38%→100% 才换 −77%，见 README 价签一节）。
+    fn set_cache_budget_bytes(&self, bytes: u64) -> Result<usize> {
+        let _ = bytes;
+        Err(EngineError::Unsupported {
+            engine: self.name(),
+            op: "cache budget bytes",
+        })
+    }
+
+    /// 读回当前预算（字节）；`0` = 没设。两家之外返回 [`EngineError::Unsupported`]。
+    fn cache_budget_bytes(&self) -> Result<u64> {
+        Err(EngineError::Unsupported {
+            engine: self.name(),
+            op: "cache budget bytes",
+        })
+    }
+
     /// 落盘数据（内存引擎为 no-op）
     fn flush(&self) -> Result<()>;
 
@@ -741,6 +785,11 @@ pub fn open_engine_with<N: EngineName>(
     }
     if let Some(rows) = config.vacuum_auto_slice_rows {
         db.set_vacuum_auto_slice(rows);
+    }
+    if let Some(bytes) = config.cache_budget_bytes {
+        // 同 `cache_auto_max` 那一条的理由：`?` 是有意的 —— 给 memory/bitcask 配了预算档要**当场失败**，
+        // 不能让下游以为"我配过了"（那一档决定的是 RSS 上限，静默失效比报错危险得多）。
+        db.set_cache_budget_bytes(bytes)?;
     }
     Ok(db)
 }
@@ -1133,7 +1182,7 @@ macro_rules! impl_engine {
         }
     };
 
-    // ---- 缓存自动档上限分支（M32）----
+    // ---- 缓存自动档上限分支（M32）+ 内存预算档（M76）----
     (@cache_max yes) => {
         fn set_cache_auto_max(&self, n: usize) -> Result<()> {
             self.inner.set_cache_auto_max(n);
@@ -1143,8 +1192,17 @@ macro_rules! impl_engine {
         fn cache_auto_max(&self) -> Result<usize> {
             Ok(self.inner.cache_auto_max())
         }
+
+        fn set_cache_budget_bytes(&self, bytes: u64) -> Result<usize> {
+            Ok(self.inner.set_cache_budget_bytes(bytes))
+        }
+
+        fn cache_budget_bytes(&self) -> Result<u64> {
+            Ok(self.inner.cache_budget_bytes())
+        }
     };
     // 没有"缓存槽数"这个概念的引擎：明说 unsupported，别回"设置成功"
+    // （预算档走 trait 的默认实现，也是 Unsupported）
     (@cache_max no) => {
         fn set_cache_auto_max(&self, _n: usize) -> Result<()> {
             Err(EngineError::Unsupported {
@@ -2556,6 +2614,115 @@ mod tests {
             )
             .err()
             .unwrap_or_else(|| panic!("{name}: 带 cache_auto_max 打开要失败，不能静默忽略"));
+            assert!(
+                matches!(bad, EngineError::Unsupported { .. }),
+                "{name}: 要的是 Unsupported，实际 {bad}"
+            );
+        }
+
+        cleanup(dirs.into_iter().map(Some).collect());
+    }
+
+    /// 缓存**内存预算**这颗旋钮：两家里调得动、另外两家当场说不行（M76 的门面侧守卫）。
+    ///
+    /// 为什么门面层还要一条（与 [`cache_auto_max_knob_routes_to_two_engines_and_is_refused_by_the_other_two`]
+    /// 同一个理由）：`set_cache_budget_bytes` / `cache_budget_bytes` 走的是 `impl_engine!` 的
+    /// `@cache_max` 分支 + trait 默认实现 —— **分支标错不会编译失败**，而 `bitcask` 一旦走到默认实现
+    /// 之外拿到 `Ok(())`，下游就以为"我给这进程封了 32 MB"，实际一颗旋钮都没动。
+    /// 决定 RSS 上限的旋钮，静默失效比报错危险。
+    ///
+    /// 换算与"封顶被不被执行"**不在这里量**（那是各家自己的账，守卫是 bplus
+    /// `test_cache_budget_bytes_prices_slots_and_is_enforced` 与 lsm
+    /// `test_block_cache_budget_bytes_replaces_the_clamp_and_respects_explicit`）；这里只核两条路
+    /// （热调 / 带配置打开）都真的进了引擎，且读回来的是给的那个字节数。
+    #[test]
+    fn cache_budget_knob_routes_to_two_engines_and_is_refused_by_the_other_two() {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        for name in ["bplus_tree", "lsm_tree"] {
+            let dir = tmp_dir(&format!("cache_budget_{name}"));
+            dirs.push(dir.clone());
+            let db = open_engine(name, Some(&dir)).expect("默认档");
+            // 没设过预算 ⇒ 读回 0，而不是"看起来像个数"
+            assert_eq!(db.cache_budget_bytes().unwrap(), 0, "{name}: 默认档不该像设过预算");
+
+            // 热调：返回的是**换算后的生效槽数**，读回来的是**给的那个字节数**
+            let slots = db.set_cache_budget_bytes(32_000_000).expect("设预算不该报错");
+            assert!(slots > 0, "{name}: 32 MB 换算出 0 槽 ⇒ 价签或除法坏了");
+            assert_eq!(db.cache_budget_bytes().unwrap(), 32_000_000, "{name}: 预算没落到引擎里");
+            let t = db.tuning();
+            assert_eq!(
+                t.get("cache_budget_bytes"),
+                Some("32000000"),
+                "{name}: tuning 要看得见给的预算：{t}"
+            );
+            let cap_key = if name == "bplus_tree" { "max_cache_pages" } else { "block_cache_capacity" };
+            assert_eq!(
+                t.get(cap_key).unwrap().parse::<usize>().unwrap(),
+                slots,
+                "{name}: 返回的槽数与 tuning 里的生效容量不是同一个数 ⇒ 报的是别的门"
+            );
+
+            // 撤掉预算 ⇒ 读回 0（不许停在最后一次换算值上）
+            db.set_cache_budget_bytes(0).expect("撤预算不该报错");
+            assert_eq!(db.cache_budget_bytes().unwrap(), 0, "{name}: 撤掉之后要读回 0");
+            drop(db); // 同一个目录还要再开一次：锁要放开
+
+            // 带配置打开：那条路也必须真的进引擎（"以为配过了"是这个洞的形状）
+            let cfg_dir = tmp_dir(&format!("cache_budget_cfg_{name}"));
+            dirs.push(cfg_dir.clone());
+            let db2 = open_engine_with(
+                name,
+                Some(&cfg_dir),
+                &EngineConfig {
+                    cache_budget_bytes: Some(8_000_000),
+                    ..Default::default()
+                },
+            )
+            .expect("带预算打开");
+            assert_eq!(
+                db2.cache_budget_bytes().unwrap(),
+                8_000_000,
+                "{name}: 配置里的预算没进引擎"
+            );
+        }
+
+        // 没有"缓存槽数"这个概念的两家：热调与带配置打开都要**当场失败**
+        for name in ["bitcask", "memory"] {
+            let dir = tmp_dir(&format!("cache_budget_bad_{name}"));
+            dirs.push(dir.clone());
+            let db = open_engine(name, Some(&dir)).expect("默认档");
+            let e = db
+                .set_cache_budget_bytes(8_000_000)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: 设预算要报错，不能静默返回成功"));
+            assert!(
+                matches!(e, EngineError::Unsupported { engine, op }
+                    if engine == name && op == "cache budget bytes"),
+                "错误要指到具体的引擎与操作：{e}"
+            );
+            assert!(
+                matches!(db.cache_budget_bytes(), Err(EngineError::Unsupported { .. })),
+                "{name}: 读预算也要报同一个错"
+            );
+            assert!(
+                db.tuning().get("cache_budget_bytes").is_none(),
+                "{name}: 没有这一档就不该出现在清单里"
+            );
+            drop(db);
+
+            let cfg_dir = tmp_dir(&format!("cache_budget_cfg_bad_{name}"));
+            dirs.push(cfg_dir.clone());
+            let bad = open_engine_with(
+                name,
+                Some(&cfg_dir),
+                &EngineConfig {
+                    cache_budget_bytes: Some(8_000_000),
+                    ..Default::default()
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{name}: 带 cache_budget_bytes 打开要失败，不能静默忽略"));
             assert!(
                 matches!(bad, EngineError::Unsupported { .. }),
                 "{name}: 要的是 Unsupported，实际 {bad}"
@@ -4065,6 +4232,122 @@ mod tests {
              点读两把都填 ⇒ 实测 bplus 每页 走查 4.2 KB / 点读 6.8 KB（lsm 10.1 KB，姿势无关）。\
              给点读型下游定预算要用 point 那一读数，别按 4 KiB 估。"
         );
+    }
+
+    /// M76 的验收台架：按**内存预算**给缓存档之后，实测常驻必须真的**不超过给的那些字节**
+    /// （`#[ignore]`，手动 release 单线程跑）。
+    ///
+    /// 为什么这一格不能在单元守卫里量：守卫钉的是**槽数**（`容量 = 预算 ÷ 每槽价签`、封顶被执行），
+    /// 而"预算 = 内存上限"这句话的最终凭据是**真实字节** —— 那要 `mem_probe::live()`，
+    /// 它是进程级计数，并行用例互相污染（M27/M36/M52 各栽过一次），只能单线程 release 跑。
+    ///
+    /// 两把尺子必须对上，这才算机制而不是巧合：
+    /// ① 换算尺（守卫里）：`槽数 == 预算 ÷ 价签`；
+    /// ② 字节尺（这里）：`焐满之后 live 增量 ≤ 预算 × 1.25`，并顺带读出**这一档的每槽实测价** ——
+    ///   它比价签小 ⇒ 价签是保守的（宁少不多，符合"预算不许超"）；它比价签大 ⇒ 换算在超支，红。
+    ///
+    /// ```text
+    /// CACHE_BUDGET_ROWS=600000 CACHE_BUDGET_MB=32 CACHE_BUDGET_POSTURE=point cargo test --release --lib -- \
+    ///     --ignored --nocapture --test-threads=1 cache_budget_bytes_acceptance
+    /// ```
+    #[test]
+    #[ignore = "预算档验收：手动 release 单线程跑：CACHE_BUDGET_ROWS=600000 CACHE_BUDGET_MB=32 cargo test --release --lib -- --ignored --nocapture --test-threads=1 cache_budget_bytes_acceptance"]
+    fn cache_budget_bytes_acceptance() {
+        let rows: usize = std::env::var("CACHE_BUDGET_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600_000);
+        let budget_mb: u64 = std::env::var("CACHE_BUDGET_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+        let budget = budget_mb * 1_000_000;
+        let posture =
+            std::env::var("CACHE_BUDGET_POSTURE").unwrap_or_else(|_| "point".to_string());
+        fn key(i: usize) -> Vec<u8> {
+            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+        }
+        fn val(i: usize) -> Vec<u8> {
+            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+        }
+        let mb = |b: i64| b as f64 / 1024.0 / 1024.0;
+
+        eprintln!(
+            "=== 预算档验收 rows={rows} 预算={budget_mb} MB({budget} B) 姿势={posture} ==="
+        );
+        for kind in [EngineKind::BPlusTree, EngineKind::LsmTree] {
+            let label = kind.as_str();
+            let dir = tmp_dir(&format!("cache_budget_accept_{label}"));
+            let arg = match kind {
+                EngineKind::BPlusTree => Some(dir.join("bplus.db")),
+                _ => Some(dir.clone()),
+            };
+            let arg = arg.as_deref();
+            {
+                let db = open_engine(kind, arg).unwrap();
+                for base in (0..rows).step_by(1000) {
+                    let end = (base + 1000).min(rows);
+                    let items: Vec<(Vec<u8>, Vec<u8>)> =
+                        (base..end).map(|i| (key(i), val(i))).collect();
+                    let tx = db.begin();
+                    if let Err(bad) = tx.batch_set(&items) {
+                        panic!("{label}: batch_set 冲突 {}", String::from_utf8_lossy(&bad));
+                    }
+                    tx.commit();
+                }
+                db.flush().unwrap();
+                db.checkpoint().unwrap();
+            }
+            // 冷重开 ⇒ 缓存空着，量出来的才是"这一档买了多少字节"
+            let db = open_engine(kind, arg).unwrap();
+            // ⚠️ `order` 必须在取基线**之前**分配（M57 那条：晚分配就把它算进差值，每槽虚高 2.3 KB）
+            let order = shuffled(rows);
+            let slots = db.set_cache_budget_bytes(budget).expect("设预算不该报错");
+            let t = db.tuning();
+            let cap_key = if kind == EngineKind::BPlusTree { "max_cache_pages" } else { "block_cache_capacity" };
+            let cap: usize = t.get(cap_key).unwrap_or("0").parse().unwrap_or(0);
+            let denom: usize = t
+                .get(if kind == EngineKind::BPlusTree { "total_pages" } else { "sst_blocks" })
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            assert_eq!(cap, slots, "{label}: 返回的槽数与 tuning 里的生效容量不是同一个数");
+            let l0 = crate::mem_probe::live() as i64;
+            if posture == "point" {
+                let tx = db.begin();
+                for &i in &order {
+                    assert!(tx.get(&key(i)).is_some(), "{label}: 点读落空");
+                }
+            } else {
+                let mut after: Option<Vec<u8>> = None;
+                loop {
+                    let tx = db.begin();
+                    let (page, next) = tx.scan_page(after.as_deref(), 512);
+                    drop(page);
+                    match next {
+                        Some(n) => after = Some(n),
+                        None => break,
+                    }
+                }
+            }
+            let l1 = crate::mem_probe::live() as i64;
+            let held = l1 - l0;
+            eprintln!(
+                "{label:<10} [{posture}] 预算 {budget} B ⇒ 容量 {cap} 槽（分母 {denom}，覆盖率 {:.1}%）｜\
+                 焐满之后 live {:+.1} MB ⇒ **每槽实测 {:.0} B**（换算按价签，所以这一档只可能少买不可能多买）",
+                if denom > 0 { cap as f64 / denom as f64 * 100.0 } else { 0.0 },
+                mb(held),
+                if cap > 0 { held as f64 / cap as f64 } else { 0.0 },
+            );
+            assert!(
+                held <= (budget as i64) * 5 / 4,
+                "{label}: 给了 {budget} B 的预算，焐满之后实测住了 {held} B（>预算×1.25）⇒ \
+                 要么价签偏小、要么封顶没被执行 ⇒ 下游照这个数封 RSS 会爆",
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        eprintln!("CACHE BUDGET DONE");
     }
 
     /// M75 第一步：**只量不改** —— 标准表里 `search 末页(深翻)` 那 7.46 s 到底花在哪几段。

@@ -183,7 +183,27 @@ pub struct BPlusTree {
     /// 只剩 5.6% 覆盖率 ⇒ 每次点读都付一次未命中。调用方要么认这个预算、要么自己把顶抬起来
     /// （抬到 ≥ 总页数 = 把库复制进 RAM，价签在 README 里写着），但那个决定不该由库替他做。
     auto_max_pages: usize,
+    /// **内存预算档**（字节）：`0` = 不设预算（走 [`Self::auto_max_pages`] 那条）。
+    ///
+    /// 为什么用字节而不是槽数（M76）：下游给的约束就是字节（"这进程只能再住 32 MB"），
+    /// 而换算需要**每槽真实常驻** —— 一页名义 4 KiB，实测一个页缓存槽位连解析缓存一起住
+    /// [`CACHE_PAGE_RESIDENT_BYTES`]。换算只在这一处发生，`tuning()` 把"给的字节 / 换来的槽数 /
+    /// 生效槽数"三个数一起报回去，调用方不用自己乘价签。
+    cache_budget_bytes: u64,
+    /// 调用方**显式**给的那一档容量（自动档下它只是初值 [`AUTO_MIN_PAGES`]）。
+    ///
+    /// 为什么要留着：预算档会把生效容量压到它下面，撤掉预算之后得能回到调用方原本要的那个数 ——
+    /// 只读 `page_manager.cache_capacity()` 读到的是"被预算压过的生效值"，撤预算就撤不回去了。
+    explicit_pages: usize,
 }
+
+/// 一个页缓存槽位的**真实常驻**（字节）：实测 `cache_slot_resident_price`，600k 档、乱序点读姿势，
+/// 默认档那一臂 6 758 B/槽、抬顶后的边际 6 838 B/槽（走查姿势 4 264 B/槽 —— 取**大**的那档，
+/// 因为预算的含义是"不许超过这么多"，按小的换算会在点读型下游身上超支 1.6 倍）。
+///
+/// ⚠️ 这个数不是页的名义大小（4 KiB）：页缓存与解析缓存同源、上限一起长（见 [`BPlusTree::node_cache`]），
+/// 拿 4 KiB 换算会让常驻到预算的 1.66 倍（守卫 `cache_budget_bytes_*` 钉的就是这一格）。
+pub(crate) const CACHE_PAGE_RESIDENT_BYTES: u64 = 7_000;
 
 /// 自动档的下限：与旧的写死默认值一致 ⇒ 从"没旋钮"换到"自动档"不会让谁的工作集变小
 const AUTO_MIN_PAGES: usize = 1024;
@@ -250,6 +270,8 @@ impl BPlusTree {
             node_cache: std::collections::HashMap::new(),
             auto_cache: auto,
             auto_max_pages: AUTO_MAX_PAGES,
+            cache_budget_bytes: 0,
+            explicit_pages: ask,
         })
     }
 
@@ -301,10 +323,52 @@ impl BPlusTree {
         self.page_manager.flush_all();
         // 自动档要在每次刷盘后重新评估：库是会长大的，只在 open 时定一次容量，
         // 等于"导入完就再也没调过旋钮"—— 而那正是这次要修的那个洞。
-        if self.auto_cache {
-            let cap = auto_cache_pages(self.page_manager.next_page_id(), self.auto_max_pages);
-            self.page_manager.set_cache_capacity(cap);
-        }
+        self.reevaluate_cache_capacity();
+    }
+
+    /// 重算页缓存的**生效容量**：`min(自动档/显式档, 预算换算出的槽数)`，就地改上限、不重建缓存。
+    ///
+    /// 三处都走这一个函数（`flush_all`、抬自动档顶、设/撤预算），因为"预算"与"跟着库长的自动档"
+    /// 是两个正交的约束：只在其中一处应用，另一处一跑就会把预算冲掉（M22/M32 那条"设了没生效"）。
+    fn reevaluate_cache_capacity(&mut self) {
+        let base = if self.auto_cache {
+            auto_cache_pages(self.page_manager.next_page_id(), self.auto_max_pages)
+        } else {
+            self.explicit_pages
+        };
+        // 预算档（M76）：**它替换自动档那道 `clamp`，不是叠在它下面**。
+        // 语义 = "能装多少装多少，但一口字节都不许多"：`生效容量 = min(想装的槽数, 预算 ÷ 每槽真实常驻)`。
+        // 为什么不是 `min(自动档, 预算槽数)`：自动档那道夹是"没人给约束时"的默认政策（地板 1024、
+        // 顶 2048），调用方既然报了预算，那他就是那个约束 —— 拿 2048 页去夹会把"给我 64 MB"
+        // 悄悄变成"还是 8 MB"，而按价签那份预算明明装得下 9142 页。
+        // 反过来，调用方**显式**给过容量（非自动档）时预算只当天花板：两个都是他定的，不许抬。
+        let cap = if self.cache_budget_bytes > 0 {
+            let budget_pages = (self.cache_budget_bytes / CACHE_PAGE_RESIDENT_BYTES) as usize;
+            let want = if self.auto_cache {
+                self.page_manager.next_page_id() as usize
+            } else {
+                self.explicit_pages
+            };
+            want.min(budget_pages).max(1)
+        } else {
+            base
+        };
+        self.page_manager.set_cache_capacity(cap);
+    }
+
+    /// 按**内存预算**给缓存档（字节）。返回换算后的生效槽数，便于调用方当场核对。
+    ///
+    /// `0` = 撤掉预算档，回到自动档/显式档那条（与改前一字不差）。
+    /// 换算价签见 [`CACHE_PAGE_RESIDENT_BYTES`]：那是**实测的每槽真实常驻**，不是页的名义大小。
+    pub fn set_cache_budget_bytes(&mut self, bytes: u64) -> usize {
+        self.cache_budget_bytes = bytes;
+        self.reevaluate_cache_capacity();
+        self.page_manager.cache_capacity()
+    }
+
+    /// 调用方给的那一档字节（生效槽数看 [`BPlusTree::max_cache_pages`]）
+    pub fn cache_budget_bytes(&self) -> u64 {
+        self.cache_budget_bytes
     }
 
     /// 缓存策略读数：`(生效容量, 钉住的上层页数, 是否自动档)`
@@ -319,10 +383,7 @@ impl BPlusTree {
     /// 焐热的页全丢掉，自动档就变成"每次重估都自己清一次缓存"。
     pub fn set_cache_auto_max(&mut self, pages: usize) {
         self.auto_max_pages = pages.max(AUTO_MIN_PAGES);
-        if self.auto_cache {
-            let cap = auto_cache_pages(self.page_manager.next_page_id(), self.auto_max_pages);
-            self.page_manager.set_cache_capacity(cap);
-        }
+        self.reevaluate_cache_capacity();
     }
 
     /// 当前自动档上限（非自动档时它也返回，但不起作用 —— 与 `cache_policy()` 的口径一致）

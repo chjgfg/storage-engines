@@ -281,7 +281,20 @@ pub struct LSMTree {
     /// 一棵树按自己的块数改上限，会把同进程里另一棵树的驻留块换出去，那是净负收益。
     /// 共享缓存的容量由装配方（`cf.rs`）自己定。
     cache_shared: bool,
+    /// **内存预算档**（字节）；`0` = 不设预算（走 `block_cache_blocks` / `block_cache_auto_max` 那条）。
+    ///
+    /// 为什么用字节（M76）：下游的约束从来是"这进程还能住多少"，而此前两个旋钮都以**块数**计，
+    /// 按内存定档要自己乘价签 —— 价签是实测的 10.1 KB/块，不是块的名义大小（`sst_block_entries`
+    /// × 条目大小会变）。换算只在这一处发生，`tuning()` 把"给的字节 / 生效块数 / 分母"一起报回去。
+    cache_budget_bytes: u64,
 }
+
+/// 一个块缓存槽位的**真实常驻**（字节）：实测 `cache_slot_resident_price`，600k 档，
+/// 走查 10 130 B/槽、乱序点读 10 192 B/槽（两种姿势一字不差 ⇒ 块缓存没有 bplus 那种"解析缓存"
+/// 第二份账），向上取整到 10 400 留余量。
+///
+/// ⚠️ 预算的语义是"不许超过这么多"，所以换算宁少不多：`槽数 = 预算 ÷ 本值`。
+pub(crate) const BLOCK_SLOT_RESIDENT_BYTES: u64 = 10_400;
 
 struct BgCompactCtrl {
     stop: Arc<AtomicBool>,
@@ -373,6 +386,7 @@ impl LSMTree {
             bg: None,
             bulk_mode: false,
             cache_shared: false,
+            cache_budget_bytes: 0,
         };
 
         let manifest = db.manifest_path();
@@ -501,7 +515,7 @@ impl LSMTree {
     fn reevaluate_cache_capacity(&mut self) {
         let floor = self.opts.block_cache_blocks;
         let ceil = self.opts.block_cache_auto_max;
-        let target = if ceil == 0 || floor == 0 {
+        let base = if ceil == 0 || floor == 0 {
             // 关自动档：配置值就是生效值。地板 0 = 显式关缓存，上限不参与
             // （否则"关"会被自动档悄悄打开）
             floor
@@ -512,7 +526,36 @@ impl LSMTree {
         } else {
             self.sst_block_count().clamp(floor, ceil)
         };
+        // 预算档（M76）：**替换自动档那道 `clamp`，不是叠在它下面** ——
+        // `生效容量 = min(想装的块数, 预算 ÷ 每槽真实常驻)`。拿 `clamp(块数, 地板, 顶)` 去夹预算，
+        // "给我 64 MB"会被默认的 1024 块顶悄悄变成 7 MB。
+        // 调用方显式关了缓存（地板 0）时预算**不把缓存打开**；显式给过容量（顶 0）时预算只当天花板。
+        let target = if floor == 0 {
+            0
+        } else if self.cache_budget_bytes > 0 {
+            let budget_blocks = (self.cache_budget_bytes / BLOCK_SLOT_RESIDENT_BYTES) as usize;
+            let want = if ceil == 0 { floor } else { self.sst_block_count() };
+            want.min(budget_blocks).max(1)
+        } else {
+            base
+        };
         self.block_cache.lock().unwrap().set_capacity(target);
+    }
+
+    /// 按**内存预算**给块缓存档（字节）；返回换算后的生效块数。`0` = 撤掉预算档（回到改前那条）。
+    ///
+    /// 换算价签见 [`BLOCK_SLOT_RESIDENT_BYTES`]（实测每槽真实常驻，不是块的名义大小）。
+    /// 设了预算之后**自动档那道 `clamp` 不再参与**（预算替换它，见 [`Self::reevaluate_cache_capacity`]），
+    /// 而 flush / compact 之后的重估继续按预算封顶。
+    pub fn set_cache_budget_bytes(&mut self, bytes: u64) -> usize {
+        self.cache_budget_bytes = bytes;
+        self.reevaluate_cache_capacity();
+        self.block_cache.lock().unwrap().capacity()
+    }
+
+    /// 调用方给的那一档字节（生效块数看 [`Self::block_cache_capacity`]）
+    pub fn cache_budget_bytes(&self) -> u64 {
+        self.cache_budget_bytes
     }
 
     /// 把块缓存自动档的上限改成 `blocks`，并**就地**重估容量（`usize::MAX` = 不设顶）。

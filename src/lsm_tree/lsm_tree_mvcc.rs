@@ -415,6 +415,9 @@ impl MVCC {
         t.push("block_cache_capacity", kv.block_cache_capacity());
         // 分母（M32）：没有它，调用方看见"容量 1024"分不清是"顶撞上了"还是"库就这么点块"
         t.push("sst_blocks", kv.sst_block_count());
+        // 预算档（M76）：**给的字节**要报 —— 生效块数已经在 `block_cache_capacity` 那一格里了，
+        // 两个数同时在场，调用方才看得出"预算换算成了多少槽"以及"是不是被库自己的块数封顶了"。
+        t.push("cache_budget_bytes", kv.cache_budget_bytes());
         drop(kv);
         t.push("use_mmap", o.use_mmap);
         t.push("l0_compact_threshold", o.l0_compact_threshold);
@@ -433,6 +436,20 @@ impl MVCC {
 
     pub fn cache_auto_max(&self) -> usize {
         self.kv.lock().unwrap().options().block_cache_auto_max
+    }
+
+    /// 按**内存预算**给块缓存档（M76）：`bytes ÷ 每槽真实常驻` = 槽数上限，返回换算后的生效块数。
+    ///
+    /// `0` = 撤掉预算档（回到 `block_cache_blocks` / `block_cache_auto_max` 那条，与改前一字不差）。
+    /// 它与"抬顶"是两道正交的约束（取小），预算**允许压到地板以下**，且在 flush/compact 之后的
+    /// 重估里继续生效。存在的理由见 [`LSMTree::cache_budget_bytes`]。
+    pub fn set_cache_budget_bytes(&self, bytes: u64) -> usize {
+        self.kv.lock().unwrap().set_cache_budget_bytes(bytes)
+    }
+
+    /// 调用方给的那一档字节（生效块数 = `tuning()["block_cache_capacity"]`）
+    pub fn cache_budget_bytes(&self) -> u64 {
+        self.kv.lock().unwrap().cache_budget_bytes()
     }
 
     pub fn checkpoint(&self) {
@@ -1706,6 +1723,139 @@ mod tests {
             );
         }
         cleanup(&path);
+    }
+
+    /// M76 的守卫（LSM 一侧）：块缓存能按**内存预算（字节）**给档，而预算真的当约束。
+    ///
+    /// 与 bplus 那条同形，形状是 LSM 自己的：`sst_block_entries = 8` 造出 ≈26 块的小库，
+    /// 地板 4 / 顶 8 ⇒ 预算必须**既能压到地板以下**（它替换 `clamp(块数, 地板, 顶)` 那道夹，
+    /// 不是叠在下面）、**又能长到顶以上**（给够字节就全库驻留），同时
+    /// ① 不许把调用方**显式关掉**的缓存（地板 0）悄悄打开；
+    /// ② 不许抬他**显式定过**的容量（顶 0 那条路，预算只当天花板）；
+    /// ③ 撤预算（`0`）要回到没设过的那个默认封顶；
+    /// ④ 封顶要被真的执行（走完一轮，住着块数 ≤ 预算槽数）；
+    /// ⑤ 换算一格不差 —— 价签在这里**重述一遍**（10 400 B/槽），库里的常数被改小便红，
+    ///    而"改小"正是"按名义块大小乘 ⇒ 内存爆炸"那个事故形状。
+    #[test]
+    fn test_block_cache_budget_bytes_replaces_the_clamp_and_respects_explicit() {
+        const BLOCK_ENTRIES: usize = 8;
+        const FLOOR: usize = 4;
+        const CEIL: usize = 8;
+        const PRICE: u64 = 10_400;
+        // 200 把键 × 每块 8 条 ⇒ ≈26 块：地板 4、顶 8 都被它甩开，两个方向都量得动
+        const KEYS: usize = 200;
+        // 预算取"槽数 × 价签 + 一点余量"，让换算数是整数好核对
+        const SMALL: u64 = 20_000; // ⇒ 1 槽（比地板 4 还小）
+        const BIG: u64 = 500_000; // ⇒ 48 槽（比这块库的块数还大 ⇒ 全库驻留）
+
+        fn build(
+            tag: &str,
+            floor: usize,
+            ceil: usize,
+        ) -> (MVCC, std::path::PathBuf, Vec<Vec<u8>>) {
+            let path = tmp_db(tag);
+            let keys: Vec<Vec<u8>> = (0..KEYS).map(|i| format!("k{i:04}").into_bytes()).collect();
+            let opts = LSMTreeOptions {
+                sst_block_entries: BLOCK_ENTRIES,
+                block_cache_blocks: floor,
+                block_cache_auto_max: ceil,
+                ..LSMTreeOptions::for_mvcc()
+            };
+            let mvcc = MVCC::try_open_with(&path, Some(opts)).unwrap();
+            for base in (0..KEYS).step_by(20) {
+                let end = (base + 20).min(KEYS);
+                let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end)
+                    .map(|i| (keys[i].clone(), format!("v{i}").into_bytes()))
+                    .collect();
+                let tx = mvcc.begin_transaction();
+                if let Err(bad) = tx.batch_set(&items) {
+                    panic!("batch_set 冲突: {}", String::from_utf8_lossy(&bad));
+                }
+                tx.commit();
+                mvcc.flush();
+            }
+            (mvcc, path, keys)
+        }
+        let shape = |mvcc: &MVCC| -> (usize, usize) {
+            let kv = mvcc.kv.lock().unwrap();
+            (kv.sst_blocks_for_test(), kv.block_cache_capacity())
+        };
+        let held = |mvcc: &MVCC| -> usize { mvcc.kv.lock().unwrap().cached_blocks_for_test() };
+
+        // ── 自动档那条路（地板 4 / 顶 8）──
+        let (mvcc, path, keys) = build("budget_auto", FLOOR, CEIL);
+        let (blocks, cap_default) = shape(&mvcc);
+        assert!(blocks > CEIL * 2, "形状没造出来：{blocks} 块没把顶 {CEIL} 甩开 ⇒ 后面是空转");
+        assert_eq!(cap_default, CEIL, "没设预算就该是自动档封顶 {CEIL}");
+        assert_eq!(mvcc.cache_budget_bytes(), 0, "没设过预算要读回 0");
+
+        // ⑤② 小预算：替换那道夹 ⇒ 能压到地板 4 以下
+        let cap_small = mvcc.set_cache_budget_bytes(SMALL);
+        assert_eq!(cap_small, (SMALL / PRICE) as usize, "小预算换算不是「预算 ÷ 每槽价签」");
+        assert!(cap_small < FLOOR, "小预算 {cap_small} 没能压到地板 {FLOOR} 以下 ⇒ 预算没替换 clamp");
+        assert_eq!(mvcc.cache_budget_bytes(), SMALL, "给的字节要读得回来");
+        assert_eq!(
+            mvcc.tuning().get("cache_budget_bytes"),
+            Some(SMALL.to_string().as_str()),
+            "tuning 里看不见给的预算 = 调用方分不清「设过」与「设了没生效」"
+        );
+
+        // ④ 封顶真的被执行：小预算下走完一整轮，住着块数不得超过 1 槽
+        {
+            let tx = mvcc.begin_transaction();
+            for k in &keys {
+                assert!(tx.get(k).is_some(), "点读一把键落空");
+            }
+        }
+        let held_small = held(&mvcc);
+        assert!(
+            held_small <= cap_small,
+            "说容量 {cap_small} 块，走完一轮却住着 {held_small} 块 ⇒ 封顶只是名义"
+        );
+
+        // ③ 大预算：长到顶 8 以上（覆盖率 = 全库）
+        let cap_big = mvcc.set_cache_budget_bytes(BIG);
+        assert_eq!(cap_big, blocks.min((BIG / PRICE) as usize), "大预算换算不是 min(块数, 预算槽数)");
+        assert!(cap_big > CEIL, "给了 {BIG} B 却仍封顶 {CEIL} ⇒ 被自动档那道顶夹住");
+
+        // ③ 撤预算 ⇒ 回到没设过的那个默认数
+        assert_eq!(mvcc.set_cache_budget_bytes(0), CEIL, "撤掉预算要回到自动档默认 {CEIL}");
+        assert_eq!(mvcc.cache_budget_bytes(), 0, "撤掉之后要读回 0");
+        drop(mvcc);
+        let _ = std::fs::remove_dir_all(&path);
+
+        // ① 显式关掉缓存（地板 0）：预算**不许把它打开**
+        let (mvcc, path, _k) = build("budget_off", 0, CEIL);
+        assert_eq!(shape(&mvcc).1, 0, "地板 0 就该是关缓存");
+        assert_eq!(
+            mvcc.set_cache_budget_bytes(BIG),
+            0,
+            "调用方显式关了块缓存，预算把它打开了 ⇒ 「关」这个决定被库替客户改了"
+        );
+        drop(mvcc);
+        let _ = std::fs::remove_dir_all(&path);
+
+        // ② 显式容量（顶 0 ⇒ 自动档不参与）：预算只当天花板
+        let (mvcc, path, _k) = build("budget_explicit", 6, 0);
+        assert_eq!(shape(&mvcc).1, 6, "顶 0 ⇒ 生效容量应恒等于显式的 6 块");
+        assert_eq!(
+            mvcc.set_cache_budget_bytes(BIG),
+            6,
+            "调用方显式要过 6 块，大预算不许把它抬上去"
+        );
+        assert_eq!(
+            mvcc.set_cache_budget_bytes(SMALL),
+            cap_small,
+            "显式 6 块时小预算照样要压得下去（封顶 {cap_small}）"
+        );
+        eprintln!(
+            "[块缓存预算] 块数 {blocks}｜默认封顶 {CEIL}｜预算 {SMALL} B ⇒ {cap_small} 块（走完一轮住着 \
+             {held_small} 块）｜预算 {BIG} B ⇒ {cap_big} 块（顶没夹住）｜撤掉 ⇒ {CEIL}｜关缓存 ⇒ 0\
+             ｜显式 6 块：大预算 6 / 小预算 {cap_small}"
+        );
+        drop(mvcc);
+        // 台架自己造的目录要自己收掉 —— 这颗基座的临时现场没有 Drop 守卫，漏一次就积一次
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// WAL 阈值触发必须真的把文件截住（对照「关闭自动触发」），且截断之后重开仍能读到

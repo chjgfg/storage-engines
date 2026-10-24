@@ -361,6 +361,23 @@ impl MVCC {
         self.kv.lock().unwrap().cache_auto_max()
     }
 
+    /// 按**内存预算**给页缓存档（M76）：`bytes ÷ 每槽真实常驻` = 槽数上限，返回换算后的生效页数。
+    ///
+    /// 存在的理由：下游的约束一直是字节（"这进程只能再住 32 MB"），而此前能调的两个旋钮都以
+    /// **槽数**计（`max_cache_pages`、`cache_auto_max`），要按内存定档就得自己乘价签 ——
+    /// 而价签是实测的 6.8 KB/槽（点读姿势），不是页的名义 4 KiB；按 4 KiB 乘会把常驻买到 1.66 倍。
+    ///
+    /// `0` = 撤掉预算档（回到自动档/显式档，与改前一字不差）。预算**允许压到自动档地板 1024 以下**，
+    /// 且在每次刷盘后的重估里继续生效（`BPlusTree::reevaluate_cache_capacity` 是三个入口共用的那一个）。
+    pub fn set_cache_budget_bytes(&self, bytes: u64) -> usize {
+        self.kv.lock().unwrap().set_cache_budget_bytes(bytes)
+    }
+
+    /// 调用方给的那一档字节（生效页数 = [`Self::max_cache_pages`]）
+    pub fn cache_budget_bytes(&self) -> u64 {
+        self.kv.lock().unwrap().cache_budget_bytes()
+    }
+
     /// 钉住预算（M49）：上层页可以占多少容量。`0` = 一页都不钉，叶子拿到全部容量。
     /// 生效值还要与容量的一半取小，见 [`BPlusTree::set_pin_budget_pages`]。
     pub fn set_pin_budget_pages(&self, pages: usize) {
@@ -396,6 +413,9 @@ impl MVCC {
         t.push("total_pages", tree.next_page_id() as usize);
         t.push("cache_pin_budget", tree.pin_budget_pages());
         t.push("cache_pin_limit", tree.pin_limit_pages());
+        // 预算档（M76）：**给的字节**与**换算出的槽数**都要报 —— 只报其中一个，调用方就分不清
+        // "预算太小装不下几页"与"价签乘错了"。`0` = 没设预算（走自动档/显式档）。
+        t.push("cache_budget_bytes", tree.cache_budget_bytes());
         drop(tree);
         t
     }
@@ -2849,6 +2869,140 @@ mod tests {
                  {warm_default}（缺 {warm_default_miss}）| 抬到不设顶后容量 {cap1}，焐热一趟再走一趟落盘 \
                  {raised_reads}（缺 {raised_miss}）；住着 {resident_before} → {resident_after} 页\
                  （钉住 {pinned}，没重建）"
+            );
+        }
+        cleanup(&path);
+    }
+
+    /// M76 的守卫：缓存档可以**按内存预算（字节）**给，而预算真的当约束 —— 不是又一颗"记了个数"的旋钮。
+    ///
+    /// 存在的理由：这台基座要住的机器给的是**字节**约束（"这进程还能住 32 MB"），而此前能调的两颗
+    /// 旋钮都以槽数计 ⇒ 下游要自己乘价签。价签是实测的 **≈ 6.8 KB/槽**（乱序点读姿势，页缓存连
+    /// 解析缓存一起算），不是页的名义 4 KiB —— 按 4 KiB 乘会把常驻买到 **1.66 倍**，正是"内存爆炸"那个方向。
+    ///
+    /// 六格各抓一种退化（少一格就有一种溜过去）：
+    /// ① 没设预算时读回 `0`（不许看起来像设过）；
+    /// ② 小预算换算 = `预算 ÷ 每槽价签`，且**替换**自动档那道 `clamp` ⇒ 能落到地板 1024 以下
+    ///    （否则"只准住 2 MB"被地板吃掉）；
+    /// ③ 大预算能长到顶 2048 **以上**（否则"给我 30 MB"被那道顶夹回 8 MB）；
+    /// ④ 撤预算（`0`）回到**没设过的那个默认数** 2048，不是停在最后一次换算值上；
+    /// ⑤ 显式容量那条路上预算**只当天花板**：大预算不许抬调用方定过的 500，小预算照样压得下去；
+    /// ⑥ 容量真的被执行：小预算下走完一整轮点读，**住着页数 ≤ 预算槽数**（否则封顶只是名义）。
+    #[test]
+    fn test_cache_budget_bytes_prices_slots_and_is_enforced() {
+        const ROWS: usize = 1300; // 与上一条同一形状：一把键 ≈ 3.3 KB ⇒ 页数跟着行数长
+        /// 换算尺子在这里**重述一遍**价签：库里的常数被改小便红 —— 那正是"按名义页大小乘"的事故形状
+        const PRICE: u64 = 7_000;
+        let path = tmp_db("cache_budget");
+        {
+            let mvcc = MVCC::open(&path, 64, 0);
+            let pad = vec![b'k'; 3300];
+            let keys: Vec<Vec<u8>> = (0..ROWS)
+                .map(|i| {
+                    let mut key = format!("k{i:06}_").into_bytes();
+                    key.extend_from_slice(&pad);
+                    key
+                })
+                .collect();
+            for key in &keys {
+                let tx = mvcc.begin_transaction();
+                assert!(tx.set(key, b"v".to_vec()), "灌一把键失败");
+                tx.commit();
+            }
+            mvcc.flush();
+            let total = mvcc.kv.lock().unwrap().next_page_id() as usize;
+            assert!(
+                total > 2048,
+                "形状没造出来：{total} 页 ≤ 默认顶 ⇒ ③④都是空转（要重挑 ROWS/键长）"
+            );
+            let resident = |mvcc: &MVCC| -> usize { mvcc.kv.lock().unwrap().cached_pages_for_test() };
+            let sweep = |mvcc: &MVCC| {
+                let tx = mvcc.begin_transaction();
+                for key in &keys {
+                    assert!(tx.get(key).is_some(), "点读一把键读不到");
+                }
+                drop(tx);
+            };
+
+            // ① 默认：自动档封顶 2048，且预算读回 0
+            assert_eq!(mvcc.cache_policy().0, 2048, "没设预算就该是自动档的 2048");
+            assert_eq!(mvcc.cache_budget_bytes(), 0, "没设过预算要读回 0");
+
+            // ② 小预算：换算 285 槽，必须压到地板 1024 以下
+            let small: u64 = 2_000_000;
+            let cap_small = mvcc.set_cache_budget_bytes(small);
+            assert_eq!(
+                cap_small,
+                (small / PRICE) as usize,
+                "小预算的换算不是「预算 ÷ 每槽价签」（{small} / {PRICE}）"
+            );
+            assert!(
+                cap_small < 1024,
+                "小预算 {cap_small} 页没能压到自动档地板 1024 以下 ⇒ 预算没替换那道 clamp"
+            );
+            assert_eq!(mvcc.cache_budget_bytes(), small, "给的字节要读得回来");
+            assert_eq!(
+                mvcc.tuning().get("cache_budget_bytes"),
+                Some(small.to_string().as_str()),
+                "tuning 里必须看得见给的预算，否则调用方分不清「设过」与「设了没生效」"
+            );
+
+            // ⑥ 封顶真的被执行：冷重开之后走完一轮，住着页数不得超过预算槽数
+            drop(mvcc);
+            let mvcc = MVCC::open(&path, 64, 0);
+            assert_eq!(
+                mvcc.cache_budget_bytes(),
+                0,
+                "预算是**会话级**旋钮：重开之后不该带着上次的值（带着就等于库替进程记了个数）"
+            );
+            mvcc.set_cache_budget_bytes(small);
+            sweep(&mvcc);
+            let held = resident(&mvcc);
+            assert!(
+                held <= cap_small,
+                "预算档说容量 {cap_small} 页，走完一轮却住着 {held} 页 ⇒ 容量只是名义，封顶没被执行"
+            );
+
+            // ③ 大预算：长到顶 2048 以上（覆盖率 = min(总页数, 预算槽数)）
+            let big: u64 = 30_000_000;
+            let cap_big = mvcc.set_cache_budget_bytes(big);
+            assert_eq!(
+                cap_big,
+                total.min((big / PRICE) as usize),
+                "大预算的换算不是「min(总页数, 预算 ÷ 价签)」：总页数 {total}、预算槽 {} 页",
+                (big / PRICE) as usize
+            );
+            assert!(
+                cap_big > 2048,
+                "给了 {big} B 却只配 2048 页 ⇒ 预算被自动档那道顶夹住了（实际 {cap_big}）"
+            );
+
+            // ④ 撤预算 ⇒ 回到没设过的那个默认数
+            assert_eq!(
+                mvcc.set_cache_budget_bytes(0),
+                2048,
+                "撤掉预算（0）必须回到自动档默认 2048，不许停在最后一次换算值上"
+            );
+            assert_eq!(mvcc.cache_budget_bytes(), 0, "撤掉之后要读回 0");
+
+            // ⑤ 显式容量那条路：预算只当天花板，不抬已经定过的数
+            drop(mvcc);
+            let mvcc = MVCC::open(&path, 64, 500);
+            assert_eq!(mvcc.cache_policy().0, 500, "显式容量 500 页没生效");
+            assert_eq!(
+                mvcc.set_cache_budget_bytes(big),
+                500,
+                "调用方显式要过 500 页，大预算不许把它抬上去"
+            );
+            assert_eq!(
+                mvcc.set_cache_budget_bytes(small),
+                cap_small,
+                "显式容量 500 页时小预算照样要压得下去（封顶 285）"
+            );
+            eprintln!(
+                "[缓存预算] 总页数 {total}｜默认 2048｜预算 {small} B ⇒ {cap_small} 页\
+                 （走完一轮住着 {held} 页，≤ 封顶）｜预算 {big} B ⇒ {cap_big} 页（顶 2048 没夹住它）\
+                 ｜撤掉 ⇒ 2048｜显式 500 页时：大预算仍是 500、小预算 {cap_small}"
             );
         }
         cleanup(&path);

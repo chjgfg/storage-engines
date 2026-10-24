@@ -136,7 +136,8 @@ let db = open_from_env()?;
 | `bitcask_max_file_bytes` | `None`(= 64 MiB) | 只有 `bitcask` | active 分片软上限,决定 rotate 与 `merge()` 的粒度 |
 | `wal_checkpoint_bytes` | `None`(= 16 MiB) | 三个磁盘引擎 | 涨过就在下一次提交后自动 checkpoint;`Some(0)` = 关闭 |
 | `vacuum_auto_slice_rows` | `None`(= 16 Ki 行) | 四引擎 | 自动回收切片宽度;`Some(0)` = 关闭 |
-| `cache_auto_max` | `None`(= bplus 2048 页 / lsm 1024 块) | `bplus_tree` + `lsm_tree` | **自动档的顶**(单位是各家的槽位:bplus = 4 KiB 页、lsm = SST 块)。`Some(usize::MAX)` = 不设顶 ⇒ 自动档就等于"跟着库长",代价是把库复制进 RAM(bplus 200k 行 ≈ 47 MB、lsm 600k 档全驻留 ≈ 18.7 MB)。热调 `KvEngine::set_cache_auto_max` / 读回 `cache_auto_max`（M32）；**给另外两家会在打开时就返回 `Unsupported`**,不静默"设置成功" |
+| `cache_auto_max` | `None`(= bplus 2048 页 / lsm 1024 块) | `bplus_tree` + `lsm_tree` | **自动档的顶**(单位是各家的槽位:bplus = 4 KiB 页、lsm = SST 块)。`Some(usize::MAX)` = 不设顶 ⇒ 自动档就等于"跟着库长",代价是把库复制进 RAM(bplus 600k 档全驻留实测 **237.2 MB**、lsm 600k 档 **90.8 MB** —— ⚠️ M57 之前这里写的"18.7 MB"是拿错了档,那是 40 000 键那一档)。热调 `KvEngine::set_cache_auto_max` / 读回 `cache_auto_max`（M32）；**给另外两家会在打开时就返回 `Unsupported`**,不静默"设置成功" |
+| `cache_budget_bytes` | `None`(= 不设预算) | `bplus_tree` + `lsm_tree` | **按内存预算给缓存档**(字节,M76)。生效容量 = `min(库的槽数, 预算 ÷ 每槽真实常驻)` —— 价签是实测的 **bplus 7 000 B/页、lsm 10 400 B/块**(不是页/块的名义大小:每个 bplus 槽同时住着原始页与解析出来的节点,拿 4 KiB 乘会把常驻买到 1.66 倍)。设了预算,`cache_auto_max` 那道 `clamp` 就不再参与(既允许低于地板 1024 页,也允许高于顶 2048 页);`0` = 撤掉,回到默认。热调 `KvEngine::set_cache_budget_bytes(bytes) -> Result<usize>`(交回换算后的生效槽数)/ 读回 `cache_budget_bytes`;`tuning()` 报 `cache_budget_bytes` + 生效容量 + 分母。**给另外两家当场 `Unsupported`** |
 
 ```rust
 use storage_engines::{open_engine_with, EngineConfig, LSMTreeOptions};
@@ -2550,13 +2551,30 @@ M22/M23/M32/M49 把缓存顶的决定权交给了调用方，但**只给了旋�
 
 **② 公式（照着填）**
 
+⚠️ **M76 起这条换算已经进了库**：给字节就行 —— `EngineConfig.cache_budget_bytes = Some(32_000_000)`
+或运行中 `db.set_cache_budget_bytes(32_000_000)?`（交回换算后的**生效槽数**）。库里用的价签就是下面的
+**bplus 7 000 B/页、lsm 10 400 B/块**（比 ① 的实测边际价 6 838 / 10 122 略高 ⇒ 宁少不多，因为预算的语义是"不许超过"）。
+**实测验收**（新台架 `cache_budget_bytes_acceptance`，release，600k 档、点读姿势）：
+
+| 给的预算 | bplus 槽 / 覆盖率 / 实测常驻 | lsm 槽 / 覆盖率 / 实测常驻 |
+|---|---|---|
+| 32 MB | 4 571 / 12.6% / **+27.7 MB** | 3 076 / 32.7% / **+29.8 MB** |
+| 256 MB | 36 393 / **100%** / +237.3 MB | 9 397 / **100%** / +90.8 MB |
+
+⇒ 两臂实测常驻都**不超过给的字节**（断言界 = 预算 × 1.25）；256 MB 那一臂每槽实测 6 836 B / 10 130 B，
+与 ① 那把独立台架的 6 838 / 10 122 差 0.03% / 0.08% —— 换算用的常数由此对上。
+手工公式留着是为了**核对**，以及给"我要精确知道买了多少覆盖率"的场合：
+
 ```text
 bplus：页数 cap  = 预算字节 ÷ 6 800      （纯走查/批量扫可除 4 300）
         叶子槽   = cap − min(1024, cap ÷ 2)   ← 上层页钉住、不参与换出（M49：这格非单调，别指望调小它就住满）
         覆盖率   = cap ÷ tuning()["total_pages"]
 lsm：  块数      = 预算字节 ÷ 10 100
         覆盖率   = tuning()["block_cache_capacity"] ÷ tuning()["sst_blocks"]
-入口：`EngineConfig.cache_auto_max`（打开时就带上）或 `KvEngine::set_cache_auto_max`（运行中抬，不重建缓存）。
+入口：预算档 `EngineConfig.cache_budget_bytes` / `KvEngine::set_cache_budget_bytes`（M76，**按字节**，两道顶取小里它最新）；
+      槽数档 `EngineConfig.cache_auto_max`（打开时就带上）或 `KvEngine::set_cache_auto_max`（运行中抬，不重建缓存）。
+      ⚠️ 设了预算档，`cache_auto_max` 那道 `clamp` 就不再参与（预算既允许低于地板 1024 页、也允许高于默认顶 2048 页）；
+      两条都是"调用方显式定过容量"时预算**只当天花板**，不拿它去抬已经定过的数。
       ⚠️ 分母自己读，别照抄下面的表：12 129 / 36 393 页、3 127 / 9 397 块只对"键 38 B + 值 56 B"这个形状成立。
 ```
 
@@ -2587,8 +2605,10 @@ lsm：  块数      = 预算字节 ÷ 10 100
 1. **别买中间档。** 单价 ≈ 命中地板（~8 µs）+ 未命中率 × 一次未命中价（25~94 µs）⇒ 实测把覆盖率从 8.4% 抬到 16.9% 只换来 **3%**（bplus），
    而从 38% 抬到 100% 换来 **−77%**（lsm）。**要么认默认地板，要么一次给到覆盖率 ≥ 90%，中间那截是白花。**
 2. **1 核 6 GB 的机器**：全驻留负担得起（lsm 600k = 90.8 MB；bplus 600k 点读姿势 = 237 MB，占 6 GB 的 3.7%）
-   ⇒ 这种机器上默认档**太省**，建议直接"不设顶"（`cache_auto_max = usize::MAX`），把 ④ 那 −77% 拿到手。
-3. **RSS ≤ 80 MB 的下游（twosync 那一档）做不到的就说做不到**：lsm 只有 200k 库能全驻留（30.1 MB）；600k 库全驻留 90.8 MB 已经越顶 ⇒ 最多给 ~6 600 块（64 MB，覆盖率 70%）。
+   ⇒ 这种机器上默认档**太省**，建议直接给够字节：`cache_budget_bytes = 256_000_000`（M76 起这一档按预算给，
+   不必再算"要多少槽"、也不必 `cache_auto_max = usize::MAX` 那种"不设顶"写法），把 ④ 那 −77% 拿到手。
+3. **RSS ≤ 80 MB 的下游（twosync 那一档）做不到的就说做不到**：给 `cache_budget_bytes = 64_000_000` 就是
+   明码上限 —— lsm 只有 200k 库能全驻留（30.1 MB）；600k 库全驻留 90.8 MB 已经越顶 ⇒ 64 MB 只买 6 153 块（覆盖率 70%）。
    bplus 在 80 MB 顶下**做不到全驻留**（200k 库点读姿势就要 78.3 MB，600k 要 237 MB）⇒ 可行姿势是"默认档 + 把随机点读换成顺序读"：
    `scan_page` 每行 **2.7 µs**，而乱序点读 **29.7~45 µs/次**，差一个数量级（这不是缓存能补的，是访问形状）。
 4. ⚠️ **这是堆活字节，不是 RSS，也不是引擎常驻的全部**：`live()` 不含运行时/栈/mmap；预算里还要放
