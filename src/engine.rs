@@ -4803,6 +4803,8 @@ mod tests {
             let (d, live, peak, ms) = timed(|| migrate(&*db, &*target, 1000).unwrap());
             line(label, "migrate → memory", d.as_secs_f64() * 1e6 / rows.max(1) as f64, "µs/行", live, peak,
                  &format!("搬 {} 行 / {} 页 / {} B", ms.rows, ms.pages, ms.bytes));
+            // ⚠️ 极端档假红：2000 万行 lsm 从 set_with_ttl 到 migrate 结束 >60 min，那 1000 个
+            // TTL 键（排在键序最末）已过期、被 scan 正确过滤 ⇒ ms.rows 少 1000；引擎对，是这句 `want` 不 scale-safe。
             assert_eq!(ms.rows, want, "{label}: migrate 搬走的行数必须等于源库 live_keys（少了=游标或过滤有洞）");
             let bulk_rows = (rows / 10).max(1);
             let (d, live, peak, ()) = timed(|| {
