@@ -5072,12 +5072,31 @@ mod tests {
             line(label, "vacuum_bounded 一片", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("扫 {} 行、裁 {} 行（预算 2048）", vr.stats.rows_scanned, vr.stats.versions_removed));
 
-            let (d, live, peak, ()) = timed(|| {
-                db.flush().unwrap();
-                let _ = db.merge();
-            });
+            // M81（方案第 2 项）：`flush+merge` 拆成 `flush` + `merge` 两格。
+            // 原先合成一格时 bitcask 那一格里几乎全是 merge（`docs/test.txt`：5M 同格 21.4s，
+            // 而 bplus 同格 18.5µs ⇒ flush 那一半在 bitcask 上是零头）。拆格本身一秒不省，
+            // 它的作用是让"merge 已从 vacuum 拆出去"那笔省下的时间在下一格露出来。
+            let (d, live, peak, ()) = timed(|| db.flush().unwrap());
+            let disk_after_flush = if kind == EngineKind::Memory { 0 } else { disk_bytes(arg.unwrap()) };
+            line(label, "flush", d.as_secs_f64() * 1e6, "µs/次", live, peak,
+                 &format!("磁盘 {:.1} MB", disk_after_flush as f64 / 1e6));
+
+            let (d, live, peak, m) = timed(|| db.merge());
+            // ⚠️ M43 那条铁律在这儿落地：`Unsupported` 是"本引擎没有这一步"，其余错**不许吞**——
+            // merge 失败意味着引擎已进入隔离态，后面每一格的读数都是假的，必须当场红。
+            if let Err(e) = &m {
+                assert!(
+                    matches!(e, EngineError::Unsupported { .. }),
+                    "{label}: merge 失败（此后引擎处于隔离态，后面的格子全是假读数）: {e}"
+                );
+            }
             let disk2 = if kind == EngineKind::Memory { 0 } else { disk_bytes(arg.unwrap()) };
-            line(label, "flush+merge", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("磁盘 {:.1} MB", disk2 as f64 / 1e6));
+            let note = if m.is_err() {
+                "（本引擎无 merge）".to_string()
+            } else {
+                format!("磁盘 {:.1} MB（merge 前 {:.1}）", disk2 as f64 / 1e6, disk_after_flush as f64 / 1e6)
+            };
+            line(label, "merge", d.as_secs_f64() * 1e6, "µs/次", live, peak, &note);
 
             // ---- bulk 导入（另一条写路径：无 WAL、无冲突检测） ----
             // ---- 物化全库的出口：`Vec` 有多大、峰值多少 MB，就是这条的意义 ----

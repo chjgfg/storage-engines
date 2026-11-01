@@ -94,7 +94,20 @@ impl Maintenance {
         let full = self.config.full_vacuum_interval
             .is_some_and(|interval| now.saturating_duration_since(self.last_full) >= interval);
         let result = if full {
-            db.vacuum().map(|stats| crate::VacuumRound { stats, next_cursor: None })
+            // M81（方案第 2 项）之后 `vacuum()` 不再自带 merge ⇒ 全库收尾要自己补上那一步：
+            // bitcask 硬删除腾出的空间只有 merge 才归还，而维护器的合同就是"长跑不靠调用方记得
+            // 做维护"（`full_maintenance_waits_for_interval_and_active_reader` 钉的就是日志字节）。
+            // 其余三家 merge 回 `Unsupported` —— 那是"本引擎没有这一步"，不是失败，不许记成错误。
+            // 次数上这一刀是**净减**：改前每一次全库 vacuum 都附送一次整库重写，现在只在
+            // 全库收尾里做一次，且 bounded 轮（长跑的常态）一次都不付。
+            db.vacuum().and_then(|stats| {
+                let round = crate::VacuumRound { stats, next_cursor: None };
+                match db.merge() {
+                    Err(EngineError::Unsupported { .. }) => Ok(round),
+                    Err(e) => Err(e),
+                    Ok(()) => Ok(round),
+                }
+            })
         } else {
             db.vacuum_bounded(self.cursor.as_deref(), self.config.slice_rows)
         };
@@ -202,7 +215,7 @@ pub fn start_maintenance(db: Arc<dyn KvEngine>, config: MaintenanceConfig) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{assert, assert_eq, format, vec};
+    use std::{assert, assert_eq, format, println, vec};
     use crate::{open_engine, open_engine_with, EngineConfig};
 
     struct Scratch(std::path::PathBuf);
@@ -345,5 +358,112 @@ mod tests {
         let status = worker.stop().unwrap();
         assert_eq!(status.full_runs, 0);
         assert_eq!(Arc::strong_count(&db), 1, "stop 必须释放数据库，不能遗留后台线程");
+    }
+
+    /// 方案第 5 项：长读事务挡住自动回收 → 放开之后**排空**，一条活键都不许丢（要规模才测得到）。
+    ///
+    /// 为什么不并进上面那几条小库测试：bplus 的 `vacuum_bounded` 按 `VAC_CHUNK_ROWS = 8192` 行
+    /// 一块续跑，而续跑是**叶粒度**定位（降到含游标的叶子，从该片第一条重喂）。一把键的版本组
+    /// 要**正好骑在块边界上**才走进"同一编码键被第二次判定"那条路径 —— 小库里一块装得下全表，
+    /// 边界根本不出现。11-02 那条 `vacuum_chunk_resume_must_not_readjudicate_carried_group` 是把
+    /// 块压到 4 行、在小库上**确定性**复现的；这一条是它的另一侧：**自然块大小 + 真规模**。
+    ///
+    /// 规模怎么定的（不是随手挑的大数）：200k 把键 × 2 版 = 40 万版本行 ⇒ 一次全库回收天然切出
+    /// ~49 个块边界，每个边界约一半概率落在某把两版键的中间 ⇒ 期望二十几次"组骑边"，不靠运气。
+    /// 判据一律走**计数**（逐键读回 + 排空次数），墙钟只打印不作判据。
+    #[test]
+    #[ignore = "约 30~90 s：自然块大小下的 bplus 长跑回收守卫（块边界要规模才出现）"]
+    fn bplus_long_reader_does_not_lose_live_rows_at_scale() {
+        const KEYS: usize = 200_000;
+        const BATCH: usize = 5_000;
+        let scratch = Scratch::new("bplus_scale_vac");
+        let db = open_engine("bplus_tree", Some(&scratch.0.join("db"))).unwrap();
+        let key = |i: usize| format!("{i:08}#/hot/x.json").into_bytes();
+        let v1 = |i: usize| format!("base{i}").into_bytes();
+        let v2 = |i: usize| format!("upd{i}").into_bytes();
+
+        // 第一遍：基线，一把键一版。分批事务（一把 20 万键的写集本身就是一份大内存账）。
+        for base in (0..KEYS).step_by(BATCH) {
+            let end = (base + BATCH).min(KEYS);
+            let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end).map(|i| (key(i), v1(i))).collect();
+            let tx = db.begin();
+            if let Err(bad) = tx.batch_set(&items) {
+                panic!("灌基线失败 @ {base}: 冲突 {bad:?}");
+            }
+            tx.commit();
+        }
+
+        // 长读事务挂在这里：它不释放，回收一片都不许裁（`skipped_active_txn` 那一支）。
+        let reader = db.begin();
+        // 第二遍：每把键更新 ⇒ 上一版的行全变垃圾，待回收账开始攒。
+        for base in (0..KEYS).step_by(BATCH) {
+            let end = (base + BATCH).min(KEYS);
+            let items: Vec<(Vec<u8>, Vec<u8>)> = (base..end).map(|i| (key(i), v2(i))).collect();
+            let tx = db.begin();
+            if let Err(bad) = tx.batch_set(&items) {
+                panic!("灌更新失败 @ {base}: 冲突 {bad:?}");
+            }
+            tx.commit();
+        }
+        let blocked = db.reclamation_status().expect("bplus 必须有回收账可读");
+        assert!(blocked.pending_rows > 0, "更新 20 万把键之后必须攒出待回收账");
+
+        reader.commit();
+        drop(reader);
+        // ⚠️ 方案正文点名的这一条：**排空**，不是一次 begin/commit。一片只裁 `slice` 行，账可能有
+        // 几十片。但"排空"的终点**不是 `pending_rows == 0`** —— `VacuumScheduler::take_tick`
+        // （`common/kernel.rs:154`）的门是 `pending < slice ⇒ 不裁`，所以不足一片的尾巴按设计留着，
+        // 等下一批写把它顶过阈值。首跑就是被这条判据绊红的：4000 次 tick 后 pending 恒在 6784
+        // = 400000 − 24×16384，`active_txns: 0`（没人挡），即"停在尾巴上"而不是"停在半路"。
+        // ⇒ 判据改成**跑到不再前进为止**，并钉住停下的位置：剩余账必须小于一整片。
+        let slice = db.vacuum_auto_slice();
+        let mut ticks = 0usize;
+        let mut prev_removed = db.reclamation_status().unwrap().versions_removed;
+        loop {
+            db.begin().commit();
+            let st = db.reclamation_status().unwrap();
+            if st.versions_removed == prev_removed {
+                assert!(
+                    st.pending_rows < slice,
+                    "回收停在半路：还剩 {} 行账 ≥ 一片 {slice} 行，却没有再裁（active_txns={}）",
+                    st.pending_rows,
+                    st.active_txns
+                );
+                break;
+            }
+            prev_removed = st.versions_removed;
+            ticks += 1;
+            assert!(ticks < 4_000, "回收不收敛：{ticks} 次 tick 还在前进，已裁 {prev_removed} 行");
+        }
+        assert!(ticks > 1, "一次 tick 就排空 ⇒ 规模没到位、块边界根本没出现，这一条等于没测: ticks={ticks}");
+        println!(
+            "自动回收：{ticks} 次 tick 裁掉 {prev_removed} 行（slice={slice}），停在不足一片的尾巴上，剩余账 {:?}",
+            db.reclamation_status().unwrap().pending_rows
+        );
+
+        // 判据一（自动路径）：逐键读回最新值 —— 丢任何一把（或读回旧值）就是静默丢活键。
+        let tx = db.begin();
+        let mut lost: Vec<usize> = Vec::new();
+        for i in 0..KEYS {
+            if tx.get(&key(i)).as_deref() != Some(v2(i).as_slice()) && lost.len() < 10 {
+                lost.push(i);
+            }
+        }
+        tx.commit();
+        assert!(lost.is_empty(), "自动回收后丢失或读回旧值的键（前 10 把，共 {KEYS} 把）: {lost:?}");
+
+        // 判据二（手动门）：全库 `vacuum()` 必须真把链裁到 1，且仍然一条活键不丢 ——
+        // 两条路都要过，因为骑块边那条路径只在"续跑换了下界"时出现，手动全库轮走的是同一套分块。
+        db.vacuum().unwrap();
+        assert_eq!(db.health().max_chain, 1, "全库 vacuum 后每把键应只剩一版");
+        let tx = db.begin();
+        let mut lost2: Vec<usize> = Vec::new();
+        for i in 0..KEYS {
+            if tx.get(&key(i)).as_deref() != Some(v2(i).as_slice()) && lost2.len() < 10 {
+                lost2.push(i);
+            }
+        }
+        tx.commit();
+        assert!(lost2.is_empty(), "全库 vacuum 后丢失或读回旧值的键（前 10 把）: {lost2:?}");
     }
 }

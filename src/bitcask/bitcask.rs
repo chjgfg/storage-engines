@@ -342,6 +342,90 @@ thread_local! {
     static MERGE_BULK_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// ── M81：`merge()` 内部的**时间**账（门控 `MERGE_TIME_SPLIT`，`#[cfg(test)]` ⇒ 不随 crate 发布）──
+//
+// 要回答的是第 3 项的立项判据：20M 档那 113.5s 里，"走 KeyDir"（纯内存 —— 改成两趟只是多走一遍，
+// 本身不花钱）与"每键一次 `read_live` + `append`"（每键 seek + read_exact 两次系统调用再加一次写）
+// 各占多少；后者才是"按段增量"省得掉的那笔 ⇒ `rw` 不过 60% 就不立项。
+// 五格里还有两格是这条修法顺带省/不省的边界：
+//   `pre`    = fsync + 删密封段 + rename + 换 active（增量 merge 也要付，只是份数少）
+//   `rescan` = 腾掉旧索引后 M43 那趟"重扫新日志建索引"（**部分 merge 就地改 KeyLoc ⇒ 整趟不付**）
+//   `hint`   = 收尾删旧 hint / 落新 hint
+//
+// ⚠️ 与 M62 那把内存尺子的分工：内存尺子会 `reset_peak()`（常开会锯短外层 `timed()` 的峰值读数，
+// M37 实测 171.4 → 47.2），这一把**只加时间差、不碰任何水位** ⇒ 两个门控独立；量时间别开内存那把。
+#[cfg(test)]
+fn merge_time_on() -> bool {
+    std::env::var("MERGE_TIME_SPLIT").is_ok()
+}
+
+// 五格累计纳秒：0=walk（KeyDir 抄块）1=read_live+append 2=pre 3=rescan 4=hint
+#[cfg(test)]
+thread_local! {
+    static MERGE_T_NS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+    static MERGE_T_LAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn merge_t_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn merge_t_start() {
+    if merge_time_on() {
+        MERGE_T_NS.set([0; 5]);
+        MERGE_T_LAST.set(merge_t_now());
+    }
+}
+
+/// 顺序段用：把"上一段"记进 slot，并把段首水位推到此刻
+#[cfg(test)]
+fn merge_t_mark(slot: usize) {
+    if !merge_time_on() {
+        return;
+    }
+    let now = merge_t_now();
+    let mut s = MERGE_T_NS.get();
+    s[slot] = s[slot].saturating_add(now.saturating_sub(MERGE_T_LAST.get()));
+    MERGE_T_NS.set(s);
+    MERGE_T_LAST.set(now);
+}
+
+/// 交错的段用（walk 与 rewrite 在同一个块循环里交替）：直接把刚测完的一截加进 slot，不动水位
+#[cfg(test)]
+fn merge_t_add(slot: usize, ns: u64) {
+    if merge_time_on() {
+        let mut s = MERGE_T_NS.get();
+        s[slot] = s[slot].saturating_add(ns);
+        MERGE_T_NS.set(s);
+    }
+}
+
+#[cfg(test)]
+fn merge_t_dump(label: &str) {
+    if !merge_time_on() {
+        return;
+    }
+    let s = MERGE_T_NS.get();
+    let s = [
+        s[0] as f64 / 1e9,
+        s[1] as f64 / 1e9,
+        s[2] as f64 / 1e9,
+        s[3] as f64 / 1e9,
+        s[4] as f64 / 1e9,
+    ];
+    let total = s[0] + s[1] + s[2] + s[3] + s[4];
+    let pct = |v: f64| if total > 0.0 { v / total * 100.0 } else { 0.0 };
+    eprintln!(
+        "merge_time {label}: walk={:.3}s rw={:.3}s pre={:.3}s rescan={:.3}s hint={:.3}s total={:.3}s | rw={:.1}% rw+rescan={:.1}%（判据：rw 过 60% 才立项）",
+        s[0], s[1], s[2], s[3], s[4], total, pct(s[1]), pct(s[1] + s[3])
+    );
+}
+
 // 测试专用（M77 的尺子）：hint 门**这一次给清单预留了几条**。
 //
 // 为什么钉这个数而不是钉时间：省下来的那 110 ms 是墙钟（本机跨轮漂 1.3~1.9×），
@@ -1484,6 +1568,9 @@ impl Bitcask {
         // M62：分段账的进门（门控 `MERGE_STAGE_SPLIT`，默认 no-op ⇒ 不动外层台架的水位）
         #[cfg(test)]
         merge_probe_start();
+        // M81：同一句 merge 的**时间**账（另一个门控，不碰水位）
+        #[cfg(test)]
+        merge_t_start();
         self.active.flush_buf()?;
 
         let target = self.base_path.clone();
@@ -1514,6 +1601,9 @@ impl Bitcask {
         loop {
             let mut chunk: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(MERGE_CHUNK_KEYS + 1);
             let mut next_lower: Option<Vec<u8>> = None;
+            // M81 时间格 0：这一块的"走 KeyDir + 抄出来"
+            #[cfg(test)]
+            let t_walk0 = merge_t_now();
             {
                 use std::ops::Bound::{Included, Unbounded};
                 for (k, loc) in self
@@ -1530,7 +1620,12 @@ impl Bitcask {
                 }
             }
             #[cfg(test)]
+            merge_t_add(0, merge_t_now().saturating_sub(t_walk0));
+            #[cfg(test)]
             note_merge_chunk(chunk.len());
+            // M81 时间格 1：这一块的 `read_live`（seek + read_exact）+ `append`
+            #[cfg(test)]
+            let t_rw0 = merge_t_now();
             for (key, loc) in chunk {
                 match loc {
                     KeyLoc::Live {
@@ -1547,6 +1642,8 @@ impl Bitcask {
                     }
                 }
             }
+            #[cfg(test)]
+            merge_t_add(1, merge_t_now().saturating_sub(t_rw0));
             match next_lower {
                 Some(l) => lower = l,
                 None => break,
@@ -1616,6 +1713,9 @@ impl Bitcask {
             dirty: false,
         };
         self.active_id = 0;
+        // M81 时间格 2：fsync + 关密封句柄 + 删密封段 + rename + 换 active（增量 merge 也要付这一笔）
+        #[cfg(test)]
+        merge_t_mark(2);
         // M43：索引不再"抄"出来，而是**重扫新日志**扫出来。三件事的顺序是死的：
         //
         // 1. 先删 hint —— hint 是旧索引的持久化副本，旧索引里那些 `pos` 说的是已被删掉/改名的
@@ -1659,12 +1759,20 @@ impl Bitcask {
                 );
                 #[cfg(test)]
                 merge_probe_stop();
+                // 失败也要收账：不然时间格 3 停在半路、整行读数不出现，看起来像"没走进 merge"
+                #[cfg(test)]
+                merge_t_mark(3);
+                #[cfg(test)]
+                merge_t_dump(&format!("{}(重扫失败)", self.base_path.display()));
                 return Err(e);
             }
         };
         // M62 段 2：树已建完并换上 ⇒ 这里的净增就是**终态索引**相对进门时旧索引的差
         #[cfg(test)]
         merge_probe_mark(2);
+        // M81 时间格 3：删旧 hint + 腾掉旧索引 + 重扫新日志建索引（部分 merge 就地改 KeyLoc ⇒ 整格不付）
+        #[cfg(test)]
+        merge_t_mark(3);
         self.index_rebuilding = false;
 
         let _ = std::fs::remove_file(&hold_path);
@@ -1675,6 +1783,11 @@ impl Bitcask {
         merge_probe_mark(3);
         #[cfg(test)]
         merge_probe_stop();
+        // M81 时间格 4 + 收账
+        #[cfg(test)]
+        merge_t_mark(4);
+        #[cfg(test)]
+        merge_t_dump(&self.base_path.display().to_string());
         Ok(())
     }
 

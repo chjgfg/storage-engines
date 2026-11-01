@@ -760,22 +760,22 @@ impl MVCC {
         }
         ;
 
-        // 压缩：丢掉已硬删除的空间（同样只在全库轮次）
+        // M81（方案第 2 项）：**merge 不再跟着 vacuum 跑**。
+        //
+        // 改前的形状：全库轮只要有回收就附一次整库重写 ⇒ 600k 台架同一趟付了两遍
+        // （`MERGE_TIME_SPLIT` 一手读数 3.564s + 3.216s；20M 档 `docs/test.txt` 里
+        // vacuum 166.9s 内含一次 merge + flush+merge 113.5s = 280.4s）。
+        // 拆出后这一家与 bplus/lsm/memory 同形状：vacuum = 裁版本 + blob 重写，不动段文件布局。
+        //
+        // ⚠️ 语义变更（不是纯性能手术）：**硬删除腾出的空间不再当场归还**，等调用方显式 `merge()`。
+        // "长跑不靠调用方记得"那一头由维护器兜：[`crate::maintenance::Maintenance`] 的全库收尾
+        // 现在是 `vacuum()` + `merge()` 两步，仍保证日志字节有界。
+        // M43 那条"这一句的 Err 不许吞"跟着搬到那两个调用点（`MVCC::merge()` 上那段注释讲的是
+        // 同一个隔离态），这里不再有我替调用方咽下的错。
         #[cfg(test)]
         {
             vac_base = crate::mem_probe::stage_mark(2, vac_base);
-        }
-        if full_sweep && (removed > 0 || blob_rewritten) {
-            // M43：这一句的 Err 从此**不许再吞**。B1 之后 `merge()` 失败会把引擎留在"旧索引已
-            // 腾掉、新索引还没扫完"的隔离态（此后每一扇能报错的门都报错，见 `Bitcask::usable`）；
-            // 吞掉它，`vacuum()` 回 `Ok` 就是宣称"回收完成、库还好"。
-            // 改前的形状里吞得起：那时 merge 要么全程不动 `key_dir`、要么一次性换成完整的新索引，
-            // 失败也留不下半截状态。**这一处跟着改法是必须的，不是顺手清理。**
-            kv.merge()?;
-            #[cfg(test)]
-            {
-                let _ = crate::mem_probe::stage_mark(3, vac_base);
-            }
+            let _ = crate::mem_probe::stage_mark(3, vac_base);
         }
 
         Ok(VacuumRound {
@@ -2232,7 +2232,7 @@ mod tests {
                 d.as_secs_f64()
             );
             println!(
-                "  ① 归组判定 {:>8.1} MB ｜ ② 删除+flush+sync {:>8.1} MB ｜ ③ blob GC {:>8.1} MB ｜ ④ merge {:>8.1} MB",
+                "  ① 归组判定 {:>8.1} MB ｜ ② 删除+flush+sync {:>8.1} MB ｜ ③ blob GC {:>8.1} MB ｜ ④ merge {:>8.1} MB（M81 起 vacuum 不再自带 merge ⇒ 这一格恒 0，merge 的账去看门 M 那一扇）",
                 mb(p[0]),
                 mb(p[1]),
                 mb(p[2]),

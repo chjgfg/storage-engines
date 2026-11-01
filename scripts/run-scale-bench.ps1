@@ -239,7 +239,8 @@ try {
         try {
             $childEnv = @{ SCALE_ROWS = $case.rows; SCALE_SCRATCH_DIR = $case.scratch
                 TMP = $case.scratch; TEMP = $case.scratch; RUST_BACKTRACE = '1'
-                VACUUM_STAGE_SPLIT = $null; OPEN_STAGE_SPLIT = $null }
+                VACUUM_STAGE_SPLIT = $null; OPEN_STAGE_SPLIT = $null
+                MERGE_STAGE_SPLIT = $null; MERGE_TIME_SPLIT = $null }
             $exit = Invoke-LoggedProcess -Exe $build.executable -Arguments '--exact engine::tests::scale_baseline_all_engines --ignored --nocapture --test-threads=1' `
                 -Log (Join-Path $runDir $record.log) -Environment $childEnv -State $state -OnLine {
                     param($Line, $State)
@@ -259,9 +260,13 @@ try {
             $record.metrics = $state.metrics.Count
             @($state.metrics.ToArray()) | Export-Csv -LiteralPath (Join-Path $runDir ($name + '.csv')) -NoTypeInformation -Encoding UTF8
             $expected = @('bitcask','bplus_tree','lsm_tree','memory')
-            if ($exit -ne 0 -or -not $state.done -or $state.metrics.Count -ne 122 -or
+            # M81 第 2 项：`flush+merge` 拆成两格 ⇒ 32 类变 33 类，122 → 126。
+            # 放在一个变量里：方案第 4 项（末页免total +4）与第 6 项（memory 冷重开 +1~2）还要动这个数，
+            # 别再回到"三处硬编码各改一遍"那种会漏一处的写法。
+            $expectedMetrics = 126
+            if ($exit -ne 0 -or -not $state.done -or $state.metrics.Count -ne $expectedMetrics -or
                 @($expected | Where-Object { -not $state.engines.ContainsKey($_) }).Count -ne 0) {
-                throw "验收失败：exit=$exit，完成标记=$($state.done)，性能格=$($state.metrics.Count)/122"
+                throw "验收失败：exit=$exit，完成标记=$($state.done)，性能格=$($state.metrics.Count)/$expectedMetrics"
             }
             $record.status = 'PASS'
         } catch {
