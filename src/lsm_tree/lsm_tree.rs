@@ -222,6 +222,8 @@ const MEM_ENTRY_OVERHEAD: usize = 451;
 #[cfg(test)]
 thread_local! {
     static MEM_SCAN_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // 层范围二分的比较次数；块访问计数看不见逐篇枚举的纯 CPU 代价。
+    static LEVEL_RANGE_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// 记一次「把 memtable 数了一遍」的步数（只由 `scan_mem_entry_count` 调用）
@@ -260,6 +262,9 @@ pub struct LSMTree {
     mem_bytes: usize,
     immutables: Vec<MemMap>,
     levels: Vec<Vec<SstFile>>,
+    /// L1+ 的范围是否有序且仅可能端点相接。恢复/测试注入可带任意重叠，不能盲目二分。
+    /// 只在文件集变化时验证；读路径不再为确认不变量而逐篇扫元数据。
+    level_ranges_ordered: Vec<bool>,
     next_sst_id: AtomicU64,
     write_seq: AtomicU64,
     dirty: bool,
@@ -371,6 +376,7 @@ impl LSMTree {
             mem_bytes: 0,
             immutables: Vec::new(),
             levels: (0..max_levels).map(|_| Vec::new()).collect(),
+            level_ranges_ordered: vec![true; max_levels],
             next_sst_id: AtomicU64::new(1),
             write_seq: AtomicU64::new(1),
             dirty: false,
@@ -1196,8 +1202,10 @@ impl LSMTree {
         to: Option<&'a [u8]>,
         snap_seq: u64,
     ) -> LightMerge<'a> {
-        let probe_low = from.unwrap_or(&[]);
         let mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + '_>> = Vec::new();
+        if matches!((from, to), (Some(lo), Some(hi)) if lo >= hi) {
+            return LightMerge::new(sources);
+        }
         if !self.mem.is_empty() {
             sources.push(Box::new(Self::mem_light_iter(&self.mem, from, to, snap_seq)));
         }
@@ -1211,21 +1219,17 @@ impl LSMTree {
         if let Some(l0) = self.levels.first() {
             ssts.extend(l0.iter().rev());
         }
-        for level in self.levels.iter().skip(1) {
-            ssts.extend(level.iter());
+        for level in 1..self.levels.len() {
+            let files = match to {
+                Some(hi) => self.sst_candidates(level, from.unwrap_or(&[]), hi),
+                None => &self.levels[level],
+            };
+            ssts.extend(files.iter());
         }
         for sst in ssts {
-            // ⚠️ M47：`to == None` 时**不能**拿一个合成的上界去剪文件 —— 键是任意字节，
-            // 任何"够大的填充值"都存在比它更大的真键（改前那行用 `&[0xffu8; 8]`，
-            // 于是 `min_key = [0xff;12]` 的文件在"全库"走查里被整篇跳过：少数、少扫、不报错）。
-            // 有上界时才用 min/max 双向剪；没有上界就只剪"整篇在 `from` 之下"的那一头。
-            let alive = !(sst.min_key.is_empty() && sst.max_key.is_empty());
-            let overlaps = match to {
-                Some(hi) => alive && sst.may_overlap(probe_low, hi),
-                None => alive && sst.max_key.as_slice() >= probe_low,
-            };
-            if !overlaps {
-                continue; // min/max 不相干 ⇒ 整篇不读
+            // 无上界不造哨兵；有上界是半开区间，min_key == to 的源初始化也不应读块。
+            if !sst.may_overlap_half_open(from, to) {
+                continue;
             }
             sources.push(Box::new(sst.light_iter(from, to, snap_seq)));
         }
@@ -1338,11 +1342,43 @@ impl LSMTree {
             self.levels.push(Vec::new());
         }
         self.levels[level].push(sst);
+        self.refresh_level_ranges(level);
         self.stats_dirty = true;
         self.write_manifest()
     }
 
-    /// 跨源点查：**每个源都要走一遍，取最大可见 seq**，不能"在第一个含它的源就收手"。
+    fn refresh_level_ranges(&mut self, level: usize) {
+        self.level_ranges_ordered.resize(self.levels.len(), false);
+        self.level_ranges_ordered[level] = self.levels[level]
+            .windows(2)
+            .all(|pair| pair[0].max_key <= pair[1].min_key);
+    }
+
+    /// 返回闭区间可能相交的连续片段，保持原源序（同 seq 的取胜次序不变）。
+    /// 正常 L1+ 的 min/max 都单调，可二分两头；端点相等要保留所有相邻文件。
+    /// L0 及恢复得到的乱序/重叠层不能二分，仍交全片段给调用方逐篇检查。
+    fn sst_candidates(&self, level: usize, low: &[u8], high: &[u8]) -> &[SstFile] {
+        let files = &self.levels[level];
+        if low > high {
+            return &files[..0];
+        }
+        if level == 0 || !self.level_ranges_ordered[level] {
+            return files;
+        }
+        let end = files.partition_point(|sst| {
+            #[cfg(test)]
+            LEVEL_RANGE_PROBES.with(|c| c.set(c.get() + 1));
+            sst.min_key.as_slice() <= high
+        });
+        let start = files[..end].partition_point(|sst| {
+            #[cfg(test)]
+            LEVEL_RANGE_PROBES.with(|c| c.set(c.get() + 1));
+            sst.max_key.as_slice() < low
+        });
+        &files[start..end]
+    }
+
+    /// 跨源点查：**每个可能含键的源都要比较，取最大可见 seq**，不能在第一层命中就收手。
     ///
     /// L0 那一段看着确实可以收手（flush 单调：后建的文件只装更晚的 seq），但 L1+ 不行：
     /// `merge_to_ssts` 只按 `target_bytes` 切文件，切的粒度是**编码键**，而同一把 raw key 的
@@ -1374,11 +1410,8 @@ impl LSMTree {
                 }
             }
         }
-        for level in self.levels.iter().skip(1) {
-            for sst in level {
-                if key < sst.min_key.as_slice() || key > sst.max_key.as_slice() {
-                    continue;
-                }
+        for level in 1..self.levels.len() {
+            for sst in self.sst_candidates(level, key, key) {
                 if let Some(v) = sst.get_at(key, snap_seq) {
                     consider(&mut best, v);
                 }
@@ -1422,13 +1455,13 @@ impl LSMTree {
     /// 不必像 [`Self::range_scan`] 那样把整段（连 value）物化出来再挑。
     ///
     /// **遮蔽语义必须与 `range_scan` 一致**（这点是被测试逼出来的，不是想当然）：
-    /// 一个 key 由「最新的含它的源 + 该源内最大可见 seq」定论；若定论成 `Drop`，该 key
-    /// 就整体不可见 —— **不能**回退到更旧源里同 key 的 `Put`。所以这里先取各源的最大键，
-    /// 再用现成的跨源点查 [`Self::get_raw`] 定论（它用的就是 `merge_range_at` 那套取胜规则）。
+    /// 一个 key 由跨源最大可见 seq 定论；若定论成 `Drop`，该 key 就整体不可见，不能回退
+    /// 到更旧源的 `Put`。候选阶段只找最大键，不按层决定 value；随后由 `get_value_at` 定论。
     ///
-    /// 被拒的 key 进 `excluded` 后重找。常态一次命中；若拒绝数超过 `BACK_SCAN_FALLBACK`
-    /// （例如以 `key` 为前缀的更长 key 大量交错那种退化形状），直接回退到一次
-    /// `range_scan` —— 宁可慢，不能让「每次重找全源」比旧实现还差。
+    /// 按 SST 的 max_key 降序探测；只要后续源的上界不大于当前候选，便无需读它的数据块。
+    /// 正常 L1+ 先二分定位范围再反向走，L0/异常重叠层只排序引用，不改真实源序。
+    /// 被拒的 key 进 `excluded` 后重找。若拒绝数超过 `BACK_SCAN_FALLBACK`，回退到同一
+    /// snapshot 的一次 `range_scan_at_seq`，避免前缀交错等退化形状反复扫描。
     pub fn find_back(
         &self,
         low: &[u8],
@@ -1437,6 +1470,9 @@ impl LSMTree {
         accept: impl Fn(&[u8], &Option<Vec<u8>>) -> bool,
     ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
         const BACK_SCAN_FALLBACK: usize = 4096;
+        if low > high {
+            return None;
+        }
 
         let mut excluded: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         loop {
@@ -1453,20 +1489,18 @@ impl LSMTree {
             for imm in &self.immutables {
                 consider(Self::mem_max_key(imm, low, high, snap_seq, &excluded));
             }
-            if let Some(l0) = self.levels.first() {
-                for sst in l0.iter() {
-                    consider(
-                        sst.find_back(low, high, snap_seq, |k, _| !excluded.contains(k))
-                            .map(|(k, _)| k),
-                    );
-                }
-            }
-            for level in self.levels.iter().skip(1) {
-                for sst in level {
-                    consider(
-                        sst.find_back(low, high, snap_seq, |k, _| !excluded.contains(k))
-                            .map(|(k, _)| k),
-                    );
+            for level in 0..self.levels.len() {
+                let files = self.sst_candidates(level, low, high);
+                if level > 0 && self.level_ranges_ordered[level] {
+                    Self::sst_max_key(files.iter().rev(), low, high, snap_seq, &excluded, &mut cand);
+                } else {
+                    // L0 可任意重叠，MANIFEST 恢复也不保证 L1+ 的范围有序。
+                    // 只排序候选引用；不能按文件 id/层次推断 seq 新旧。
+                    let mut by_max: Vec<_> = files.iter()
+                        .filter(|sst| sst.may_overlap(low, high))
+                        .collect();
+                    by_max.sort_unstable_by(|a, b| b.max_key.cmp(&a.max_key));
+                    Self::sst_max_key(by_max.into_iter(), low, high, snap_seq, &excluded, &mut cand);
                 }
             }
 
@@ -1474,7 +1508,7 @@ impl LSMTree {
             if excluded.len() >= BACK_SCAN_FALLBACK {
                 // 退化形状：回退成一次正向全扫再反向挑（代价与旧实现同阶）
                 return self
-                    .range_scan(low.to_vec(), high.to_vec())
+                    .range_scan_at_seq(low, high, snap_seq)
                     .into_iter()
                     .rev()
                     .find(|(k, v)| accept(k.as_slice(), v));
@@ -1487,6 +1521,27 @@ impl LSMTree {
             };
             if accept(&key, &val) {
                 return Some((key, val));
+            }
+        }
+    }
+
+    /// 输入必须按 max_key 降序。等于 cand 的源也可跳过：这里只决定键，值另作跨源点查。
+    fn sst_max_key<'a>(
+        ssts: impl Iterator<Item = &'a SstFile>,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        excluded: &HashSet<Vec<u8>>,
+        cand: &mut Option<Vec<u8>>,
+    ) {
+        for sst in ssts {
+            if cand.as_ref().is_some_and(|k| k.as_slice() >= high || sst.max_key.as_slice() <= k.as_slice()) {
+                break;
+            }
+            if let Some((k, _)) = sst.find_back(low, high, snap_seq, |k, _| !excluded.contains(k)) {
+                if cand.as_ref().is_none_or(|best| k > *best) {
+                    *cand = Some(k);
+                }
             }
         }
     }
@@ -1945,6 +2000,7 @@ impl LSMTree {
             self.repair_level_overlaps(&mut all_next, &mut replaced, &keep)?;
         }
         self.levels[next] = all_next;
+        self.refresh_level_ranges(next);
         self.stats_dirty = true;
         self.reevaluate_cache_capacity();
         // ⚠️ 顺序：**先把新文件集记进 MANIFEST，再删旧文件**（M26）。
@@ -2233,6 +2289,7 @@ impl LSMTree {
                         }
                     }
                     self.levels[level] = files;
+                    self.refresh_level_ranges(level);
                 }
             }
         }
@@ -2533,6 +2590,232 @@ mod tests {
         let p = crate::common::tmp_test_path("lsm", tag, "");
         let _ = fs::remove_dir_all(&p);
         p
+    }
+
+    fn pruning_options() -> LSMTreeOptions {
+        LSMTreeOptions {
+            enable_mem_wal: false,
+            enable_bloom: false,
+            sst_block_entries: 2,
+            block_cache_blocks: 0,
+            max_compactions_per_flush: 0,
+            ..LSMTreeOptions::default()
+        }
+    }
+
+    fn version_key(version: u64) -> Vec<u8> {
+        let mut key = b"p".to_vec();
+        key.extend_from_slice(&version.to_be_bytes());
+        key
+    }
+
+    /// 同一 raw key 的编码版本组分散到更多不重叠 SST：反向定位的数据块不随篇数增长。
+    /// 全源逐 SST seek 是旧形状的计数正控，range_scan 是独立的结果对照。
+    #[test]
+    fn test_sst_pruning_seek_blocks_do_not_scale_with_files() {
+        use crate::lsm_tree::sst::block_reads;
+        for count in [8usize, 64, 256] {
+            let dir = tmp_dir(&format!("sst_pruning_{count}"));
+            let opts = pruning_options();
+            {
+                let mut db = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+                db.bulk_mode = true;
+                for file in 0..count {
+                    let entries = (0..4).map(|i| {
+                        let n = (file * 4 + i) as u64;
+                        (version_key(n), StoredEntry::put(1, Some(n.to_be_bytes().to_vec())))
+                    }).collect();
+                    db.inject_sst_for_test(1, entries).unwrap();
+                }
+                assert!(db.level_ranges_ordered[1]);
+            }
+            // 冷重开也必须重建范围不变量；不是只在注入路径有效。
+            {
+                let db = LSMTree::open_with_config(&dir, opts).unwrap();
+                assert!(db.level_ranges_ordered[1]);
+                for n in [(count * 4 - 1) as u64, (count * 2 - 1) as u64] {
+                    let mut high = version_key(n);
+                    high.push(0); // 不存在、但位于 n 与 n+1 之间的前缀扩展
+                    let low = version_key(0);
+                    let before = block_reads();
+                    let hit = db.find_back(&low, &high, 1, |_, _| true);
+                    let used = block_reads() - before;
+                    assert_eq!(hit.as_ref().map(|(k, _)| k), Some(&version_key(n)));
+                    assert!(used > 0 && used <= 3, "{count} SST 的一次 seek 访问 {used} 块");
+                    assert_eq!(hit, db.range_scan_at_seq(&low, &high, 1).pop());
+                }
+                let low = version_key(0);
+                let high = version_key(u64::MAX);
+                let before = block_reads();
+                for sst in &db.levels[1] {
+                    assert!(sst.find_back(&low, &high, 1, |_, _| true).is_some());
+                }
+                assert!(block_reads() - before >= count as u64, "全源正控必须随 SST 数增长");
+
+                let key = version_key((count * 2 - 1) as u64);
+                let before = LEVEL_RANGE_PROBES.with(|c| c.get());
+                assert!(db.get_entry_at(&key, 1).is_some());
+                let probes = LEVEL_RANGE_PROBES.with(|c| c.get()) - before;
+                assert!(probes > 0 && probes <= 24, "点查范围定位比较了 {probes} 次");
+                assert_eq!(db.sst_candidates(1, &key, &key).len(), 1);
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_sst_pruning_keeps_l0_overlap_and_source_seq_rules() {
+        let dir = tmp_dir("sst_pruning_semantics");
+        let opts = pruning_options();
+        {
+            let mut db = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+            db.inject_sst_for_test(1, vec![
+                (b"a".to_vec(), StoredEntry::put(50, Some(b"l1".to_vec()))),
+                (b"a\0".to_vec(), StoredEntry::put(8, Some(b"old".to_vec()))),
+            ]).unwrap();
+            db.inject_sst_for_test(1, vec![
+                (b"a\0".to_vec(), StoredEntry::drop_at(20)),
+                (b"a\0\0".to_vec(), StoredEntry::put(12, Some(b"middle".to_vec()))),
+            ]).unwrap();
+            assert!(db.level_ranges_ordered[1], "相接端点应保留二分路径");
+            assert_eq!(db.sst_candidates(1, b"a\0", b"a\0").len(), 2);
+            db.inject_sst_for_test(2, vec![
+                (b"a".to_vec(), StoredEntry::put(60, Some(b"higher-seq".to_vec()))),
+                (b"a\0".to_vec(), StoredEntry::put(6, Some(b"older".to_vec()))),
+                (b"a\0\0".to_vec(), StoredEntry::drop_at(30)),
+                (b"b".to_vec(), StoredEntry::put(90, Some(b"last".to_vec()))),
+            ]).unwrap();
+            db.inject_sst_for_test(0, vec![
+                (b"a".to_vec(), StoredEntry::put(2, Some(b"l0".to_vec()))),
+                (b"a\0".to_vec(), StoredEntry::put(40, Some(b"revived".to_vec()))),
+                (b"a\0\x01".to_vec(), StoredEntry::put(4, Some(b"nested".to_vec()))),
+            ]).unwrap();
+            db.inject_sst_for_test(0, vec![
+                (b"a\0".to_vec(), StoredEntry::put(3, Some(b"new-file-old-seq".to_vec()))),
+                (b"a\0\0".to_vec(), StoredEntry::put(5, None)),
+            ]).unwrap();
+        }
+        for abnormal in [false, true] {
+            let mut db = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+            if abnormal {
+                // 尾部插一个 min 更小且包住多个文件的范围，模拟恢复后乱序/嵌套重叠。
+                db.inject_sst_for_test(1, vec![
+                    (b"a".to_vec(), StoredEntry::put(70, Some(b"recovered".to_vec()))),
+                    (b"a\0".to_vec(), StoredEntry::drop_at(45)),
+                    (b"b".to_vec(), StoredEntry::put(7, Some(b"early".to_vec()))),
+                ]).unwrap();
+                drop(db);
+                db = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+                assert!(!db.level_ranges_ordered[1]);
+            }
+            db.mem_insert_no_wal(b"a\0\x01".to_vec(), StoredEntry::put(3, Some(b"mem-old".to_vec())));
+            db.mem_insert_no_wal(b"b".to_vec(), StoredEntry::put(10, None));
+            let mut imm = MemMap::new();
+            imm.entry(b"a\x01".to_vec()).or_default().insert(18, EntryValue::Put(Some(b"imm".to_vec())));
+            db.immutables.push(imm);
+            for snap in [0, 3, 7, 15, 25, 35, 50, 100] {
+                for (lo, hi) in [(b"a".as_slice(), b"b".as_slice()), (b"a\0".as_slice(), b"a\x01".as_slice())] {
+                    let rows = db.range_scan_at_seq(lo, hi, snap);
+                    for mode in 0..4 {
+                        let accept = |key: &[u8], value: &Option<Vec<u8>>| match mode {
+                            0 => true,
+                            1 => key.len() == 2, // 拒绝更长的前缀键，继续退
+                            2 => value.is_some(),
+                            _ => key == b"a\0", // Drop 必须遮住同键旧 Put
+                        };
+                        let want = rows.iter().rev().find(|(k, v)| accept(k, v)).cloned();
+                        assert_eq!(db.find_back(lo, hi, snap, accept), want, "snap={snap}, mode={mode}, abnormal={abnormal}");
+                    }
+                }
+            }
+            assert!(db.find_back(b"z", b"a", 100, |_, _| true).is_none());
+            // 不把本轮 mem/immutable 写回磁盘，下一轮只考察原文件集。
+            db.mem.clear();
+            db.immutables.clear();
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sst_pruning_l0_descending_files_and_light_bounds() {
+        use crate::lsm_tree::sst::block_reads;
+        let dir = tmp_dir("sst_pruning_l0_bounds");
+        {
+            let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
+            db.bulk_mode = true;
+            for n in (0..64).rev() {
+                db.inject_sst_for_test(0, vec![(version_key(n), StoredEntry::put(1, Some(vec![1])))]).unwrap();
+            }
+            let before = block_reads();
+            assert_eq!(db.find_back(&version_key(0), &version_key(u64::MAX), 1, |_, _| true).unwrap().0, version_key(63));
+            assert_eq!(block_reads() - before, 2, "乱序 L0 也只需候选+取值两块");
+
+            let from = version_key(10);
+            let to = version_key(11);
+            let before = block_reads();
+            let rows: Vec<_> = db.light_iter_range(Some(&from), Some(&to), 1).collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, from);
+            assert_eq!(block_reads() - before, 1, "min_key == to 的文件不该初始化读块");
+            let before = block_reads();
+            assert_eq!(db.light_iter_range(Some(&to), Some(&from), 1).count(), 0);
+            assert_eq!(db.light_iter_range(Some(&from), Some(&from), 1).count(), 0);
+            assert_eq!(block_reads() - before, 0);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sst_pruning_refreshes_ranges_after_compaction() {
+        let dir = tmp_dir("sst_pruning_compaction");
+        let mut opts = pruning_options();
+        opts.target_sst_bytes = 128;
+        {
+            let mut db = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+            for start in [0, 12] {
+                db.inject_sst_for_test(0, (start..start + 12).map(|n| {
+                    (version_key(n), StoredEntry::put(1, Some(vec![1])))
+                }).collect()).unwrap();
+            }
+            let low = version_key(0);
+            let high = version_key(23);
+            let want = db.range_scan(low.clone(), high.clone());
+            db.compact_level(0).unwrap();
+            assert!(db.levels[1].len() > 1);
+            assert!(db.level_ranges_ordered[1]);
+            db.compact_level(1).unwrap();
+            assert!(!db.levels[2].is_empty());
+            assert!(db.level_ranges_ordered[1] && db.level_ranges_ordered[2]);
+            assert_eq!(db.range_scan(low.clone(), high.clone()), want);
+            for (key, value) in &want {
+                assert_eq!(db.get_value_at(key, 1), Some(value.clone()));
+            }
+            assert_eq!(db.find_back(&low, &high, 1, |_, _| true), want.last().cloned());
+        }
+        {
+            let db = LSMTree::open_with_config(&dir, opts).unwrap();
+            assert!(db.level_ranges_ordered[1] && db.level_ranges_ordered[2]);
+            assert_eq!(db.find_back(&version_key(0), &version_key(23), 1, |_, _| true).unwrap().0, version_key(23));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sst_pruning_rejection_fallback_preserves_snapshot() {
+        let dir = tmp_dir("sst_pruning_fallback");
+        {
+            let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
+            for n in 0..4098 {
+                db.mem_insert_no_wal(format!("k{n:04}").into_bytes(), StoredEntry::put(1, Some(vec![1])));
+            }
+            db.mem_insert_no_wal(b"k0000".to_vec(), StoredEntry::drop_at(10));
+            let accept = |k: &[u8], _: &Option<Vec<u8>>| k == b"k0000";
+            let want = db.range_scan_at_seq(b"k0000", b"k9999", 1).into_iter().rev().find(|(k, v)| accept(k, v));
+            assert!(want.is_some());
+            assert_eq!(db.find_back(b"k0000", b"k9999", 1, accept), want);
+            db.mem.clear();
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// M41a：`flush()` 必须把 memtable **搬**进 SST，一条都不许复制值。

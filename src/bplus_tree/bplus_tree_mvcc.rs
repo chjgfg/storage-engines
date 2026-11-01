@@ -68,6 +68,30 @@ pub(crate) fn reset_vac_pending() {
     VAC_PENDING_MAX.with(|c| c.set(0));
 }
 
+// 测试专用：把 `vacuum_bounded` 的块大小临时压小，好在小库上**确定性**复现"版本组跨块边界"
+// 那条路径（自然块 8192 行 ⇒ 要几十万行才碰得到一次对齐）。0 = 用默认 `VAC_CHUNK_ROWS`。
+#[cfg(test)]
+thread_local! {
+    static VAC_CHUNK_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_vac_chunk_override(n: usize) {
+    VAC_CHUNK_OVERRIDE.with(|c| c.set(n));
+}
+
+#[inline]
+fn vac_chunk_limit() -> usize {
+    #[cfg(test)]
+    {
+        let o = VAC_CHUNK_OVERRIDE.with(|c| c.get());
+        if o > 0 {
+            return o;
+        }
+    }
+    VAC_CHUNK_ROWS
+}
+
 pub struct MVCC {
     kv: Arc<Mutex<BPlusTree>>,
     /// 大 value 外置存储（与 kv 同库目录）
@@ -270,19 +294,20 @@ impl MVCC {
     /// 一片的代价 = 走 `slice` 行叶子条目，锁也就按这么久。
     /// 游标回到库尾之后，下一片自动从头开始第二遍。
     fn tick_auto_vacuum(&self) {
-        let Some(slice) = self.vac.take_tick() else {
-            return;
-        };
-        let after = self.vac.cursor();
-        if let Ok(round) = self.vacuum_bounded(after.as_deref(), slice) {
-            self.vac.set_cursor(round.next_cursor);
+        if let Err(e) = self.vac.run_pending(|after, rows| self.vacuum_bounded(after, rows)) {
+            log::warn!("自动版本回收失败，保留待回收账: {e}");
         }
+    }
+
+    /// 轻量回收状态，不扫描数据库。
+    pub fn reclamation_status(&self) -> crate::common::ReclamationStatus {
+        self.vac.status(&self.active_txn.lock().unwrap())
     }
 
     /// 自动回收的切片宽度（行数）：每攒够这么多行新版本，就裁一片这么多行。
     ///
     /// 默认 [`MVCC::VACUUM_AUTO_SLICE_DEFAULT`]；**设 0 关闭自动回收**，那时版本行只增不减，
-    /// 得靠手动 `vacuum()` —— 也就是回到「热点 key 堆二十万版、点读陪跑整条链」的状态。
+    /// 得靠手动/后台维护裁版本。点读的链尾早停仍在，但历史页与维护成本会积累。
     pub fn set_vacuum_auto_slice(&self, rows: u64) {
         self.vac.set_slice(rows);
     }
@@ -575,7 +600,18 @@ impl MVCC {
             let mut chunk_rows = 0usize;
             let mut next_lower: Option<Vec<u8>> = None;
             let mut done = false;
+            // 本块续跑下界：首块 = 逻辑游标 `after`，其后 = 上一块最后一行的 `enc ‖ 0x00`。
+            let resume_bound = lower.clone();
             kv.scan_entries_break_from(lower.as_deref(), |enc, row| {
+                // ⚠️ `scan_entries_break_from` 只下降到 containing 叶子，随后**从该片第一条**起遍历
+                // （叶粒度定位，过滤交给调用方——见其文档）。上一块已经消费过的行会被再喂一遍；若某个
+                // 版本组正好骑在块边界上（它最新那版恰是续跑叶子的首条），那一版会**第二次**进 `group`，
+                // 让 `vacuum_plan_group` 排序后把"同一 enc 的较早副本"划进 `last_old` 之前、连同活版本的
+                // enc 一起塞进 `to_delete`（判保留的最新版本被物理删掉 ⇒ 静默丢活键）。
+                // ⇒ 按本块续跑下界显式跳过已消费的行（`resume_bound` 是上一块尾行的严格后继方向）。
+                if resume_bound.as_ref().is_some_and(|b| enc < b.as_slice()) {
+                    return false;
+                }
                 let Some(vk) = decode_key(enc) else {
                     return false;
                 };
@@ -608,7 +644,7 @@ impl MVCC {
                     .is_some_and(|s| s.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB));
                 group.push((vk.version, enc.to_vec(), is_tomb, refs_blob));
                 chunk_rows += 1;
-                if chunk_rows >= VAC_CHUNK_ROWS {
+                if chunk_rows >= vac_chunk_limit() {
                     let mut bound = enc.to_vec();
                     bound.push(0u8);
                     next_lower = Some(bound);
@@ -1320,6 +1356,76 @@ mod tests {
         let _ = std::fs::remove_file(crate::bplus_tree::storage::freelist_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::lock_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::blob_path(path));
+    }
+
+    /// 把 `vacuum_bounded` 的块大小临时压小的 RAII 守卫：离开作用域（含 panic 展开）一律复位，
+    /// 免得 thread_local 漏给同线程后跑的别的 vacuum 测试。
+    struct VacChunkGuard;
+    impl Drop for VacChunkGuard {
+        fn drop(&mut self) {
+            set_vac_chunk_override(0);
+        }
+    }
+
+    /// 回归：版本组**跨块边界**时，块续跑不能把已消费的行再喂进 `group`。
+    ///
+    /// `scan_entries_break_from` 只下降到 containing 叶子，然后**从该片第一条**起遍历（叶粒度定位，
+    /// 过滤交给调用方）。`vacuum_bounded` 续跑下界是上一块最后一行的 `enc ‖ 0x00`，而回调原先只按
+    /// 逻辑游标 `after` 过滤、**没按这个续跑下界过滤** ⇒ 续跑那块会把上一块尾部的行重新扫一遍。
+    /// 若某把键的版本组正好骑在块边界上（它最新那版恰是续跑叶子的第一条），那一版会**第二次**进
+    /// `group`；`vacuum_plan_group` 排序后把"同一 enc 的较早副本"划进 `last_old` 之前 ⇒ 连同活版本
+    /// 的 enc 一起进 `to_delete` ⇒ 判保留的最新版本被物理删掉（静默丢活键）。
+    ///
+    /// 自然块 8192 行要几十万行才碰得到一次这种对齐，所以这里用 `order=4`（叶子只装得下 ~3 行）
+    /// + 块大小压到 4，让"组骑边界、且最新那版是续跑叶首条"在小库上**确定性**发生。
+    /// 判据：回收后每把键的最新版本都还得读得回来（丢任何一把 = 红）。摘掉续跑下界过滤这条就红。
+    #[test]
+    fn vacuum_chunk_resume_must_not_readjudicate_carried_group() {
+        let path = tmp_db("vac_chunk_resume");
+        cleanup(&path);
+        // order=4 ⇒ 叶子最多 3 行；两版一把键 ⇒ 每 1.5 把键换一片叶子，叶首条常是某键的最新那版。
+        let mvcc = MVCC::open(&path, 4, 0);
+        let n_keys = 64usize;
+        let key = |i: usize| format!("k{i:04}").into_bytes();
+        // 第一遍：每把键写 v1（基线）。
+        let tx = mvcc.begin_transaction();
+        for i in 0..n_keys {
+            assert!(tx.set(&key(i), format!("base{i}").into_bytes()), "灌基线失败");
+        }
+        tx.commit();
+        // 第二遍：每把键写 v2（更新）⇒ 每把键都有 [v1(死), v2(活)] 两版，v2 必须留下。
+        let tx = mvcc.begin_transaction();
+        for i in 0..n_keys {
+            assert!(tx.set(&key(i), format!("upd{i}").into_bytes()), "灌更新失败");
+        }
+        tx.commit();
+
+        // 块大小压到 4：让版本组骑在块边界上（自然块 8192 在小库上根本不分块 ⇒ 复现不到）。
+        set_vac_chunk_override(4);
+        let _guard = VacChunkGuard;
+        mvcc.vacuum().expect("vacuum 失败");
+        drop(_guard);
+
+        // 每把键的最新版本（upd{i}）都得读得回来；丢任何一把 = 续跑重复判定把活版本删了。
+        let mut lost = Vec::new();
+        for i in 0..n_keys {
+            let tx = mvcc.begin_transaction();
+            let got = tx.get(&key(i));
+            tx.commit();
+            match got {
+                Some(v) if v == format!("upd{i}").into_bytes() => {}
+                other => lost.push((i, other.map(|v| String::from_utf8_lossy(&v).to_string()))),
+            }
+        }
+        drop(mvcc);
+        cleanup(&path);
+        assert!(
+            lost.is_empty(),
+            "块续跑重复判定过删了活版本：丢 {} 把，首丢 key={:?} 读到={:?}",
+            lost.len(),
+            lost.first().map(|(i, _)| *i),
+            lost.first().map(|(_, v)| v.clone())
+        );
     }
 
     /// 探针：一次点读 / 一次点写访问了多少页。

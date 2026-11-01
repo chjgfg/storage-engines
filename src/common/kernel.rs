@@ -9,7 +9,7 @@
 use std::thread_local;
 use std::collections::HashSet;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -91,6 +91,25 @@ pub struct VacuumScheduler {
     pending: Arc<AtomicU64>,
     /// 下一片从哪个逻辑 key 之后继续（`None` = 从头）
     cursor: Arc<Mutex<Option<Vec<u8>>>>,
+    running: AtomicBool,
+    committed_rows: AtomicU64,
+    completed_slices: AtomicU64,
+    skipped_active: AtomicU64,
+    failed_slices: AtomicU64,
+    versions_removed: AtomicU64,
+}
+
+/// 持有整个切片的独占权，而不是只保护取账那一下。失败/跳过/panic 自动退回预算。
+struct VacuumLease<'a> {
+    scheduler: &'a VacuumScheduler,
+    reserved: u64,
+}
+
+impl Drop for VacuumLease<'_> {
+    fn drop(&mut self) {
+        self.scheduler.pending.fetch_add(self.reserved, Ordering::SeqCst);
+        self.scheduler.running.store(false, Ordering::Release);
+    }
 }
 
 impl Default for VacuumScheduler {
@@ -105,6 +124,12 @@ impl VacuumScheduler {
             slice: Arc::new(AtomicU64::new(slice_rows)),
             pending: Arc::new(AtomicU64::new(0)),
             cursor: Arc::new(Mutex::new(None)),
+            running: AtomicBool::new(false),
+            committed_rows: AtomicU64::new(0),
+            completed_slices: AtomicU64::new(0),
+            skipped_active: AtomicU64::new(0),
+            failed_slices: AtomicU64::new(0),
+            versions_removed: AtomicU64::new(0),
         }
     }
 
@@ -121,6 +146,7 @@ impl VacuumScheduler {
     pub fn on_commit(&self, rows: u64) {
         if rows > 0 {
             self.pending.fetch_add(rows, Ordering::SeqCst);
+            self.committed_rows.fetch_add(rows, Ordering::SeqCst);
         }
     }
 
@@ -134,13 +160,61 @@ impl VacuumScheduler {
         if seen < slice {
             return None;
         }
-        // CAS 失败 = 别的线程已经取走这笔账正在裁，本轮让给它
+        // 只取一片，不能把大事务剩余的账清零；下一次 begin 继续偿还积压。
         match self
             .pending
-            .compare_exchange(seen, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(seen, seen - slice, Ordering::SeqCst, Ordering::SeqCst)
         {
             Ok(_) => Some(slice),
             Err(_) => None,
+        }
+    }
+
+    /// 自动切片的唯一驱动。跳过/失败保留账与游标；并发调用不重复使用同一游标。
+    pub fn run_pending<E>(
+        &self,
+        run: impl FnOnce(Option<&[u8]>, u64) -> Result<crate::common::VacuumRound, E>,
+    ) -> Result<(), E> {
+        if self.slice() == 0
+            || self.pending.load(Ordering::SeqCst) < self.slice()
+            || self.running.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()
+        {
+            return Ok(());
+        }
+        let mut lease = VacuumLease { scheduler: self, reserved: 0 };
+        let Some(slice) = self.take_tick() else { return Ok(()) };
+        lease.reserved = slice;
+        let cursor = self.cursor();
+        match run(cursor.as_deref(), slice) {
+            Ok(round) if round.stats.skipped_active_txn => {
+                self.skipped_active.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(round) => {
+                self.set_cursor(round.next_cursor);
+                self.versions_removed.fetch_add(round.stats.versions_removed as u64, Ordering::SeqCst);
+                self.completed_slices.fetch_add(1, Ordering::SeqCst);
+                lease.reserved = 0;
+            }
+            Err(e) => {
+                self.failed_slices.fetch_add(1, Ordering::SeqCst);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// O(活跃事务数)，不读取存储页、value 或全库键。
+    pub fn status(&self, active: &Registry) -> crate::common::types::ReclamationStatus {
+        crate::common::types::ReclamationStatus {
+            pending_rows: self.pending.load(Ordering::SeqCst),
+            committed_rows: self.committed_rows.load(Ordering::SeqCst),
+            completed_slices: self.completed_slices.load(Ordering::SeqCst),
+            skipped_active: self.skipped_active.load(Ordering::SeqCst),
+            failed_slices: self.failed_slices.load(Ordering::SeqCst),
+            versions_removed: self.versions_removed.load(Ordering::SeqCst),
+            running: self.running.load(Ordering::Acquire),
+            active_txns: active.len() as u64,
+            oldest_active_version: active.keys().copied().min(),
         }
     }
 
@@ -664,6 +738,41 @@ mod tests {
         assert_eq!(s.take_tick(), None);
         s.set_slice(8);
         assert_eq!(s.take_tick(), Some(8), "重新打开后原来的账还在");
+    }
+
+    #[test]
+    fn scheduler_refunds_errors_and_panics_and_serializes_cursor() {
+        use crate::common::{VacuumRound, VacuumStats};
+        let s = VacuumScheduler::new(8);
+        s.on_commit(24);
+        let status = || s.status(&Registry::new());
+        let fail: Result<(), &str> = s.run_pending(|_, _| Err("disk error"));
+        assert_eq!(fail, Err("disk error"));
+        assert_eq!(status().pending_rows, 24);
+        assert_eq!(status().failed_slices, 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), ()> = s.run_pending(|_, _| panic!("probe"));
+        }));
+        assert!(panic.is_err());
+        assert!(!status().running);
+        assert_eq!(status().pending_rows, 24);
+        let ok: Result<(), ()> = s.run_pending(|after, rows| {
+            assert_eq!(after, None);
+            assert_eq!(rows, 8);
+            // 同一片还没返回时，再入不能取账或读写游标（等价于另一线程撞进来）。
+            let nested: Result<(), ()> = s.run_pending(|_, _| panic!("duplicate slice"));
+            assert!(nested.is_ok());
+            Ok(VacuumRound {
+                stats: VacuumStats { xmin: 1, versions_removed: 3, blob_rewritten: None,
+                    skipped_active_txn: false, rows_scanned: 8 },
+                next_cursor: Some(b"next".to_vec()),
+            })
+        });
+        assert!(ok.is_ok());
+        assert_eq!(status().pending_rows, 16);
+        assert_eq!(status().committed_rows, 24);
+        assert_eq!(status().versions_removed, 3);
+        assert_eq!(s.cursor().as_deref(), Some(&b"next"[..]));
     }
 
     #[test]

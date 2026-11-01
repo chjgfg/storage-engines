@@ -317,13 +317,14 @@ impl MVCC {
     /// 触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率 1:1，这是「跟得上」的下界。
     /// LSM 的一片是「每个源各读 slice 行」的窗口，块读取代价由稀疏索引压住。
     fn tick_auto_vacuum(&self) {
-        let Some(slice) = self.vac.take_tick() else {
-            return;
-        };
-        let after = self.vac.cursor();
-        if let Ok(round) = self.vacuum_bounded(after.as_deref(), slice) {
-            self.vac.set_cursor(round.next_cursor);
+        if let Err(e) = self.vac.run_pending(|after, rows| self.vacuum_bounded(after, rows)) {
+            log::warn!("自动版本回收失败，保留待回收账: {e}");
         }
+    }
+
+    /// 轻量回收状态，不扫描数据库。
+    pub fn reclamation_status(&self) -> crate::common::ReclamationStatus {
+        self.vac.status(&self.active_txn.lock().unwrap())
     }
 
     /// 自动回收的切片宽度（行数）：每攒够这么多行新版本，就裁一片这么多行。
@@ -338,8 +339,8 @@ impl MVCC {
         self.vac.slice()
     }
 
-    /// 默认切片宽度 = 16 Ki 行。一片的代价是「每个源读不超过这么多行」的窗口，
-    /// 与库总量无关 —— 这正是切片存在的理由。
+    /// 默认切片宽度 = 16 Ki 行；按完整键组结束，所以超长链可超过预算。
+    /// 多源归并仍有源状态和定位成本；这是行预算，不是 IO/内存/时间硬上限。
     pub const VACUUM_AUTO_SLICE_DEFAULT: u64 = 16 * 1024;
 
     /// 开启 bulk load：单写者、无 WAL、无冲突检测。

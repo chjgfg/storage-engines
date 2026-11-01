@@ -25,7 +25,7 @@ pub(crate) use codec::user_value_copies;
 pub(crate) use kernel::{collect_held_max, reset_collect_held};
 pub use types::{
     DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
-    SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
+    ReclamationStatus, SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use store::{
     RowValue, VersionedStore, collect_rows, collect_rows_as, count_window, export_rows_streaming,

@@ -195,6 +195,9 @@ pub struct EngineConfig {
     /// ⚠️ 调用方**显式**给过容量（`max_cache_pages != 0` / `block_cache_auto_max == 0`）时预算只当天花板：
     /// 两个数都是他定的，库不拿预算去抬他显式要的那一档。
     /// 换算价签与"别买中间档"那条实测在 README 的缓存价签一节。
+    /// 这是按样本每槽价估计容量，不是实时字节记账，更不是进程 RSS 硬上限。
+    /// 大键/大值会改变每槽真实大小；后端至少保留一槽时也可能超过极小预算。
+    /// 扫描返回值、事务写集、memtable、blob 重写、OS 文件缓存均不在此预算内。
     pub cache_budget_bytes: Option<u64>,
 }
 
@@ -225,6 +228,14 @@ impl Default for EngineConfig {
 /// `Send` 是**必须**的：句柄要能跟着任务跨线程走（交易进程里典型是"主线程开库、
 /// 工作线程读写"）。刻意**不要求 `Sync`** —— 事务内部有 `Cell`（WAL 是否已开）与
 /// 写集，跨线程共享一个事务对象本身就没有语义：单写者模型下"共享"只会变成竞态。
+/// # 资源合同
+///
+/// 返回 Vec 的接口按返回字节占内存（scan/reverse_scan/prefix_scan/export/multi_get），
+/// 不是分页或字节限额。scan_page 只限制行数；一条大值、长键、超长历史组仍能超过估计。
+/// 本库四家流式出口只保留固定候选片及当前行，但后端缓存/SST源数/当前版本组、回调自己
+/// 累积的结果另计；自定义 trait 实现的默认收集型 fallback 不享有同样的内存保证。
+/// search 的精确 total 需要走完整个匹配范围；offset 深翻需走过被跳过的行，连续翻页用游标。
+/// 所有接口均为同步调用；快照事务长期持有会阻挡版本回收，流式不等于短事务。
 pub trait KvTxn: Send {
     // ---- 基本读写 ----
 
@@ -289,7 +300,8 @@ pub trait KvTxn: Send {
 
     // ---- 扫描 / 搜索 ----
 
-    /// 范围扫描 `[start, end)`；`None` 表示该端无界
+    /// 范围扫描 `[start, end)`；None 表示该端无界。物化全部命中结果，内存按返回字节增长。
+    /// 大库导出/搬运使用流式出口；有界读取使用 scan_page。
     fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<ExportRecord>;
 
     fn reverse_scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<ExportRecord>;
@@ -441,6 +453,11 @@ pub trait KvEngine: Send + Sync {
     /// 代价是 O(物理行数)（引擎内部只走元数据/键，不物化 value），所以**别放进热路径**，
     /// 按分钟级采样足够。
     fn health(&self) -> MvccHealth;
+
+    /// 轻量回收账与活跃事务状态，O(活跃事务数)，不扫描库。第三方实现未接线时返回 None。
+    fn reclamation_status(&self) -> Option<crate::common::ReclamationStatus> {
+        None
+    }
 
     /// 自动回收的切片宽度（版本行数）：每攒够这么多行新版本，引擎自己裁一片这么多行。
     ///
@@ -788,7 +805,7 @@ pub fn open_engine_with<N: EngineName>(
     }
     if let Some(bytes) = config.cache_budget_bytes {
         // 同 `cache_auto_max` 那一条的理由：`?` 是有意的 —— 给 memory/bitcask 配了预算档要**当场失败**，
-        // 不能让下游以为"我配过了"（那一档决定的是 RSS 上限，静默失效比报错危险得多）。
+        // 不能让下游以为"我配过了"（这档限制的是估计缓存容量，不是 RSS；仍须拒绝静默失效）。
         db.set_cache_budget_bytes(bytes)?;
     }
     Ok(db)
@@ -890,6 +907,10 @@ macro_rules! impl_engine {
 
             fn health(&self) -> MvccHealth {
                 self.inner.health()
+            }
+
+            fn reclamation_status(&self) -> Option<crate::common::ReclamationStatus> {
+                Some(self.inner.reclamation_status())
             }
 
             fn set_vacuum_auto_slice(&self, rows: u64) {
@@ -4496,22 +4517,304 @@ mod tests {
         eprintln!("DEEP PAGE DONE");
     }
 
+    // 这份种子同时供台架与独立验收使用；期望不能从源库 health/scan 推导，
+    // 否则源库与 migrate 一起漏行时会自洽地通过。
+    fn scale_key(i: usize) -> Vec<u8> {
+        format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
+    }
+
+    fn scale_val(i: usize) -> Vec<u8> {
+        format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+    }
+
+    /// TTL 两格仍量真实 set/get；紧接着在计时外去掉期限，而非把期限调得更长。
+    /// 必须先验值再 persist（不是 set_raw 重播种），缺失/过期/损坏不能被修补后蒙混过关。
+    fn scale_persist_auxiliary(db: &dyn KvEngine, rows: usize) {
+        let tx = db.begin();
+        for i in 0..1000.min(rows) {
+            let key = scale_key(rows * 4 + i);
+            assert_eq!(tx.get(&key), Some(scale_val(i)), "{}: TTL 辅助键 {i} 丢失或值损坏", db.name());
+            assert!(tx.get_ttl(&key).flatten().is_some(), "{}: TTL 辅助键 {i} 没有期限", db.name());
+            assert!(tx.persist_key(&key), "{}: TTL 辅助键 {i} 永久化失败", db.name());
+        }
+        tx.commit();
+        let tx = db.begin();
+        for i in 0..1000.min(rows) {
+            let key = scale_key(rows * 4 + i);
+            assert_eq!(tx.get(&key), Some(scale_val(i)), "{}: persist 改了辅助键 {i} 的值", db.name());
+            assert_eq!(tx.get_ttl(&key), Some(None), "{}: persist 后辅助键 {i} 仍有期限", db.name());
+        }
+        tx.commit();
+    }
+
+    /// 对目标逐行验完整键与最新用户字节；只留前一把键，额外内存 O(1)。
+    /// 合法键域 + 严格递增（不重不乱）+ 独立总数，才能证明没有遗漏；仅比较两次计数不够。
+    fn scale_check_migration(
+        target: &dyn KvEngine,
+        rows: usize,
+        stats: MigrateStats,
+    ) -> std::result::Result<(), String> {
+        let ttl_rows = 1000.min(rows);
+        let want = (rows + ttl_rows + 1) as u64;
+        if stats.rows != want || stats.with_ttl != 0 {
+            return Err(format!("迁移统计应为 {want} 行、0 TTL，实际 {stats:?}"));
+        }
+        let mut seen = 0u64;
+        let mut bytes = 0u64;
+        let mut previous: Option<Vec<u8>> = None;
+        let mut error = None;
+        let handed = target.export_latest_visible_for_each(false, &mut |rec| {
+            let expected = if rec.key == b"counter:hits" {
+                Some(b"1000".to_vec())
+            } else {
+                std::str::from_utf8(&rec.key).ok()
+                    .and_then(|s| s.split_once('#'))
+                    .and_then(|(n, _)| n.parse::<usize>().ok())
+                    .filter(|&i| rec.key == scale_key(i))
+                    .and_then(|i| {
+                        if i < rows {
+                            Some(scale_val(if i < (rows / 10).max(1) { i + rows } else { i }))
+                        } else if i >= rows * 4 && i - rows * 4 < ttl_rows {
+                            Some(scale_val(i - rows * 4))
+                        } else {
+                            None
+                        }
+                    })
+            };
+            let reason = if previous.as_ref().is_some_and(|p| p >= &rec.key) {
+                Some("键重复或逆序")
+            } else if expected.is_none() {
+                Some("出现种子之外的键")
+            } else if rec.value != expected {
+                Some("用户值不符（含更新/计数器）")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                error = Some(format!("{reason}: {}", String::from_utf8_lossy(&rec.key)));
+                return false;
+            }
+            seen += 1;
+            bytes += expected.as_ref().unwrap().len() as u64;
+            previous = Some(rec.key);
+            true
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if seen != want || handed as u64 != seen {
+            return Err(format!("目标应有 {want} 个唯一合法键，实际 {seen}（导出报告 {handed}）"));
+        }
+        if stats.bytes != bytes {
+            return Err(format!("用户字节应为 {bytes}，迁移报告 {}", stats.bytes));
+        }
+        Ok(())
+    }
+
+    /// 只拥有本次新建的子目录；SCALE_SCRATCH_DIR 可把大台架放到有空间的盘。
+    /// guard 必须先于引擎声明，正常结束或 panic 都先释放文件锁再删本次目录。
+    struct ScaleScratch(PathBuf);
+
+    impl ScaleScratch {
+        fn new(tag: &str) -> Self {
+            let root = std::env::var_os("SCALE_SCRATCH_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            std::fs::create_dir_all(&root).expect("创建台架 scratch 根目录");
+            let unique = crate::common::tmp_test_path("se_engine", tag, "");
+            let path = root.join(unique.file_name().unwrap());
+            // create_dir 而不是清旧目录：碰撞宁可失败，绝不删除别次台架的数据。
+            std::fs::create_dir(&path).expect("创建本次台架 scratch 子目录");
+            Self(path)
+        }
+    }
+
+    impl Drop for ScaleScratch {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("台架 scratch 清理失败 {}: {e}", self.0.display());
+                }
+            }
+        }
+    }
+
+    // 小回归使用同一键/值账，直接播种「更新结束」状态，不跑性能循环。
+    fn scale_seed_test_fixture(db: &dyn KvEngine, rows: usize) {
+        let tx = db.begin();
+        for i in 0..rows {
+            let v = scale_val(if i < (rows / 10).max(1) { i + rows } else { i });
+            assert!(tx.set_raw(&scale_key(i), v));
+        }
+        for i in 0..1000.min(rows) {
+            assert!(tx.set_with_ttl(&scale_key(rows * 4 + i), scale_val(i), Duration::from_secs(3600)));
+        }
+        assert!(tx.set_raw(b"counter:hits", b"1000".to_vec()));
+        tx.commit();
+    }
+
+    #[test]
+    fn scale_fixture_persist_preserves_all_engines_and_migration_values() {
+        for kind in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree, EngineKind::Memory] {
+            let scratch = ScaleScratch::new("scale_persist_test");
+            let path = match kind {
+                EngineKind::Memory => None,
+                EngineKind::BPlusTree => Some(scratch.0.join("bplus.db")),
+                _ => Some(scratch.0.clone()),
+            };
+            let db = open_engine(kind, path.as_deref()).unwrap();
+            scale_seed_test_fixture(&*db, 12);
+            scale_persist_auxiliary(&*db, 12);
+            let target = open_engine(EngineKind::Memory, None).unwrap();
+            let stats = migrate(&*db, &*target, 3).unwrap();
+            scale_check_migration(&*target, 12, stats).unwrap();
+            let tx = target.begin();
+            for i in 0..12 {
+                assert_eq!(tx.get_ttl(&scale_key(48 + i)), Some(None));
+            }
+            tx.commit();
+        }
+    }
+
+    #[test]
+    fn scale_ttl_deadline_and_migration_have_exact_before_after_sets() {
+        // 短 TTL 的边界用明确的逻辑时刻：100 写、2 秒 TTL，101 活，102/103 死。
+        // 实际四引擎再分别注入「尚未到期/已经到期」的信封状态来验迁移，
+        // 不 sleep，也不要求 CI/磁盘必须抢在两秒内完成（没有全局时钟补丁）。
+        let value = b"short-lived";
+        let meta = crate::common::decode_value_meta(&crate::common::pack_ttl(value, 102));
+        assert_eq!(meta.user(), value);
+        assert!(!meta.is_expired_at(101));
+        assert!(meta.is_expired_at(102));
+        assert!(meta.is_expired_at(103));
+        for kind in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree, EngineKind::Memory] {
+            let scratch = ScaleScratch::new("scale_ttl_test");
+            let path = match kind {
+                EngineKind::Memory => None,
+                EngineKind::BPlusTree => Some(scratch.0.join("bplus.db")),
+                _ => Some(scratch.0.clone()),
+            };
+            let db = open_engine(kind, path.as_deref()).unwrap();
+            let tx = db.begin();
+            assert!(tx.set_raw(b"plain", vec![0x01, 0x00, 0xFE]));
+            // 两个确定的状态，期限本身不是长跑台架的解决方案；台架使用 persist。
+            assert!(tx.set(b"ttl", crate::common::pack_ttl(value, u64::MAX)));
+            tx.commit();
+            let before = open_engine(EngineKind::Memory, None).unwrap();
+            let stats = migrate(&*db, &*before, 1).unwrap();
+            assert_eq!(stats.rows, 2, "{}: 未过期集合", kind.as_str());
+            assert_eq!(stats.with_ttl, 1);
+            let tx = before.begin();
+            assert_eq!(tx.get(b"plain"), Some(vec![0x01, 0x00, 0xFE]));
+            assert_eq!(tx.get(b"ttl"), Some(value.to_vec()));
+            assert!(tx.get_ttl(b"ttl").flatten().is_some());
+            assert_eq!(tx.scan(None, None).len(), 2);
+            tx.commit();
+
+            // 只改变辅助键的过期元数据，普通键不动；迁移期望固定为 1，不问 health。
+            let tx = db.begin();
+            assert!(tx.set(b"ttl", crate::common::pack_ttl(value, 0)));
+            tx.commit();
+            let tx = db.begin();
+            assert_eq!(tx.get(b"ttl"), None);
+            assert_eq!(tx.get_ttl(b"ttl"), None);
+            tx.commit();
+            let after = open_engine(EngineKind::Memory, None).unwrap();
+            let stats = migrate(&*db, &*after, 1).unwrap();
+            assert_eq!(stats.rows, 1, "{}: 已过期集合", kind.as_str());
+            assert_eq!(stats.with_ttl, 0);
+            let tx = after.begin();
+            assert_eq!(tx.get(b"plain"), Some(vec![0x01, 0x00, 0xFE]));
+            assert_eq!(tx.get(b"ttl"), None);
+            assert_eq!(tx.scan(None, None).len(), 1);
+            tx.commit();
+        }
+    }
+
+    #[test]
+    fn scale_migration_manifest_rejects_missing_and_corrupt_data() {
+        let rows = 12;
+        let db = open_engine(EngineKind::Memory, None).unwrap();
+        scale_seed_test_fixture(&*db, rows);
+        scale_persist_auxiliary(&*db, rows);
+        for defect in ["missing", "wrong-value", "same-count-wrong-key", "counter"] {
+            let target = open_engine(EngineKind::Memory, None).unwrap();
+            let stats = migrate(&*db, &*target, 3).unwrap();
+            scale_check_migration(&*target, rows, stats).unwrap();
+            let tx = target.begin();
+            match defect {
+                "missing" => assert!(tx.delete(&scale_key(1))),
+                "wrong-value" => assert!(tx.set_raw(&scale_key(0), scale_val(0))), // 忘带更新版
+                "same-count-wrong-key" => {
+                    assert!(tx.delete(&scale_key(1)));
+                    assert!(tx.set_raw(b"unexpected", scale_val(1)));
+                }
+                "counter" => assert!(tx.set_raw(b"counter:hits", b"999".to_vec())),
+                _ => unreachable!(),
+            }
+            tx.commit();
+            // stats 仍是原本正确的数：不能仅信迁移自己的计数，目标缺/错行也必须失败。
+            assert!(scale_check_migration(&*target, rows, stats).is_err(), "必须抓到 {defect}");
+        }
+        // 源端先丢一个非 TTL 键，migrate 与目标就会自洽地同少一行；独立种子账仍必须红。
+        let tx = db.begin();
+        assert!(tx.delete(&scale_key(1)));
+        tx.commit();
+        let target = open_engine(EngineKind::Memory, None).unwrap();
+        let stats = migrate(&*db, &*target, 3).unwrap();
+        assert_eq!(stats.rows, (rows * 2) as u64);
+        assert!(scale_check_migration(&*target, rows, stats).is_err());
+    }
+
+    #[test]
+    fn scale_persist_auxiliary_rejects_missing_keys_without_reseeding() {
+        let db = open_engine(EngineKind::Memory, None).unwrap();
+        scale_seed_test_fixture(&*db, 12);
+        let missing = scale_key(48);
+        let tx = db.begin();
+        assert!(tx.delete(&missing));
+        tx.commit();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scale_persist_auxiliary(&*db, 12);
+        }));
+        assert!(failed.is_err());
+        assert_eq!(db.begin().get(&missing), None);
+    }
+
+    #[test]
+    fn scale_scratch_cleans_owned_directory_on_unwind() {
+        let scratch = ScaleScratch::new("scale_cleanup_test");
+        let path = scratch.0.clone();
+        assert!(path.is_dir());
+        let failed = std::panic::catch_unwind(move || {
+            let _scratch = scratch;
+            panic!("simulate benchmark assertion failure");
+        });
+        assert!(failed.is_err());
+        assert!(!path.exists());
+    }
+
+    // 固定规模的 IDE / cargo test 入口；共享下面的同一套台架，不复制五份负载。
+    include!("scale_bench.rs");
+
     #[test]
     #[ignore = "大库基线，手动 release 单线程跑：SCALE_ROWS=50000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline"]
     fn scale_baseline_all_engines() {
         let rows: usize = std::env::var("SCALE_ROWS")
-            .ok()
-            .and_then(|s| s.parse().ok())
+            .map(|s| s.parse().expect("SCALE_ROWS 必须是正整数"))
             .unwrap_or(50_000);
-        // 键 ≈ 35 字节、值 ≈ 60 字节：照下游真实形状（也都远小于任何 blob 阈值）
-        fn key(i: usize) -> Vec<u8> {
-            format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
-        }
-        fn val(i: usize) -> Vec<u8> {
-            format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
-        }
+        run_scale_baseline(rows);
+    }
 
+    fn run_scale_baseline(rows: usize) {
+        assert!(rows > 0 && rows.checked_mul(16).is_some(), "SCALE_ROWS 必须为非零且不溢出的行数");
+        // 键 ≈ 35 字节、值 ≈ 60 字节：照下游真实形状（也都远小于任何 blob 阈值）
+        use self::{scale_key as key, scale_val as val};
+
+        eprintln!("SCALE_BEGIN rows={rows} package={} os={} arch={} optimized={}",
+            env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, !cfg!(debug_assertions));
         eprintln!("=== 大库基线 rows={rows}（µs/次 + 常驻/峰值 MB）===");
+        eprintln!("验收政策：TTL 两格后计时外 persist 同一批辅助键；后续固定 rows+min(rows,1000)+1，迁移目标逐键逐值验收不计入32类性能格。");
         for kind in [
             EngineKind::Bitcask,
             EngineKind::BPlusTree,
@@ -4519,7 +4822,9 @@ mod tests {
             EngineKind::Memory,
         ] {
             let label = kind.as_str();
-            let dir = tmp_dir(&format!("scale_{label}"));
+            let scratch = ScaleScratch::new(&format!("scale_{label}"));
+            let dir = scratch.0.clone();
+            eprintln!("{label}: scratch={}", dir.display());
             // B+ 树的"库"是一个文件，另两家是目录，memory 不落盘
             let arg = match kind {
                 EngineKind::Memory => None,
@@ -4723,16 +5028,22 @@ mod tests {
             });
             line(label, "get_ttl×1000", d.as_secs_f64() * 1e6 / ttl_rows as f64, "µs/次", live, peak, &format!("{hits}/{ttl_rows} 有 TTL"));
             assert_eq!(hits, ttl_rows, "{label}: 刚写的 TTL 必须全部读得回来（读不回来=信封在某一家被吞了）");
+            // 性能负载与短 TTL 语义分离：不让 20M 档几个小时的墙钟决定迁移期望。
+            // 保留同一批键/值/行数，但多写 ttl_rows 个辅助版本，后续不再走 TTL 分支；
+            // 这不是历史 TTL 负载的逐字节同形状，必须在输出中单独交代，不能冒充性能改进。
+            scale_persist_auxiliary(&*db, rows);
+            eprintln!("{label}: 验收准备(不计时) persist {ttl_rows} 辅助键，新增 {ttl_rows} 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状");
 
             // ---- TTL / 计数器 ----
             let (d, live, peak, ()) = timed(|| {
                 let tx = db.begin();
-                for _ in 0..1000 {
-                    let _ = tx.incr(b"counter:hits", 1);
+                for expected in 1..=1000 {
+                    assert_eq!(tx.incr(b"counter:hits", 1), Ok(expected), "{label}: incr 不许忽略失败");
                 }
                 tx.commit();
             });
             line(label, "incr×1000", d.as_secs_f64() * 1e6 / 1000.0, "µs/次", live, peak, "");
+            assert_eq!(db.begin().get(b"counter:hits"), Some(b"1000".to_vec()), "{label}: incr 提交后计数器缺失");
 
             // ---- 更新 10% 的键（制造版本链，看点写是否被链拖住） ----
             let updates: usize = (rows / 10).max(1);
@@ -4780,9 +5091,7 @@ mod tests {
             // 与上面那一行是**同一件事的两种写法**，所以这一对就是这一刀的凭据：
             // 峰值不该再随库大小涨（那是调用方要的那份 `Vec`，不是遍历的账）。
             let snap = dir.join("export_stream.bin");
-            // `tmp_dir` 只负责清掉旧残留，**不创建目录** —— 磁盘引擎由 open 时自己建，
-            // memory 一家没人建 ⇒ 这里不先 create_dir_all 就会在 memory 那一档 panic（第一版就栽了）。
-            let _ = std::fs::create_dir_all(&dir);
+            // ScaleScratch 已在计时外建好目录，包括不落盘的 memory 一家。
             let (d, live, peak, n) = timed(|| {
                 let mut w = crate::common::kv_snapshot::ExportWriter::bin(&snap, false).unwrap();
                 let handed = db.export_latest_visible_for_each(false, &mut |rec| w.push(rec));
@@ -4796,16 +5105,17 @@ mod tests {
             let _ = std::fs::remove_file(&snap);
 
             // ---- 跨引擎搬家：这一家 → memory（读侧 scan_page、写侧一页一事务，M17）----
-            // 期望值现问源库要（`live_keys`），因为此刻库里除了灌的 {rows} 行，还多了上面
-            // TTL/计数器那两条写进去的键 —— 拿 {rows} 当期望会假红。
-            let want = db.health().live_keys;
+            // 独立种子账：rows 个普通键 + ttl_rows 个已永久化辅助键 + 1 个计数器。
+            // 绝不问源库 health 要期望：源端非 TTL 丢失也必须红，不能一起少而自洽。
+            let want = (rows + ttl_rows + 1) as u64;
             let target = open_engine(EngineKind::Memory, None).unwrap();
             let (d, live, peak, ms) = timed(|| migrate(&*db, &*target, 1000).unwrap());
             line(label, "migrate → memory", d.as_secs_f64() * 1e6 / rows.max(1) as f64, "µs/行", live, peak,
                  &format!("搬 {} 行 / {} 页 / {} B", ms.rows, ms.pages, ms.bytes));
-            // ⚠️ 极端档假红：2000 万行 lsm 从 set_with_ttl 到 migrate 结束 >60 min，那 1000 个
-            // TTL 键（排在键序最末）已过期、被 scan 正确过滤 ⇒ ms.rows 少 1000；引擎对，是这句 `want` 不 scale-safe。
-            assert_eq!(ms.rows, want, "{label}: migrate 搬走的行数必须等于源库 live_keys（少了=游标或过滤有洞）");
+            // 验收在计时外逐行流过目标，不在 O(N) 内存的目标旁再攒第二份全库 Vec。
+            scale_check_migration(&*target, rows, ms)
+                .unwrap_or_else(|e| panic!("{label}: migrate 验收失败: {e}"));
+            eprintln!("{label}: migrate 验收通过(不计时) {want} 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0");
             let bulk_rows = (rows / 10).max(1);
             let (d, live, peak, ()) = timed(|| {
                 let mut bulk = db.begin_bulk();
@@ -4843,12 +5153,14 @@ mod tests {
             drop(tx);
             drop(db);
 
-            if kind != EngineKind::Memory {
-                let _ = std::fs::remove_dir_all(&dir);
-                let _ = std::fs::remove_file(&dir);
-            }
+            // 明确在成功标记之前清理；错误不能被脚本误判为完整通过。
+            std::fs::remove_dir_all(&scratch.0)
+                .unwrap_or_else(|e| panic!("台架清理失败 {}: {e}", scratch.0.display()));
+            drop(scratch);
+            eprintln!("SCALE_ENGINE_DONE rows={rows} engine={label}");
             eprintln!();
         }
+        eprintln!("SCALE_DONE rows={rows} engines=4");
     }
 
     /// M68 —— 把 `tools` 搬运层量进标准表：**三跳每跳跑两臂**（流式 vs 先物化整库），同一进程同一构建 ⇒ 比值即因果。

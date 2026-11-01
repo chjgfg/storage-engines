@@ -567,11 +567,21 @@ impl SstFile {
         }
     }
 
+    fn has_entries(&self) -> bool {
+        self.entries_cache.as_ref().map_or(!self.index.is_empty(), |entries| !entries.is_empty())
+    }
+
     pub fn may_overlap(&self, low: &[u8], high: &[u8]) -> bool {
-        if self.min_key.is_empty() && self.max_key.is_empty() {
-            return false;
-        }
-        self.min_key.as_slice() <= high && self.max_key.as_slice() >= low
+        // 空字节串也是真键，不能靠 min/max 都为空来判空文件。
+        self.has_entries() && low <= high
+            && self.min_key.as_slice() <= high && self.max_key.as_slice() >= low
+    }
+
+    pub(crate) fn may_overlap_half_open(&self, from: Option<&[u8]>, to: Option<&[u8]>) -> bool {
+        self.has_entries()
+            && !matches!((from, to), (Some(lo), Some(hi)) if lo >= hi)
+            && from.is_none_or(|lo| self.max_key.as_slice() >= lo)
+            && to.is_none_or(|hi| self.min_key.as_slice() < hi)
     }
 
     pub fn get(&self, key: &[u8]) -> Option<StoredEntry> {
@@ -602,18 +612,26 @@ impl SstFile {
             note_sst_entry_walks(e.len() as u64);
             return best;
         }
-        let bi = self.find_block(key)?;
-        let block = self.load_block(bi).ok()?;
+        let mut bi = self.find_block(key)?;
         let mut best: Option<StoredEntry> = None;
-        for (k, se) in &block.entries {
-            if k.as_slice() == key && se.visible_at(snap_seq) {
-                if best.as_ref().map(|b| se.seq >= b.seq).unwrap_or(true) {
-                    best = Some(se.clone());
+        loop {
+            let block = self.load_block(bi).ok()?;
+            for (k, se) in block.entries.iter().rev() {
+                if k.as_slice() == key && se.visible_at(snap_seq) {
+                    if best.as_ref().is_none_or(|b| se.seq > b.seq) {
+                        best = Some(se.clone());
+                    }
                 }
             }
+            #[cfg(test)]
+            note_sst_entry_walks(block.entries.len() as u64);
+            // 同键的 seq 可横跨任意多块，甚至不按 seq 排；不能只看 find_block 的最后一块。
+            // 本块首键更小则之前全小；首键等于 key 时前块尾部仍可能有同键。
+            if bi == 0 || self.index[bi].first_key.as_slice() < key {
+                break;
+            }
+            bi -= 1;
         }
-        #[cfg(test)]
-        note_sst_entry_walks(block.entries.len() as u64);
         best
     }
 
@@ -671,14 +689,10 @@ impl SstFile {
     ///
     /// 旧 `range_at` 从第 0 块开始逐条 `continue` 到 `low`，于是区间查询的代价与
     /// **整个文件**成正比而不是与命中行数成正比 —— MVCC 点读放大因此变成随库总量增长。
-    /// 起点额外回退一块：块是按**固定条数**切分的，同一个 key 的多个 seq 可能跨块边界，
-    /// 少回退一块就可能漏掉该 key 更旧的 seq（`snap_seq` 截断较新 seq 时会取错）。
+    /// 起点取第一个 first_key >= low 的前一块，保留任意长的跨块同键版本组。
     /// v1 文件整份在 `entries_cache` 里，没有索引，保持从头扫。
     fn iter_from_key(&self, low: &[u8]) -> SstEntryIter<'_> {
-        let block_i = self
-            .find_block(low)
-            .map(|i| i.saturating_sub(1))
-            .unwrap_or(0);
+        let block_i = self.first_block_for_key(low);
         SstEntryIter {
             sst: self,
             block_i,
@@ -688,18 +702,8 @@ impl SstFile {
         }
     }
 
-    /// 在闭区间 `[low, high]` 内**从大到小**找第一个被 `accept` 接受的 key。
-    ///
-    /// 用稀疏索引直接定位 `high` 所在块，块内反向扫，一块扫完退到前一块；一旦某块里
-    /// 出现 `k < low` 即可收尾 —— 块内与块间都按 key 升序，再往前全部落在区间之外。
-    ///
-    /// 与 [`Self::range_at`] 保持同一套「每个 key 只取最大可见 seq」的语义：反向遇到某
-    /// key 的第一条若 `seq > snap_seq` 不可见，会继续在该 key 的更旧条目里找次大可见 seq；
-    /// 一旦该 key 定论（拿到可见条目并交给 `accept`），同 key 更旧的 seq 不再回看。
-    ///
-    /// 已知边界：若同一个 key 的条目**跨块**、且较新的那条落在后一块而 `snap_seq` 把它截断，
-    /// 这里取到的是「本块内最大可见 seq」，与 `range_at` 扫全文件相比可能偏旧。MVCC 调用
-    /// 传 `snap_seq = u64::MAX`（全可见），不落入该边界。
+    /// 在闭区间 `[low, high]` 内反向查找。稀疏索引定位 high，完整折叠同键的所有可见 seq
+    /// 后才交给 accept；版本组可跨块，seq 不要求有序。拒绝一次后不再复活该键的旧值。
     pub fn find_back(
         &self,
         low: &[u8],
@@ -711,53 +715,59 @@ impl SstFile {
             return None;
         }
 
-        // v1：整份在内存里，反向线性扫即可
-        if let Some(all) = &self.entries_cache {
-            for (k, se) in all.iter().rev() {
-                let ks = k.as_slice();
-                if ks > high {
-                    continue;
-                }
-                if ks < low {
-                    return None;
-                }
-                if accept(ks, se) {
-                    return Some((k.clone(), se.clone()));
+        let mut pending: Option<(Vec<u8>, StoredEntry)> = None;
+        // None 表示越界/文件结束，收口最后一个组。反向只用 > 替换，保留同 seq 时
+        // 正向 range_at 取最后一条的规则。pending 跨块保留，不能每块重置。
+        let mut feed = |entry: Option<(&[u8], &StoredEntry)>| {
+            if pending.as_ref().is_some_and(|(pk, _)| {
+                entry.is_none_or(|(k, _)| k != pk.as_slice())
+            }) {
+                let (k, se) = pending.take().unwrap();
+                if accept(&k, &se) {
+                    return Some((k, se));
                 }
             }
-            return None;
+            if let Some((k, se)) = entry {
+                if se.visible_at(snap_seq)
+                    && pending.as_ref().is_none_or(|(_, best)| se.seq > best.seq)
+                {
+                    pending = Some((k.to_vec(), se.clone()));
+                }
+            }
+            None
+        };
+
+        if let Some(all) = &self.entries_cache {
+            for (k, se) in all.iter().rev() {
+                if k.as_slice() > high {
+                    continue;
+                }
+                if k.as_slice() < low {
+                    break;
+                }
+                if let Some(hit) = feed(Some((k, se))) {
+                    return Some(hit);
+                }
+            }
+            return feed(None);
         }
 
         let mut block_i = self.find_block(high)?;
         loop {
             let block = self.load_block(block_i).ok()?;
-            // 已经定论的 key：同 key 更旧的 seq 不再考虑（对齐 range_at 的每 key 取胜）
-            let mut decided: Option<Vec<u8>> = None;
-            let mut idx = block.entries.len();
-            while idx > 0 {
-                idx -= 1;
-                let (k, se) = &block.entries[idx];
-                let ks = k.as_slice();
-                if ks > high {
+            for (k, se) in block.entries.iter().rev() {
+                if k.as_slice() > high {
                     continue;
                 }
-                if ks < low {
-                    return None;
+                if k.as_slice() < low {
+                    return feed(None);
                 }
-                if decided.as_deref() == Some(ks) {
-                    continue;
-                }
-                if !se.visible_at(snap_seq) {
-                    continue;
-                }
-                decided = Some(k.clone());
-                if accept(ks, se) {
-                    return Some((k.clone(), se.clone()));
+                if let Some(hit) = feed(Some((k, se))) {
+                    return Some(hit);
                 }
             }
-
             if block_i == 0 {
-                return None;
+                return feed(None);
             }
             block_i -= 1;
         }
@@ -833,6 +843,9 @@ impl SstFile {
         to: Option<&[u8]>,
         snap_seq: u64,
     ) -> impl Iterator<Item = (Vec<u8>, LightEntry)> + '_ {
+        if !self.may_overlap_half_open(from, to) {
+            return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>;
+        }
         let filter = move |(k, se): &(Vec<u8>, StoredEntry)| -> Option<(Vec<u8>, LightEntry)> {
             if !se.visible_at(snap_seq) {
                 return None;
@@ -961,6 +974,14 @@ impl SstFile {
             f(&k, &se);
         }
         Ok(())
+    }
+
+    fn first_block_for_key(&self, key: &[u8]) -> usize {
+        self.index.partition_point(|entry| {
+            #[cfg(test)]
+            INDEX_PROBES.with(|c| c.set(c.get() + 1));
+            entry.first_key.as_slice() < key
+        }).saturating_sub(1)
     }
 
     fn find_block(&self, key: &[u8]) -> Option<usize> {
@@ -2423,6 +2444,83 @@ mod tests {
         // 空区间 / 越界区间
         assert!(sst.find_back(&low, &b"k005".to_vec(), u64::MAX, |_, _| true).is_none());
         assert!(sst.find_back(b"zzz", b"zzzz", u64::MAX, |_, _| true).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sst_pruning_back_and_get_keep_cross_block_versions() {
+        use std::collections::BTreeMap;
+        let path = tmp("pruning_versions");
+        let mut builder = SstBuilder::with_options(1, &path, 2, false);
+        builder.add(b"a".to_vec(), StoredEntry::put(1, Some(b"a".to_vec())));
+        // 只要求键有序，不假设 seq 有序；b 的版本组跨五块。
+        for seq in [5, 2, 9, 1, 7, 3, 11, 10] {
+            let value = if seq == 10 {
+                StoredEntry::drop_at(seq)
+            } else {
+                StoredEntry::put(seq, Some(vec![seq as u8]))
+            };
+            builder.add(b"b".to_vec(), value);
+        }
+        builder.add(b"c".to_vec(), StoredEntry::put(20, Some(b"c".to_vec())));
+        let mut sst = builder.finish().unwrap();
+        let all: Vec<_> = sst.iter_all().collect();
+        for memory_backed in [false, true] {
+            if memory_backed {
+                // 同一折叠逻辑也覆盖旧格式的内存条目路径。
+                sst.entries_cache = Some(all.clone());
+            }
+            for snap in [0, 1, 4, 7, 9, 10, 11, 20] {
+                let mut expected = BTreeMap::<Vec<u8>, StoredEntry>::new();
+                for (k, se) in &all {
+                    if se.visible_at(snap) && expected.get(k).is_none_or(|old| se.seq >= old.seq) {
+                        expected.insert(k.clone(), se.clone());
+                    }
+                }
+                assert_eq!(sst.get_at(b"b", snap), expected.get(b"b".as_slice()).cloned());
+                assert_eq!(sst.range_at(b"b", b"b", snap), expected.iter()
+                    .filter(|(k, _)| k.as_slice() == b"b").map(|(k, se)| (k.clone(), se.clone())).collect::<Vec<_>>());
+                let want = expected.iter().rev().find(|(_, se)| !matches!(se.value, EntryValue::Drop))
+                    .map(|(k, se)| (k.clone(), se.clone()));
+                assert_eq!(sst.find_back(b"a", b"c", snap, |_, se| !matches!(se.value, EntryValue::Drop)), want);
+                let mut called = Vec::new();
+                assert!(sst.find_back(b"a", b"c", snap, |k, _| {
+                    called.push(k.to_vec());
+                    false
+                }).is_none());
+                assert_eq!(called, expected.keys().rev().cloned().collect::<Vec<_>>(), "每键只允许拒绝一次");
+            }
+        }
+        drop(sst);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sst_pruning_half_open_bounds_and_empty_key() {
+        let path = tmp("pruning_bounds");
+        let mut builder = SstBuilder::with_options(1, &path, 1, false);
+        builder.add(b"m".to_vec(), StoredEntry::put(1, Some(vec![1])));
+        let sst = builder.finish().unwrap();
+        let before = block_reads();
+        assert_eq!(sst.light_iter(None, Some(b"m"), 1).count(), 0);
+        assert_eq!(sst.light_iter(Some(b"n"), None, 1).count(), 0);
+        assert_eq!(sst.light_iter(Some(b"z"), Some(b"a"), 1).count(), 0);
+        assert_eq!(block_reads() - before, 0, "界外源不能为了初始化先读一块");
+        assert_eq!(sst.light_iter(Some(b"m"), None, 1).count(), 1);
+        assert!(block_reads() > before, "相交源是计数正控");
+        drop(sst);
+        let _ = std::fs::remove_file(&path);
+
+        let path = tmp("pruning_empty_key");
+        let mut builder = SstBuilder::with_options(2, &path, 1, false);
+        builder.add(Vec::new(), StoredEntry::put(1, Some(vec![2])));
+        let sst = builder.finish().unwrap();
+        assert!(sst.may_overlap(b"", b""));
+        assert_eq!(sst.get_at(b"", 1), Some(StoredEntry::put(1, Some(vec![2]))));
+        assert_eq!(sst.find_back(b"", b"", 1, |_, _| true).unwrap().0, Vec::<u8>::new());
+        assert_eq!(sst.light_iter(None, None, 1).count(), 1);
+        assert_eq!(sst.light_iter(None, Some(b""), 1).count(), 0);
+        drop(sst);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -394,19 +394,20 @@ impl MVCC {
     /// 一片的代价 = 读 `slice` 行元数据（不读 value），锁也就按这么久。
     /// 长尾那一片（库尾之后）会自动从头开始下一遍。
     fn tick_auto_vacuum(&self) {
-        let Some(slice) = self.vac.take_tick() else {
-            return;
-        };
-        let after = self.vac.cursor();
-        if let Ok(round) = self.vacuum_bounded(after.as_deref(), slice) {
-            self.vac.set_cursor(round.next_cursor);
+        if let Err(e) = self.vac.run_pending(|after, rows| self.vacuum_bounded(after, rows)) {
+            log::warn!("自动版本回收失败，保留待回收账: {e}");
         }
+    }
+
+    /// 轻量回收状态，不扫描数据库。
+    pub fn reclamation_status(&self) -> crate::common::ReclamationStatus {
+        self.vac.status(&self.active_txn.lock().unwrap())
     }
 
     /// 自动回收的切片宽度（行数）：每攒够这么多行新版本，就裁一片这么多行。
     ///
     /// 默认 [`MVCC::VACUUM_AUTO_SLICE_DEFAULT`]；**设 0 关闭自动回收**，那时版本行只增不减，
-    /// 得靠手动 `vacuum()` —— 也就是回到「热点 key 堆二十万版、点读陪跑整条链」的状态。
+    /// 得靠手动/后台维护裁版本。点读的链尾早停仍在，但历史索引、日志与维护成本会积累。
     /// 记账/取账/游标的策略在 [`crate::common::VacuumScheduler`]（四引擎共用）。
     pub fn set_vacuum_auto_slice(&self, rows: u64) {
         self.vac.set_slice(rows);

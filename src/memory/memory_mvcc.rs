@@ -101,18 +101,20 @@ impl MVCC {
     ///
     /// 触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率 1:1，这是「跟得上」的下界。
     fn tick_auto_vacuum(&self) {
-        let Some(slice) = self.vac.take_tick() else {
-            return;
-        };
-        let after = self.vac.cursor();
-        let round = self.vacuum_bounded(after.as_deref(), slice);
-        self.vac.set_cursor(round.next_cursor);
+        let _: Result<(), std::convert::Infallible> = self.vac.run_pending(|after, rows| {
+            Ok(self.vacuum_bounded(after, rows))
+        });
+    }
+
+    /// 轻量回收状态，不扫描数据库。
+    pub fn reclamation_status(&self) -> crate::common::ReclamationStatus {
+        self.vac.status(&self.active_txn.lock().unwrap())
     }
 
     /// 自动回收的切片宽度（行数）：每攒够这么多行新版本，就裁一片这么多行。
     ///
     /// 默认 [`MVCC::VACUUM_AUTO_SLICE_DEFAULT`]；**设 0 关闭自动回收**。内存引擎没有磁盘
-    /// 空间问题，但版本链一样会让点读点写陪跑整条链 —— 涨的慢不等于不涨。
+    /// 空间问题，但旧版本仍占堆内存。点读早停与版本回收是两件独立的事。
     pub fn set_vacuum_auto_slice(&self, rows: u64) {
         self.vac.set_slice(rows);
     }

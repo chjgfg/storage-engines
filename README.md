@@ -6,7 +6,7 @@
 
 - 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
 - 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 332 个单元测试 + 4 个集成测试
+- 369 个普通单元测试 + 35 个默认忽略的专项/规模测试 + 4 个集成测试（2026-11-02 全目标实测：lib **369 passed / 0 failed / 35 ignored**、集成四个各 1 条、bin 内 5 条、文档测试 **6 passed / 2 ignored**，0 失败；规模五档默认忽略，需显式单跑）
 - 当前版本 **0.4.0**:随 uptime 恶化的七条通道逐条堵死,版本回收改为自动 —— 破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M78**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响)、search 要精确 total 合成一趟折叠(600k 末页 5.21 → 2.40 s，M75b)、缓存档可按**内存预算**给(`cache_budget_bytes`，实测常驻 ≤ 给的字节，M76)、hint 载入的预留一次到位(bitcask 冷重开 337.6 → 214.7 ms，M77))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
 - 许可证:MIT 或 Apache-2.0 任选
 
@@ -93,7 +93,120 @@ tx.commit();
 
 ---
 
+## 自行运行大规模压测
+
+**固定测试入口：[`src/scale_bench.rs`](src/scale_bench.rs)**。包含 60万、100万、500万、1000万、2000万五个 `#[ignore]` 测试，
+只传不同规模，复用同一个参数化台架，不复制五份实现。它们属于库内单元测试，因而能使用块/页/堆分配计数器；
+不是可脱离项目直接 `rustc` 的单文件程序。原 `engine::tests::scale_baseline_all_engines` 与 `SCALE_ROWS` 入口保留，支持其它规模。
+普通 `cargo test` 不跑这些大档；**不要不带精确过滤直接运行所有 ignored 测试**。
+
+推荐在项目根目录用 PowerShell 脚本运行（Windows PowerShell 5.1+）：
+
+```powershell
+# 建议先单跑60万；若失败，先返回日志，不必继续烧时间跑更大档
+.\scripts\run-scale-bench.ps1 -Rows "600000"
+
+# 默认按顺序跑 60万、100万、500万、1000万、2000万，任意失败立即停止
+.\scripts\run-scale-bench.ps1
+
+# 选档、重复次数、独立测试盘；-Rows 是逗号分隔字符串
+.\scripts\run-scale-bench.ps1 -Rows "1000000,5000000,10000000,20000000" -Repeat 2 -ScratchRoot "D:\storage-bench-scratch"
+
+# 只自测脚本的失败退出码、双流日志与安全清理，不编译/运行大台架
+.\scripts\run-scale-bench.ps1 -SelfTest
+```
+
+默认离线构建；新机器缺依赖时加 `-AllowNetwork`。脚本只构建一次 release，直接运行实际生成的库测试二进制，
+每档 `--exact --ignored --nocapture --test-threads=1`，一个仓库一次只允许一个脚本实例。
+它记录 Git HEAD、dirty 状态、源码与二进制 SHA256、锁文件摘要、Rust/CPU/内存环境；源码或二进制在档位间改变会拒绝继续。
+运行前会清除子进程中的分段探针环境变量，避免嵌套 reset_peak 污染表内峰值。
+
+每次结果放 `data/bench-results/<时间-唯一ID>/`（可用 `-OutputRoot` 改）：
+
+- `summary.json`：每档的 PASS/FAIL、退出码、完成时间、122格数量、cleanup 状态。
+- `rows_<规模>_pass_<轮次>.csv`：原始操作名、归一化操作名、单位耗时、堆常驻/峰值增量、额外计数。
+- 同名 `.log`：完整 stdout/stderr，含独立迁移验收和四引擎结束标记；错误不会过滤掉。
+- `run.json` / `source.json` / `build.log`：环境、版本指纹、计划档位、编译记录；失败另有 `failure.txt`。
+
+**返回给我：先给 `summary.json`、CSV 和 `run.json`；有 FAIL/异常时再附对应完整日志。**
+MB 是分段 Rust 堆增量，不是 RSS。跨构建的时间差只是线索，不能把数据形状/工作量不同当算法进步。
+固定接口、参数语义、事务/TTL语义、磁盘格式作为改动约束；如果确实必须改变这些合同，会先说明，不悄悄改。
+
+**清理范围：**每档建唯一 scratch 并写 ownership marker，Rust RAII + 脚本 finally 两层清理；断言失败也清理，
+只留下结果日志/摘要。不会清理用户原库、其它运行目录、`backups/` 或共享 `target/` 编译缓存。
+强杀整个脚本、断电不会执行 finally，这种情况不能保证当场删除。下次用这次结果目录明确清理：
+
+```powershell
+.\scripts\run-scale-bench.ps1 -CleanRun "D:\...\data\bench-results\<本次目录>"
+```
+
+清理只接受清单与 marker 匹配的目录，发现链接或归属不符会拒绝；不会按后缀/时间通配删库。
+直接用 IDE/cargo 单独跑 `.rs` 入口时也有 Rust RAII，但强杀后没有脚本清单，请核对日志里的 `scratch=` 精确目录。
+
+```powershell
+# 不用脚本，运行固定的一档（在终端或IDE都可以）
+cargo test --release --lib engine::tests::scale_bench::rows_10000000 -- --exact --ignored --nocapture --test-threads=1
+```
+
+2026-10-31 交付自测：脚本 SelfTest 通过；2000/3000 行两档各122格、四家独立逐值验收、cleanup=OK。
+这些小档只证明入口/验收/清理能用，不冒充大档性能结果。此前我启动的修复版600k已按交接安排中止，
+尚未完成的B+少一行线索保留待你实测；未启动20M，不会写成通过。
+
 ## 下游接入使用说明
+
+### 0. 资源合同与长跑维护（2026-10-31）
+
+本节描述当前工作树的合同；后面的 M 系列测量是历史记录，不能替代这些边界。
+
+| 接口 / 机制 | 保证什么 | 不保证什么 |
+|---|---|---|
+| `scan` / `reverse_scan` / `prefix_scan` / 物化 `export` | 返回完整结果 | 不是有界内存，结果 Vec 按用户字节增长 |
+| `scan_page(after, limit)` | 最多返回 limit 行，游标向前推进 | limit 是行数不是字节；大值、长键、版本组仍需内存 |
+| 四个内置引擎的流式导出 / `scan_foreach` | 不先收集整个结果，回调可提前停止 | 后端缓存/源状态/当前版本组另计；回调自行 collect 仍占整库；自定义 trait 的默认 fallback 可能物化 |
+| `search_keys` | `without_total()` 避免强制精确计数 | 精确 total 要遍历匹配范围；offset 深翻仍要跳过前面各行 |
+| `cache_budget_bytes` | 按样本槽价估算缓存容量，bplus 7000 B/页、lsm 10400 B/块 | **不是进程 RSS 或任意数据形状下的字节硬上限**；不含结果 Vec、memtable、写集、blob GC 等，极小预算仍至少一槽；0 是撤销预算，不是禁用缓存 |
+| 自动版本切片 | 默认 16 Ki 行提交账触发，一次只消费一片；阻塞/失败保留账和游标，无新写也可在下一次 begin 重试 | 完整键组可能超出预算；不是后台线程、不是时间上限，也不负责缩小物理日志 |
+| `health()` | 全库版本行/链长统计 | O(物理行数)，不能当高频轻量采样 |
+| `reclamation_status()` | 待处理账、完成/阻塞/失败轮数、自动裁行数、活跃数与最老 xid；不扫描库 | O(活跃事务数)，xid 不是事务年龄；返回 None 表示第三方引擎未接线 |
+
+**自动回收与物理回收分开：**所有事务均为同步调用。长事务（包括只读和流式导出持有的快照）
+会阻挡回收，库不会为了回收强制结束或回滚别人的事务。把存储操作放到专用工作线程；
+`spawn_blocking` 能隔离运行时，但不能消除磁盘成本或库锁等待。
+
+若要持续扫描存量垃圾、并低频执行全库收尾，可为每个库启动**一个**维护器：
+
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+use storage_engines::{open_engine, KvEngine, MaintenanceConfig, start_maintenance};
+
+let db: Arc<dyn KvEngine> = Arc::from(open_engine("bitcask", Some(std::path::Path::new("data/bitcask")))?);
+let maintenance = start_maintenance(db.clone(), MaintenanceConfig {
+    interval: Duration::from_secs(1),
+    slice_rows: 16 * 1024,
+    full_vacuum_interval: Some(Duration::from_secs(30 * 60)),
+})?;
+// 保存 maintenance 句柄；status() 可读阻塞轮数、blocked_for、最近错误等。
+// full_vacuum_interval: None 只做版本切片，把全库收尾交给维护窗口。
+maintenance.stop()?;
+# Ok::<(), storage_engines::EngineError>(())
+```
+
+普通 open 不启动维护线程。bulk loader 仍要求单写者，bulk 导入前先 stop，finish 后再启动维护器。
+若已有管理线程，使用 `Maintenance::new(config)?.tick(db.as_ref())`，
+无需再起线程。后台休息能立即唤醒停止；**正在进行的全库操作不可中断，stop/Drop 会等待它结束**。
+不要在持有库锁的回调里等待维护器退出。全库收尾仍会占用锁、CPU、IO 和临时空间；
+放到后台不代表前台没有延迟，因此对实时延迟敏感时设 `None`，在明确维护窗口执行 `vacuum()`。
+
+全库收尾按引擎分别解释：Bitcask 重写日志/blob；B+ 树空页回收供复用，不保证文件缩短；
+LSM 下发 xmin 过滤并按既有压实策略处理 SST/blob，不承诺一次 vacuum 就将末层全部重写；
+memory 仅删除版本。**没有承诺“四家定时立即缩盘”或任意负载下的无界增长都已消除。**
+维护器启动后默认每 30 分钟尝试一次全库收尾，即使没有新写，也能处理上次运行留下的垃圾。
+有活跃事务会跳过并重试，错误可从 status 读取；该后台调度不改磁盘格式和事务持久化语义。
+
+基准表的 MB = 分配器请求的堆活字节/1e6，常驻与峰值是**每个操作的增量**，不是 OS RSS；
+不能把 B+ 树冷重开那格的 0 MB 读成“运行总内存为零”，也不能把各段峰值相加。
+
 
 这一节是给"引进来直接用、不再自己包一层"的读者写的。入口名字在 **crate 根**就能 import
 (`use storage_engines::{open_engine, EngineKind, ...}`),全路径 `storage_engines::engine::*` 同样可用。
@@ -570,6 +683,20 @@ pub mod storage {
 - **收尾判据 = `cargo check --all-targets` 0 warning**(不是 0 error)：`unused_imports` 正好量"这行导入多余不多余"。
 - 这一族**不含** `log::warn!`/`log::error!`(本来就带路径写)与本仓库自己的 `impl_engine!`/`arm_list!` 等 `macro_rules!`(同 crate,IDE 认)。
 
+### 11. 清理 `%TEMP%` 的规矩：备份不住在那儿
+
+M 系列每轮改动前的源码/脚本快照（94 个：33 `.rs` + 53 `.py` + 7 `.bak` + 1 `.fn`，4.1 MB）此前**唯一副本住在 `%TEMP%`**，
+而 Temp 是与并行挖矿/twosync 会话共用、Windows 也会定期清的地方 —— 2026-10-23 一次清理里就有 1 个备份数对不上、无法自证是谁删的。
+现已搬进 **`backups/m-serial/`**（已 git-ignored，不进发布物）。
+
+- ⚠️ **`backups/m-serial/` 不是垃圾**：任何清理脚本一律跳过它。它不在 git 里，删了就是真没了。
+- **别在 `%TEMP%` 落唯一副本**：要留改前快照就写进 `backups/m-serial/`（`cp -p` + 逐文件 `sha256sum` 两侧比对，不符数报 0 才算搬完）。
+- **Temp 里的东西按后缀通配删必翻车**，因为名字和种类不是一对一的：`bitcask_hint_*_lazy_blob_dir_*.log` 是**目录**（189 个，各含 8 B `data.blob`）；
+  而 `MANIFEST.LOG`、`data.log`、`*.wal` 住在 `se_engine_*` 目录**里面**，是引擎数据，删了库就坏。
+- **判据 = 前缀白名单 + mtime 切档**，不用后缀：本项目的只有 `se_engine_*` `bplus_anon_*` `mvcc_<pid>_<ns>` `lsm_*` `bitcask_*` `mNN_*`；
+  `ts*` 是 twosync、`glb_*`/`asi_*`/`sa_*`/`wq_*`/`kor_*`/`deu_*`/`hkg*` 是挖矿会话、`proc-macro-srv*` 是 rust-analyzer、`ns*.tmp`/UUID `.tmp` 是安装程序 —— 都不许碰。
+- **先列名单再删**：dry-run 落一张表 → 保护项断言（表里 `.rs`/`.py`/`.bak`/`.json` 命中数必须为 0）→ 按表执行 → 回查数量。只列后删，不许在同一条命令里夹 `-delete`。
+
 ## 项目结构
 
 ```
@@ -586,6 +713,7 @@ src/
     └── bin/           命令行工具(import_kv / export_kv / bench)
 
 tests/                 四个引擎的集成测试(会在 ./data/ 下建演示库)
+backups/m-serial/      M 系列各轮改动前的源码/脚本快照(git-ignored,唯一副本,清理时跳过)
 ```
 
 每个引擎目录下的文件职责一致:

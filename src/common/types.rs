@@ -61,6 +61,24 @@ pub struct MvccHealth {
     pub active_txns: u64,
 }
 
+/// 轻量回收状态：只读取调度计数与活跃事务表，不走查数据库。
+///
+/// 这些计数只覆盖 begin 触发的自动切片；手动/后台维护的结果由各自调用返回。
+/// `pending_rows` 是尚未消费的提交行账，不是精确的垃圾行数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReclamationStatus {
+    pub pending_rows: u64,
+    pub committed_rows: u64,
+    pub completed_slices: u64,
+    pub skipped_active: u64,
+    pub failed_slices: u64,
+    pub versions_removed: u64,
+    pub running: bool,
+    pub active_txns: u64,
+    /// 版本号，不是时间戳；用于定位长期阻塞回收的事务，库不会强制结束它。
+    pub oldest_active_version: Option<u64>,
+}
+
 /// 引擎的崩溃安全画像。
 ///
 /// 四个引擎**不等价**，所以这里给的是"哪些构件在/不在"，而不是一个 `Level(1..=5)`：
@@ -130,8 +148,8 @@ pub struct VacuumRound {
     pub stats: VacuumStats,
     /// 本轮停在哪个逻辑 key 上：原样作为下一轮的 `after` 传回即可接着扫。
     ///
-    /// `None` ⇒ **已经扫完全库**，这一轮才是最后一轮 —— blob 回收与日志压缩只在这里做
-    /// （两者都是全库代价，放进中间轮等于每轮重写一遍库）。
+    /// None 只表示本轮游标已到库尾，不会自动触发 blob 重写或日志 merge。
+    /// 只有调用时 budget_rows == u64::MAX 的全库 vacuum 才做那些收尾。
     pub next_cursor: Option<Vec<u8>>,
 }
 

@@ -20,6 +20,8 @@
 
 pub mod common;
 pub mod engine;
+pub mod maintenance;
+pub use maintenance::{Maintenance, MaintenanceConfig, MaintenanceHandle, MaintenanceStatus, start_maintenance};
 
 pub mod bitcask;
 pub mod bplus_tree;
@@ -30,7 +32,7 @@ pub mod tools;
 
 pub use common::{
     DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
-    SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
+    ReclamationStatus, SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };
 pub use engine::{
     EngineConfig, EngineError, EngineKind, EngineName, KvBulk, KvEngine, KvTxn, MigrateStats, StorageConfig,
