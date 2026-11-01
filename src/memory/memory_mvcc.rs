@@ -49,7 +49,18 @@ pub struct MVCC {
     next_version: Arc<AtomicU64>,
     /// 自动回收：切片宽度 / 记账 / 游标（策略与实现在 [`crate::common::VacuumScheduler`]）
     vac: Arc<VacuumScheduler>,
+    /// M81 第 6 项：启停快照文件。`None` = 不落盘（裸 [`MVCC::new`] 的既有形状，一字未变）。
+    ///
+    /// 语义钉死成**只在启停各碰一次文件**（用户口径）：open 读一次、`Drop` 写一次。
+    /// 运行期的 set/delete/事务/`flush()`/`checkpoint()` 一律不碰文件 —— `flush` 维持 no-op，
+    /// 所以台架里 memory 的 `flush` 格一个数都不变。
+    /// 代价如实写明：**没有手动存盘口子**，中途要落盘只能释放句柄（或走 export 工具）。
+    /// 这是"优雅停止不丢"，**不是崩溃安全**：进程被杀或被 `std::process::exit` 收尾都不跑 `Drop`。
+    snapshot: Option<std::path::PathBuf>,
 }
+
+/// 快照文件名（放在门面给的引擎目录里：`data_dir/memory/snapshot.bxp`）
+pub const SNAPSHOT_FILE: &str = "snapshot.bxp";
 
 /// 普通 MVCC 事务
 ///
@@ -80,7 +91,160 @@ impl MVCC {
             active_txn: Arc::new(Mutex::new(HashMap::new())),
             next_version: Arc::new(AtomicU64::new(1)),
             vac: Arc::new(VacuumScheduler::new(MVCC::VACUUM_AUTO_SLICE_DEFAULT)),
+            snapshot: None,
         }
+    }
+
+    /// 打开一个带启停快照的 memory 库（M81 第 6 项）：`dir` 里放 [`SNAPSHOT_FILE`]。
+    /// 文件在就读入重放，不在就从空库开始 —— 两种都算打开成功。
+    ///
+    /// ⚠️ `snapshot` 字段是**重放成功之后**才赋值的，顺序不能反过来：读中途失败就直接返回 `Err`，
+    /// 此时这个半成品对象的 `Drop` 里 `snapshot` 还是 `None` ⇒ 不会把一份好快照覆盖成半截库。
+    /// （反过来写就是"打开失败一次，库没了"——比不落盘坏得多。）
+    pub fn open_with_snapshot(dir: &std::path::Path) -> std::io::Result<Self> {
+        let path = dir.join(SNAPSHOT_FILE);
+        let mut mvcc = Self::new();
+        mvcc.load_snapshot_from(&path)?;
+        mvcc.snapshot = Some(path);
+        Ok(mvcc)
+    }
+
+    /// 快照路径（门面的 `path()` 用它；`MVCC::new()` 开的库返回 `None`，行为与改前一致）
+    pub fn snapshot_path(&self) -> Option<&std::path::Path> {
+        self.snapshot.as_deref()
+    }
+
+    /// 读入快照并重放。三条硬规矩都是这个仓库一路在收的东西：
+    /// ① **已过期的行不许复活**（拿文件里的绝对 expire 与 now 比，不信任"它当时是活的"）；
+    /// ② 按页一事务（照 `migrate` 的写侧），不把两千万行攒进一个写集；
+    /// ③ TTL 按"expire − now"起算 —— 与 `migrate` 同式，文件里那个剩余时长早就过期了。
+    fn load_snapshot_from(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        const PAGE: usize = 1_000;
+        let now = crate::common::codec::now_unix_secs();
+        let mut batch: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = Vec::with_capacity(PAGE);
+        let mut expired = 0usize;
+        let mut err: Option<std::io::Error> = None;
+        let stats = crate::common::kv_snapshot::read_bin_with(&path, &mut |rec| {
+            let Some(value) = rec.value else {
+                return true; // 快照不写墓碑：墓碑行从来不出导出（`include_deleted = false`）
+            };
+            if let Some(e) = rec.expire_unix_secs {
+                if e <= now {
+                    expired += 1;
+                    return true;
+                }
+            }
+            batch.push((rec.key, value, rec.expire_unix_secs));
+            if batch.len() >= PAGE {
+                if let Some(e) = MVCC::replay_page(self, &mut batch, now) {
+                    err = Some(e);
+                    return false;
+                }
+            }
+            true
+        })?;
+        if let Some(e) = err {
+            return Err(e);
+        }
+        if let Some(e) = MVCC::replay_page(self, &mut batch, now) {
+            return Err(e);
+        }
+        log::info!(
+            "memory: 快照读入 {} 行（跳过已过期 {} 行）{}",
+            stats.records - expired,
+            expired,
+            path.display()
+        );
+        Ok(())
+    }
+
+    /// 把攒好的一页交进库里，一事务一页。**返回 `Err` 而不是 `Result` 是有意的**：调用方在
+    /// `read_bin_with` 的回调里，那里没有 `?` 可用，只能把错递出去。
+    ///
+    /// 为什么单独抽出来：回调里要同时用 `&MVCC`（开事务）与 `&mut batch`，写成内联块会让
+    /// 借用检查在两件事之间反复；而"攒满一页就冲"与"收尾把剩的冲掉"必须是**同一份**代码，
+    /// 否则尾巴那半页会静默不写（本仓库收过这类账）。
+    fn replay_page(
+        mvcc: &MVCC,
+        batch: &mut Vec<(Vec<u8>, Vec<u8>, Option<u64>)>,
+        now: u64,
+    ) -> Option<std::io::Error> {
+        if batch.is_empty() {
+            return None;
+        }
+        let tx = mvcc.begin_transaction();
+        let mut bad: Option<Vec<u8>> = None;
+        for (k, v, expire) in batch.drain(..) {
+            let ok = match expire {
+                // 绝对时刻减 now：文件里躺过多久都不影响这一行还剩多少命（与 migrate 同式）
+                Some(e) => tx.set_with_ttl(&k, v, std::time::Duration::from_secs(e - now)),
+                None => tx.set(&k, v),
+            };
+            if !ok && bad.is_none() {
+                bad = Some(k);
+            }
+        }
+        tx.commit();
+        bad.map(|k| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("快照重放被引擎拒收: {k:?}"),
+            )
+        })
+    }
+
+    /// 写一次整库快照（`BPEXP003`）。只在 `Drop` 里调用 —— 运行期没有任何一条路会走到这里。
+    ///
+    /// 两条口径：
+    /// - **流式**：走 `scan_page` 一页一页折，不 `export_latest_visible` 把整库摆进 `Vec`
+    ///   （M44 那条"导出不必再把整库摆进内存"对快照同样成立；20M 档那一格本来就要 GB 级）。
+    /// - TTL 逐行现读（`get_meta` 的 `expire_unix_secs`），与 `migrate` 同一件事：
+    ///   **TTL 在源侧读**，文件里存绝对时刻。少了这一步，走文件同步必丢 TTL（001/002 里没地方放）。
+    ///
+    /// 写盘失败**不吞**：一路 `?` 交给 `Drop`，那里降成 `warn`（析构里不能抛）。
+    fn write_snapshot(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        const PAGE: usize = 1_000;
+        use crate::common::kv_snapshot::{KvRecord, Sink};
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut sink = Sink::bin_v3(path)?;
+        let tx = self.begin_transaction();
+        let mut written = 0usize;
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (rows, next) = tx.scan_page(after.as_deref(), PAGE);
+            if rows.is_empty() && next.is_none() {
+                break;
+            }
+            for rec in rows {
+                let expire = tx.get_meta(&rec.key).and_then(|m| m.expire_unix_secs);
+                let mut kr = KvRecord::new(rec.key, rec.value);
+                if let Some(e) = expire {
+                    kr = kr.with_expire(e);
+                }
+                sink.write(&kr)?;
+                written += 1;
+            }
+            match next {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        tx.commit();
+        let stats = sink.finish()?;
+        if stats.records != written {
+            // 不拿 assert：这条在 `Drop` 之路上，panic 会在已经 panic 的展开里再炸一次。
+            // 两份账不一致 = 有行静默没落盘，必须报出去而不是"看起来成功了"。
+            return Err(std::io::Error::other(format!(
+                "memory 快照写出 {written} 行，收尾账却是 {} 行",
+                stats.records
+            )));
+        }
+        Ok(written)
     }
 
     pub fn begin_transaction(&self) -> Transaction {
@@ -175,9 +339,13 @@ impl MVCC {
         handed
     }
 
-    /// 崩溃安全画像：**全空，这是设计而非疏漏** —— 纯内存引擎没有任何持久化，
-    /// 进程一exit 数据就没了。它存在的意义是让四家能用同一套断言比对语义
-    /// （门面层 `open_engine("memory")` 也就能被测试/演示用）。
+    /// 崩溃安全画像：**全空，这是设计而非疏漏**。
+    ///
+    /// ⚠️ M81 第 6 项之后"全空"的含义要说准：它**没有崩溃安全**（进程被杀 / `exit` 都不跑析构，
+    /// 启停快照写不出来），也仍然没有事务 WAL、没有校验和 —— 这几条一个都没变。
+    /// 变的是：给了快照目录的 `open_engine("memory", Some(dir))` 现在**优雅停止不丢**
+    /// （`Drop` 写整库快照、下次 open 读回）。这不改变它"对照实验"的定位：
+    /// 快照既不是 WAL 也不带校验和，扛不住掉电。
     pub fn durability_profile(&self) -> DurabilityProfile {
         DurabilityProfile {
             engine: "memory",
@@ -394,6 +562,23 @@ impl BulkLoader {
 
     pub fn finish(mut self) {
         self.core.first_finish();
+    }
+}
+
+/// M81 第 6 项：**停止落盘**。`snapshot` 为 `None`（裸 [`MVCC::new`]，四个 CLI 与所有既有测试的
+/// 形状）时这里什么都不做 —— 一行字节都不写，改前行为一字不变。
+///
+/// ⚠️ 这是"优雅停止不丢"，**不是崩溃安全**：进程被杀、被 `std::process::exit` 收尾都不跑析构。
+/// 所以统一 import 工具收尾必须先让句柄正常离开作用域，不能 `exit` 了事（方案第 6 项记的坑）。
+impl Drop for MVCC {
+    fn drop(&mut self) {
+        let Some(path) = self.snapshot.clone() else {
+            return;
+        };
+        match self.write_snapshot(&path) {
+            Ok(n) => log::info!("memory: 停止落盘 {n} 行 → {}", path.display()),
+            Err(e) => log::warn!("memory 快照落盘失败（{}）: {e}", path.display()),
+        }
     }
 }
 

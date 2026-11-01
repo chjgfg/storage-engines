@@ -649,9 +649,11 @@ impl EngineKind {
 
     /// 能不能上生产。
     ///
-    /// 返回 `false` 的只有一个：`memory` —— 它没有任何持久化（见
-    /// [`KvEngine::durability_profile`]：无事务 WAL、无校验和），进程一退数据就没。
-    /// 它是给教学/测试当对照用的，不是"更快的选项"。
+    /// 返回 `false` 的只有一个：`memory` —— 它**没有崩溃安全**（见
+    /// [`KvEngine::durability_profile`]：无事务 WAL、无校验和），进程被杀数据就没。
+    /// ⚠️ M81 第 6 项之后这条判据的措辞要说准：给了目录的 memory 现在**优雅停止不丢**
+    /// （`Drop` 写整库快照、open 读回），但快照不是 WAL、也不带校验和 ⇒ 上生产仍然不行，
+    /// 判据本身一字未动。它是给教学/测试当对照用的，不是"更快的选项"。
     pub fn is_production_ok(self) -> bool {
         self != EngineKind::Memory
     }
@@ -815,7 +817,13 @@ pub fn open_engine_with<N: EngineName>(
             )?,
         }),
         "memory" => Box::new(MemoryEngine {
-            inner: crate::memory::MVCC::new(),
+            // M81 第 6 项：**给了目录 = 启停快照**（open 读一次、`Drop` 写一次，运行期不碰文件）；
+            // 没给目录 = 纯内存，与改前一字不差（四个 CLI 与所有 `open_engine("memory", None)`
+            // 的调用方走这一支，`flush`/`checkpoint` 仍是 no-op ⇒ 台架里 memory 的 flush 格不变）。
+            inner: match path {
+                Some(dir) => crate::memory::MVCC::open_with_snapshot(dir)?,
+                None => crate::memory::MVCC::new(),
+            },
         }),
         _ => unreachable!("canonical_name 已校验"),
     };
@@ -1150,6 +1158,13 @@ macro_rules! impl_engine {
             None
         }
     };
+    // M81 第 6 项：memory 的"路径"就是它的启停快照。`snapshot_path()` 自己返回 `Option`
+    // （没给目录开的库 = `None`，与改前一致），所以不能走下面那条 `Some(...)` 的通用臂。
+    (@path $self:ident, snapshot) => {
+        fn path(&self) -> Option<&Path> {
+            self.inner.snapshot_path()
+        }
+    };
     (@path $self:ident, $method:ident) => {
         fn path(&self) -> Option<&Path> {
             Some(self.inner.$method())
@@ -1201,7 +1216,9 @@ macro_rules! impl_engine {
         }
     };
     (@durable no) => {
-        /// 纯内存引擎：无盘可落
+        /// 纯内存引擎：`flush` 仍然是 no-op。M81 第 6 项的启停快照**不走这扇门** ——
+        /// 它在 open 读、在 `Drop` 写，所以台架里 memory 的 `flush` 格一个数都不变，
+        /// 而"没有手动存盘口子"这条代价仍然成立（想中途落盘只能释放句柄或走 export）。
         fn flush(&self) -> Result<()> {
             Ok(())
         }
@@ -1356,7 +1373,7 @@ impl_engine! {
     txn_inner: crate::memory::memory_mvcc::Transaction,
     bulk_inner: crate::memory::memory_mvcc::BulkLoader,
     name: "memory",
-    path: none,
+    path: snapshot,
     vacuum: plain,
     durable: no,
     wal: no,
@@ -2093,6 +2110,67 @@ mod tests {
             dirs.push(dir);
         }
         cleanup(dirs);
+    }
+
+    /// M81 第 6 项：memory 的启停快照 —— **只在启停各碰一次文件**。四条判据各钉一件事，
+    /// 单看任何一条都像是"过了"，合起来才是这个合同：
+    /// ① 运行期不碰文件：写满 1000 行之后快照**还不存在**；
+    /// ② `flush()` 仍然是 no-op（所以台架里 memory 的 `flush` 格一个数都不变）；
+    /// ③ 停止写、启动读：值与 TTL 都回来，而**已过期的那把不许复活**；
+    /// ④ 没给目录 = 一行字节都不写（`MVCC::new()` 的既有形状，四个 CLI 与所有旧测试靠它，
+    ///    所以下面那条 `memory_engine_has_no_path_and_no_merge` 守卫并不会红 —— 方案预计的
+    ///    "path() 必红"只在"给了目录"那一支成立）。
+    #[test]
+    fn memory_snapshot_round_trips_only_at_open_and_stop() {
+        let dir = tmp_dir("memory_snapshot");
+        let snap = dir.join("snapshot.bxp");
+        {
+            let db = open_engine("memory", Some(&dir)).unwrap();
+            assert_eq!(db.path().as_deref(), Some(snap.as_path()), "给了目录就该报快照路径");
+            let tx = db.begin();
+            for i in 0..1000 {
+                assert!(tx.set(format!("k{i:04}").as_bytes(), format!("v{i}").into_bytes()), "灌第 {i} 把");
+            }
+            assert!(tx.set_with_ttl(b"ttl", b"live".to_vec(), std::time::Duration::from_secs(3600)), "写 TTL 行");
+            assert!(tx.set(b"dead", crate::common::codec::pack_ttl(b"gone", 1)), "写已过期行");
+            tx.commit();
+            assert!(!snap.exists(), "① 运行期不许碰文件：还没释放句柄就不该有快照");
+            drop(tx); // 事务借着库，必须先放开才能 drop 引擎（快照正是在那一刻写的）
+            db.flush().unwrap();
+            assert!(!snap.exists(), "② flush() 必须仍是 no-op");
+            drop(db); // 停止落盘发生在句柄释放时（计时格外）
+        }
+        assert!(snap.exists(), "③ Drop 必须写出快照（优雅停止不丢）");
+        let written = std::fs::metadata(&snap).unwrap().len();
+        {
+            let db = open_engine("memory", Some(&dir)).unwrap();
+            let tx = db.begin();
+            assert_eq!(tx.get(b"k0000").as_deref(), Some(b"v0".as_ref()), "重开读不回第一行");
+            assert_eq!(tx.get(b"k0999").as_deref(), Some(b"v999".as_ref()), "重开读不回最后一行");
+            assert_eq!(tx.get(b"ttl").as_deref(), Some(b"live".as_ref()), "TTL 行丢了");
+            assert!(tx.get_ttl(b"ttl").flatten().is_some(), "TTL 行读回来变成永久了");
+            assert_eq!(tx.get(b"dead"), None, "已过期的行不许复活");
+            for i in 0..50 {
+                tx.set(format!("again{i}").as_bytes(), b"x".to_vec());
+            }
+            tx.commit();
+            assert_eq!(
+                std::fs::metadata(&snap).unwrap().len(),
+                written,
+                "④ 运行期再写一批，快照字节数必须一字不变"
+            );
+        }
+        // 没给目录的那次 open：连"别人的快照"也不许碰
+        let before = std::fs::metadata(&snap).unwrap().len();
+        {
+            let db = open_engine("memory", None).unwrap();
+            assert!(db.path().is_none(), "没给目录 = 仍然没有路径（改前形状）");
+            let tx = db.begin();
+            assert!(tx.set(b"x", b"y".to_vec()));
+            tx.commit();
+        }
+        assert_eq!(std::fs::metadata(&snap).unwrap().len(), before, "纯内存那次 open/drop 不许写任何文件");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4955,9 +5033,11 @@ mod tests {
             let scratch = ScaleScratch::new(&format!("scale_{label}"));
             let dir = scratch.0.clone();
             eprintln!("{label}: scratch={}", dir.display());
-            // B+ 树的"库"是一个文件，另两家是目录，memory 不落盘
+            // B+ 树的"库"是一个文件，另两家是目录；memory 从 M81 第 6 项起也拿目录 ——
+            // 目录就是它启停快照的落点（`<dir>/snapshot.bxp`）。"没给目录 = 纯内存"的旧形状仍然
+            // 有效，但台架这一支必须走"有快照"的那条路，否则对它来说"冷重开"还是空库、那格没意义。
             let arg = match kind {
-                EngineKind::Memory => None,
+                EngineKind::Memory => Some(dir.clone()),
                 EngineKind::BPlusTree => Some(dir.join("bplus.db")),
                 _ => Some(dir.clone()),
             };
@@ -4985,18 +5065,25 @@ mod tests {
                 db.flush().unwrap();
                 db.checkpoint().unwrap();
             });
-            let disk = if kind == EngineKind::Memory { 0 } else { disk_bytes(arg.unwrap()) };
+            let disk = disk_bytes(arg.unwrap());
             line(label, "flush+checkpoint", d.as_secs_f64() * 1e6, "µs", live, peak, &format!("磁盘 {:.1} MB", disk as f64 / 1e6));
 
             // ---- 冷重开：恢复要多久、恢复完常驻多少 ----
-            // memory 不落盘 ⇒ 对它"重开"就是新建一个空库（这正是 `is_production_ok() == false`
-            // 的全部内容），量恢复时间没有意义，直接跳过并保持同一个句柄。
-            let db = if kind == EngineKind::Memory {
-                eprintln!("{label:<10} {:<24} {:>17}   （内存引擎不落盘：重开 = 空库）", "冷重开(恢复)", "");
-                db
-            } else {
+            // M81 第 6 项：memory 有启停快照了 ⇒ 这一格对它成了**真读数**（open 读快照），
+            // 原来那两处"内存引擎不落盘：重开 = 空库"的特判因此拆掉（格数 130 → 132）。
+            // 停止那一次写发生在 `Drop` 里、按方案的口径落在计时格外 —— 但它是实打实的价，
+            // 所以补一行"不计时"的读数（与 `验收准备(不计时)` 同一套写法，不进性能格）。
+            let db = {
                 let st_base = open_stages_begin();
+                let t_stop = std::time::Instant::now();
                 drop(db);
+                if kind == EngineKind::Memory {
+                    eprintln!(
+                        "{label:<10} {:<24} {:>13}   （Drop 内写出整库快照，不进性能格）",
+                        "停止落盘",
+                        format!("{:.1} ms", t_stop.elapsed().as_secs_f64() * 1e3)
+                    );
+                }
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
                 line(
                     label,
@@ -5219,7 +5306,7 @@ mod tests {
             // 而 bplus 同格 18.5µs ⇒ flush 那一半在 bitcask 上是零头）。拆格本身一秒不省，
             // 它的作用是让"merge 已从 vacuum 拆出去"那笔省下的时间在下一格露出来。
             let (d, live, peak, ()) = timed(|| db.flush().unwrap());
-            let disk_after_flush = if kind == EngineKind::Memory { 0 } else { disk_bytes(arg.unwrap()) };
+            let disk_after_flush = disk_bytes(arg.unwrap());
             line(label, "flush", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("磁盘 {:.1} MB", disk_after_flush as f64 / 1e6));
 
@@ -5232,7 +5319,7 @@ mod tests {
                     "{label}: merge 失败（此后引擎处于隔离态，后面的格子全是假读数）: {e}"
                 );
             }
-            let disk2 = if kind == EngineKind::Memory { 0 } else { disk_bytes(arg.unwrap()) };
+            let disk2 = disk_bytes(arg.unwrap());
             let note = if m.is_err() {
                 "（本引擎无 merge）".to_string()
             } else {
@@ -5288,10 +5375,9 @@ mod tests {
             line(label, &format!("bulk 灌 {bulk_rows} 行"), d.as_secs_f64() * 1e6 / bulk_rows as f64, "µs/行", live, peak, "");
 
             // ---- 再冷重开一次：bulk 之后的恢复代价 ----
-            let db = if kind == EngineKind::Memory {
-                eprintln!("{label:<10} {:<24} {:>17}", "再冷重开", "（同上，跳过）");
-                db
-            } else {
+            // （M81 第 6 项：memory 走同一条路了 —— 这一次 drop 会把它连 bulk 一起写进快照。
+            //   "停止落盘"那行不计时读数只在上面那一处打，免得同一格的两条噪声线混淆。）
+            let db = {
                 let st_base = open_stages_begin();
                 drop(db);
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());

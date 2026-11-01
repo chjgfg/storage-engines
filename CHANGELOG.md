@@ -18,6 +18,37 @@
 
 ## 未发布：merge 从 vacuum 拆出 + merge 时间构成 + 大档回收守卫（2026-11-02，M81）
 
+### 第 6 项（前半）：KvRecord v3 带 TTL + memory 启停快照
+
+- `KvRecord` 新增 `expire_unix_secs: Option<u64>`，bin 格式加**第三版 `BPEXP003`** = 001 的字段序 +
+  每条 8 字节绝对到期时刻（**0 = 永久**）。001/002 的字节形状一字未动（`test_bin_format_matches_downstream_bytes`
+  那条逐字节守卫继续绿）；读侧**只认魔数、不照内容猜形状**。为什么不往 002 上叠：002 那 8 字节是 LSM 的
+  写入 seq，语义无关，而"seq + expire 同时带"今天没有任何调用方 ⇒ `BinWriter` 直接拒收那个组合。
+- JSONL 加**可选** `expire` 字段：旧行缺它 = 永久（不报错）；有它但值坏了 ⇒ **报错**。
+  后者是必须的——`"expire":12x` 读成 12 就是"静默少读"换个地方重演（本文件那条 base64 截断事故的同一类）。
+  守卫 `bin_v3_carries_expire_and_all_three_versions_read_back`。
+- **memory 启停快照**（用户钉死的口径：只有启动和停止碰文件）：`memory::MVCC` 加
+  `snapshot: Option<PathBuf>`；`open_engine("memory", Some(dir))` ⇒ open 读 `dir/snapshot.bxp`、
+  `Drop` 写整库快照（流式，走 `scan_page` 一页一页折，不 `export` 把整库摆进 `Vec`）；
+  **`flush()`/`checkpoint()` 维持 no-op** ⇒ 台架里 memory 的 `flush` 格一个数不变。
+  ⭐ `snapshot` 字段**只在重放成功之后才赋值**——反过来写就是"打开失败一次，把一份好快照覆盖成半截库"。
+  重放三条：已过期的行不许复活、按页一事务（照 `migrate` 写侧）、TTL 按"expire − now"起算。
+- 合同影响：memory 的 `path()` 从"恒 `None`"变成"给了目录就 `Some(快照文件)`"，没给目录仍是 `None`
+  ⇒ 守卫 `memory_engine_has_no_path_and_no_merge` **不会红**（方案预计的"必红"只在给了目录那一支成立），
+  新守卫 `memory_snapshot_round_trips_only_at_open_and_stop` 钉四条：运行期不碰文件、`flush` 仍是
+  no-op、启停往返保住值与 TTL 且不复活过期行、没给目录时连别人的快照都不碰。
+- 措辞逐处改准（不改判据）：`durability_profile` / `is_production_ok` / `@durable no` 那三条注释从
+  "没有任何持久化"改成"**没有崩溃安全**（快照不是 WAL、不带校验和），但优雅停止不丢"。
+  `is_production_ok()` 对 memory 仍然返回 `false`，一字未改。
+- 台架：memory 冷重开的**两处特判拆掉** ⇒ 格数 **130 → 132**（35 类）。600k 实测
+  `冷重开(恢复)` **1,317,159.9 µs**、`再冷重开` **1,670,365.2 µs**（改前这两格对 memory 是一行"跳过"文字）；
+  停止那一次写按方案的口径落在计时格外，但如实打一行不计时读数：**`停止落盘 1647.0 ms`**。
+  同一趟四家 `migrate → memory` 独立种子验收仍全过 601001 唯一键；bench 的 migrate 目标走
+  `open_engine(Memory, None)` ⇒ 不与引擎自己的快照路径相撞（方案记的"同一路径双句柄覆盖"那条坑，
+  在这里是核过的不是假设）。
+- ⚠️ 第 6 项**后半未做**：顶层 `sync(from, to)`（skip-existing，墓碑算"见过"）、统一
+  `bin/export_kv.rs` + `bin/import_kv.rs`、`[[bin]]` 12 → 8。
+
 ### 第 4 项：`search_last_page` 新门（末页免 total）—— 本轮唯一一处公开面变更
 
 - `KvTxn` 新增**带默认实现**的 `search_last_page(page_size)`（additive：不破任何现有实现方与调用方）。

@@ -20,6 +20,13 @@ use std::{
 
 pub const BIN_MAGIC: &[u8; 8] = b"BPEXP001";
 pub const BIN_MAGIC_V2: &[u8; 8] = b"BPEXP002";
+/// M81 第 6 项：`BPEXP003` = `BPEXP001` 的字段序 + 每条 8 字节 `expire_unix_secs`（**0 = 永久**）。
+///
+/// 为什么要有第三版而不是往 002 上叠：002 的 8 字节是 LSM 的写入 seq，语义完全不同；而
+/// "seq + expire 同时带"今天没有任何调用方（统一工具明确不收 `--with-seq`，seq 只对 lsm 裸层
+/// 有意义，带着它跨库互导就是埋漂移）⇒ 与其造一个没人读的四种组合，不如一条版号一件事。
+/// ⚠️ 001 的字节形状**一个字都不许变**：`test_bin_format_matches_downstream_bytes` 钉着它。
+pub const BIN_MAGIC_V3: &[u8; 8] = b"BPEXP003";
 pub const TOMBSTONE_LEN: u32 = u32::MAX;
 
 /// 一条快照记录。`value: None` 是 tombstone。
@@ -29,6 +36,12 @@ pub struct KvRecord {
     pub value: Option<Vec<u8>>,
     /// LSM 的写入 seq，仅 `--with-seq` 导出时有值；其他引擎一律 `None`
     pub seq: Option<u64>,
+    /// 绝对到期时刻（unix 秒）。`None` = 永久。
+    ///
+    /// 为什么存**绝对值**而不是剩余时长：快照与 `migrate` 同一条口径 —— 导出记的是
+    /// "expire − now"要落地时才换算（`migrate` 第一版丢 TTL 被环测抓出来的教训见
+    /// `engine.rs` 的 `migrate` 注释）。剩余时长在文件里躺一小时就少一小时。
+    pub expire_unix_secs: Option<u64>,
 }
 
 impl KvRecord {
@@ -38,6 +51,7 @@ impl KvRecord {
             key,
             value,
             seq: None,
+            expire_unix_secs: None,
         }
     }
 
@@ -47,7 +61,14 @@ impl KvRecord {
             key,
             value,
             seq: Some(seq),
+            expire_unix_secs: None,
         }
+    }
+
+    /// 带上绝对到期时刻（`BPEXP003` / JSONL 的 `expire` 字段唯一能携带它的途径）
+    pub fn with_expire(mut self, expire_unix_secs: u64) -> Self {
+        self.expire_unix_secs = Some(expire_unix_secs);
+        self
     }
 }
 
@@ -163,17 +184,43 @@ pub struct BinWriter {
     w: BufWriter<File>,
     stats: IoStats,
     with_seq: bool,
+    with_expire: bool,
 }
 
 impl BinWriter {
     pub fn create(path: &Path, with_seq: bool) -> std::io::Result<Self> {
+        Self::create_shape(path, with_seq, false)
+    }
+
+    /// `BPEXP003`：001 的字段序 + 每条 8 字节 `expire_unix_secs`（**0 = 永久**）。M81 第 6 项。
+    pub fn create_v3(path: &Path) -> std::io::Result<Self> {
+        Self::create_shape(path, false, true)
+    }
+
+    fn create_shape(path: &Path, with_seq: bool, with_expire: bool) -> std::io::Result<Self> {
+        if with_seq && with_expire {
+            // 没有"既带 seq 又带 expire"的版本：那是两条互不相干的元数据叠成一个组合爆炸，
+            // 而今天没有任何调用方需要它（统一工具不收 --with-seq，理由见 BIN_MAGIC_V3 注释）。
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "BPEXP 没有同时带 seq 与 expire 的版本（002=seq，003=expire）",
+            ));
+        }
         let f = File::create(path)?;
         let mut w = BufWriter::new(f);
-        w.write_all(if with_seq { BIN_MAGIC_V2 } else { BIN_MAGIC })?;
+        let magic: &[u8; 8] = if with_seq {
+            BIN_MAGIC_V2
+        } else if with_expire {
+            BIN_MAGIC_V3
+        } else {
+            BIN_MAGIC
+        };
+        w.write_all(magic)?;
         Ok(Self {
             w,
             stats: IoStats::default(),
             with_seq,
+            with_expire,
         })
     }
 
@@ -189,6 +236,9 @@ impl BinWriter {
         }
         if self.with_seq {
             self.w.write_all(&rec.seq.unwrap_or(0).to_le_bytes())?;
+        }
+        if self.with_expire {
+            self.w.write_all(&rec.expire_unix_secs.unwrap_or(0).to_le_bytes())?;
         }
         self.stats.push(&rec.value);
         Ok(())
@@ -217,24 +267,22 @@ impl JsonlWriter {
 
     pub fn write(&mut self, rec: &KvRecord) -> std::io::Result<()> {
         let k = b64_encode(&rec.key);
+        // 可选元数据按"存在才加"拼在尾部：缺字段 = 读侧当 `None` ⇒ 旧版工具读新版行只会**少看**
+        // 一个字段，不会读错；而两个字段都不在时，这一行的字节与改动前一字不差。
+        let mut extra = String::new();
+        if let Some(seq) = rec.seq {
+            extra.push_str(&format!(",\"seq\":{seq}"));
+        }
+        if let Some(e) = rec.expire_unix_secs {
+            extra.push_str(&format!(",\"expire\":{e}"));
+        }
         match &rec.value {
             Some(v) => {
                 let v = b64_encode(v);
-                if let Some(seq) = rec.seq {
-                    writeln!(self.w, "{{\"key\":\"{k}\",\"value\":\"{v}\",\"seq\":{seq}}}")?;
-                } else {
-                    writeln!(self.w, "{{\"key\":\"{k}\",\"value\":\"{v}\"}}")?;
-                }
+                writeln!(self.w, "{{\"key\":\"{k}\",\"value\":\"{v}\"{extra}}}")?;
             }
             None => {
-                if let Some(seq) = rec.seq {
-                    writeln!(
-                        self.w,
-                        "{{\"key\":\"{k}\",\"value\":null,\"seq\":{seq}}}"
-                    )?;
-                } else {
-                    writeln!(self.w, "{{\"key\":\"{k}\",\"value\":null}}")?;
-                }
+                writeln!(self.w, "{{\"key\":\"{k}\",\"value\":null{extra}}}")?;
             }
         }
         self.stats.push(&rec.value);
@@ -251,6 +299,17 @@ impl JsonlWriter {
 pub fn write_bin(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats> {
     let with_seq = records.iter().any(|r| r.seq.is_some());
     let mut w = BinWriter::create(path, with_seq)?;
+    for rec in records {
+        w.write(rec)?;
+    }
+    w.finish()
+}
+
+/// `BPEXP003` 的收集壳（M81 第 6 项）：与 [`write_bin`] 同一份行编码，只是版号定死成带 expire。
+/// 走 003 的理由见 [`KvRecord::expire_unix_secs`] —— 001/002 里没有地方放 TTL，
+/// 而"今天走文件同步必丢 TTL"正是这一项要堵的那件事。
+pub fn write_bin_v3(path: &Path, records: &[KvRecord]) -> std::io::Result<IoStats> {
+    let mut w = BinWriter::create_v3(path)?;
     for rec in records {
         w.write(rec)?;
     }
@@ -283,10 +342,24 @@ impl Sink {
         Ok(Self::Bin(BinWriter::create(path, with_seq)?))
     }
 
+    /// `BPEXP003`（带 expire）的流式写口 —— memory 快照走这条：整库不另攒一份 `Vec`
+    /// （M44 那条"导出不必再把整库摆进内存"的教训，对快照同样是账）。
+    pub fn bin_v3(path: &Path) -> std::io::Result<Self> {
+        Ok(Self::Bin(BinWriter::create_v3(path)?))
+    }
+
     pub fn write(&mut self, rec: &KvRecord) -> std::io::Result<()> {
         match self {
             Self::Jsonl(w) => w.write(rec),
             Self::Bin(w) => w.write(rec),
+        }
+    }
+
+    /// 收尾：落盘 + 返回条数账（两个写口都有 `finish`，这里只是把它们并到一条门上）。
+    pub fn finish(self) -> std::io::Result<IoStats> {
+        match self {
+            Self::Jsonl(w) => w.finish(),
+            Self::Bin(w) => w.finish(),
         }
     }
 }
@@ -375,13 +448,20 @@ pub fn read_bin_with(
             "文件过短",
         ));
     }
-    let with_seq = &data[..8] == BIN_MAGIC_V2;
-    if &data[..8] != BIN_MAGIC && !with_seq {
+    // 读侧三版都认（M81 第 6 项）：版号只从魔数判，不看内容猜 —— 猜出来的形状会让一个截断的
+    // 001 被读成 003 的前缀，那比报"非法魔数"坏得多。
+    let (with_seq, with_expire) = if &data[..8] == BIN_MAGIC {
+        (false, false)
+    } else if &data[..8] == BIN_MAGIC_V2 {
+        (true, false)
+    } else if &data[..8] == BIN_MAGIC_V3 {
+        (false, true)
+    } else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "非法导出文件魔数（期望 BPEXP001/BPEXP002）",
+            "非法导出文件魔数（期望 BPEXP001/BPEXP002/BPEXP003）",
         ));
-    }
+    };
     let mut off = 8usize;
     let mut stats = IoStats::default();
     while off + 4 <= data.len() {
@@ -415,8 +495,24 @@ pub fn read_bin_with(
         } else {
             None
         };
+        let expire_unix_secs = if with_expire {
+            if off + 8 > data.len() {
+                break;
+            }
+            let e = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            off += 8;
+            // 0 = 永久（文件里没有一个"空的 Option"这种写法，读回来才不用猜）
+            (e != 0).then_some(e)
+        } else {
+            None
+        };
         stats.push(&value);
-        if !on(KvRecord { key, value, seq }) {
+        if !on(KvRecord {
+            key,
+            value,
+            seq,
+            expire_unix_secs,
+        }) {
             break;
         }
     }
@@ -447,6 +543,40 @@ pub fn read_jsonl_with(
     Ok(stats)
 }
 
+/// 行里可选的无符号整数字段（今天只有 `"expire":N`）。找不到 = `None`；
+/// 有字段但后面不是数字 ⇒ 报错。为什么不敢静默丢掉：`JSONL` 那条路历史上已经因为"静默少读"
+/// 丢过一次数据（`b64_decode` 截断那次，301 行进库只剩 32 把）—— 少读一个 TTL 是同一类事故：
+/// 键会活得比它该有的样子久。
+///
+/// ⚠️ 字段名带冒号一起匹配，而 key/value 都是 base64（字母表里没有 `"` 和 `:`）⇒ 不会在
+/// 值内部误命中。`seq` 今天仍然**不**从 JSONL 读回（改动前就是这样，本条不顺手扩大范围）。
+fn jsonl_u64_field(line: &str, tag: &str) -> std::io::Result<Option<u64>> {
+    let Some(i) = line.find(tag) else {
+        return Ok(None);
+    };
+    let rest = &line[i + tag.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    // 数字后面必须正好收尾在 JSON 的分隔上。少了这一步，`"expire":12x}` 会被读成 12 ——
+    // 那就是"静默少读"换个地方重演（本文件那条 base64 截断事故的同一类）。
+    let terminated = match rest[digits.len()..].chars().next() {
+        None => true,
+        Some(c) => matches!(c, ',' | '}' | ' ' | '\t' | '\r' | '\n'),
+    };
+    if !terminated {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{tag} 的值不是干净的整数: {line}"),
+        ));
+    }
+    let n: u64 = digits.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{tag} {e}: {line}"),
+        )
+    })?;
+    Ok((n != 0).then_some(n))
+}
+
 /// 一行 JSONL → 一条记录（解码失败带 `InvalidData`，两条读路共用同一个错形）
 fn parse_jsonl_record(line: &str) -> std::io::Result<KvRecord> {
     let (key_b64, val_part) = parse_jsonl_line(line)
@@ -460,7 +590,12 @@ fn parse_jsonl_record(line: &str) -> std::io::Result<KvRecord> {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
         ),
     };
-    Ok(KvRecord { key, value, seq: None })
+    Ok(KvRecord {
+        key,
+        value,
+        seq: None,
+        expire_unix_secs: jsonl_u64_field(line, "\"expire\":")?,
+    })
 }
 
 pub fn read_bin(path: &Path) -> std::io::Result<(Vec<KvRecord>, IoStats)> {
@@ -526,6 +661,66 @@ mod tests {
         assert_eq!(b64_encode(b"fo"), "Zm8=");
         assert_eq!(b64_encode(b"foo"), "Zm9v");
         assert_eq!(b64_decode("Zm9v").unwrap(), b"foo");
+    }
+
+    /// M81 第 6 项：三版 bin 都要读得回来，而 expire 只有 003 装得下。四条判据各挡一种"看着像过了"：
+    /// ① 001 加了字段之后没被顺手改形（读回一律 `None`，不是猜出个 0）；
+    /// ② 003 往返保住**绝对**到期时刻，且永久行读回 `None` 而不是 `Some(0)`；
+    /// ③ 读侧只认魔数、不照内容猜形状 ⇒ 头改坏必须报错；
+    /// ④ JSONL 的 `expire` 是**可选**字段：旧行缺它 = 永久（不报错），有它但值坏了 = 必须报错
+    ///    （静默丢掉一个 TTL，就是让那把键活得比它该有的样子久）。
+    #[test]
+    fn bin_v3_carries_expire_and_all_three_versions_read_back() {
+        let dir = crate::common::tmp_test_path("kv_snapshot", "v3", "");
+        std::fs::create_dir_all(&dir).unwrap();
+        let recs = vec![
+            KvRecord::new(b"k1".to_vec(), Some(b"v1".to_vec())),
+            KvRecord::new(b"k2".to_vec(), None),
+            KvRecord::new(b"k3".to_vec(), Some(b"v3".to_vec())).with_expire(1_900_000_000),
+        ];
+        let p1 = dir.join("a.bxp");
+        let p2 = dir.join("b.bxp");
+        let p3 = dir.join("c.bxp");
+        write_bin(&p1, &recs).unwrap();
+        write_bin(&p2, &[KvRecord::with_seq(b"s".to_vec(), Some(b"1".to_vec()), 7)]).unwrap();
+        write_bin_v3(&p3, &recs).unwrap();
+
+        let (back1, st1) = read_bin(&p1).unwrap();
+        assert_eq!(st1.records, 3);
+        assert!(
+            back1.iter().all(|r| r.expire_unix_secs.is_none()),
+            "001 里没有放 expire 的地方，读回来必须全是 None"
+        );
+        let (back2, _) = read_bin(&p2).unwrap();
+        assert_eq!(back2[0].seq, Some(7), "002 的 seq 不能被读丢");
+        let (back3, st3) = read_bin(&p3).unwrap();
+        assert_eq!(st3.records, 3);
+        assert_eq!(back3[2].expire_unix_secs, Some(1_900_000_000), "003 的绝对到期时刻要原样回来");
+        assert_eq!(back3[0].expire_unix_secs, None, "永久行读回 None，不是 Some(0)");
+        assert_eq!(back3[1].value, None, "墓碑在 003 里还是墓碑");
+
+        let mut bad = std::fs::read(&p3).unwrap();
+        bad[5] = b'9'; // BPEXP003 → BPEXP903：不认识的版号
+        let pbad = dir.join("bad.bxp");
+        std::fs::write(&pbad, &bad).unwrap();
+        assert!(read_bin(&pbad).is_err(), "魔数不认识就必须报错，不许照内容猜形状");
+
+        let pj = dir.join("a.jsonl");
+        write_jsonl(&pj, &recs).unwrap();
+        let (j, _) = read_jsonl(&pj).unwrap();
+        assert_eq!(j[2].expire_unix_secs, Some(1_900_000_000));
+        assert_eq!(j[0].expire_unix_secs, None);
+        let pold = dir.join("old.jsonl");
+        std::fs::write(&pold, "{\"key\":\"a2V5\",\"value\":\"dg==\"}\n").unwrap();
+        let (o, _) = read_jsonl(&pold).unwrap();
+        assert_eq!(o[0].key, b"key");
+        assert_eq!(o[0].value.as_deref(), Some(b"v".as_ref()));
+        assert_eq!(o[0].expire_unix_secs, None, "旧行缺 expire 字段 = 永久，不是报错");
+        let pbroken = dir.join("broken.jsonl");
+        std::fs::write(&pbroken, "{\"key\":\"a2V5\",\"value\":\"dg==\",\"expire\":12x}\n").unwrap();
+        assert!(read_jsonl(&pbroken).is_err(), "expire 有字段但值坏了 ⇒ 必须报错");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// M45 的第一条守卫：**每一个长度**都要往返一致，不是"挑几个长度"。
