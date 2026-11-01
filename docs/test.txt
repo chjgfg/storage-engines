@@ -1,0 +1,806 @@
+PS D:\develop\workspace\rust_workspace\storage-engines> cargo test --release --lib engine::tests::scale_bench::rows_600000 -- --exact --ignored --nocapture --test-threads=1
+    Finished `release` profile [optimized] target(s) in 0.31s
+     Running unittests src\lib.rs (target\release\deps\storage_engines-8b51a0d493b00083.exe)
+
+running 1 test
+test engine::tests::scale_bench::rows_600000 ... SCALE_BEGIN rows=600000 package=0.4.0 os=windows arch=x86_64 optimized=true
+=== 大库基线 rows=600000（µs/次 + 常驻/峰值 MB）===
+验收政策：TTL 两格后计时外 persist 同一批辅助键；后续固定 rows+min(rows,1000)+1，迁移目标逐键逐值验收不计入32类性能格。
+bitcask: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_4352_scale_bitcask_1793400927573038400_0
+bitcask    open 空库                       8032.2 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    灌 600000 行(事务)                  18.5 µs/行    常驻      87.6 MB  峰值 +    87.9 MB
+bitcask    flush+checkpoint            196095.5 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 107.3 MB
+bitcask    冷重开(恢复)                     179272.6 µs      常驻      57.7 MB  峰值 +    86.5 MB  常驻 57.7 MB
+bitcask    点读×N 乱序                         12.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    点读×N 有序                          5.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    multi_get×1000                  11.4 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+bitcask    multi_get×1000 全miss             1.2 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bitcask    一次全量 scan                        5.1 µs/行    常驻     104.8 MB  峰值 +   123.7 MB  600000 行
+bitcask    窗口 scan(1%)                      4.9 µs/行    常驻       0.9 MB  峰值 +     1.2 MB  6000 行
+bitcask    prefix_scan 2B前缀                 5.2 µs/行    常驻     104.8 MB  峰值 +   123.7 MB  600000 行
+bitcask    scan_page 翻完整库                2423.2 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  1200 页 / 600000 行（页宽 500）
+bitcask    seek_prev 中间键                   55.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bitcask    reverse_scan 1% 窗口               4.2 µs/行    常驻       0.9 MB  峰值 +     1.2 MB  6000 行
+bitcask    search 首页                  2181008.5 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 600000
+bitcask    search 首页(免 total)            2442.4 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+bitcask    search 末页(深翻)              2216272.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 600000
+bitcask    key_count 2B前缀             2166143.4 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  600000 键
+bitcask    set_with_ttl×1000               15.0 µs/次    常驻       4.3 MB  峰值 +     4.4 MB
+bitcask    get_ttl×1000                     4.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bitcask: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bitcask    incr×1000                       29.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    更新 60000 键                      17.9 µs/次    常驻       6.1 MB  峰值 +     6.3 MB
+bitcask    health()                    167117.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=637425 max_chain=2
+bitcask    vacuum() 全库                4352610.1 µs/次    常驻     -10.5 MB  峰值 +    21.3 MB  裁掉 36424 行
+bitcask    vacuum_bounded 一片             2884.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bitcask    flush+merge                2318905.3 µs/次    常驻       0.0 MB  峰值 +    31.5 MB  磁盘 116.7 MB
+bitcask    export 全库(物化)                    4.4 µs/行    常驻     105.0 MB  峰值 +   123.7 MB  601001 行进 Vec
+bitcask    export 流式(逐行落地)                  4.4 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  601001 行 → 磁盘 59.5 MB，内存里一行都不攒
+bitcask    migrate → memory                17.3 µs/行    常驻     115.9 MB  峰值 +   116.1 MB  搬 601001 行 / 602 页 / 31809894 B
+bitcask: migrate 验收通过(不计时) 601001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bitcask    bulk 灌 60000 行                   4.9 µs/行    常驻      16.7 MB  峰值 +    23.6 MB
+bitcask    再冷重开                        199457.9 µs      常驻      63.6 MB  峰值 +    95.3 MB  常驻 63.6 MB
+SCALE_ENGINE_DONE rows=600000 engine=bitcask
+
+bplus_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_4352_scale_bplus_tree_1793400994203599700_1
+bplus_tree open 空库                      29747.9 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bplus_tree 灌 600000 行(事务)                  40.6 µs/行    常驻      19.0 MB  峰值 +    24.2 MB
+bplus_tree flush+checkpoint            132597.1 µs      常驻       0.0 MB  峰值 +     2.8 MB  磁盘 149.1 MB
+bplus_tree 冷重开(恢复)                       2759.4 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+bplus_tree 点读×N 乱序                         24.1 µs/次    常驻      13.8 MB  峰值 +    14.4 MB
+bplus_tree 点读×N 有序                          3.7 µs/次    常驻      -1.1 MB  峰值 +     0.5 MB
+bplus_tree multi_get×1000                  23.6 µs/键    常驻      -0.2 MB  峰值 +     1.7 MB  读到 1000 条
+bplus_tree multi_get×1000 全miss             1.3 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bplus_tree 一次全量 scan                        1.6 µs/行    常驻     105.5 MB  峰值 +   124.3 MB  600000 行
+bplus_tree 窗口 scan(1%)                      1.9 µs/行    常驻       0.9 MB  峰值 +     1.3 MB  6000 行
+bplus_tree prefix_scan 2B前缀                 1.5 µs/行    常驻     104.8 MB  峰值 +   123.7 MB  600000 行
+bplus_tree scan_page 翻完整库                 881.0 µs/页    常驻       0.6 MB  峰值 +     1.3 MB  1200 页 / 600000 行（页宽 500）
+bplus_tree seek_prev 中间键                   17.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bplus_tree reverse_scan 1% 窗口               1.8 µs/行    常驻       0.9 MB  峰值 +     1.2 MB  6000 行
+bplus_tree search 首页                   812602.6 µs/次    常驻       0.4 MB  峰值 +     1.2 MB  命中 600000
+bplus_tree search 首页(免 total)            4218.2 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  拿了 100 条, has_next=true
+bplus_tree search 末页(深翻)               757743.6 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  命中 600000
+bplus_tree key_count 2B前缀              819557.2 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  600000 键
+bplus_tree set_with_ttl×1000               25.9 µs/次    常驻       0.3 MB  峰值 +     0.4 MB
+bplus_tree get_ttl×1000                     3.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bplus_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bplus_tree incr×1000                       26.6 µs/次    常驻      -0.3 MB  峰值 +     0.0 MB
+bplus_tree 更新 60000 键                      46.9 µs/次    常驻       0.7 MB  峰值 +     7.5 MB
+bplus_tree health()                    696128.8 µs/次    常驻       0.1 MB  峰值 +     0.3 MB  rows=637425 max_chain=2
+bplus_tree vacuum() 全库                2123331.0 µs/次    常驻       0.2 MB  峰值 +     1.1 MB  裁掉 36424 行
+bplus_tree vacuum_bounded 一片             4313.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bplus_tree flush+merge                     17.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 149.6 MB
+bplus_tree export 全库(物化)                    1.8 µs/行    常驻     105.4 MB  峰值 +   124.1 MB  601001 行进 Vec
+bplus_tree export 流式(逐行落地)                  2.0 µs/行    常驻       0.0 MB  峰值 +     0.8 MB  601001 行 → 磁盘 59.5 MB，内存里一行都不攒
+bplus_tree migrate → memory                 8.0 µs/行    常驻     112.3 MB  峰值 +   114.0 MB  搬 601001 行 / 602 页 / 31809894 B
+bplus_tree: migrate 验收通过(不计时) 601001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bplus_tree bulk 灌 60000 行                  13.8 µs/行    常驻       2.6 MB  峰值 +    13.5 MB
+bplus_tree 再冷重开                          3846.0 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+SCALE_ENGINE_DONE rows=600000 engine=bplus_tree
+
+lsm_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_4352_scale_lsm_tree_1793401056048507900_2
+lsm_tree   open 空库                       6862.9 µs      常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   灌 600000 行(事务)                  22.0 µs/行    常驻      22.6 MB  峰值 +    46.6 MB
+lsm_tree   flush+checkpoint             48328.2 µs      常驻     -10.6 MB  峰值 +     1.0 MB  磁盘 71.5 MB
+lsm_tree   冷重开(恢复)                       8319.1 µs      常驻       1.6 MB  峰值 +     1.6 MB  常驻 1.6 MB
+lsm_tree   点读×N 乱序                         34.0 µs/次    常驻      10.4 MB  峰值 +    10.5 MB
+lsm_tree   点读×N 有序                          5.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   multi_get×1000                  45.5 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+lsm_tree   multi_get×1000 全miss             0.9 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+lsm_tree   一次全量 scan                        3.8 µs/行    常驻     104.8 MB  峰值 +   123.7 MB  600000 行
+lsm_tree   窗口 scan(1%)                      4.5 µs/行    常驻       0.9 MB  峰值 +     1.2 MB  6000 行
+lsm_tree   prefix_scan 2B前缀                 4.6 µs/行    常驻     104.8 MB  峰值 +   123.7 MB  600000 行
+lsm_tree   scan_page 翻完整库                1918.7 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  1200 页 / 600000 行（页宽 500）
+lsm_tree   seek_prev 中间键                  134.6 µs/次    常驻      -0.0 MB  峰值 +     0.0 MB  命中 true
+lsm_tree   reverse_scan 1% 窗口               3.1 µs/行    常驻       0.9 MB  峰值 +     1.2 MB  6000 行
+lsm_tree   search 首页                  2181165.2 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 600000
+lsm_tree   search 首页(免 total)            9326.8 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+lsm_tree   search 末页(深翻)              2390602.7 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 600000
+lsm_tree   key_count 2B前缀             2124004.8 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  600000 键
+lsm_tree   set_with_ttl×1000               21.4 µs/次    常驻       0.6 MB  峰值 +     0.7 MB
+lsm_tree   get_ttl×1000                     2.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+lsm_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+lsm_tree   incr×1000                       23.4 µs/次    常驻       0.1 MB  峰值 +     0.1 MB
+lsm_tree   更新 60000 键                      31.9 µs/次    常驻      13.0 MB  峰值 +    33.1 MB
+lsm_tree   health()                    919745.0 µs/次    常驻      -0.0 MB  峰值 +     0.3 MB  rows=637425 max_chain=2
+lsm_tree   vacuum() 全库                2963438.8 µs/次    常驻     -13.9 MB  峰值 +    19.8 MB  裁掉 36424 行
+lsm_tree   vacuum_bounded 一片             4032.8 µs/次    常驻      -0.1 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+lsm_tree   flush+merge                   5567.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 91.8 MB
+lsm_tree   export 全库(物化)                    4.5 µs/行    常驻     105.0 MB  峰值 +   123.9 MB  601001 行进 Vec
+lsm_tree   export 流式(逐行落地)                  6.1 µs/行    常驻       0.0 MB  峰值 +     0.7 MB  601001 行 → 磁盘 59.5 MB，内存里一行都不攒
+lsm_tree   migrate → memory                19.0 µs/行    常驻     115.9 MB  峰值 +   116.1 MB  搬 601001 行 / 602 页 / 31809894 B
+lsm_tree: migrate 验收通过(不计时) 601001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+lsm_tree   bulk 灌 60000 行                   2.6 µs/行    常驻       0.0 MB  峰值 +    13.9 MB
+lsm_tree   再冷重开                         11501.2 µs      常驻       1.9 MB  峰值 +     2.0 MB  常驻 1.9 MB
+SCALE_ENGINE_DONE rows=600000 engine=lsm_tree
+
+memory: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_4352_scale_memory_1793401133152089200_3
+memory     open 空库                         51.2 µs      常驻       0.0 MB  峰值 +     0.0 MB
+memory     灌 600000 行(事务)                   3.8 µs/行    常驻     115.7 MB  峰值 +   116.0 MB
+memory     flush+checkpoint                 0.3 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     冷重开(恢复)                                      （内存引擎不落盘：重开 = 空库）
+memory     点读×N 乱序                          2.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     点读×N 有序                          1.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     multi_get×1000                   2.4 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+memory     multi_get×1000 全miss             0.6 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+memory     一次全量 scan                        1.2 µs/行    常驻     104.8 MB  峰值 +   123.7 MB  600000 行
+memory     窗口 scan(1%)                      1.0 µs/行    常驻       0.9 MB  峰值 +     1.3 MB  6000 行
+memory     prefix_scan 2B前缀                 1.0 µs/行    常驻     104.8 MB  峰值 +   123.7 MB  600000 行
+memory     scan_page 翻完整库                 551.7 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  1200 页 / 600000 行（页宽 500）
+memory     seek_prev 中间键                   24.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+memory     reverse_scan 1% 窗口               1.2 µs/行    常驻       0.9 MB  峰值 +     1.3 MB  6000 行
+memory     search 首页                   546858.2 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 600000
+memory     search 首页(免 total)            2687.0 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+memory     search 末页(深翻)               476604.7 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 600000
+memory     key_count 2B前缀              513972.8 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  600000 键
+memory     set_with_ttl×1000                3.5 µs/次    常驻       0.2 MB  峰值 +     0.3 MB
+memory     get_ttl×1000                     1.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+memory: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+memory     incr×1000                        9.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     更新 60000 键                       3.7 µs/次    常驻       6.4 MB  峰值 +     7.2 MB
+memory     health()                    141039.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=636425 max_chain=2
+memory     vacuum() 全库                 420724.7 µs/次    常驻      -7.2 MB  峰值 +     0.3 MB  裁掉 35424 行
+memory     vacuum_bounded 一片             1246.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+memory     flush+merge                      0.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     export 全库(物化)                    1.0 µs/行    常驻     105.0 MB  峰值 +   123.8 MB  601001 行进 Vec
+memory     export 流式(逐行落地)                  1.2 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  601001 行 → 磁盘 59.5 MB，内存里一行都不攒
+memory     migrate → memory                 5.6 µs/行    常驻     115.9 MB  峰值 +   116.1 MB  搬 601001 行 / 602 页 / 31809894 B
+memory: migrate 验收通过(不计时) 601001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+memory     bulk 灌 60000 行                   1.2 µs/行    常驻      12.9 MB  峰值 +    15.8 MB
+memory     再冷重开                               （同上，跳过）
+SCALE_ENGINE_DONE rows=600000 engine=memory
+
+SCALE_DONE rows=600000 engines=4
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 221.63s
+
+PS D:\develop\workspace\rust_workspace\storage-engines>
+
+
+
+
+PS D:\develop\workspace\rust_workspace\storage-engines> cargo test --release --lib engine::tests::scale_bench::rows_1000000 -- --exact --ignored --nocapture --test-threads=1
+    Finished `release` profile [optimized] target(s) in 0.13s
+     Running unittests src\lib.rs (target\release\deps\storage_engines-8b51a0d493b00083.exe)
+
+running 1 test
+test engine::tests::scale_bench::rows_1000000 ... SCALE_BEGIN rows=1000000 package=0.4.0 os=windows arch=x86_64 optimized=true
+=== 大库基线 rows=1000000（µs/次 + 常驻/峰值 MB）===
+验收政策：TTL 两格后计时外 persist 同一批辅助键；后续固定 rows+min(rows,1000)+1，迁移目标逐键逐值验收不计入32类性能格。
+bitcask: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_9432_scale_bitcask_1793401400161406300_0
+bitcask    open 空库                       8437.2 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    灌 1000000 行(事务)                 17.3 µs/行    常驻     143.1 MB  峰值 +   143.5 MB
+bitcask    flush+checkpoint            364818.4 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 178.9 MB
+bitcask    冷重开(恢复)                     262443.5 µs      常驻      96.2 MB  峰值 +   144.2 MB  常驻 96.2 MB
+bitcask    点读×N 乱序                         10.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    点读×N 有序                          3.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    multi_get×1000                   9.5 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+bitcask    multi_get×1000 全miss             0.6 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bitcask    一次全量 scan                        3.2 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+bitcask    窗口 scan(1%)                      2.9 µs/行    常驻       1.7 MB  峰值 +     2.2 MB  10000 行
+bitcask    prefix_scan 2B前缀                 3.0 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+bitcask    scan_page 翻完整库                1707.0 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  2000 页 / 1000000 行（页宽 500）
+bitcask    seek_prev 中间键                   63.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bitcask    reverse_scan 1% 窗口               3.9 µs/行    常驻       1.7 MB  峰值 +     2.2 MB  10000 行
+bitcask    search 首页                  3311459.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 1000000
+bitcask    search 首页(免 total)            2129.1 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+bitcask    search 末页(深翻)              2858912.3 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 1000000
+bitcask    key_count 2B前缀             3226276.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+bitcask    set_with_ttl×1000               12.0 µs/次    常驻       4.3 MB  峰值 +     4.4 MB
+bitcask    get_ttl×1000                     5.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bitcask: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bitcask    incr×1000                       24.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    更新 100000 键                     17.0 µs/次    常驻       9.1 MB  峰值 +    10.0 MB
+bitcask    health()                    226307.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=1052849 max_chain=2
+bitcask    vacuum() 全库                5963128.7 µs/次    常驻     -13.5 MB  峰值 +    37.2 MB  裁掉 51848 行
+bitcask    vacuum_bounded 一片             1596.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bitcask    flush+merge                3229336.1 µs/次    常驻       0.0 MB  峰值 +    50.3 MB  磁盘 194.3 MB
+bitcask    export 全库(物化)                    3.7 µs/行    常驻     141.5 MB  峰值 +   141.6 MB  1001001 行进 Vec
+bitcask    export 流式(逐行落地)                  3.4 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  1001001 行 → 磁盘 99.2 MB，内存里一行都不攒
+bitcask    migrate → memory                 9.6 µs/行    常驻     193.2 MB  峰值 +   193.4 MB  搬 1001001 行 / 1002 页 / 53149894 B
+bitcask: migrate 验收通过(不计时) 1001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bitcask    bulk 灌 100000 行                  4.6 µs/行    常驻      22.3 MB  峰值 +    28.9 MB
+bitcask    再冷重开                        272560.4 µs      常驻     105.9 MB  峰值 +   158.8 MB  常驻 105.9 MB
+SCALE_ENGINE_DONE rows=1000000 engine=bitcask
+
+bplus_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_9432_scale_bplus_tree_1793401483990679200_1
+bplus_tree open 空库                      27078.5 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bplus_tree 灌 1000000 行(事务)                 39.0 µs/行    常驻      19.1 MB  峰值 +    25.5 MB
+bplus_tree flush+checkpoint            299078.9 µs      常驻       0.0 MB  峰值 +     4.3 MB  磁盘 248.5 MB
+bplus_tree 冷重开(恢复)                       1847.9 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+bplus_tree 点读×N 乱序                         28.6 µs/次    常驻      11.8 MB  峰值 +    14.4 MB
+bplus_tree 点读×N 有序                          3.4 µs/次    常驻       0.7 MB  峰值 +     2.5 MB
+bplus_tree multi_get×1000                  20.3 µs/键    常驻       0.1 MB  峰值 +     1.9 MB  读到 1000 条
+bplus_tree multi_get×1000 全miss             1.0 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bplus_tree 一次全量 scan                        1.6 µs/行    常驻     142.1 MB  峰值 +   142.6 MB  1000000 行
+bplus_tree 窗口 scan(1%)                      1.8 µs/行    常驻       1.8 MB  峰值 +     2.3 MB  10000 行
+bplus_tree prefix_scan 2B前缀                 1.8 µs/行    常驻     141.2 MB  峰值 +   141.6 MB  1000000 行
+bplus_tree scan_page 翻完整库                 924.2 µs/页    常驻      -0.7 MB  峰值 +     1.0 MB  2000 页 / 1000000 行（页宽 500）
+bplus_tree seek_prev 中间键                  147.1 µs/次    常驻      -0.2 MB  峰值 +     0.0 MB  命中 true
+bplus_tree reverse_scan 1% 窗口               1.9 µs/行    常驻       1.9 MB  峰值 +     2.4 MB  10000 行
+bplus_tree search 首页                  1369914.1 µs/次    常驻       0.8 MB  峰值 +     1.7 MB  命中 1000000
+bplus_tree search 首页(免 total)            5170.4 µs/次    常驻       0.1 MB  峰值 +     1.0 MB  拿了 100 条, has_next=true
+bplus_tree search 末页(深翻)              1448889.6 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  命中 1000000
+bplus_tree key_count 2B前缀             1478101.2 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  1000000 键
+bplus_tree set_with_ttl×1000               29.9 µs/次    常驻       0.3 MB  峰值 +     0.4 MB
+bplus_tree get_ttl×1000                     3.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bplus_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bplus_tree incr×1000                       21.2 µs/次    常驻      -0.0 MB  峰值 +     0.0 MB
+bplus_tree 更新 100000 键                     55.3 µs/次    常驻       2.3 MB  峰值 +     6.6 MB
+bplus_tree health()                   1209579.5 µs/次    常驻       0.2 MB  峰值 +     0.2 MB  rows=1052849 max_chain=2
+bplus_tree vacuum() 全库                3460039.4 µs/次    常驻       0.5 MB  峰值 +     1.4 MB  裁掉 51848 行
+bplus_tree vacuum_bounded 一片             3966.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bplus_tree flush+merge                     15.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 248.9 MB
+bplus_tree export 全库(物化)                    1.6 µs/行    常驻     136.8 MB  峰值 +   137.2 MB  1001001 行进 Vec
+bplus_tree export 流式(逐行落地)                  2.0 µs/行    常驻       0.4 MB  峰值 +     1.3 MB  1001001 行 → 磁盘 99.2 MB，内存里一行都不攒
+bplus_tree migrate → memory                 7.6 µs/行    常驻     193.3 MB  峰值 +   193.5 MB  搬 1001001 行 / 1002 页 / 53149894 B
+bplus_tree: migrate 验收通过(不计时) 1001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bplus_tree bulk 灌 100000 行                 13.8 µs/行    常驻      -0.7 MB  峰值 +    20.1 MB
+bplus_tree 再冷重开                          3109.0 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+SCALE_ENGINE_DONE rows=1000000 engine=bplus_tree
+
+lsm_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_9432_scale_lsm_tree_1793401590312158700_2
+lsm_tree   open 空库                       6865.9 µs      常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   灌 1000000 行(事务)                 19.5 µs/行    常驻      19.2 MB  峰值 +    47.8 MB
+lsm_tree   flush+checkpoint            601372.5 µs      常驻      -6.2 MB  峰值 +     1.0 MB  磁盘 119.2 MB
+lsm_tree   冷重开(恢复)                      12206.9 µs      常驻       2.6 MB  峰值 +     2.7 MB  常驻 2.6 MB
+lsm_tree   点读×N 乱序                         31.7 µs/次    常驻      10.4 MB  峰值 +    10.5 MB
+lsm_tree   点读×N 有序                          4.1 µs/次    常驻      -0.0 MB  峰值 +     0.0 MB
+lsm_tree   multi_get×1000                  36.3 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+lsm_tree   multi_get×1000 全miss             1.4 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+lsm_tree   一次全量 scan                        3.2 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+lsm_tree   窗口 scan(1%)                      3.0 µs/行    常驻       1.7 MB  峰值 +     2.2 MB  10000 行
+lsm_tree   prefix_scan 2B前缀                 3.0 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+lsm_tree   scan_page 翻完整库                1356.1 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  2000 页 / 1000000 行（页宽 500）
+lsm_tree   seek_prev 中间键                   83.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+lsm_tree   reverse_scan 1% 窗口               2.4 µs/行    常驻       1.7 MB  峰值 +     2.2 MB  10000 行
+lsm_tree   search 首页                  2351078.3 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 1000000
+lsm_tree   search 首页(免 total)            6377.0 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+lsm_tree   search 末页(深翻)              2431732.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 1000000
+lsm_tree   key_count 2B前缀             2682822.2 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+lsm_tree   set_with_ttl×1000               14.7 µs/次    常驻       0.6 MB  峰值 +     0.7 MB
+lsm_tree   get_ttl×1000                     3.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+lsm_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+lsm_tree   incr×1000                       16.9 µs/次    常驻       0.1 MB  峰值 +     0.1 MB
+lsm_tree   更新 100000 键                     28.9 µs/次    常驻      14.6 MB  峰值 +    33.8 MB
+lsm_tree   health()                    929176.2 µs/次    常驻      -0.0 MB  峰值 +     0.6 MB  rows=1052849 max_chain=2
+lsm_tree   vacuum() 全库                3955658.3 µs/次    常驻     -15.3 MB  峰值 +    19.8 MB  裁掉 51848 行
+lsm_tree   vacuum_bounded 一片             4863.8 µs/次    常驻      -0.1 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+lsm_tree   flush+merge                   6937.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 152.7 MB
+lsm_tree   export 全库(物化)                    4.2 µs/行    常驻     141.5 MB  峰值 +   141.8 MB  1001001 行进 Vec
+lsm_tree   export 流式(逐行落地)                  3.9 µs/行    常驻       0.0 MB  峰值 +     0.7 MB  1001001 行 → 磁盘 99.2 MB，内存里一行都不攒
+lsm_tree   migrate → memory                11.5 µs/行    常驻     193.2 MB  峰值 +   193.4 MB  搬 1001001 行 / 1002 页 / 53149894 B
+lsm_tree: migrate 验收通过(不计时) 1001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+lsm_tree   bulk 灌 100000 行                  2.1 µs/行    常驻       0.0 MB  峰值 +    23.2 MB
+lsm_tree   再冷重开                         15381.6 µs      常驻       3.2 MB  峰值 +     3.2 MB  常驻 3.2 MB
+SCALE_ENGINE_DONE rows=1000000 engine=lsm_tree
+
+memory: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_9432_scale_memory_1793401693888576100_3
+memory     open 空库                         89.7 µs      常驻       0.0 MB  峰值 +     0.0 MB
+memory     灌 1000000 行(事务)                  3.0 µs/行    常驻     192.8 MB  峰值 +   193.2 MB
+memory     flush+checkpoint                 0.3 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     冷重开(恢复)                                      （内存引擎不落盘：重开 = 空库）
+memory     点读×N 乱序                          2.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     点读×N 有序                          1.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     multi_get×1000                   4.2 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+memory     multi_get×1000 全miss             0.8 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+memory     一次全量 scan                        1.0 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+memory     窗口 scan(1%)                      0.9 µs/行    常驻       1.7 MB  峰值 +     2.2 MB  10000 行
+memory     prefix_scan 2B前缀                 1.0 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+memory     scan_page 翻完整库                 524.8 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  2000 页 / 1000000 行（页宽 500）
+memory     seek_prev 中间键                   14.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+memory     reverse_scan 1% 窗口               1.1 µs/行    常驻       1.7 MB  峰值 +     2.2 MB  10000 行
+memory     search 首页                   810524.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 1000000
+memory     search 首页(免 total)            2710.8 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+memory     search 末页(深翻)               817561.8 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 1000000
+memory     key_count 2B前缀              839641.7 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+memory     set_with_ttl×1000                3.4 µs/次    常驻       0.2 MB  峰值 +     0.3 MB
+memory     get_ttl×1000                     1.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+memory: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+memory     incr×1000                        4.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     更新 100000 键                      3.4 µs/次    常驻      10.8 MB  峰值 +    12.1 MB
+memory     health()                    216019.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=1060041 max_chain=2
+memory     vacuum() 全库                 614952.9 µs/次    常驻     -12.0 MB  峰值 +     0.3 MB  裁掉 59040 行
+memory     vacuum_bounded 一片             1843.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+memory     flush+merge                      1.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     export 全库(物化)                    1.1 µs/行    常驻     141.5 MB  峰值 +   141.6 MB  1001001 行进 Vec
+memory     export 流式(逐行落地)                  1.2 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  1001001 行 → 磁盘 99.2 MB，内存里一行都不攒
+memory     migrate → memory                 4.6 µs/行    常驻     193.2 MB  峰值 +   193.4 MB  搬 1001001 行 / 1002 页 / 53149894 B
+memory: migrate 验收通过(不计时) 1001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+memory     bulk 灌 100000 行                  1.1 µs/行    常驻      23.3 MB  峰值 +    28.1 MB
+memory     再冷重开                               （同上，跳过）
+SCALE_ENGINE_DONE rows=1000000 engine=memory
+
+SCALE_DONE rows=1000000 engines=4
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 317.57s
+
+PS D:\develop\workspace\rust_workspace\storage-engines>
+
+
+
+
+PS D:\develop\workspace\rust_workspace\storage-engines> cargo test --release --lib engine::tests::scale_bench::rows_5000000 -- --exact --ignored --nocapture --test-threads=1
+    Finished `release` profile [optimized] target(s) in 0.46s
+     Running unittests src\lib.rs (target\release\deps\storage_engines-8b51a0d493b00083.exe)
+
+running 1 test
+test engine::tests::scale_bench::rows_5000000 ... SCALE_BEGIN rows=5000000 package=0.4.0 os=windows arch=x86_64 optimized=true
+=== 大库基线 rows=5000000（µs/次 + 常驻/峰值 MB）===
+验收政策：TTL 两格后计时外 persist 同一批辅助键；后续固定 rows+min(rows,1000)+1，迁移目标逐键逐值验收不计入32类性能格。
+bitcask: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_10288_scale_bitcask_1793402873668047000_0
+bitcask    open 空库                       7147.6 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    灌 5000000 行(事务)                 22.6 µs/行    常驻     699.0 MB  峰值 +   699.3 MB
+bitcask    flush+checkpoint           3271680.5 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 898.9 MB
+bitcask    冷重开(恢复)                    1121443.0 µs      常驻     480.9 MB  峰值 +   720.9 MB  常驻 480.9 MB
+bitcask    点读×N 乱序                          9.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    点读×N 有序                          5.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    multi_get×1000                  37.0 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+bitcask    multi_get×1000 全miss             2.1 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bitcask    一次全量 scan                        4.8 µs/行    常驻     861.5 MB  峰值 +   989.3 MB  5000000 行
+bitcask    窗口 scan(1%)                     10.3 µs/行    常驻       7.7 MB  峰值 +     8.3 MB  50000 行
+bitcask    prefix_scan 2B前缀                 4.5 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+bitcask    scan_page 翻完整库                1857.2 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  10000 页 / 5000000 行（页宽 500）
+bitcask    seek_prev 中间键                  280.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bitcask    reverse_scan 1% 窗口               6.3 µs/行    常驻       7.7 MB  峰值 +     8.3 MB  50000 行
+bitcask    search 首页                 19287272.1 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 5000000
+bitcask    search 首页(免 total)            2973.9 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+bitcask    search 末页(深翻)             16555180.3 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 5000000
+bitcask    key_count 2B前缀             3574507.1 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+bitcask    set_with_ttl×1000               12.0 µs/次    常驻       4.3 MB  峰值 +     4.4 MB
+bitcask    get_ttl×1000                     3.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bitcask: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bitcask    incr×1000                       23.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    更新 500000 键                     36.5 µs/次    常驻      45.5 MB  峰值 +    45.6 MB
+bitcask    health()                    930115.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=5256241 max_chain=2
+bitcask    vacuum() 全库               37362907.6 µs/次    常驻     -49.8 MB  峰值 +   192.7 MB  裁掉 255240 行
+bitcask    vacuum_bounded 一片             1336.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bitcask    flush+merge               21364339.7 µs/次    常驻       0.0 MB  峰值 +   242.2 MB  磁盘 906.2 MB
+bitcask    export 全库(物化)                    4.5 µs/行    常驻     862.2 MB  峰值 +   989.9 MB  5001001 行进 Vec
+bitcask    export 流式(逐行落地)                  4.3 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  5001001 行 → 磁盘 499.6 MB，内存里一行都不攒
+bitcask    migrate → memory                 9.7 µs/行    常驻     969.5 MB  峰值 +   969.6 MB  搬 5001001 行 / 5002 页 / 269549894 B
+bitcask: migrate 验收通过(不计时) 5001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bitcask    bulk 灌 500000 行                  4.7 µs/行    常驻      77.9 MB  峰值 +   101.9 MB
+bitcask    再冷重开                       1312720.8 µs      常驻     529.1 MB  峰值 +   793.2 MB  常驻 529.1 MB
+SCALE_ENGINE_DONE rows=5000000 engine=bitcask
+
+bplus_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_10288_scale_bplus_tree_1793403348210192300_1
+bplus_tree open 空库                      30778.6 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bplus_tree 灌 5000000 行(事务)                 42.2 µs/行    常驻      24.3 MB  峰值 +    33.1 MB
+bplus_tree flush+checkpoint             29458.6 µs      常驻       0.0 MB  峰值 +     0.8 MB  磁盘 1242.3 MB
+bplus_tree 冷重开(恢复)                       3130.1 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+bplus_tree 点读×N 乱序                         39.7 µs/次    常驻      13.6 MB  峰值 +    14.4 MB
+bplus_tree 点读×N 有序                          4.0 µs/次    常驻      -1.3 MB  峰值 +     0.8 MB
+bplus_tree multi_get×1000                  27.8 µs/键    常驻       0.4 MB  峰值 +     2.1 MB  读到 1000 条
+bplus_tree multi_get×1000 全miss             1.6 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bplus_tree 一次全量 scan                        1.8 µs/行    常驻     862.5 MB  峰值 +   989.3 MB  5000000 行
+bplus_tree 窗口 scan(1%)                      1.8 µs/行    常驻       7.8 MB  峰值 +     8.4 MB  50000 行
+bplus_tree prefix_scan 2B前缀                 2.5 µs/行    常驻     139.8 MB  峰值 +   140.3 MB  1000000 行
+bplus_tree scan_page 翻完整库                 986.7 µs/页    常驻       1.9 MB  峰值 +     2.3 MB  10000 页 / 5000000 行（页宽 500）
+bplus_tree seek_prev 中间键                   94.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bplus_tree reverse_scan 1% 窗口               1.7 µs/行    常驻       7.9 MB  峰值 +     8.5 MB  50000 行
+bplus_tree search 首页                  6960559.1 µs/次    常驻      -1.8 MB  峰值 +     1.0 MB  命中 5000000
+bplus_tree search 首页(免 total)            5080.4 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  拿了 100 条, has_next=true
+bplus_tree search 末页(深翻)              6822707.1 µs/次    常驻       0.8 MB  峰值 +     2.8 MB  命中 5000000
+bplus_tree key_count 2B前缀             2190592.1 µs/次    常驻      -1.4 MB  峰值 +     2.0 MB  1000000 键
+bplus_tree set_with_ttl×1000               23.4 µs/次    常驻       0.3 MB  峰值 +     0.4 MB
+bplus_tree get_ttl×1000                     2.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bplus_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bplus_tree incr×1000                       21.3 µs/次    常驻       0.0 MB  峰值 +     0.1 MB
+bplus_tree 更新 500000 键                     57.9 µs/次    常驻       6.6 MB  峰值 +    10.6 MB
+bplus_tree health()                   4993350.8 µs/次    常驻       0.0 MB  峰值 +     0.1 MB  rows=5256241 max_chain=2
+bplus_tree vacuum() 全库               14973666.2 µs/次    常驻      -5.6 MB  峰值 +     1.4 MB  裁掉 255240 行
+bplus_tree vacuum_bounded 一片             3906.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bplus_tree flush+merge                     14.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 1242.8 MB
+bplus_tree export 全库(物化)                    1.8 µs/行    常驻     863.0 MB  峰值 +   992.4 MB  5001001 行进 Vec
+bplus_tree export 流式(逐行落地)                  1.8 µs/行    常驻       0.8 MB  峰值 +     2.6 MB  5001001 行 → 磁盘 499.6 MB，内存里一行都不攒
+bplus_tree migrate → memory                 7.6 µs/行    常驻     968.3 MB  峰值 +   969.6 MB  搬 5001001 行 / 5002 页 / 269549894 B
+bplus_tree: migrate 验收通过(不计时) 5001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bplus_tree bulk 灌 500000 行                 14.5 µs/行    常驻       2.1 MB  峰值 +    94.3 MB
+bplus_tree 再冷重开                          4471.5 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+SCALE_ENGINE_DONE rows=5000000 engine=bplus_tree
+
+lsm_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_10288_scale_lsm_tree_1793403939513376700_2
+lsm_tree   open 空库                       7724.5 µs      常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   灌 5000000 行(事务)                 28.2 µs/行    常驻      48.9 MB  峰值 +    58.2 MB
+lsm_tree   flush+checkpoint           1372027.8 µs      常驻     -25.2 MB  峰值 +     1.0 MB  磁盘 600.7 MB
+lsm_tree   冷重开(恢复)                      45445.4 µs      常驻      13.1 MB  峰值 +    13.2 MB  常驻 13.1 MB
+lsm_tree   点读×N 乱序                         39.4 µs/次    常驻      10.5 MB  峰值 +    10.6 MB
+lsm_tree   点读×N 有序                          4.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   multi_get×1000                  41.7 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+lsm_tree   multi_get×1000 全miss             1.6 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+lsm_tree   一次全量 scan                        3.2 µs/行    常驻     861.6 MB  峰值 +   989.3 MB  5000000 行
+lsm_tree   窗口 scan(1%)                      3.0 µs/行    常驻       7.7 MB  峰值 +     8.3 MB  50000 行
+lsm_tree   prefix_scan 2B前缀                 3.8 µs/行    常驻     141.2 MB  峰值 +   141.9 MB  1000000 行
+lsm_tree   scan_page 翻完整库                1959.8 µs/页    常驻      -0.0 MB  峰值 +     0.2 MB  10000 页 / 5000000 行（页宽 500）
+lsm_tree   seek_prev 中间键                  138.7 µs/次    常驻      -0.0 MB  峰值 +     0.0 MB  命中 true
+lsm_tree   reverse_scan 1% 窗口               2.9 µs/行    常驻       7.7 MB  峰值 +     8.3 MB  50000 行
+lsm_tree   search 首页                 15063547.5 µs/次    常驻       0.0 MB  峰值 +     0.7 MB  命中 5000000
+lsm_tree   search 首页(免 total)           18810.7 µs/次    常驻       0.0 MB  峰值 +     0.7 MB  拿了 100 条, has_next=true
+lsm_tree   search 末页(深翻)             13799050.6 µs/次    常驻       0.0 MB  峰值 +     0.7 MB  命中 5000000
+lsm_tree   key_count 2B前缀             3546029.9 µs/次    常驻       0.0 MB  峰值 +     0.7 MB  1000000 键
+lsm_tree   set_with_ttl×1000               14.3 µs/次    常驻       0.6 MB  峰值 +     0.7 MB
+lsm_tree   get_ttl×1000                     2.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+lsm_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+lsm_tree   incr×1000                       16.6 µs/次    常驻       0.1 MB  峰值 +     0.1 MB
+lsm_tree   更新 500000 键                     53.4 µs/次    常驻      32.3 MB  峰值 +    34.8 MB
+lsm_tree   health()                   5034920.5 µs/次    常驻       0.1 MB  峰值 +     3.1 MB  rows=5420081 max_chain=2
+lsm_tree   vacuum() 全库               29364583.8 µs/次    常驻     -31.8 MB  峰值 +     3.7 MB  裁掉 419080 行
+lsm_tree   vacuum_bounded 一片            15783.1 µs/次    常驻       0.5 MB  峰值 +     0.5 MB  扫 2048 行、裁 1024 行（预算 2048）
+lsm_tree   flush+merge                 574763.0 µs/次    常驻      -0.5 MB  峰值 +     1.0 MB  磁盘 676.7 MB
+lsm_tree   export 全库(物化)                    3.8 µs/行    常驻     862.2 MB  峰值 +   989.9 MB  5001001 行进 Vec
+lsm_tree   export 流式(逐行落地)                  3.9 µs/行    常驻       0.0 MB  峰值 +     0.7 MB  5001001 行 → 磁盘 499.6 MB，内存里一行都不攒
+lsm_tree   migrate → memory                11.5 µs/行    常驻     969.5 MB  峰值 +   969.6 MB  搬 5001001 行 / 5002 页 / 269549894 B
+lsm_tree: migrate 验收通过(不计时) 5001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+lsm_tree   bulk 灌 500000 行                  1.5 µs/行    常驻       0.2 MB  峰值 +   116.0 MB
+lsm_tree   再冷重开                         58407.3 µs      常驻      15.0 MB  峰值 +    15.1 MB  常驻 15.0 MB
+SCALE_ENGINE_DONE rows=5000000 engine=lsm_tree
+
+memory: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_10288_scale_memory_1793404542658495300_3
+memory     open 空库                        395.6 µs      常驻       0.0 MB  峰值 +     0.0 MB
+memory     灌 5000000 行(事务)                  2.8 µs/行    常驻     968.7 MB  峰值 +   969.0 MB
+memory     flush+checkpoint                 0.3 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     冷重开(恢复)                                      （内存引擎不落盘：重开 = 空库）
+memory     点读×N 乱序                          3.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     点读×N 有序                          1.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     multi_get×1000                   3.5 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+memory     multi_get×1000 全miss             0.7 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+memory     一次全量 scan                        1.3 µs/行    常驻     861.5 MB  峰值 +   989.4 MB  5000000 行
+memory     窗口 scan(1%)                      1.3 µs/行    常驻       7.7 MB  峰值 +     8.3 MB  50000 行
+memory     prefix_scan 2B前缀                 1.5 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+memory     scan_page 翻完整库                 562.1 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  10000 页 / 5000000 行（页宽 500）
+memory     seek_prev 中间键                   22.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+memory     reverse_scan 1% 窗口               1.1 µs/行    常驻       7.7 MB  峰值 +     8.3 MB  50000 行
+memory     search 首页                  4657882.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 5000000
+memory     search 首页(免 total)            3337.5 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+memory     search 末页(深翻)              4387717.5 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 5000000
+memory     key_count 2B前缀             1007015.3 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+memory     set_with_ttl×1000                2.1 µs/次    常驻       0.2 MB  峰值 +     0.3 MB
+memory     get_ttl×1000                     1.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+memory: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+memory     incr×1000                        3.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     更新 500000 键                      3.6 µs/次    常驻      97.0 MB  峰值 +    97.1 MB
+memory     health()                   1185564.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=5502001 max_chain=2
+memory     vacuum() 全库                3179266.6 µs/次    常驻    -102.7 MB  峰值 +     0.3 MB  裁掉 501000 行
+memory     vacuum_bounded 一片             1125.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+memory     flush+merge                      0.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     export 全库(物化)                    1.2 µs/行    常驻     862.2 MB  峰值 +   990.0 MB  5001001 行进 Vec
+memory     export 流式(逐行落地)                  1.4 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  5001001 行 → 磁盘 499.6 MB，内存里一行都不攒
+memory     migrate → memory                 5.9 µs/行    常驻     969.5 MB  峰值 +   969.6 MB  搬 5001001 行 / 5002 页 / 269549894 B
+memory: migrate 验收通过(不计时) 5001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+memory     bulk 灌 500000 行                  1.2 µs/行    常驻     107.5 MB  峰值 +   131.5 MB
+memory     再冷重开                               （同上，跳过）
+SCALE_ENGINE_DONE rows=5000000 engine=memory
+
+SCALE_DONE rows=5000000 engines=4
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 1793.45s
+
+PS D:\develop\workspace\rust_workspace\storage-engines>
+
+
+
+
+PS D:\develop\workspace\rust_workspace\storage-engines> cargo test --release --lib engine::tests::scale_bench::rows_10000000 -- --exact --ignored --nocapture --test-threads=1
+    Finished `release` profile [optimized] target(s) in 1.03s
+     Running unittests src\lib.rs (target\release\deps\storage_engines-8b51a0d493b00083.exe)
+
+running 1 test
+test engine::tests::scale_bench::rows_10000000 ... SCALE_BEGIN rows=10000000 package=0.4.0 os=windows arch=x86_64 optimized=true
+=== 大库基线 rows=10000000（µs/次 + 常驻/峰值 MB）===
+验收政策：TTL 两格后计时外 persist 同一批辅助键；后续固定 rows+min(rows,1000)+1，迁移目标逐键逐值验收不计入32类性能格。
+bitcask: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_8508_scale_bitcask_1793427253933516500_0
+bitcask    open 空库                       8660.0 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    灌 10000000 行(事务)                39.4 µs/行    常驻    1393.7 MB  峰值 +  1394.1 MB
+bitcask    flush+checkpoint           5941423.6 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 1798.9 MB
+bitcask    冷重开(恢复)                    2185009.1 µs      常驻     961.8 MB  峰值 +  1441.8 MB  常驻 961.8 MB
+bitcask    点读×N 乱序                          9.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    点读×N 有序                          4.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    multi_get×1000                  26.2 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+bitcask    multi_get×1000 全miss             1.7 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bitcask    一次全量 scan                        3.4 µs/行    常驻    1724.2 MB  峰值 +  1979.2 MB  10000000 行
+bitcask    窗口 scan(1%)                      8.1 µs/行    常驻      15.5 MB  峰值 +    16.0 MB  100000 行
+bitcask    prefix_scan 2B前缀                 4.9 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+bitcask    scan_page 翻完整库                1844.8 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  20000 页 / 10000000 行（页宽 500）
+bitcask    seek_prev 中间键                24066.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bitcask    reverse_scan 1% 窗口               3.7 µs/行    常驻      15.5 MB  峰值 +    16.0 MB  100000 行
+bitcask    search 首页                 36320807.0 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 10000000
+bitcask    search 首页(免 total)            2217.2 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+bitcask    search 末页(深翻)             31062515.0 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 10000000
+bitcask    key_count 2B前缀             3039920.8 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+bitcask    set_with_ttl×1000               13.2 µs/次    常驻       4.3 MB  峰值 +     4.4 MB
+bitcask    get_ttl×1000                     4.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bitcask: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bitcask    incr×1000                       24.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    更新 1000000 键                    73.2 µs/次    常驻      89.8 MB  峰值 +    90.9 MB
+bitcask    health()                   2292961.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=10502289 max_chain=2
+bitcask    vacuum() 全库               74745952.1 µs/次    常驻     -94.2 MB  峰值 +   387.4 MB  裁掉 501288 行
+bitcask    vacuum_bounded 一片             1537.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bitcask    flush+merge               46184528.9 µs/次    常驻       0.0 MB  峰值 +   481.3 MB  磁盘 1815.2 MB
+bitcask    export 全库(物化)                    3.7 µs/行    常驻    1726.4 MB  峰值 +  1981.3 MB  10001001 行进 Vec
+bitcask    export 流式(逐行落地)                  3.7 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  10001001 行 → 磁盘 1001.1 MB，内存里一行都不攒
+bitcask    migrate → memory                11.9 µs/行    常驻    1940.7 MB  峰值 +  1940.9 MB  搬 10001001 行 / 10002 页 / 541049894 B
+bitcask: migrate 验收通过(不计时) 10001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bitcask    bulk 灌 1000000 行                 5.4 µs/行    常驻     147.3 MB  峰值 +   195.3 MB
+bitcask    再冷重开                       4240460.1 µs      常驻    1058.1 MB  峰值 +  1586.2 MB  常驻 1058.1 MB
+SCALE_ENGINE_DONE rows=10000000 engine=bitcask
+
+bplus_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_8508_scale_bplus_tree_1793428401677604900_1
+bplus_tree open 空库                      49379.1 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bplus_tree 灌 10000000 行(事务)                45.9 µs/行    常驻      34.7 MB  峰值 +    41.8 MB
+bplus_tree flush+checkpoint             62888.2 µs      常驻       0.0 MB  峰值 +     1.5 MB  磁盘 2484.7 MB
+bplus_tree 冷重开(恢复)                       3077.9 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+bplus_tree 点读×N 乱序                         45.7 µs/次    常驻      13.8 MB  峰值 +    14.4 MB
+bplus_tree 点读×N 有序                          4.0 µs/次    常驻       0.4 MB  峰值 +     0.6 MB
+bplus_tree multi_get×1000                  40.7 µs/键    常驻      -1.7 MB  峰值 +     0.3 MB  读到 1000 条
+bplus_tree multi_get×1000 全miss             1.3 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bplus_tree 一次全量 scan                        3.2 µs/行    常驻    1724.0 MB  峰值 +  1979.6 MB  10000000 行
+bplus_tree 窗口 scan(1%)                      2.1 µs/行    常驻      15.6 MB  峰值 +    16.2 MB  100000 行
+bplus_tree prefix_scan 2B前缀                 2.9 µs/行    常驻     142.5 MB  峰值 +   142.9 MB  1000000 行
+bplus_tree scan_page 翻完整库                1146.1 µs/页    常驻      -1.4 MB  峰值 +     0.9 MB  20000 页 / 10000000 行（页宽 500）
+bplus_tree seek_prev 中间键                  109.2 µs/次    常驻      -0.2 MB  峰值 +     0.0 MB  命中 true
+bplus_tree reverse_scan 1% 窗口               2.2 µs/行    常驻      15.9 MB  峰值 +    16.4 MB  100000 行
+bplus_tree search 首页                 18782034.2 µs/次    常驻      -0.4 MB  峰值 +     2.9 MB  命中 10000000
+bplus_tree search 首页(免 total)            4880.7 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  拿了 100 条, has_next=true
+bplus_tree search 末页(深翻)             17744537.8 µs/次    常驻       2.2 MB  峰值 +     3.3 MB  命中 10000000
+bplus_tree key_count 2B前缀             3495761.2 µs/次    常驻      -1.4 MB  峰值 +     1.0 MB  1000000 键
+bplus_tree set_with_ttl×1000              226.2 µs/次    常驻       0.3 MB  峰值 +     0.4 MB
+bplus_tree get_ttl×1000                     2.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bplus_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bplus_tree incr×1000                      111.1 µs/次    常驻       0.0 MB  峰值 +     0.1 MB
+bplus_tree 更新 1000000 键                   139.9 µs/次    常驻       2.0 MB  峰值 +    10.2 MB
+bplus_tree health()                  11813621.5 µs/次    常驻       0.2 MB  峰值 +     0.2 MB  rows=10502289 max_chain=2
+bplus_tree vacuum() 全库               58254556.9 µs/次    常驻       0.9 MB  峰值 +     2.6 MB  裁掉 501288 行
+bplus_tree vacuum_bounded 一片             7614.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bplus_tree flush+merge                     18.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 2485.2 MB
+bplus_tree export 全库(物化)                    2.5 µs/行    常驻    1726.0 MB  峰值 +  1981.5 MB  10001001 行进 Vec
+bplus_tree export 流式(逐行落地)                  2.3 µs/行    常驻      -0.4 MB  峰值 +     1.9 MB  10001001 行 → 磁盘 1001.1 MB，内存里一行都不攒
+bplus_tree migrate → memory                 9.7 µs/行    常驻    1941.8 MB  峰值 +  1942.0 MB  搬 10001001 行 / 10002 页 / 541049894 B
+bplus_tree: migrate 验收通过(不计时) 10001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bplus_tree bulk 灌 1000000 行                15.3 µs/行    常驻       1.5 MB  峰值 +   184.4 MB
+bplus_tree 再冷重开                          8300.2 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+SCALE_ENGINE_DONE rows=10000000 engine=bplus_tree
+
+lsm_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_8508_scale_lsm_tree_1793429864420316100_2
+lsm_tree   open 空库                      46641.4 µs      常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   灌 10000000 行(事务)                58.6 µs/行    常驻      59.3 MB  峰值 +    71.5 MB
+lsm_tree   flush+checkpoint           4320397.0 µs      常驻     -22.5 MB  峰值 +     1.0 MB  磁盘 1202.5 MB
+lsm_tree   冷重开(恢复)                     184506.3 µs      常驻      26.3 MB  峰值 +    26.3 MB  常驻 26.3 MB
+lsm_tree   点读×N 乱序                         37.6 µs/次    常驻      10.5 MB  峰值 +    10.6 MB
+lsm_tree   点读×N 有序                          4.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   multi_get×1000                  37.3 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+lsm_tree   multi_get×1000 全miss             1.0 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+lsm_tree   一次全量 scan                        3.3 µs/行    常驻    1724.2 MB  峰值 +  1979.2 MB  10000000 行
+lsm_tree   窗口 scan(1%)                      2.5 µs/行    常驻      15.5 MB  峰值 +    16.0 MB  100000 行
+lsm_tree   prefix_scan 2B前缀                 3.3 µs/行    常驻     141.2 MB  峰值 +   141.8 MB  1000000 行
+lsm_tree   scan_page 翻完整库                1868.3 µs/页    常驻       0.0 MB  峰值 +     0.3 MB  20000 页 / 10000000 行（页宽 500）
+lsm_tree   seek_prev 中间键                  153.8 µs/次    常驻      -0.0 MB  峰值 +     0.0 MB  命中 true
+lsm_tree   reverse_scan 1% 窗口               3.4 µs/行    常驻      15.5 MB  峰值 +    16.0 MB  100000 行
+lsm_tree   search 首页                 31817772.8 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  命中 10000000
+lsm_tree   search 首页(免 total)           52516.8 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  拿了 100 条, has_next=true
+lsm_tree   search 末页(深翻)             36760728.5 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  命中 10000000
+lsm_tree   key_count 2B前缀             4131932.2 µs/次    常驻      -0.0 MB  峰值 +     0.7 MB  1000000 键
+lsm_tree   set_with_ttl×1000               21.6 µs/次    常驻       0.6 MB  峰值 +     0.7 MB
+lsm_tree   get_ttl×1000                     4.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+lsm_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+lsm_tree   incr×1000                       19.8 µs/次    常驻       0.1 MB  峰值 +     0.1 MB
+lsm_tree   更新 1000000 键                    68.6 µs/次    常驻       7.8 MB  峰值 +    36.4 MB
+lsm_tree   health()                  12950238.8 µs/次    常驻      -0.0 MB  峰值 +     6.4 MB  rows=10993809 max_chain=2
+lsm_tree   vacuum() 全库               60776351.8 µs/次    常驻      -6.4 MB  峰值 +    30.1 MB  裁掉 992808 行
+lsm_tree   vacuum_bounded 一片            26564.1 µs/次    常驻       0.5 MB  峰值 +     0.5 MB  扫 2048 行、裁 1024 行（预算 2048）
+lsm_tree   flush+merge                 657761.5 µs/次    常驻      -0.5 MB  峰值 +     1.0 MB  磁盘 1336.8 MB
+lsm_tree   export 全库(物化)                    4.7 µs/行    常驻    1726.4 MB  峰值 +  1981.3 MB  10001001 行进 Vec
+lsm_tree   export 流式(逐行落地)                  4.4 µs/行    常驻       0.0 MB  峰值 +     0.8 MB  10001001 行 → 磁盘 1001.1 MB，内存里一行都不攒
+lsm_tree   migrate → memory                12.8 µs/行    常驻    1940.7 MB  峰值 +  1940.9 MB  搬 10001001 行 / 10002 页 / 541049894 B
+lsm_tree: migrate 验收通过(不计时) 10001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+lsm_tree   bulk 灌 1000000 行                 1.9 µs/行    常驻       0.3 MB  峰值 +   232.0 MB
+lsm_tree   再冷重开                        125078.2 µs      常驻      29.2 MB  峰值 +    29.2 MB  常驻 29.2 MB
+SCALE_ENGINE_DONE rows=10000000 engine=lsm_tree
+
+memory: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_8508_scale_memory_1793431413971242700_3
+memory     open 空库                        700.6 µs      常驻       0.0 MB  峰值 +     0.0 MB
+memory     灌 10000000 行(事务)                 3.5 µs/行    常驻    1938.4 MB  峰值 +  1938.7 MB
+memory     flush+checkpoint                 0.3 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     冷重开(恢复)                                      （内存引擎不落盘：重开 = 空库）
+memory     点读×N 乱序                          3.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     点读×N 有序                          2.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     multi_get×1000                   3.9 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+memory     multi_get×1000 全miss             0.8 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+memory     一次全量 scan                        1.7 µs/行    常驻    1724.2 MB  峰值 +  1979.2 MB  10000000 行
+memory     窗口 scan(1%)                      1.5 µs/行    常驻      15.5 MB  峰值 +    16.1 MB  100000 行
+memory     prefix_scan 2B前缀                 1.7 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+memory     scan_page 翻完整库                 686.2 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  20000 页 / 10000000 行（页宽 500）
+memory     seek_prev 中间键                   21.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+memory     reverse_scan 1% 窗口               1.5 µs/行    常驻      15.5 MB  峰值 +    16.1 MB  100000 行
+memory     search 首页                 12809429.5 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 10000000
+memory     search 首页(免 total)            4271.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+memory     search 末页(深翻)             12884549.9 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 10000000
+memory     key_count 2B前缀             1428978.2 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+memory     set_with_ttl×1000                2.7 µs/次    常驻       0.2 MB  峰值 +     0.3 MB
+memory     get_ttl×1000                     2.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+memory: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+memory     incr×1000                        4.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     更新 1000000 键                     3.8 µs/次    常驻     195.0 MB  峰值 +   195.1 MB
+memory     health()                   2499196.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=11002001 max_chain=2
+memory     vacuum() 全库                7533488.9 µs/次    常驻    -205.3 MB  峰值 +     0.3 MB  裁掉 1001000 行
+memory     vacuum_bounded 一片             2708.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+memory     flush+merge                      0.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     export 全库(物化)                    2.2 µs/行    常驻    1726.4 MB  峰值 +  1981.3 MB  10001001 行进 Vec
+memory     export 流式(逐行落地)                  1.8 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  10001001 行 → 磁盘 1001.1 MB，内存里一行都不攒
+memory     migrate → memory                 7.1 µs/行    常驻    1940.7 MB  峰值 +  1940.9 MB  搬 10001001 行 / 10002 页 / 541049894 B
+memory: migrate 验收通过(不计时) 10001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+memory     bulk 灌 1000000 行                 1.6 µs/行    常驻     215.0 MB  峰值 +   263.0 MB
+memory     再冷重开                               （同上，跳过）
+SCALE_ENGINE_DONE rows=10000000 engine=memory
+
+SCALE_DONE rows=10000000 engines=4
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 4479.50s
+
+PS D:\develop\workspace\rust_workspace\storage-engines>
+
+
+
+
+PS D:\develop\workspace\rust_workspace\storage-engines> cargo test --release --lib engine::tests::scale_bench::rows_20000000 -- --exact --ignored --nocapture --test-threads=1
+    Finished `release` profile [optimized] target(s) in 0.40s
+     Running unittests src\lib.rs (target\release\deps\storage_engines-8b51a0d493b00083.exe)
+
+running 1 test
+test engine::tests::scale_bench::rows_20000000 ... SCALE_BEGIN rows=20000000 package=0.4.0 os=windows arch=x86_64 optimized=true
+=== 大库基线 rows=20000000（µs/次 + 常驻/峰值 MB）===
+验收政策：TTL 两格后计时外 persist 同一批辅助键；后续固定 rows+min(rows,1000)+1，迁移目标逐键逐值验收不计入32类性能格。
+bitcask: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_23596_scale_bitcask_1793429289848957000_0
+bitcask    open 空库                       9841.8 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    灌 20000000 行(事务)                83.6 µs/行    常驻    2783.2 MB  峰值 +  2783.6 MB
+bitcask    flush+checkpoint          13501271.9 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 3608.9 MB
+bitcask    冷重开(恢复)                    5762834.3 µs      常驻    1923.6 MB  峰值 +  2883.6 MB  常驻 1923.6 MB
+bitcask    点读×N 乱序                         10.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    点读×N 有序                          4.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    multi_get×1000                   9.1 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+bitcask    multi_get×1000 全miss             0.8 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+bitcask    一次全量 scan                        4.2 µs/行    常驻    3459.5 MB  峰值 +  3965.7 MB  20000000 行
+bitcask    窗口 scan(1%)                      3.3 µs/行    常驻      31.2 MB  峰值 +    31.6 MB  200000 行
+bitcask    prefix_scan 2B前缀                 3.5 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+bitcask    scan_page 翻完整库                1750.4 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  40000 页 / 20000000 行（页宽 500）
+bitcask    seek_prev 中间键                   64.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bitcask    reverse_scan 1% 窗口               3.4 µs/行    常驻      31.2 MB  峰值 +    31.6 MB  200000 行
+bitcask    search 首页                 64069374.4 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 20000000
+bitcask    search 首页(免 total)            2605.0 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+bitcask    search 末页(深翻)             63721791.4 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 20000000
+bitcask    key_count 2B前缀             5438118.4 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+bitcask    set_with_ttl×1000               29.5 µs/次    常驻       4.3 MB  峰值 +     4.4 MB
+bitcask    get_ttl×1000                     8.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bitcask: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bitcask    incr×1000                       54.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+bitcask    更新 2000000 键                   117.9 µs/次    常驻     179.6 MB  峰值 +   180.6 MB
+bitcask    health()                   3542663.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=21002577 max_chain=2
+bitcask    vacuum() 全库              166933031.6 µs/次    常驻    -184.0 MB  峰值 +   778.9 MB  裁掉 1001576 行
+bitcask    vacuum_bounded 一片             1395.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bitcask    flush+merge              113517212.9 µs/次    常驻       0.0 MB  峰值 +   962.6 MB  磁盘 3623.0 MB
+bitcask    export 全库(物化)                    4.4 µs/行    常驻    3462.7 MB  峰值 +  3968.8 MB  20001001 行进 Vec
+bitcask    export 流式(逐行落地)                  4.2 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒
+bitcask    migrate → memory                11.7 µs/行    常驻    3891.2 MB  峰值 +  3891.4 MB  搬 20001001 行 / 20002 页 / 1092049894 B
+bitcask: migrate 验收通过(不计时) 20001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bitcask    bulk 灌 2000000 行                 4.8 µs/行    常驻     286.3 MB  峰值 +   382.5 MB
+bitcask    再冷重开                       6731285.6 µs      常驻    2116.1 MB  峰值 +  3172.2 MB  常驻 2116.1 MB
+SCALE_ENGINE_DONE rows=20000000 engine=bitcask
+
+bplus_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_23596_scale_bplus_tree_1793432605539795200_1
+bplus_tree open 空库                     197178.2 µs      常驻       0.0 MB  峰值 +     0.0 MB
+bplus_tree 灌 20000000 行(事务)                41.0 µs/行    常驻      55.4 MB  峰值 +    69.6 MB
+bplus_tree flush+checkpoint            145813.5 µs      常驻       0.0 MB  峰值 +     3.1 MB  磁盘 4969.4 MB
+bplus_tree 冷重开(恢复)                       2280.6 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+bplus_tree 点读×N 乱序                         42.4 µs/次    常驻      11.6 MB  峰值 +    14.4 MB
+bplus_tree 点读×N 有序                          3.2 µs/次    常驻       1.6 MB  峰值 +     2.8 MB
+bplus_tree multi_get×1000                  31.3 µs/键    常驻      -0.9 MB  峰值 +     1.1 MB  读到 1000 条
+bplus_tree multi_get×1000 全miss             1.7 µs/键    常驻      -0.2 MB  峰值 +     0.1 MB  读到 0 条(应为 0)
+bplus_tree 一次全量 scan                        2.7 µs/行    常驻    3460.0 MB  峰值 +  3967.2 MB  20000000 行
+bplus_tree 窗口 scan(1%)                      1.4 µs/行    常驻      31.5 MB  峰值 +    31.9 MB  200000 行
+bplus_tree prefix_scan 2B前缀                 2.1 µs/行    常驻     142.6 MB  峰值 +   143.0 MB  1000000 行
+bplus_tree scan_page 翻完整库                 846.0 µs/页    常驻      -0.1 MB  峰值 +     0.3 MB  40000 页 / 20000000 行（页宽 500）
+bplus_tree seek_prev 中间键                  122.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+bplus_tree reverse_scan 1% 窗口               1.6 µs/行    常驻      28.9 MB  峰值 +    32.0 MB  200000 行
+bplus_tree search 首页                 26448266.9 µs/次    常驻       0.3 MB  峰值 +     3.5 MB  命中 20000000
+bplus_tree search 首页(免 total)            4509.1 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  拿了 100 条, has_next=true
+bplus_tree search 末页(深翻)             26363338.7 µs/次    常驻       0.2 MB  峰值 +     3.2 MB  命中 20000000
+bplus_tree key_count 2B前缀             2043421.6 µs/次    常驻       1.3 MB  峰值 +     2.2 MB  1000000 键
+bplus_tree set_with_ttl×1000               23.5 µs/次    常驻       0.3 MB  峰值 +     0.4 MB
+bplus_tree get_ttl×1000                     2.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+bplus_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+bplus_tree incr×1000                       22.0 µs/次    常驻       0.0 MB  峰值 +     0.1 MB
+bplus_tree 更新 2000000 键                    59.9 µs/次    常驻       4.9 MB  峰值 +    10.9 MB
+bplus_tree health()                  16137636.2 µs/次    常驻       0.1 MB  峰值 +     0.1 MB  rows=21002577 max_chain=2
+bplus_tree vacuum() 全库               55175477.4 µs/次    常驻       0.2 MB  峰值 +     4.0 MB  裁掉 1001576 行
+bplus_tree vacuum_bounded 一片             2349.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+bplus_tree flush+merge                     18.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 5210.7 MB
+bplus_tree export 全库(物化)                    2.5 µs/行    常驻    3462.6 MB  峰值 +  3969.9 MB  20001001 行进 Vec
+bplus_tree export 流式(逐行落地)                  1.6 µs/行    常驻       0.1 MB  峰值 +     3.5 MB  20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒
+bplus_tree migrate → memory                 7.4 µs/行    常驻    3892.9 MB  峰值 +  3893.1 MB  搬 20001001 行 / 20002 页 / 1092049894 B
+bplus_tree: migrate 验收通过(不计时) 20001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+bplus_tree bulk 灌 2000000 行                15.9 µs/行    常驻       0.1 MB  峰值 +   370.5 MB
+bplus_tree 再冷重开                          2533.5 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB
+SCALE_ENGINE_DONE rows=20000000 engine=bplus_tree
+
+lsm_tree: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_23596_scale_lsm_tree_1793434995655950100_2
+lsm_tree   open 空库                       6771.7 µs      常驻       0.0 MB  峰值 +     0.0 MB
+lsm_tree   灌 20000000 行(事务)                27.0 µs/行    常驻      82.9 MB  峰值 +    97.8 MB
+lsm_tree   flush+checkpoint           1359762.4 µs      常驻     -19.8 MB  峰值 +     1.0 MB  磁盘 2416.1 MB
+lsm_tree   冷重开(恢复)                     195865.3 µs      常驻      52.6 MB  峰值 +    52.6 MB  常驻 52.6 MB
+lsm_tree   点读×N 乱序                         34.2 µs/次    常驻      10.5 MB  峰值 +    10.6 MB
+lsm_tree   点读×N 有序                          4.2 µs/次    常驻       0.0 MB  峰值 +     0.1 MB
+lsm_tree   multi_get×1000                  34.7 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 1000 条
+lsm_tree   multi_get×1000 全miss             3.1 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+lsm_tree   一次全量 scan                        4.8 µs/行    常驻    3459.5 MB  峰值 +  3965.7 MB  20000000 行
+lsm_tree   窗口 scan(1%)                      2.6 µs/行    常驻      31.2 MB  峰值 +    31.6 MB  200000 行
+lsm_tree   prefix_scan 2B前缀                 3.2 µs/行    常驻     141.2 MB  峰值 +   141.8 MB  1000000 行
+lsm_tree   scan_page 翻完整库                4713.0 µs/页    常驻       0.1 MB  峰值 +     1.8 MB  40000 页 / 20000000 行（页宽 500）
+lsm_tree   seek_prev 中间键                  162.2 µs/次    常驻      -0.0 MB  峰值 +     0.0 MB  命中 true
+lsm_tree   reverse_scan 1% 窗口               2.8 µs/行    常驻      31.2 MB  峰值 +    31.6 MB  200000 行
+lsm_tree   search 首页                 79814356.1 µs/次    常驻       0.0 MB  峰值 +     2.8 MB  命中 20000000
+lsm_tree   search 首页(免 total)           40912.9 µs/次    常驻      -0.0 MB  峰值 +     2.8 MB  拿了 100 条, has_next=true
+lsm_tree   search 末页(深翻)             80681271.0 µs/次    常驻       0.1 MB  峰值 +     2.9 MB  命中 20000000
+lsm_tree   key_count 2B前缀             3417909.7 µs/次    常驻      -0.1 MB  峰值 +     0.6 MB  1000000 键
+lsm_tree   set_with_ttl×1000               13.4 µs/次    常驻       0.6 MB  峰值 +     0.7 MB
+lsm_tree   get_ttl×1000                     3.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+lsm_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+lsm_tree   incr×1000                       16.8 µs/次    常驻       0.1 MB  峰值 +     0.1 MB
+lsm_tree   更新 2000000 键                    69.3 µs/次    常驻      18.5 MB  峰值 +    39.0 MB
+lsm_tree   health()                  18325998.8 µs/次    常驻       0.0 MB  峰值 +    12.9 MB  rows=21993809 max_chain=2
+lsm_tree   vacuum() 全库              117661582.5 µs/次    常驻     -13.1 MB  峰值 +    23.8 MB  裁掉 2001000 行
+lsm_tree   vacuum_bounded 一片            42107.5 µs/次    常驻       0.5 MB  峰值 +     3.0 MB  扫 2048 行、裁 1024 行（预算 2048）
+lsm_tree   flush+merge                1420911.2 µs/次    常驻      -1.7 MB  峰值 +     1.3 MB  磁盘 2667.2 MB
+lsm_tree   export 全库(物化)                    5.0 µs/行    常驻    3462.7 MB  峰值 +  3968.8 MB  20001001 行进 Vec
+lsm_tree   export 流式(逐行落地)                  4.6 µs/行    常驻       0.0 MB  峰值 +     4.5 MB  20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒
+lsm_tree   migrate → memory                14.1 µs/行    常驻    3891.2 MB  峰值 +  3891.4 MB  搬 20001001 行 / 20002 页 / 1092049894 B
+lsm_tree: migrate 验收通过(不计时) 20001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+lsm_tree   bulk 灌 2000000 行                 1.7 µs/行    常驻       0.7 MB  峰值 +   464.0 MB
+lsm_tree   再冷重开                        210543.3 µs      常驻      58.7 MB  峰值 +    58.7 MB  常驻 58.7 MB
+SCALE_ENGINE_DONE rows=20000000 engine=lsm_tree
+
+memory: scratch=C:\Users\ADMINI~1\AppData\Local\Temp\se_engine_23596_scale_memory_1793437574379954200_3
+memory     open 空库                       1647.0 µs      常驻       0.0 MB  峰值 +     0.0 MB
+memory     灌 20000000 行(事务)                 3.1 µs/行    常驻    3887.9 MB  峰值 +  3888.3 MB
+memory     flush+checkpoint                 0.2 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     冷重开(恢复)                                      （内存引擎不落盘：重开 = 空库）
+memory     点读×N 乱序                          3.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     点读×N 有序                          1.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     multi_get×1000                   3.5 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条
+memory     multi_get×1000 全miss             0.7 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)
+memory     一次全量 scan                        2.0 µs/行    常驻    3459.5 MB  峰值 +  3965.7 MB  20000000 行
+memory     窗口 scan(1%)                      1.6 µs/行    常驻      31.2 MB  峰值 +    31.7 MB  200000 行
+memory     prefix_scan 2B前缀                 1.8 µs/行    常驻     141.2 MB  峰值 +   141.4 MB  1000000 行
+memory     scan_page 翻完整库                 855.6 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  40000 页 / 20000000 行（页宽 500）
+memory     seek_prev 中间键                   27.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true
+memory     reverse_scan 1% 窗口               2.2 µs/行    常驻      31.2 MB  峰值 +    31.7 MB  200000 行
+memory     search 首页                 44523200.4 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 20000000
+memory     search 首页(免 total)            8043.7 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true
+memory     search 末页(深翻)             47377274.9 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 20000000
+memory     key_count 2B前缀             2579145.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  1000000 键
+memory     set_with_ttl×1000                4.3 µs/次    常驻       0.2 MB  峰值 +     0.3 MB
+memory     get_ttl×1000                     2.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL
+memory: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状
+memory     incr×1000                        6.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB
+memory     更新 2000000 键                     4.2 µs/次    常驻     389.9 MB  峰值 +   390.1 MB
+memory     health()                   5134343.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=22002001 max_chain=2
+memory     vacuum() 全库               19163581.6 µs/次    常驻    -411.5 MB  峰值 +     0.3 MB  裁掉 2001000 行
+memory     vacuum_bounded 一片             1232.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）
+memory     flush+merge                      0.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB
+memory     export 全库(物化)                    3.7 µs/行    常驻    3462.7 MB  峰值 +  3968.8 MB  20001001 行进 Vec
+memory     export 流式(逐行落地)                  2.5 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒
+memory     migrate → memory                16.2 µs/行    常驻    3891.2 MB  峰值 +  3891.4 MB  搬 20001001 行 / 20002 页 / 1092049894 B
+memory: migrate 验收通过(不计时) 20001001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0
+memory     bulk 灌 2000000 行                 3.3 µs/行    常驻     435.0 MB  峰值 +   531.0 MB
+memory     再冷重开                               （同上，跳过）
+SCALE_ENGINE_DONE rows=20000000 engine=memory
+
+SCALE_DONE rows=20000000 engines=4
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 9294.77s
+
+PS D:\develop\workspace\rust_workspace\storage-engines>
