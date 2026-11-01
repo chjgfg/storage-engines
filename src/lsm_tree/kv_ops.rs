@@ -253,6 +253,69 @@ impl Transaction {
 
     // ── 模糊 / 前缀搜索 + 分页 ──
 
+    /// 从库尾取 `page_size` 条**逻辑键**（免 total，升序交出）—— M81 第 4 项。
+    ///
+    /// 推进机制与 [`Transaction::seek_prev`] 同源（`seek_prev_with` 自己就是那个循环；方案初版
+    /// "没法循环递减"的论据已撤回）：每拿到一把逻辑键，把上界收紧成**它本身**，而版本行合同
+    /// `raw ‖ version_be > raw` 让那一组整体自动出局 ⇒ 不在同一把键的旧版本上打转，也不需要
+    /// `excluded` 那张表（`find_back` 的 `excluded` 记的是编码键，按它拦不住同键旧版本 —— 方案
+    /// 第 4 项坑 2 说的就是这个，收紧下界那条路把它整个省掉）。
+    /// 起点取库里真实存在的最大编码键（[`LSMTree::store_max_key`]），不造 `\xFF` 哨兵。
+    ///
+    /// 代价 = `page_size` 次反向定位、每次 O(块) ⇒ **不随库大小涨**（台架 `seek_prev 中间键`
+    /// 六档单价 134.6 → 162.2 µs 就是这条路径的形状）。
+    /// ⚠️ 唯一的退化形状：库尾连着一大片全是墓碑/过期键 ⇒ 为凑够 N 条活键要一路往前退。这与
+    /// `find_back` 自己的 `BACK_SCAN_FALLBACK` 是同一类问题，所以这里给一条**明确的界**：退过
+    /// `LAST_PAGE_MAX_STEPS` 就改走 `reverse_scan` 截尾（慢，但正确，且形状与三家默认实现一致）。
+    pub fn search_last_page(&self, page_size: usize) -> SearchPage {
+        const LAST_PAGE_MAX_STEPS: usize = 8 * 1024;
+        let mut items: Vec<ExportRecord> = Vec::new();
+        let mut bound: Option<Vec<u8>> = {
+            let kv = self.kv.lock().unwrap();
+            kv.store_max_key()
+        };
+        let mut steps = 0usize;
+        while items.len() < page_size {
+            let Some(start) = bound.clone() else { break };
+            let raw = {
+                let kv = self.kv.lock().unwrap();
+                kv.find_back(b"", &start, u64::MAX, |_, _| true)
+                    .and_then(|(enc, _)| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+            };
+            let Some(raw) = raw else { break };
+            // 下一轮上界 = 这一把键本身（含端点），它的版本行全都 > 它 ⇒ 整组出局
+            bound = Some(raw.clone());
+            let logical = self.latest_visible_raw(&raw).and_then(|(_, v)| v);
+            if let Some(rec) = crate::common::live_record_of_logical(raw, logical, now_unix_secs())
+            {
+                items.push(rec);
+            }
+            steps += 1;
+            if steps >= LAST_PAGE_MAX_STEPS {
+                let mut v = self.reverse_scan(None, None);
+                v.truncate(page_size);
+                v.reverse();
+                return SearchPage {
+                    items: v,
+                    total: None,
+                    page: 0,
+                    page_size,
+                    total_pages: None,
+                    has_next: false,
+                };
+            }
+        }
+        items.reverse(); // 收集是降序，而 `SearchPage::items` 的合同是升序
+        SearchPage {
+            items,
+            total: None,
+            page: 0,
+            page_size,
+            total_pages: None,
+            has_next: false,
+        }
+    }
+
     /// 按 key 模糊/前缀搜索并分页。
     ///
     /// M35：整条实现收进 [`crate::common::search_page`]（四家一份，含"要不要精确 total"那条

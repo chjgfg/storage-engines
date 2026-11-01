@@ -1462,6 +1462,22 @@ impl LSMTree {
     /// 正常 L1+ 先二分定位范围再反向走，L0/异常重叠层只排序引用，不改真实源序。
     /// 被拒的 key 进 `excluded` 后重找。若拒绝数超过 `BACK_SCAN_FALLBACK`，回退到同一
     /// snapshot 的一次 `range_scan_at_seq`，避免前缀交错等退化形状反复扫描。
+    /// 库里真实存在的**最大键**（KV 层的键 = MVCC 那侧的编码键），只读常驻元数据：
+    /// mem/immutables 的 BTreeMap 尾键 + 每篇 SST 的 `max_key`。**一次块 I/O 都不做**
+    /// （min/max 从 M26 起驻留在 `SstFile` 上）。
+    ///
+    /// 为什么要有它：[`LSMTree::find_back`] 的上界是**含端点**的字节界，而任意字节空间里造不出
+    /// "最大值"哨兵 —— `\xFF×N` 那种写法会把以它为前缀的更长键整片跳掉（方案第 4 项点过这一条）。
+    /// 要"从库尾往回走"就得拿一个**真存在的键**当起点。代价 = O(源数) 的字段比较，无 I/O。
+    pub(crate) fn store_max_key(&self) -> Option<Vec<u8>> {
+        let mem_max = std::iter::once(&self.mem)
+            .chain(self.immutables.iter())
+            .filter_map(|m| m.keys().next_back())
+            .max();
+        let sst_max = self.levels.iter().flatten().map(|s| &s.max_key).max();
+        mem_max.into_iter().chain(sst_max).max().cloned()
+    }
+
     pub fn find_back(
         &self,
         low: &[u8],

@@ -333,6 +333,37 @@ pub trait KvTxn: Send {
     /// 但**时间那半属于 offset 的语义**，不是实现浪费 ⇒ 要快就换门。
     fn search_keys(&self, query: &SearchQuery) -> SearchPage;
 
+    /// 从**库尾**取 `page_size` 行（免 total，按 key 字节序升序交出）。
+    ///
+    /// 为什么要单独开这条门：[`KvTxn::search_keys`] 的 `query.page` 是 **offset 式页码** ⇒
+    /// "末页"在不知道 total 时只能从头跳过前面所有行才够到，那是 O(库)。这条门反过来走：
+    /// 每拿到一把逻辑键就把上界收紧成**它本身**，而版本行合同 `raw ‖ version_be > raw`
+    /// 让那一组整体自动出局 ⇒ 代价 = `page_size` 次反向定位、每次 O(块)，**不随库大小涨**。
+    ///
+    /// 默认实现 = [`KvTxn::reverse_scan`] 截尾（O(库)，但**正确** —— bplus/bitcask/memory 停在
+    /// 这里，读数是"反向也陪跑整库"的形状）；`lsm_tree` 覆盖成逐步退。⚠️ 别把默认实现改成
+    /// "用 offset 翻到最后一页"：免 total 时根本没有末页下标可算，`skip = usize::MAX` 那种写法
+    /// 是一行都进不了窗口、还照样走完全库。
+    ///
+    /// `total` / `total_pages` 恒 `None`（没数），`has_next` 恒 `false` —— 已在库尾，后面没有东西；
+    /// 合同看 [`SearchPage::has_next`]，它问的是"**后面**还有没有"，别拿"前面还有"冒充它。
+    fn search_last_page(&self, page_size: usize) -> SearchPage {
+        let mut items: Vec<ExportRecord> = self
+            .reverse_scan(None, None)
+            .into_iter()
+            .take(page_size)
+            .collect();
+        items.reverse(); // reverse_scan 是降序，而 `SearchPage::items` 的合同是升序
+        SearchPage {
+            items,
+            total: None,
+            page: 0,
+            page_size,
+            total_pages: None,
+            has_next: false,
+        }
+    }
+
     fn key_count(&self, prefix: &[u8]) -> usize;
 
     // ---- TTL ----
@@ -840,6 +871,8 @@ fn canonical_name(name: &str) -> Option<&'static str> {
 ///   （memory 没有 WAL，"设了阈值"这件事对它没有意义，不能假装成功）
 /// - `path: $method` → 取库路径的方法名；`none` → 纯内存
 /// - `merge: yes` → 转发 `merge`；`no` → 用 trait 默认（`Unsupported`）
+/// - `last_page: yes` → 转发 `search_last_page`（M81 第 4 项：lsm 有逐步退的反向定位）；
+///   `no` → 用 trait 默认（= `reverse_scan` 截尾，O(库) 但正确）
 macro_rules! impl_engine {
     (
         engine_struct: $engine:ident,
@@ -854,6 +887,7 @@ macro_rules! impl_engine {
         durable: $durable:tt,
         wal: $wal:tt,
         merge: $merge:tt,
+        last_page: $last_page:tt,
         cache: $cache:tt,
     ) => {
         struct $engine {
@@ -1037,6 +1071,9 @@ macro_rules! impl_engine {
             fn search_keys(&self, query: &SearchQuery) -> SearchPage {
                 self.inner.search_keys(query)
             }
+
+            // M81 第 4 项：`search_last_page` 只有 lsm 有逐步退的实现，其余三家留 trait 默认
+            impl_engine!(@last_page $last_page);
 
             fn key_count(&self, prefix: &[u8]) -> usize {
                 self.inner.key_count(prefix)
@@ -1249,6 +1286,15 @@ macro_rules! impl_engine {
     };
     // 不支持 merge：留给 trait 默认实现（返回 Unsupported）
     (@merge no) => {};
+
+    // ---- 末页(免 total) 分支（M81 第 4 项）----
+    (@last_page yes) => {
+        fn search_last_page(&self, page_size: usize) -> SearchPage {
+            self.inner.search_last_page(page_size)
+        }
+    };
+    // 没有"反向逐步退"的原语：留给 trait 默认实现（= `reverse_scan` 截尾，O(库) 但正确）
+    (@last_page no) => {};
 }
 
 impl_engine! {
@@ -1264,6 +1310,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: yes,
+    last_page: no,
     cache: no,
 }
 
@@ -1280,6 +1327,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: no,
+    last_page: no,
     cache: yes,
 }
 
@@ -1296,6 +1344,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: no,
+    last_page: yes,
     cache: yes,
 }
 
@@ -1312,6 +1361,7 @@ impl_engine! {
     durable: no,
     wal: no,
     merge: no,
+    last_page: no,
     cache: no,
 }
 
@@ -1362,6 +1412,86 @@ mod tests {
     fn cleanup(dirs: Vec<Option<PathBuf>>) {
         for d in dirs.into_iter().flatten() {
             let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// 末页(免 total) 的**对拍 + 有界性**守卫（M81 第 4 项）。两层判据缺一不可：
+    ///
+    /// ① **对拍**（四家都要过）：`search_last_page(k)` 交出的 k 行必须逐字节等于
+    ///   `scan(None,None)` 的**最后** k 行活记录。这一层管"快不许换错数据"：把推进时的
+    ///   `bound = raw`（逻辑键）写成 `bound = enc`（编码键），就会在同一把键的旧版本上打转 ——
+    ///   `find_back` 的 `excluded` 记的是编码键、拦不住同键旧版本（方案第 4 项坑 2），
+    ///   末页会全是重复键 + 旧值 ⇒ 这条立刻红。
+    ///   形状里故意塞了**尾部墓碑**与一把"**入库时就已过期**"的键：反向走时它们不计数但必须跳过，
+    ///   漏判任何一支就是短页（少一行）或把死键交出去。
+    /// ② **有界性**（只有 lsm 覆盖了这条门，故只测它）：取末页花的块读/轻量访问数不许随库涨。
+    ///   钉计数不钉墙钟（本机跨轮漂 1.3~2.6×）；改前那一格是 `scan` 全库再截尾（20M 档 80.7 s）。
+    #[test]
+    fn last_page_agrees_with_the_tail_and_stays_bounded() {
+        const N: usize = 3_000;
+        const PAGE: usize = 10;
+        for (name, db, _dir) in open_all() {
+            {
+                let tx = db.begin();
+                for i in 0..N {
+                    assert!(tx.set(format!("k{i:04}").as_bytes(), format!("v{i}").into_bytes()), "{name}: 灌第 {i} 把");
+                }
+                tx.commit();
+            }
+            // 库尾 5 把删掉 + 最后一把改成"入库即已过期" ⇒ 末页要往回多退 6 把才凑够 PAGE 行
+            {
+                let tx = db.begin();
+                for i in (N - 6)..(N - 1) {
+                    tx.delete(format!("k{i:04}").as_bytes());
+                }
+                assert!(
+                    tx.set(format!("k{:04}", N - 1).as_bytes(), crate::common::codec::pack_ttl(b"v", 1)),
+                    "{name}: 写过期键失败"
+                );
+                tx.commit();
+            }
+            let _ = db.flush(); // 让 lsm 的尾巴真落到 SST 里，否则"块读有界"那一支测的是空集
+
+            // 参考值：正向全库折叠的最后 PAGE 行（`scan` 的合同就是"活且未过期"，与末页同源）
+            let want: Vec<ExportRecord> = {
+                let tx = db.begin();
+                let mut all = tx.scan(None, None);
+                tx.commit();
+                let take = all.len().min(PAGE);
+                all.split_off(all.len() - take)
+            };
+            let (blocks, visits, page) = {
+                let tx = db.begin();
+                let s0 = crate::lsm_tree::sst::block_reads();
+                let v0 = crate::lsm_tree::sst::light_visits();
+                let page = tx.search_last_page(PAGE);
+                let out = (
+                    crate::lsm_tree::sst::block_reads() - s0,
+                    crate::lsm_tree::sst::light_visits() - v0,
+                    page,
+                );
+                tx.commit();
+                out
+            };
+            let keys_of = |v: &Vec<ExportRecord>| v.iter().map(|r| (r.key.clone(), r.value.clone())).collect::<Vec<_>>();
+            assert_eq!(keys_of(&page.items), keys_of(&want), "{name}: 末页与全库折叠的尾巴不一致（拿到 {} 行，应为 {} 行）", page.items.len(), want.len());
+            assert!(page.total.is_none() && page.total_pages.is_none(), "{name}: 免 total 不许谎称数过");
+            assert!(!page.has_next, "{name}: 已在库尾，后面不该还有东西");
+            assert_eq!(page.page_size, PAGE, "{name}: page_size 要如实带回");
+            if name == "lsm_tree" {
+                // 每退一步 ≈ 层数 × 一块 + 内存表；界给得很松（400），
+                // 而"物化全库"那一支在这个库上是几千次 ⇒ 松界也咬得住。
+                assert!(blocks <= 400, "{name}: 取 {PAGE} 行末页读了 {blocks} 块 ⇒ 不像 O(页) 的走法");
+                assert!(visits <= 400, "{name}: 取 {PAGE} 行末页轻量访问 {visits} 次 ⇒ 不像 O(页) 的走法");
+            }
+            // 页宽超过库存量 ⇒ 如实交出短页，不 panic、不补空行
+            let wide = {
+                let tx = db.begin();
+                let p = tx.search_last_page(N * 2);
+                tx.commit();
+                p
+            };
+            assert_eq!(wide.items.len(), want.len().max(N - 6), "{name}: 超宽页应如实交出全部活行");
         }
     }
 
@@ -5003,6 +5133,18 @@ mod tests {
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", last_page, page_size))
             });
             line(label, "search 末页(深翻)", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", deep.total.unwrap_or_default()));
+            // M81 第 4 项：末页的**免 total** 那一支 = 反向逐步退，代价 = 页宽 × O(块)。
+            // ⚠️ 不许与上面那格直接对拍：`search 末页(深翻)` 要精确 total（数全库那一遍是主导，
+            // 20M 档 80.7 s），这一格恒取 `page_size` 行、不数；两格行数也不同（深翻那格是
+            // `total % page_size`，尾巴不齐时更少）⇒ 只比 µs/次，别折成 µs/行。
+            // 覆盖情况：只有 lsm 走逐步退；其余三家停在 trait 默认（`reverse_scan` 截尾 = O(库)），
+            // 这一格对它们是"如实付反向原语的缺"，不是读数坏了。
+            let (d, live, peak, last_nt) = timed(|| {
+                let tx = db.begin();
+                tx.search_last_page(page_size)
+            });
+            line(label, "search 末页(免 total)", d.as_secs_f64() * 1e6, "µs/次", live, peak,
+                 &format!("拿了 {} 条, total=None", last_nt.items.len()));
             let (d, live, peak, cnt) = timed(|| {
                 let tx = db.begin();
                 tx.key_count(&key(0)[..2])
