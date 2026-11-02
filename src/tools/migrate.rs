@@ -36,8 +36,9 @@ use std::time::Instant;
 use super::kv_snapshot::{
     read_bin_with, read_jsonl_with, ExportWriter, IoStats, KvRecord,
 };
-use crate::common::codec::pack_plain;
+use crate::common::codec::{now_unix_secs, pack_plain};
 use crate::engine::{open_engine_with, EngineConfig, EngineKind, KvEngine};
+use std::time::Duration;
 
 /// bplus 的候选库文件名，**按优先级**：`data.db`（下游约定，也是这里新建时用的名字）
 /// 在前，`bplus.db`（本仓库 `StorageConfig` 早先的约定）在后。
@@ -358,6 +359,132 @@ pub fn migrate(
     })
 }
 
+/// 跨库**补齐**式同步的账（M81 第 6 项后半）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    /// 源侧交出的存活行数（= `inserted + skipped_existing`，两条加起来必须等于它，见守卫）
+    pub scanned: usize,
+    /// 真插进目标的行数
+    pub inserted: usize,
+    /// 目标"见过"（含墓碑）而整个不动的行数
+    pub skipped_existing: usize,
+    /// 判定完已经跨过到期点的行数（**不写**：插一条注定看不见的行没有意义）
+    pub skipped_expired: usize,
+    /// 插入时带上 TTL 的行数（其余按永久写）
+    pub inserted_with_ttl: usize,
+}
+
+/// 跨库补齐：`from -> to`，**目标"见过"的键一个字都不动，没见过的才插**。
+///
+/// 与 `migrate` 的分工要说清（两件事不是同一件事，别再混用）：`migrate` 是换布局的
+/// **一次性搬运**（覆盖语义 + 可选 `wipe_target`），`sync` 是"把 A 里有而 B 里没有的东西补进 B"
+/// —— 幂等：同一份源同步两次，第二次 `inserted == 0`。
+///
+/// 三条口径是这项功能的全部难点，逐条钉死：
+/// ① **"见过"含墓碑**：判据是 `get_meta(...).is_some()`，**不是 `exists()`**。墓碑的含义是
+///    "我知道这把键、它被删了"，不是"没见过"；用 `exists()` 会把已删键**复活**，而同步工具
+///    复活已删键比漏同步严重一个量级。四家在这条上的行为由 `sync_tombstone_counts_as_seen_in_every_engine`
+///    逐家实测 —— 那一条同时钉住 `exists()` 在墓碑上是 `false`（也就是"用它当判据会复活"），
+///    所以这条判据不是假设，是量出来的。
+/// ② **删除不传播**：源里的墓碑根本不进候选（`include_deleted = false`）。这是**快照补齐**，
+///    不是复制协议 —— 要"把 B 里多出来的键删掉"请走 `migrate`（覆盖 + wipe）或应用层自己管。
+/// ③ **TTL 跟着走，但不刷新已有的**：新插入的键按源里记的**绝对到期时刻**打 TTL 信封；
+///    已存在的键（含墓碑）连 TTL 都不碰。
+///    ⚠️ 这里**没有**照 `migrate` 走，因为 `migrate` 根本没有 TTL 这条式子：它的源侧出口
+///    `live_record_of_logical`（`common/store.rs:475`）交出的是**用户字节**（信封已剥），
+///    写侧再 `pack_plain` 重新打 ⇒ 带 TTL 的键搬完一律变永久。`ExportRecord` 里也没有地方放
+///    expire。`sync` 不接这个锅：到期时刻从源侧 `get_meta(...).expire_unix_secs` 单独取
+///    （和 memory 启停快照同一扇门、同一个字段），所以同步过来的键该什么时候过期还是什么时候。
+///
+/// 写入走**普通事务**（一批一个事务），不走 `begin_bulk`：skip-existing 要按键读目标，
+/// 而 bulk 那条通道是"绕过冲突检查"的门，两件事凑在同一个句柄上会把"读到的快照"和"写入的可见性"
+/// 混成两套。代价如实写在这儿：并发写同一把键时这一批可能冲突，`sync` 直接返回错误、不静默降级。
+pub fn sync(from: &dyn KvEngine, to: &dyn KvEngine) -> Result<SyncStats, String> {
+    let mut stats = SyncStats::default();
+    // 源侧一个长事务：遍历与逐键取 expire 都在**同一个快照**上，否则"这行活着"和"它几点到期"
+    // 来自两个瞬间（并发写会让插入行带上错到一半的 TTL）。
+    let src = from.begin();
+    let mut batch: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = Vec::with_capacity(BATCH);
+    let mut err: Option<String> = None;
+    let flush = |batch: &mut Vec<(Vec<u8>, Vec<u8>, Option<u64>)>, stats: &mut SyncStats| -> Result<(), String> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let drained = std::mem::replace(batch, Vec::with_capacity(BATCH));
+        let tx = to.begin();
+        let now = now_unix_secs();
+        for (key, user, expire) in drained {
+            // 判据①：`get_meta` 认墓碑，`exists` 不认。
+            if tx.get_meta(&key).is_some() {
+                stats.skipped_existing += 1;
+                continue;
+            }
+            // ⚠️ 写的一侧只用**收用户字节**的两个口子（`set_raw` / `set_with_ttl`），信封由引擎打。
+            // 不走 `batch_set`：它内部一律 `pack_plain` ⇒ 既带不了 TTL，喂已打袋的字节就是
+            // "假信封"那一支静默错；也不走 `put_batch_owned`：它收的是**逻辑字节**，
+            // 同一个 `Vec<(key, value)>` 换到那条门上含义就反过来（两家门风相反，正是本文件
+            // 顶部点名要防的事）。
+            let ok = match expire {
+                Some(e) if e > now => {
+                    let ok = tx.set_with_ttl(&key, user, Duration::from_secs(e - now));
+                    if ok {
+                        stats.inserted_with_ttl += 1;
+                    }
+                    ok
+                }
+                // 源侧出口本来就把过期行挡在外面；走到这里只剩"读到之后才跨过到期点"这一种，
+                // 插一条注定看不见的行没有意义 ⇒ 如实计个数、不写。
+                Some(_) => {
+                    stats.skipped_expired += 1;
+                    continue;
+                }
+                None => tx.set_raw(&key, user),
+            };
+            if !ok {
+                return Err(format!(
+                    "同步写入冲突（键 {:?}）⇒ 这一批不提交，整趟同步以错误收场",
+                    String::from_utf8_lossy(&key)
+                ));
+            }
+            stats.inserted += 1;
+        }
+        tx.commit();
+        Ok(())
+    };
+    let scanned = src.export_latest_visible_for_each(false, &mut |rec| {
+        let Some(user) = rec.value else {
+            // include_deleted=false ⇒ 墓碑不进这一支；真进了就是门变了，不能默默吞掉
+            err = Some(format!("源侧交出墓碑行（键 {:?}）⇒ 候选口径变了", rec.key));
+            return false;
+        };
+        stats.scanned += 1;
+        let expire = src.get_meta(&rec.key).and_then(|m| m.expire_unix_secs);
+        batch.push((rec.key, user, expire));
+        if batch.len() >= BATCH {
+            if let Err(e) = flush(&mut batch, &mut stats) {
+                err = Some(e);
+                return false;
+            }
+        }
+        true
+    });
+    if err.is_none() {
+        if let Err(e) = flush(&mut batch, &mut stats) {
+            err = Some(e);
+        }
+    }
+    if let Some(e) = err {
+        return Err(e);
+    }
+    // 两把尺子必须对上：`scanned`（源**交出**几行）vs 目标侧**判定**过的行数。
+    // 对不上就是有行被静默丢掉 —— 正是这个仓库一路在防的"共享了但没生效"。
+    let judged = stats.inserted + stats.skipped_existing + stats.skipped_expired;
+    if judged != scanned {
+        return Err(format!("源交出 {scanned} 行、目标判定 {judged} 行 ⇒ 有行被静默丢掉"));
+    }
+    Ok(stats)
+}
+
 /// 仅导出到文件（流式：堆上最多一行 + 写缓冲，与库大小无关）
 pub fn export_to_file(
     engine: EngineKind,
@@ -572,8 +699,7 @@ mod tests {
         db.checkpoint().unwrap();
     }
 
-    fn read_back(engine: EngineKind, r: &Path, k: &[u8]) -> Option<Vec<u8>> {
-        let path = display_path(engine, r);
+    fn read_back(engine: EngineKind, r: &Path, k: &[u8]) -> Option<Vec<u8>> {        let path = display_path(engine, r);
         let db = open_engine_with(engine, Some(&path), &migrate_config()).unwrap();
         let tx = db.begin();
         let v = tx.get(k);
@@ -863,6 +989,291 @@ mod tests {
         assert_eq!(read_back(EngineKind::LsmTree, &r, b"keep").as_deref(), Some(&b"K"[..]));
         assert_eq!(read_back(EngineKind::LsmTree, &r, b"drop"), None, "墓碑被搬成活键了");
         let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// 开一家引擎。memory **也要给目录**：它的启停快照（M81 第 6 项前半）就是它唯一的"跨句柄"
+    /// 载体 —— 不给目录 = 每个句柄一个空库，seed 与后面的 open 根本不是同一个库。
+    fn open_for_sync(kind: EngineKind, r: &Path) -> std::boxed::Box<dyn KvEngine> {
+        let path = display_path(kind, r);
+        let _ = std::fs::create_dir_all(if kind == EngineKind::BPlusTree {
+            path.parent().unwrap()
+        } else {
+            path.as_path()
+        });
+        open_engine_with(kind, Some(&path), &migrate_config()).unwrap()
+    }
+
+    /// 带 TTL 播种（`expire` = 绝对到期时刻；`None` = 永久）。
+    fn seed_ttl(kind: EngineKind, r: &Path, rows: &[(&[u8], &[u8], Option<u64>)]) {
+        let db = open_for_sync(kind, r);
+        let now = now_unix_secs();
+        for (k, v, expire) in rows {
+            let tx = db.begin();
+            let ok = match expire {
+                Some(e) => tx.set_with_ttl(k, v.to_vec(), Duration::from_secs(e.saturating_sub(now))),
+                None => tx.set_raw(k, v.to_vec()),
+            };
+            assert!(ok, "写入被拒: {:?}", String::from_utf8_lossy(k));
+            tx.commit();
+        }
+        db.flush().unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    /// 判据①的地基：**四家一致**把墓碑算成"见过"（`get_meta` 有值、`exists` 是 `false`）。
+    ///
+    /// 这条不是顺手写的断言，是 skip-existing 选门门的风向标：`exists()` 把墓碑算不存在 ⇒
+    /// 拿它当判据，同步会把已删键**复活**。所以这里同时钉两面：`get_meta(...).is_some()` 必须真、
+    /// `exists()` 必须假 —— 少钉后面那半，"换个门也一样"就没人发现得了。
+    #[test]
+    fn sync_tombstone_counts_as_seen_in_every_engine() {
+        for kind in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree, EngineKind::Memory] {
+            let r = root(&format!("sync_tomb_{}", kind.as_str()));
+            seed_ttl(kind, &r, &[(b"dead", b"was-here", None)]);
+            let db = open_for_sync(kind, &r);
+            {
+                let tx = db.begin();
+                assert!(tx.delete(b"dead"));
+                tx.commit();
+            }
+            {
+                let tx = db.begin();
+                let meta = tx.get_meta(b"dead");
+                assert!(meta.is_some(), "{kind}：墓碑在 get_meta 里必须是'见过'（sync 的判据就用这一门）");
+                assert!(meta.unwrap().deleted, "{kind}：那一格要报 deleted = true");
+                assert!(!tx.exists(b"dead"), "{kind}：exists 把墓碑算不存在 ⇒ 拿它当判据就会复活已删键");
+                tx.commit();
+            }
+            // ⚠️ 用**同一个句柄**当目标，不再重开：重开对三家磁盘引擎等价，对 memory 却多一层
+            // 快照重启（而 memory 的启停快照今天不保存墓碑 —— 那件事单独记在
+            // `memory_snapshot_currently_drops_tombstones_characterization`，不许混进这条判据里，
+            // 否则"门选错了"和"重启丢墓碑"两件事会互相顶包）。
+            // 真跑一次同步：源里这把键是活值 ⇒ 目标必须原样不动（既不复活，也不刷新）
+            let rs = root(&format!("sync_tomb_src_{}", kind.as_str()));
+            seed_ttl(kind, &rs, &[(b"dead", b"resurrect", None), (b"fresh", b"new", None)]);
+            let src = open_for_sync(kind, &rs);
+            let st = sync(&*src, &*db).unwrap();
+            assert_eq!(st.skipped_existing, 1, "{kind}：墓碑没算进'见过'（账 {st:?}）");
+            assert_eq!(st.inserted, 1, "{kind}：只该补进 fresh 一把（账 {st:?}）");
+            {
+                let tx = db.begin();
+                assert_eq!(tx.get(b"dead"), None, "{kind}：同步复活了已删键");
+                assert_eq!(tx.get(b"fresh").as_deref(), Some(&b"new"[..]));
+                tx.commit();
+            }
+            drop(src);
+            drop(db);
+            let _ = std::fs::remove_dir_all(&rs);
+            let _ = std::fs::remove_dir_all(&r);
+        }
+    }
+
+    /// 现状记录（和第 6 项前半同一条链，**待你定夺**的那一格）：memory 的启停快照不保存墓碑。
+    ///
+    /// 链条：`write_snapshot` 折的是 `tx.scan_page(...)` 交出的**存活行**，`KvRecord` 那一行没有
+    /// "这是墓碑"的位置 ⇒ 重启之后"这把键被删过"这件事整个消失。对纯内存引擎这本来无害
+    /// （它连崩溃安全都没有），但它一旦当 sync 的目标用，skip-existing 的判据（判据①）
+    /// 就建立在"墓碑还在"上 —— 重启一次，判据的地基就没了，任何后续同步都能把已删键复活。
+    /// ⇒ 这条断言钉的是当前行为。修的动作有两个方向（快照里带上墓碑行 / 明写"memory 快照
+    /// 不适合做 sync 目标"），都改语义，等你点。修好之后本条必须翻红并改写成"墓碑要活过重启"。
+    #[test]
+    fn memory_snapshot_currently_drops_tombstones_characterization() {
+        let r = root("mem_snap_tombstone");
+        let dir = r.join("memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let db = open_engine_with(EngineKind::Memory, Some(&dir), &migrate_config()).unwrap();
+            {
+                let tx = db.begin();
+                assert!(tx.set_raw(b"gone", b"was-here".to_vec()));
+                assert!(tx.set_raw(b"stay", b"live".to_vec()));
+                tx.commit();
+            }
+            {
+                let tx = db.begin();
+                assert!(tx.delete(b"gone"));
+                tx.commit();
+            }
+            // 重启之前：墓碑在（这条是上面那把判据的前提）
+            {
+                let tx = db.begin();
+                assert!(tx.get_meta(b"gone").is_some(), "本条的前提变了");
+                tx.commit();
+            }
+            // Drop 就是"停止落盘"（第 6 项前半钉死的口径）
+            drop(db);
+        }
+        let db = open_engine_with(EngineKind::Memory, Some(&dir), &migrate_config()).unwrap();
+        let tx = db.begin();
+        assert_eq!(tx.get(b"stay").as_deref(), Some(&b"live"[..]), "活行要活过重启（这半边是合格的）");
+        assert!(
+            tx.get_meta(b"gone").is_none(),
+            "memory 快照开始保存墓碑了 ⇒ 本条要翻红，改写成'墓碑要活过重启'"
+        );
+        tx.commit();
+        drop(tx);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// 交集+差集形状（方案点名的判据）：目标已有的**一个字都不动**，缺的补齐；再同步一次 0 插入。
+    /// 源里的墓碑不进候选 ⇒ 删除不传播。
+    #[test]
+    fn sync_fills_missing_and_is_idempotent() {
+        let rt = root("sync_fill_dst");
+        let rs = root("sync_fill_src");
+        // 目标：k1 = 旧值（已有）、k2 = 墓碑（"见过"）
+        seed_ttl(EngineKind::Bitcask, &rt, &[(b"k1", b"old", None)]);
+        let dst = open_for_sync(EngineKind::Bitcask, &rt);
+        {
+            let tx = dst.begin();
+            assert!(tx.set_raw(b"k2", b"will-be-deleted".to_vec()));
+            tx.commit();
+        }
+        {
+            let tx = dst.begin();
+            assert!(tx.delete(b"k2"));
+            tx.commit();
+        }
+        drop(dst);
+        // 源：k1 = 新值、k2 = 活值、k3/k4 目标没有、k9 是墓碑
+        seed_ttl(EngineKind::LsmTree, &rs, &[
+            (b"k1", b"new", None),
+            (b"k2", b"alive", None),
+            (b"k3", b"three", None),
+            (b"k4", b"four", None),
+        ]);
+        let src = open_for_sync(EngineKind::LsmTree, &rs);
+        {
+            let tx = src.begin();
+            assert!(tx.set_raw(b"k9", b"gone".to_vec()));
+            tx.commit();
+        }
+        {
+            let tx = src.begin();
+            assert!(tx.delete(b"k9"));
+            tx.commit();
+        }
+        let dst = open_for_sync(EngineKind::Bitcask, &rt);
+        let st = sync(&*src, &*dst).unwrap();
+        // 源交出 5 行活值（k1..k4 + k2 墓碑不进 ⇒ 实际是 k1,k2,k3,k4 四行；k9 是墓碑 ⇒ 不进候选）
+        assert_eq!(st.scanned, 4, "候选集合不对（含墓碑的源应当只交活行）: {st:?}");
+        assert_eq!((st.inserted, st.skipped_existing), (2, 2), "该补 k3/k4、该挡 k1/k2: {st:?}");
+        let tx = dst.begin();
+        assert_eq!(tx.get(b"k1").as_deref(), Some(&b"old"[..]), "已有的键被覆盖了");
+        assert_eq!(tx.get(b"k2"), None, "墓碑被复活了");
+        assert_eq!(tx.get(b"k3").as_deref(), Some(&b"three"[..]));
+        assert_eq!(tx.get(b"k4").as_deref(), Some(&b"four"[..]));
+        assert_eq!(tx.get(b"k9"), None, "删除不该传播，源里的墓碑不该在目标留下任何痕迹");
+        tx.commit();
+        drop(tx);
+        // 幂等：同一份源再同步一次 ⇒ 0 插入（第二次的判定全是"见过"）
+        let again = sync(&*src, &*dst).unwrap();
+        assert_eq!((again.scanned, again.inserted, again.skipped_existing), (4, 0, 4), "第二次同步不幂等: {again:?}");
+        drop(src);
+        drop(dst);
+        let _ = std::fs::remove_dir_all(&rs);
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    /// 判据③：TTL 跟着走（绝对到期时刻对齐），永久行仍永久；而**已存在的键 TTL 不刷新**。
+    /// 这条同时是"为什么 `sync` 不照 `migrate` 的出口走"的证据：那条出口交的是**用户字节**，
+    /// TTL 在 `live_record_of_logical` 那一步就被剥掉了。
+    #[test]
+    fn sync_carries_ttl_and_does_not_extend_existing() {
+        let rt = root("sync_ttl_dst");
+        let rs = root("sync_ttl_src");
+        let expire = now_unix_secs() + 3_600;
+        seed_ttl(EngineKind::LsmTree, &rs, &[
+            (b"ttl", b"will-expire", Some(expire)),
+            (b"perm", b"forever", None),
+        ]);
+        seed_ttl(EngineKind::Bitcask, &rt, &[(b"ttl", b"old-value", Some(expire + 99_999))]);
+        let src = open_for_sync(EngineKind::LsmTree, &rs);
+        let dst = open_for_sync(EngineKind::Bitcask, &rt);
+        let st = sync(&*src, &*dst).unwrap();
+        assert_eq!(
+            (st.inserted, st.inserted_with_ttl, st.skipped_existing),
+            (1, 0, 1),
+            "该补的是永久那把 perm（TTL 那把目标已有 ⇒ 整个不动，连 TTL 都不许刷）: {st:?}"
+        );
+        let tx = dst.begin();
+        let m = tx.get_meta(b"ttl").unwrap();
+        assert_eq!(m.expire_unix_secs, Some(expire + 99_999), "已有的键 TTL 被刷新了（合同是整个不动）");
+        assert_eq!(m.value_len, Some(9), "值也不许动");
+        let p = tx.get_meta(b"perm").unwrap();
+        assert_eq!(p.expire_unix_secs, None, "永久行同步过去仍须是永久");
+        assert_eq!(tx.get(b"perm").as_deref(), Some(&b"forever"[..]));
+        tx.commit();
+        drop(tx);
+        // 反面证据（钉住"为什么不照 migrate 那条门走"）：同一条源用 migrate 搬一次，TTL 会没。
+        drop(src);
+        drop(dst);
+        let rr = root("sync_ttl_probe");
+        seed_ttl(EngineKind::LsmTree, &rr, &[(b"probe", b"x", Some(expire))]);
+        let src2 = open_for_sync(EngineKind::LsmTree, &rr);
+        let dst2 = open_for_sync(EngineKind::Bitcask, &rt);
+        let st2 = sync(&*src2, &*dst2).unwrap();
+        assert_eq!((st2.inserted, st2.inserted_with_ttl), (1, 1), "probe 该带着 TTL 插进去: {st2:?}");
+        let tx = dst2.begin();
+        let m2 = tx.get_meta(b"probe").unwrap();
+        assert!(m2.expire_unix_secs.is_some(), "sync 这条路把 TTL 弄丢了");
+        // 绝对到期时刻对齐（±5 s 只容忍两侧读时钟的差），钉住"重打信封不是随手给个默认时长"
+        let src_tx = src2.begin();
+        let want = src_tx.get_meta(b"probe").unwrap().expire_unix_secs;
+        src_tx.commit();
+        drop(src_tx);
+        assert_eq!(m2.expire_unix_secs, want, "同步过去的到期时刻与源不一致: {want:?} vs {:?}", m2.expire_unix_secs);
+        let got_ttl = tx.get_ttl(b"probe");
+        assert!(
+            matches!(got_ttl, Some(Some(d)) if d.as_secs() > 3_590 && d.as_secs() < 3_700),
+            "新插的 TTL 行剩余时间不对: {got_ttl:?}"
+        );
+        tx.commit();
+        drop(tx);
+        drop(src2);
+        drop(dst2);
+        let _ = std::fs::remove_dir_all(&rs);
+        let _ = std::fs::remove_dir_all(&rt);
+        let _ = std::fs::remove_dir_all(&rr);
+    }
+
+    /// 现状记录（**不是**合格判据，是待你定夺的那一格）：`migrate` 今天把 TTL 弄丢。
+    ///
+    /// 链条只有一处：源侧出口 `live_record_of_logical`（`common/store.rs:475`）交的是
+    /// **用户字节**（`m.user().to_vec()` ⇒ 信封已被剥），`pump` 写侧一律 `pack_plain` 重新打 ⇒
+    /// 带 TTL 的键搬完变永久。`ExportRecord{key, value}` 里也没有地方放 expire。
+    /// ⇒ 这条断言钉的是"当前行为"，真要修就得动 `ExportRecord`（公开结构体加字段对下游是
+    /// 破坏性变更，会把下一次发布抬成 0.5.0），所以**先如实记下来、不动语义**。
+    /// 修好之后这一条必须翻红并改写成"必须保住 TTL" —— 它不是给现状背书的。
+    #[test]
+    fn migrate_currently_drops_ttl_characterization() {
+        let rr = root("mig_ttl_probe_root");
+        let src_dir = rr.join("lsm_tree");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        {
+            let db = open_engine_with(EngineKind::LsmTree, Some(&src_dir), &migrate_config()).unwrap();
+            let tx = db.begin();
+            assert!(tx.set_with_ttl(b"has-ttl", b"v".to_vec(), Duration::from_secs(3_600)));
+            tx.commit();
+            db.flush().unwrap();
+            db.checkpoint().unwrap();
+        }
+        migrate(EngineKind::LsmTree, EngineKind::Bitcask, &rr, false, false).unwrap();
+        let dst = open_engine_with(
+            EngineKind::Bitcask,
+            Some(&engine_data_path(&rr, EngineKind::Bitcask)),
+            &migrate_config(),
+        )
+        .unwrap();
+        let tx = dst.begin();
+        let m = tx.get_meta(b"has-ttl").expect("这把键要搬过去");
+        assert_eq!(
+            m.expire_unix_secs, None,
+            "migrate 的 TTL 行为变了 ⇒ 本条要翻红，并改写成'必须保住 TTL'"
+        );
+        tx.commit();
+        let _ = std::fs::remove_dir_all(&rr);
     }
 
 }

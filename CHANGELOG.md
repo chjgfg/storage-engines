@@ -18,6 +18,32 @@
 
 ## 未发布：merge 从 vacuum 拆出 + merge 时间构成 + 大档回收守卫（2026-11-02，M81）
 
+### 第 6 项后半（上半）：`tools::sync` —— 跨库补齐，目标"见过"的一个字都不动
+
+- 新顶层函数 `storage_engines::tools::sync(from: &dyn KvEngine, to: &dyn KvEngine) -> Result<SyncStats, String>`
+  （**不是 trait 方法** ⇒ 门面合同没动）。语义 = "把 A 里有而 B 里没有的补进 B"，幂等：同一份源
+  同步两次，第二次 `inserted == 0`。与 `migrate` 的分工写进文档：migrate 是换布局的一次性搬运
+  （覆盖 + 可选 wipe），sync 是补齐（不覆盖、不删）。
+- 三条口径逐条钉死，且**每条都有实测**，不是假设：
+  ① 「见过」**含墓碑**，判据 = `get_meta(...).is_some()`；`exists()` 四家都把墓碑算不存在 ⇒ 拿它当
+  判据就会**复活已删键**。守卫 `sync_tombstone_counts_as_seen_in_every_engine` 逐家钉两面
+  （`get_meta` 真 + `exists` 假），并真跑一次同步确认已删键仍是死的。
+  ② **删除不传播**：源里的墓碑根本不进候选（`include_deleted = false`）—— 这是快照补齐不是复制协议。
+  ③ **TTL 跟着走、已有键连 TTL 都不刷**：新插的按源侧 `get_meta(...).expire_unix_secs` 那个**绝对**
+  到期时刻重打信封（剩余时间由引擎 `set_with_ttl` 落地），守卫比对两侧的绝对值。
+- ⚠️ 写侧只用 `set_raw` / `set_with_ttl`（两者都收**用户字节**、信封由引擎打）。不走 `batch_set`
+  （它内部一律 `pack_plain` ⇒ 带不了 TTL，喂已打袋的字节就是"假信封"那一支静默错），也不走
+  `put_batch_owned`（它收的是**逻辑字节** —— 同一个 `Vec<(key, value)>` 换到那扇门上含义正好反过来，
+  正是 `tools/mod.rs` 顶部点名要防的事）。
+- 对账：`scanned`（源交出几行）必须等于 `inserted + skipped_existing + skipped_expired`，不等就报错
+  —— "共享了但没生效"在这个仓库里从不靠信任。
+- **两条现状记录**（都写成会翻红的断言，不是给现状背书；改语义等用户点头）：
+  `migrate_currently_drops_ttl_characterization` ⇒ `migrate` 一路**把 TTL 弄丢**（源侧出口
+  `live_record_of_logical` 交用户字节、写侧一律 `pack_plain`，而 `ExportRecord` 里没有放 expire 的
+  位置；真要修就得给公开结构体加字段 = 对下游破坏性变更，会把下一次发布抬成 0.5.0）；
+  `memory_snapshot_currently_drops_tombstones_characterization` ⇒ memory 的启停快照**不保存墓碑**
+  （活行能活过重启，"这把键被删过"活不过），所以它作为 sync 目标时判据①的地基会在重启后消失。
+
 ### 第 5 项后半：自动回收把"何时开一轮"与"这轮走完没有"拆成两件事
 
 - `VacuumScheduler::take_tick` 不再返回裸 `u64`，改返回 `VacuumTick { slice, charged }`，许可来自两支：
