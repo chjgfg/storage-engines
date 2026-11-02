@@ -18,6 +18,21 @@
 
 ## 未发布：merge 从 vacuum 拆出 + merge 时间构成 + 大档回收守卫（2026-11-02，M81）
 
+### 20M 总验收（尾巴 C）：memory 启停快照在大档的价，如实入表
+
+- v0.5.0 构建跑通 `rows_20000000`：**`test result: ok. 1 passed / 0 failed`，14441.93 s ≈ 4.0 h**，
+  四家 `SCALE_ENGINE_DONE` + `SCALE_DONE engines=4`，132 格齐。
+- memory 启停那几格：**停止落盘 44 672.1 ms**、**快照文件 2168.9 MB**、**冷重开 305.37 s**
+  （常驻 3867.9 MB / 峰值 +6037.0 MB）、**再冷重开 332.14 s**。同趟 `flush+checkpoint 0.2 µs /
+  磁盘 0.0 MB` 是"运行期一律不碰快照"在大档的直接实证。⇒ "优雅停止不丢"在 20M 档 = 停 44.7 s +
+  起 305 s + 2.1 GB 文件；`is_production_ok() == false` 不变（快照不是 WAL）。表在
+  `docs/大规模压测手册.md`「20M 档 memory 启停快照的实测」。
+- 四家 `migrate → memory` 各 **20001001 个唯一键**逐键逐值验收通过（含 B+）⇒ 手册里那条
+  "B+ 少 1 行、未修前每档都会红"的待办被这一趟直接否掉，已就地改判为"已修复绿"。
+- ⚠️ 同趟顺手记下的一格：memory `search 末页(免 total)` **115.98 s** / `seek_prev` 21 193.5 µs ——
+  就是第 4 项记过的那件事（三家的末页至今没有反向原语 ⇒ 对 memory 是 O(库) + 2147.5 MB）。
+
+
 ### 第 6 项尾巴 A + B：`import --skip-existing`（文件版补齐）与 memory 快照保存墓碑
 
 - **A** 新增 `tools::import_skip_existing_from_dir(engine, dir, input, format) -> Result<SyncStats, String>`
