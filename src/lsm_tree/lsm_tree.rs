@@ -1194,6 +1194,10 @@ impl LSMTree {
     /// （实测 2000 行的库首页 53 次块读，其中 ~32 次就是全库块数）。改成惰性之后
     /// 首页只读"覆盖到那几把键"需要的块，`scan_page` / 窗口搜索 / 有界 vacuum 一起受益。
     ///
+    /// ⚠️ M15b 那次只把**每个源内部**改成惰性，源本身还是建堆时一个个拉首键 ⇒ 无上界的
+    /// 首页仍付"库里 SST 篇数"次块读（5M 实测 315 篇 = 15.66 ms）。M81 第 1 项补上
+    /// **源级延迟激活**（见 [`LightMerge`] 的六条判据），首页代价从此与篇数脱钩。
+    ///
     /// 取胜规则与 `merge_streaming` 逐条一致：源序号小 = 更新（mem → immutables → L0 新→旧 →
     /// 更高层），同一个键只输出一行、由更新的源定论；同键同行的旧 seq 不复活。
     pub fn light_iter_range<'a>(
@@ -1203,14 +1207,20 @@ impl LSMTree {
         snap_seq: u64,
     ) -> LightMerge<'a> {
         let mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + '_>> = Vec::new();
+        // 与 sources 一一对应的驻留键下界（`None` = 建堆当场激活）。见 `LightMerge` 的六条判据。
+        let mut bound: Vec<Option<&'a [u8]>> = Vec::new();
         if matches!((from, to), (Some(lo), Some(hi)) if lo >= hi) {
-            return LightMerge::new(sources);
+            return LightMerge::build(sources, bound);
         }
+        // memtable 不排队：它没有"读块"这笔代价，拉首键只是 BTreeMap 上的一次 seek，
+        // 而它的下界要靠同一趟 seek 才拿得到 —— 排队省不下任何东西，只会让归并多一层状态。
         if !self.mem.is_empty() {
             sources.push(Box::new(Self::mem_light_iter(&self.mem, from, to, snap_seq)));
+            bound.push(None);
         }
         for imm in &self.immutables {
             sources.push(Box::new(Self::mem_light_iter(imm, from, to, snap_seq)));
+            bound.push(None);
         }
         // 源顺序必须与 merge_all_at / scan_latest_light 一致：levels[0] 旧→新，反转成新→旧。
         // 先把"有哪些 SST、按什么优先级"排成一个 Vec，再统一建迭代器 ——
@@ -1231,9 +1241,16 @@ impl LSMTree {
             if !sst.may_overlap_half_open(from, to) {
                 continue;
             }
+            // 这个源**可能**交出的最小键 = max(文件 min_key, from)：两个都是从元数据/调用方
+            // 手里直接读到的，不花一次块读。⚠️ 它是下界而不是真首键 —— 快照过滤会让真首键更大，
+            // 所以激活之后还要拿真实键重新比一轮（判据⑤）。
+            bound.push(Some(match from {
+                Some(lo) if lo >= sst.min_key.as_slice() => lo,
+                _ => sst.min_key.as_slice(),
+            }));
             sources.push(Box::new(sst.light_iter(from, to, snap_seq)));
         }
-        LightMerge::new(sources)
+        LightMerge::build(sources, bound)
     }
 
     /// mem / immutable 的轻量视图（惰性）：`MemMap` 每个 key 一条版本列表 ⇒ 范围内逐 key
@@ -2781,6 +2798,199 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// M81 第 1 项 · **计数**判据：首页（`to = None`）拉过的源数与块读**不随 L1+ 篇数涨**。
+    ///
+    /// 尺子 = `merge_activations()`（归并真的拉过几个源的首键）＋ `block_reads()`。
+    /// 为什么不用墙钟：本机同档两趟噪声实测 2.6×，而"首页付几篇的块读"是精确工作量。
+    /// 对照 = 同一棵树同一范围再走一遍 `activate_all_for_test()`（= M81 之前的旧形状）：
+    /// 它的激活数恒等于源数，所以随篇数线性涨 ⇒ `eager` 那一侧的"必须涨"断言就是这把尺子的
+    /// 阳性对照（把它摘掉，这个测试会因为尺子不咬而红，不会假绿）。
+    #[test]
+    fn test_lazy_source_activation_first_page_does_not_scale_with_files() {
+        use crate::lsm_tree::sst::block_reads;
+        const FIRST_PAGE: usize = 20;
+        let mut lazy: Vec<(u64, u64)> = Vec::new();
+        let mut eager: Vec<(u64, u64)> = Vec::new();
+        for count in [8usize, 64, 256] {
+            let dir = tmp_dir(&format!("lazy_sources_scale_{count}"));
+            {
+                let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
+                db.bulk_mode = true;
+                // 每篇 4 把键、键区间互不重叠（L1 的常态），min_key 随篇号递增。
+                for file in 0..count {
+                    let entries = (0..4)
+                        .map(|i| {
+                            let n = (file * 4 + i) as u64;
+                            (version_key(n), StoredEntry::put(1, Some(n.to_be_bytes().to_vec())))
+                        })
+                        .collect();
+                    db.inject_sst_for_test(1, entries).unwrap();
+                }
+                assert!(db.level_ranges_ordered[1]);
+
+                let a0 = merge_activations();
+                let b0 = block_reads();
+                let got: Vec<_> = db.light_iter_range(None, None, u64::MAX).take(FIRST_PAGE).collect();
+                lazy.push((merge_activations() - a0, block_reads() - b0));
+
+                let a1 = merge_activations();
+                let b1 = block_reads();
+                let mut m = db.light_iter_range(None, None, u64::MAX);
+                m.activate_all_for_test();
+                let want: Vec<_> = m.take(FIRST_PAGE).collect();
+                eager.push((merge_activations() - a1, block_reads() - b1));
+
+                assert_eq!(got.len(), FIRST_PAGE, "{count} 篇：首页凑不满 ⇒ 规模没到位");
+                assert_eq!(got, want, "{count} 篇：延迟激活交出的首页与 eager 逐字节不同");
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        assert_eq!(
+            lazy[0], lazy[2],
+            "首页代价随篇数增长（激活数, 块读）：8 篇 {:?} → 256 篇 {:?} ⇒ 延迟激活没生效",
+            lazy[0], lazy[2]
+        );
+        assert_eq!(eager[0].0, 8, "对照组（eager 旧形状）首页应当正好拉过 8 个源（= 篇数）");
+        assert_eq!(eager[1].0, 64, "eager 那一列必须是篇数：{eager:?}");
+        assert_eq!(eager[2].0, 256, "eager 那一列必须是篇数：{eager:?}");
+        assert!(
+            lazy[2].0 <= 6,
+            "256 篇里首页为了凑 {FIRST_PAGE} 把键拉了 {} 个源（每篇 4 把键 ⇒ 5 篇就该够）\
+             ⇒ 源级延迟没生效（旧形状是 256）",
+            lazy[2].0
+        );
+        assert!(
+            lazy[2].0 < eager[2].0,
+            "延迟激活没有减少源激活数：lazy {lazy:?} vs eager {eager:?}"
+        );
+        assert!(
+            lazy[0].0 > 0,
+            "lazy 一个源都没激活 ⇒ 首页根本没输出，前面的逐字节对拍是空的"
+        );
+        eprintln!(
+            "[延迟激活·首页 {FIRST_PAGE} 键] (激活源数, 块读) 8 篇 {lazy:?} → 256 篇不变；\
+             eager 旧形状 {eager:?}（激活数 = 篇数，随库线性涨）"
+        );
+    }
+
+    /// M81 第 1 项 · **结果**判据：四种形状下 lazy 与 eager 必须逐字节相同。
+    ///
+    /// 覆盖的是复核点名的四件事：同键跨源（两个 L0 文件里同一个键、seq 谁大都试过）、
+    /// 墓碑（`Drop` 参与定论）、快照过滤（`snap_seq` 卡在中间 ⇒ 真首键 > `min_key`，判据⑤）、
+    /// 全库输出与中途收手（`take(2)`）各自对拍。
+    /// 重量折叠 vs 轻量归并的等价由 `test_fold_agrees_with_point_read_on_overlapping_level`
+    /// 等既有守卫守着，这里只答"改了激活时机之后输出变了没有"。
+    #[test]
+    fn test_lazy_source_activation_agrees_with_eager_everywhere() {
+        let dir = tmp_dir("lazy_sources_differential");
+        {
+            let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
+            db.bulk_mode = true;
+            // L0：两篇范围重叠的文件 ⇒ 同键跨源 + 只有 seq 能定胜负
+            db.inject_sst_for_test(
+                0,
+                vec![
+                    (version_key(0), StoredEntry::put(1, Some(b"a1".to_vec()))),
+                    (version_key(2), StoredEntry::put(1, Some(b"c1".to_vec()))),
+                    (version_key(4), StoredEntry::drop_at(2)),
+                ],
+            )
+            .unwrap();
+            db.inject_sst_for_test(
+                0,
+                vec![
+                    (version_key(0), StoredEntry::put(2, Some(b"a2".to_vec()))),
+                    (version_key(2), StoredEntry::put(3, Some(b"c3".to_vec()))),
+                    (version_key(3), StoredEntry::put(1, Some(b"d1".to_vec()))),
+                ],
+            )
+            .unwrap();
+            // L1：不重叠的多篇 ⇒ 下界排队真正生效的形状；其中一篇最小键只在中段可见（判据⑤）
+            for entries in [
+                vec![
+                    (version_key(1), StoredEntry::put(1, Some(b"b1".to_vec()))),
+                    (version_key(5), StoredEntry::put(4, Some(b"e4".to_vec()))),
+                ],
+                vec![
+                    (version_key(2), StoredEntry::put(5, Some(b"c5".to_vec()))),
+                    (version_key(6), StoredEntry::put(1, Some(b"f1".to_vec()))),
+                ],
+                vec![(version_key(7), StoredEntry::put(9, Some(b"g9".to_vec())))],
+            ] {
+                db.inject_sst_for_test(1, entries).unwrap();
+            }
+            // 相接端点（方案二审点名的形状）：`max_key[i] == min_key[i+1]` ⇒ 同一把键住在两篇里，
+            // 后一篇那版 seq 更新。判据写成严格"<"就在这一瞬不触发 ⇒ 吐旧值 + 到更大键再吐一遍。
+            db.inject_sst_for_test(
+                1,
+                vec![
+                    (version_key(20), StoredEntry::put(1, Some(b"h1".to_vec()))),
+                    (version_key(25), StoredEntry::put(1, Some(b"i1".to_vec()))),
+                ],
+            )
+            .unwrap();
+            db.inject_sst_for_test(
+                1,
+                vec![
+                    (version_key(25), StoredEntry::put(7, Some(b"i7".to_vec()))),
+                    (version_key(26), StoredEntry::drop_at(7)),
+                ],
+            )
+            .unwrap();
+            // memtable 也放两把：驻留源和当场激活的源混排时的顺序
+            db.put(version_key(8), b"mem8".to_vec());
+            db.put(version_key(3), b"mem3".to_vec());
+
+            let mut cases = 0usize;
+            for snap in [1u64, 2, 3, 5, 8, u64::MAX] {
+                for (from, to) in [
+                    (None, None),
+                    (Some(version_key(2)), None),
+                    (None, Some(version_key(4))),
+                    (Some(version_key(1)), Some(version_key(5))),
+                    (Some(version_key(7)), Some(version_key(7))),
+                    (Some(version_key(9)), None),
+                ] {
+                    let f = from.as_deref();
+                    let t = to.as_deref();
+                    let mut m = db.light_iter_range(f, t, snap);
+                    m.activate_all_for_test();
+                    let eager: Vec<_> = m.collect();
+                    let lazy: Vec<_> = db.light_iter_range(f, t, snap).collect();
+                    assert_eq!(
+                        lazy, eager,
+                        "snap={snap} 窗口={from:?}..{to:?}：全库输出与 eager 不同"
+                    );
+                    let lazy_head: Vec<_> = db.light_iter_range(f, t, snap).take(2).collect();
+                    let mut m2 = db.light_iter_range(f, t, snap);
+                    m2.activate_all_for_test();
+                    assert_eq!(
+                        lazy_head,
+                        m2.take(2).collect::<Vec<_>>(),
+                        "snap={snap} 窗口={from:?}..{to:?}：中途收手的前两把键与 eager 不同"
+                    );
+                    cases += 1;
+                }
+            }
+            assert!(cases >= 30, "对拍用例太少（{cases}）⇒ 这一格可能根本没跑到多种形状");
+            // 相接端点单独点名（不靠 eager 对拍，独立判一次）：键 25 只能出现一次、
+            // 胜者必须是后一篇的 seq 7，且整份输出严格升序（乱序 = 未激活源的键在更大键之后补吐）。
+            let all: Vec<_> = db.light_iter_range(None, None, u64::MAX).collect();
+            let at25: Vec<_> = all.iter().filter(|(k, _)| *k == version_key(25)).collect();
+            assert_eq!(at25.len(), 1, "相接端点那把键被吐了 {} 次", at25.len());
+            assert_eq!(at25[0].1.seq, 7, "相接端点吐的是旧值（seq {}）", at25[0].1.seq);
+            assert!(
+                all.windows(2).all(|w| w[0].0 < w[1].0),
+                "全库输出非严格升序 ⇒ 延迟激活漏了顺序"
+            );
+            // 至少证明"延迟"在这些形状里真的动过：全库首页在 snap 卡中段时不该激活全部源
+            let a0 = merge_activations();
+            let _: Vec<_> = db.light_iter_range(None, Some(&version_key(1)), u64::MAX).take(1).collect();
+            assert!(merge_activations() - a0 > 0, "一次都没激活 ⇒ 尺子被架空");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_sst_pruning_refreshes_ranges_after_compaction() {
         let dir = tmp_dir("sst_pruning_compaction");
@@ -4049,6 +4259,27 @@ MANIFEST={text:?}
     }
 }
 
+// 测试专用：本线程一共**延迟激活**过多少个源（= 拉过多少个源的首键）。
+//
+// 这是第 1 项的尺子。墙钟在本地跑间能差 2 倍，而"首页付了几篇的块读"是精确的工作量计数：
+// eager 形状下它恒等于源数（随库里 SST 篇数涨），lazy 形状下它只等于"下界压得住前几把键"
+// 的那几篇。守卫用它，不用墙钟。
+#[cfg(test)]
+thread_local! {
+    static SOURCE_ACTIVATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程被激活的源数（测试探针用）
+#[cfg(test)]
+pub(crate) fn merge_activations() -> u64 {
+    SOURCE_ACTIVATIONS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_source_activation() {
+    SOURCE_ACTIVATIONS.with(|c| c.set(c.get() + 1));
+}
+
 /// [`LSMTree::light_iter_range`] 的状态机：k 路归并，每次 `next()` 只往前拉一条。
 ///
 /// 堆里只放 `(键, 源序号)`，每个源至多一个候选在堆里；真正的值在 `head` 里等着。
@@ -4058,8 +4289,33 @@ MANIFEST={text:?}
 ///   `merge_streaming` 那边走的是"堆的 tie-break 选胜者"，所以它必须比 seq；这边是"先出者待定、
 ///   后到者比 seq 换掉"，所以判据在待定那一步）
 /// 没有这个先行量就会把"该键还有更新的源"的键提前吐出去。
+///
+/// **源的激活是延迟的**（M81 第 1 项）。`waiting` 按驻留下界排队，只有"下界 ≤ 当前堆顶键"的
+/// 源才被拉第一个键 —— 而"拉一次"对 SST 就是至少一块读。为什么必须这样：首页（`to = None`）
+/// 时 `sst_candidates` 的二分剪枝帮不上忙（它剪的是**上界**），旧形状在建堆时对**每一篇** SST
+/// 各拉一次首键 ⇒ 首页付的是"库里篇数"的块读（5M 实测 315 篇 → `search 首页(免 total)`
+/// 15.66 ms，同家末页只要 763 µs）。改成延迟激活后首页只需激活"下界压得住最小键"的那些源
+/// （L0 全部 + 每层覆盖到前几把键的首篇），代价与篇数脱钩。
+///
+/// 判据（外部复核给的六条，逐条钉在这里）：
+/// ① 源序号不因激活顺序而变（`waiting` 排的只是"什么时候拉"，`MergeNode.src` 仍是建堆时的序号）
+/// ② 未激活源用**驻留**下界代表自己（SST 的 `min_key` 与 `from` 的较大者，不读块就知道）
+/// ③ 取下一个真实堆节点之前，激活所有下界 ≤ 当前堆顶键的源（`activate_covering_top`）
+/// ④ 堆空但仍有未激活源 ⇒ 继续激活，不许提前收（同一条函数的 `None => true` 分支）
+/// ⑤ 激活后真实首键可能 > `min_key`（快照过滤就会这样），所以要拿真实键重新比一轮
+///    （`activate_covering_top` 返回 `true` ⇒ 调用方 `continue` 重看堆顶）
+/// ⑥ 与 eager 形状逐字节对拍：守卫
+///    `test_lazy_source_activation_first_page_does_not_scale_with_files` 与
+///    `test_lazy_source_activation_agrees_with_eager_everywhere`
 pub struct LightMerge<'a> {
     sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>,
+    /// 每个源**可能交出的最小键**（含）。取不到驻留下界的源（memtable：本来就在内存里，
+    /// 拉首键不花 I/O）这里是 `None`，建堆时当场激活；`Some` 的源进 `waiting` 排队。
+    /// 用 `&'a [u8]` 不复制：这些切片就是 `SstFile::min_key` / 调用方给的 `from`。
+    bound: Vec<Option<&'a [u8]>>,
+    /// `bound` 里仍为 `Some` 的源序号，**按下界降序**存放 ⇒ `last()` 永远是最小下界，
+    /// 补齐覆盖时从尾部 `pop`，每个源至多被看一次（不是每轮全表扫描）。
+    waiting: Vec<usize>,
     head: Vec<Option<(Vec<u8>, LightEntry)>>,
     heap: BinaryHeap<MergeNode>,
     pending: Option<(Vec<u8>, LightEntry)>,
@@ -4100,11 +4356,27 @@ impl PartialEq for MergeNode {
 impl Eq for MergeNode {}
 
 impl<'a> LightMerge<'a> {
-    fn new(mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>) -> Self {
+    /// `bound` 与 `sources` 一一对应：`Some(b)` = 先不碰这个源，`b` 是它的驻留键下界；
+    /// `None` = 当场拉第一个键。长度不一致会把"什么时候拉"和"谁更新"错位，所以钉死。
+    fn build(
+        mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>,
+        bound: Vec<Option<&'a [u8]>>,
+    ) -> Self {
+        assert_eq!(
+            bound.len(),
+            sources.len(),
+            "light_iter_range 构造的源和下界数量不一致 ⇒ 激活顺序与源序号会错位"
+        );
         let mut head = Vec::with_capacity(sources.len());
         let mut heap = BinaryHeap::new();
-        for (src, it) in sources.iter_mut().enumerate() {
-            match it.next() {
+        let mut waiting: Vec<usize> = Vec::new();
+        for src in 0..sources.len() {
+            if bound[src].is_some() {
+                head.push(None);
+                waiting.push(src);
+                continue;
+            }
+            match sources[src].next() {
                 Some((k, le)) => {
                     heap.push(MergeNode { key: k.clone(), src });
                     head.push(Some((k, le)));
@@ -4112,7 +4384,48 @@ impl<'a> LightMerge<'a> {
                 None => head.push(None),
             }
         }
-        Self { sources, head, heap, pending: None }
+        // 降序存、从尾部取 ⇒ `waiting.last()` 始终是未激活源里下界最小的那个。
+        waiting.sort_by(|&a, &b| bound[b].cmp(&bound[a]));
+        Self { sources, bound, waiting, head, heap, pending: None }
+    }
+
+    /// 不变量③④：把"下界 ≤ 当前堆顶键"的未激活源逐个拉首键。堆空时下界最小的那个必须
+    /// 激活（堆空 ≠ 归并结束）。返回是否激活过至少一个 ⇒ 堆顶可能已经变了，调用方要重看。
+    fn activate_covering_top(&mut self) -> bool {
+        let mut any = false;
+        loop {
+            let Some(&src) = self.waiting.last() else { break };
+            let covered = match self.heap.peek() {
+                // 有堆顶：只有"下界压得住它"的源才可能交出 ≤ 堆顶的键，必须激活。
+                // ⚠️ 必须是"下界 ≤ 堆顶"而不是"下界 < 堆顶"（方案二审的那条）：L1 相邻两篇
+                // 常常 `max_key[i] == min_key[i+1]`，用严格小于就在相接端点上不触发。
+                Some(node) => self.bound[src] <= Some(node.key.as_slice()),
+                // 堆空但还有未激活源 ⇒ 剩下的键只可能来自它们（迭代中途耗尽一段也走这支：
+                // A 段 [1..10] 交完、B 段 [20..30] 还没激活，此时堆空 —— 不激活就把 B 整段
+                // 静默丢掉。B 的首键必然大于一切已吐出的键，所以单调性不破。）
+                None => true,
+            };
+            if !covered {
+                break;
+            }
+            self.waiting.pop();
+            self.activate(src);
+            any = true;
+        }
+        any
+    }
+
+    /// 拉源 `src` 的第一个真实键并入堆（真实键 > 下界是正常的：快照过滤、`from` 落在空区间）。
+    fn activate(&mut self, src: usize) {
+        #[cfg(test)]
+        note_source_activation();
+        match self.sources[src].next() {
+            Some((k, le)) => {
+                self.heap.push(MergeNode { key: k.clone(), src });
+                self.head[src] = Some((k, le));
+            }
+            None => self.head[src] = None,
+        }
     }
 
     /// 把源 `src` 的下一个候选放进堆（源 exhausted 就不放）
@@ -4124,18 +4437,33 @@ impl<'a> LightMerge<'a> {
             self.head[src] = None;
         }
     }
+
+    /// 测试用（不变量⑥的对拍一侧）：退化成"建堆即激活全部源"的旧形状，之后按普通迭代器走。
+    #[cfg(test)]
+    fn activate_all_for_test(&mut self) {
+        while let Some(src) = self.waiting.pop() {
+            self.activate(src);
+        }
+    }
 }
 
 impl<'a> Iterator for LightMerge<'a> {
     type Item = (Vec<u8>, LightEntry);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(node) = self.heap.pop() {
-            let Some((key, le)) = self.head[node.src].take() else {
-                self.advance(node.src);
+        loop {
+            // 每次真正动用堆顶之前先补齐覆盖（不变量③）：激活会带进新候选键，所以这里
+            // 必须循环到"没有未激活源的下界 ≤ 堆顶"为止，否则交出的就不是全局最小键。
+            if self.activate_covering_top() {
+                continue;
+            }
+            let Some(node) = self.heap.pop() else { break };
+            let src = node.src;
+            let Some((key, le)) = self.head[src].take() else {
+                self.advance(src);
                 continue;
             };
-            self.advance(node.src);
+            self.advance(src);
             match self.pending.take() {
                 None => self.pending = Some((key, le)),
                 Some((pk, ple)) if pk == key => {
@@ -4150,6 +4478,7 @@ impl<'a> Iterator for LightMerge<'a> {
                 }
             }
         }
+        // 走到这里 = 堆空**且**等待队列空 ⇒ 所有源都收干净了，最后一个待定键可以吐
         self.pending.take()
     }
 }
