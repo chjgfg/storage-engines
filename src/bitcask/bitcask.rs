@@ -359,11 +359,16 @@ fn merge_time_on() -> bool {
     std::env::var("MERGE_TIME_SPLIT").is_ok()
 }
 
-// 五格累计纳秒：0=walk（KeyDir 抄块）1=read_live+append 2=pre 3=rescan 4=hint
+// 五格累计纳秒：0=walk（KeyDir 抄块）1=read_live+append 2=pre 3=rescan 4=hint。
+// ⚠️ 五格必须**首尾相接**（每格从上一格的终点起算），否则加起来不等于外层墙钟 ⇒ 百分比全错。
+// M81 第一版在这里栽过一次：交错的 walk/rw 用"只累加、不动水位"的记法，而收尾那格从**进门**
+// 那一刻起算 ⇒ 把 walk+rw 又算进 `pre` 一遍，五格之和 2.901 s 对不上 bench 独立读到的 1.713 s。
+// 现在改成一律走 `merge_t_mark`（累加 + 推水位），并在 dump 里拿"五格之和 vs 外层墙钟"自校。
 #[cfg(test)]
 thread_local! {
     static MERGE_T_NS: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
     static MERGE_T_LAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MERGE_T_ENTRY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -377,12 +382,14 @@ fn merge_t_now() -> u64 {
 #[cfg(test)]
 fn merge_t_start() {
     if merge_time_on() {
+        let now = merge_t_now();
         MERGE_T_NS.set([0; 5]);
-        MERGE_T_LAST.set(merge_t_now());
+        MERGE_T_LAST.set(now);
+        MERGE_T_ENTRY.set(now);
     }
 }
 
-/// 顺序段用：把"上一段"记进 slot，并把段首水位推到此刻
+/// 顺序段与交错段**共用这一条**：把"上一格"记进 slot，并把水位推到此刻 ⇒ 五格首尾相接。
 #[cfg(test)]
 fn merge_t_mark(slot: usize) {
     if !merge_time_on() {
@@ -393,16 +400,6 @@ fn merge_t_mark(slot: usize) {
     s[slot] = s[slot].saturating_add(now.saturating_sub(MERGE_T_LAST.get()));
     MERGE_T_NS.set(s);
     MERGE_T_LAST.set(now);
-}
-
-/// 交错的段用（walk 与 rewrite 在同一个块循环里交替）：直接把刚测完的一截加进 slot，不动水位
-#[cfg(test)]
-fn merge_t_add(slot: usize, ns: u64) {
-    if merge_time_on() {
-        let mut s = MERGE_T_NS.get();
-        s[slot] = s[slot].saturating_add(ns);
-        MERGE_T_NS.set(s);
-    }
 }
 
 #[cfg(test)]
@@ -419,10 +416,19 @@ fn merge_t_dump(label: &str) {
         s[4] as f64 / 1e9,
     ];
     let total = s[0] + s[1] + s[2] + s[3] + s[4];
+    // 自校：五格首尾相接 ⇒ 它们的和必须≈外层墙钟。差超过 2% 就是尺子自己坏了（M81 第一版
+    // 重复计了 walk+rw，五格之和比 bench 独立读到的数高出整整一格 rw —— 那时代码没报错，
+    // 只有这条自校能当场抓住）。
+    let outer = (merge_t_now().saturating_sub(MERGE_T_ENTRY.get())) as f64 / 1e9;
+    let drift = if outer > 0.0 { (total - outer) / outer * 100.0 } else { 0.0 };
     let pct = |v: f64| if total > 0.0 { v / total * 100.0 } else { 0.0 };
     eprintln!(
-        "merge_time {label}: walk={:.3}s rw={:.3}s pre={:.3}s rescan={:.3}s hint={:.3}s total={:.3}s | rw={:.1}% rw+rescan={:.1}%（判据：rw 过 60% 才立项）",
+        "merge_time {label}: walk={:.3}s rw={:.3}s pre={:.3}s rescan={:.3}s hint={:.3}s total={:.3}s | rw={:.1}% rw+rescan={:.1}%（参考线：方案写的 rw>60% 门槛，复核认定无充分依据 ⇒ 只作参考）",
         s[0], s[1], s[2], s[3], s[4], total, pct(s[1]), pct(s[1] + s[3])
+    );
+    eprintln!(
+        "merge_time 自校 {label}: 五格之和 {total:.3}s vs 外层墙钟 {outer:.3}s ⇒ 差 {drift:+.1}%{}",
+        if drift.abs() > 2.0 { " ⚠️ 尺子不自洽，这一行的百分比不可用" } else { "（一致）" }
     );
 }
 
@@ -1602,8 +1608,6 @@ impl Bitcask {
             let mut chunk: Vec<(Vec<u8>, KeyLoc)> = Vec::with_capacity(MERGE_CHUNK_KEYS + 1);
             let mut next_lower: Option<Vec<u8>> = None;
             // M81 时间格 0：这一块的"走 KeyDir + 抄出来"
-            #[cfg(test)]
-            let t_walk0 = merge_t_now();
             {
                 use std::ops::Bound::{Included, Unbounded};
                 for (k, loc) in self
@@ -1619,13 +1623,12 @@ impl Bitcask {
                     }
                 }
             }
+            // 格 0 收尾（水位一并推到这里 ⇒ 下一格不会重复计它）
             #[cfg(test)]
-            merge_t_add(0, merge_t_now().saturating_sub(t_walk0));
+            merge_t_mark(0);
             #[cfg(test)]
             note_merge_chunk(chunk.len());
             // M81 时间格 1：这一块的 `read_live`（seek + read_exact）+ `append`
-            #[cfg(test)]
-            let t_rw0 = merge_t_now();
             for (key, loc) in chunk {
                 match loc {
                     KeyLoc::Live {
@@ -1643,7 +1646,7 @@ impl Bitcask {
                 }
             }
             #[cfg(test)]
-            merge_t_add(1, merge_t_now().saturating_sub(t_rw0));
+            merge_t_mark(1);
             match next_lower {
                 Some(l) => lower = l,
                 None => break,
