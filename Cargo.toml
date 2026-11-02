@@ -35,12 +35,15 @@ codegen-units = 1
 name = "storage-engines"
 path = "src/main.rs"
 
-# 数据搬运与压测工具。Cargo 不认 src/<模块>/bin/ 这个路径，必须显式声明。
-# 四个引擎各有同名的 import_kv / export_kv，而 [[bin]] 的 name 要求全局唯一，
-# 所以统一加引擎前缀。
+# 压测工具仍按引擎各留一份（它们的主体是各家自己的 bulk 灌法，没有可共用的外壳）。
+# Cargo 不认 src/<模块>/bin/ 这个路径，必须显式声明。
 #
-#   cargo run --release --bin bitcask-export-kv -- --dir ./db -o snap.bin
-#   cargo run --release --bin lsm-import-kv     -- --dir ./lsm -i snap.bin
+# 数据搬运在 M81 收成**一对**：`--engine` 选家，四家同一条读写路径（实体在
+# `src/tools/bin/`）。原先那八条 `<引擎>-{import,export}-kv` 已删 —— 它们调的就是
+# 同一个 `tools::{export_to_dir, import_from_dir}`，参数解析各抄一份正是"基座被复制"。
+#
+#   cargo run --release --bin export-kv -- --engine bitcask --dir ./db --out snap.bin
+#   cargo run --release --bin import-kv -- --engine lsm_tree --dir ./lsm --in snap.bin
 
 [[bin]]
 name = "export-kv"
@@ -54,46 +57,21 @@ path = "src/tools/bin/import_kv.rs"
 name = "bitcask-bench-bulk"
 path = "src/bitcask/bin/bench_bulk.rs"
 
-[[bin]]
-name = "bitcask-import-kv"
-path = "src/bitcask/bin/import_kv.rs"
 
-[[bin]]
-name = "bitcask-export-kv"
-path = "src/bitcask/bin/export_kv.rs"
 
 [[bin]]
 name = "bplus-bench"
 path = "src/bplus_tree/bin/bench.rs"
 
-[[bin]]
-name = "bplus-import-kv"
-path = "src/bplus_tree/bin/import_kv.rs"
 
-[[bin]]
-name = "bplus-export-kv"
-path = "src/bplus_tree/bin/export_kv.rs"
 
 [[bin]]
 name = "lsm-bench-bulk"
 path = "src/lsm_tree/bin/bench_bulk.rs"
 
-[[bin]]
-name = "lsm-import-kv"
-path = "src/lsm_tree/bin/import_kv.rs"
 
-[[bin]]
-name = "lsm-export-kv"
-path = "src/lsm_tree/bin/export_kv.rs"
 
 [[bin]]
 name = "memory-bench"
 path = "src/memory/bin/bench.rs"
 
-[[bin]]
-name = "memory-import-kv"
-path = "src/memory/bin/import_kv.rs"
-
-[[bin]]
-name = "memory-export-kv"
-path = "src/memory/bin/export_kv.rs"

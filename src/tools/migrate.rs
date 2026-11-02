@@ -531,8 +531,17 @@ fn pump_out(
 
 /// 按**引擎目录/库文件**打开的源（CLI 的 `--dir` 给的就是这个，不是 `{root}/{engine}`）
 fn open_source_at(engine: EngineKind, path: &Path) -> Result<Box<dyn KvEngine>, String> {
-    if !engine.needs_disk() {
-        return Err("memory 无磁盘目录，不能作为导出源".into());
+    // ⚠️ 这里**放开 memory**，而上面 `open_source`（migrate 那扇门）继续拒 —— 两件事不冲突：
+    // migrate 的合同是"换布局的一次性搬运"，下游 `bin/migrate_storage.rs` 就写着"memory 不能当
+    // 源/目标"，那条不能动；而文件这一侧从 M81 第 6 项起 memory **真的有一个目录**了
+    // （启停快照 `<dir>/snapshot.bxp`），"无磁盘目录"这句理由已经不成立。
+    // 拒掉它的代价是把统一 CLI 的四家变三家 —— 旧 `memory-export-kv` 能导出，收拢之后不能，
+    // 那是收拢做少了而不是做多了。
+    if !engine.needs_disk() && !path.join(crate::memory::memory_mvcc::SNAPSHOT_FILE).exists() {
+        return Err(format!(
+            "memory 在这个目录里没有快照（{}），不能作为导出源；先给它一次启停或用 --demo",
+            path.display()
+        ));
     }
     if !path.exists() {
         return Err(format!("源不存在: {}", path.display()));
@@ -547,8 +556,10 @@ fn open_target_at(
     path: &Path,
     wipe: bool,
 ) -> Result<Box<dyn KvEngine>, String> {
-    if !engine.needs_disk() {
-        return Err("memory 无磁盘目录，不能作为导入目标".into());
+    // 与上面导出源同一口径：文件这一侧放开 memory（它有快照目录了），migrate 那扇门继续拒。
+    // 导入到 memory 的形状是"读旧快照 + 灌新行 + Drop 时写回"，所以 `--wipe` 就是删快照文件。
+    if !engine.needs_disk() && wipe {
+        let _ = std::fs::remove_file(path.join(crate::memory::memory_mvcc::SNAPSHOT_FILE));
     }
     if wipe {
         let dir = if engine == EngineKind::BPlusTree {

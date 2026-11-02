@@ -18,6 +18,25 @@
 
 ## 未发布：merge 从 vacuum 拆出 + merge 时间构成 + 大档回收守卫（2026-11-02，M81）
 
+### 第 6 项收尾：八条 `<引擎>-{import,export}-kv` 删掉，搬运只剩一对 CLI
+
+- 删 `src/{bitcask,bplus_tree,lsm_tree,memory}/bin/{import_kv,export_kv}.rs` 八个文件 + `Cargo.toml`
+  八个 `[[bin]]` 条目 ⇒ `[[bin]]` 从 13 条降到 **7 条**（`main` + 统一 `export-kv`/`import-kv` + 四家 bench）。
+  它们调的是同一个 `tools::{export_to_dir, import_from_dir}`，每家一份参数解析/格式分支/收尾数条数
+  正是"基座被复制"。
+- 统一外壳的参数解析抽成 `parse_args(argv) -> Result<Args, String>` 单独测（`main` 没分支不测）：
+  三个必填各缺一次都红、带值旗标缺值就报错（不许按默认值往别的库上写）、导出这边吃 `--wipe`
+  要报错（串门）。bin 内测试 5 条 → **7 条**。
+- 旧 CLI 独有的能力没丢：`--demo N`（原先只有 `memory-export-kv` 有，因为 memory 没有磁盘库没法试导出）
+  搬进统一 `export-kv` 且四家都能用；`--input` / `--file` 两个旧名字与 `--in` 同义（都吃，不打断运维脚本）。
+- ⚠️ 顺带放开一扇门并说清边界：`open_source_at` / `open_target_at`（**文件**这一侧）不再拒 memory ——
+  那句"memory 无磁盘目录"从第 6 项前半起就不成立了（它有 `<dir>/snapshot.bxp`），拒掉等于把统一 CLI
+  的四家变三家。**`migrate` 那两扇门（`open_source` / `open_target`）继续拒 memory**：下游
+  `bin/migrate_storage.rs` 的合同里写着这条，不能动。导出侧另加一条实测判据：目录里没有快照就报错，
+  不静默导一个空库。
+- README 的历史记述（M45/M63 那几段）里旧命令名**不改**，在 CLI 一节加一句指针说明"当时的名字，
+  现已收进这一对，`--demo` 同名照用"——事故结论一字未动，只是入口换了。
+
 ### 第 6 项后半（上半）：`tools::sync` —— 跨库补齐，目标"见过"的一个字都不动
 
 
