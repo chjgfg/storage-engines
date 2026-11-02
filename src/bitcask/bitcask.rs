@@ -371,6 +371,92 @@ thread_local! {
     static MERGE_T_ENTRY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// 第 3 项的尺子（测试专用，吃同一个 `MERGE_TIME_SPLIT` 门控）：**每个分片的磁盘字节 vs 活字节**。
+//
+// 为什么先量这个而不是直接写"两趟按段增量"：方案把那一刀的立项判据从"rw 占比 > 60%"换成了
+// "预期省几秒 + 内存代价 + 恢复复杂度"，而"省几秒"只取决于**脏段里有多少活字节** ——
+// 今天的 merge 把全部活行重写一遍，按段增量的收益上限就是"只重写脏段那些活行"。
+// 分布不量出来，"值不值得为此改掉 merge 的输出形状"（今天合并完只剩一个文件、`active_id = 0`，
+// 而按段保留意味着索引重扫要吃多个文件、M60 那条"按键升序批量成树"的快路径也就不成立了）
+// 就是在猜。
+#[cfg(test)]
+thread_local! {
+    static MERGE_SEG_SIZE: std::cell::RefCell<std::collections::BTreeMap<u32, u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    static MERGE_SEG_LIVE: std::cell::RefCell<std::collections::BTreeMap<u32, (u64, u64)>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// 进门时把"盘上有哪些分片、各多大"抄一份 —— 走查中途旧段就被删了，那时再读只剩新文件。
+#[cfg(test)]
+fn merge_seg_begin(base: &std::path::Path, active_id: u32, active_end: u64) {
+    if !merge_time_on() {
+        return;
+    }
+    let mut sizes = std::collections::BTreeMap::new();
+    sizes.insert(active_id, active_end);
+    for id in discover_sealed_ids(base) {
+        let bytes = std::fs::metadata(segment_path(base, id)).map(|m| m.len()).unwrap_or(0);
+        sizes.insert(id, bytes);
+    }
+    MERGE_SEG_SIZE.with(|s| *s.borrow_mut() = sizes);
+    MERGE_SEG_LIVE.with(|l| l.borrow_mut().clear());
+}
+
+/// 走查每抄到一个活键就给那个分片记一笔（`len` = 值长，不含记录头 ⇒ 是**下界**，如实按它算）。
+#[cfg(test)]
+fn merge_seg_note_live(file_id: u32, len: u32) {
+    if !merge_time_on() {
+        return;
+    }
+    MERGE_SEG_LIVE.with(|l| {
+        let mut guard = l.borrow_mut();
+        let e = guard.entry(file_id).or_insert((0, 0));
+        e.0 += len as u64;
+        e.1 += 1;
+    });
+}
+
+/// 脏段分布 + "只重写活占比 < 50% 的段"能省掉多少活字节（= `rw` 那一格的可省上限）。
+#[cfg(test)]
+fn merge_seg_dump(label: &str) {
+    if !merge_time_on() {
+        return;
+    }
+    const DIRTY: f64 = 0.5;
+    let sizes = MERGE_SEG_SIZE.with(|s| s.borrow().clone());
+    let live = MERGE_SEG_LIVE.with(|l| l.borrow().clone());
+    let (mut total_live, mut dirty_live) = (0u64, 0u64);
+    let mut lines: Vec<String> = Vec::new();
+    for (id, size) in &sizes {
+        let (lb, lr) = live.get(id).copied().unwrap_or((0, 0));
+        total_live += lb;
+        let ratio = if *size > 0 { lb as f64 / *size as f64 } else { 0.0 };
+        if ratio < DIRTY {
+            dirty_live += lb;
+        }
+        lines.push(format!(
+            "  #{id} 盘 {:.1} MB / 活 {:.1} MB = {:.1}%（{lr} 行）",
+            *size as f64 / 1e6,
+            lb as f64 / 1e6,
+            ratio * 100.0
+        ));
+    }
+    let saved = if total_live > 0 { 1.0 - dirty_live as f64 / total_live as f64 } else { 0.0 };
+    eprintln!(
+        "merge 分段账 {label}: {} 段 | 活字节合计 {:.1} MB | 只重写占比 < {:.0}% 的段要重写 {:.1} MB \
+         ⇒ rw 那一格可省 {:.1}%（这是**上限**：段筛选、恢复复杂度、脏段里仍要搬的活行都没扣）",
+        sizes.len(),
+        total_live as f64 / 1e6,
+        DIRTY * 100.0,
+        dirty_live as f64 / 1e6,
+        saved * 100.0
+    );
+    for l in lines {
+        eprintln!("{l}");
+    }
+}
+
 #[cfg(test)]
 fn merge_t_now() -> u64 {
     std::time::SystemTime::now()
@@ -426,6 +512,7 @@ fn merge_t_dump(label: &str) {
         "merge_time {label}: walk={:.3}s rw={:.3}s pre={:.3}s rescan={:.3}s hint={:.3}s total={:.3}s | rw={:.1}% rw+rescan={:.1}%（参考线：方案写的 rw>60% 门槛，复核认定无充分依据 ⇒ 只作参考）",
         s[0], s[1], s[2], s[3], s[4], total, pct(s[1]), pct(s[1] + s[3])
     );
+    merge_seg_dump(label);
     eprintln!(
         "merge_time 自校 {label}: 五格之和 {total:.3}s vs 外层墙钟 {outer:.3}s ⇒ 差 {drift:+.1}%{}",
         if drift.abs() > 2.0 { " ⚠️ 尺子不自洽，这一行的百分比不可用" } else { "（一致）" }
@@ -1582,6 +1669,9 @@ impl Bitcask {
         let target = self.base_path.clone();
         let mut merge_path = target.clone();
         merge_path.set_extension(MERGE_FILE_EXT);
+        // 第 3 项的尺子：旧段一删就量不到了，必须在动手之前抄盘上账
+        #[cfg(test)]
+        merge_seg_begin(&target, self.active_id, self.active.end_pos);
 
         // M40：**按块走 KeyDir**。这里原先是一次 `.collect()` 出整库的
         // `(key.clone(), loc.clone())` 快照 —— 600k 键 × 2 版那档分段实测 **115.0 MB**
@@ -1614,6 +1704,9 @@ impl Bitcask {
                     .key_dir
                     .range::<[u8], _>((Included(lower.as_slice()), Unbounded))
                 {
+                    if let KeyLoc::Live { file_id, len, .. } = loc {
+                        merge_seg_note_live(*file_id, *len);
+                    }
                     chunk.push((k.clone(), loc.clone()));
                     if chunk.len() >= MERGE_CHUNK_KEYS {
                         let mut bound = k.clone();
