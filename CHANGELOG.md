@@ -18,6 +18,24 @@
 
 ## 未发布：merge 从 vacuum 拆出 + merge 时间构成 + 大档回收守卫（2026-11-02，M81）
 
+### 第 5 项后半：自动回收把"何时开一轮"与"这轮走完没有"拆成两件事
+
+- `VacuumScheduler::take_tick` 不再返回裸 `u64`，改返回 `VacuumTick { slice, charged }`，许可来自两支：
+  **账够一片** ⇒ `charged = slice`（开新一轮，取走这笔账）；**账不够但游标不在库头** ⇒
+  `charged = 0`（只是把已经发起的那一轮往前推，不碰账）。`run_pending` 里那条 `pending < slice`
+  预检删掉 —— 它是实测缺口的根：一片把账扣干之后游标还停在库中段，此后没有新写就**永不推进**，
+  后半库的垃圾无人认领。
+- 租约归还的量是 `charged` 而不是 `slice`。写错成 `slice` 的后果：续跑每失败一片就往账里补 `slice`
+  行 ⇒ 凭空开出下一轮，"回收速率比产生垃圾快"会被这个 bug 写成真的。守卫
+  `open_round_refunds_only_what_it_borrowed`（连失败两片、断言 pending 恒 0）。
+- `ReclamationStatus` 新增 `sweep_in_progress`（= 调度器 `round_open()`）⇒ 大档守卫 `bplus_long_reader
+  _does_not_lose_live_rows_at_scale` 的停顿判据从"剩余账 < 一片"升级成"剩余账 < 一片 **且** 轮次已走完"，
+  这才分得开"停在尾巴上"与"停在半路"。对照实验：把游标那一支改成 `if false`，两条新单测同红。
+- 四家 `tick_auto_vacuum` 的文档里"回收速率与产生垃圾 1:1"那句按实测改掉（这句是被复核点名的错话）：
+  攒够一片才扫一片；一轮一旦发起，由游标推到库尾。
+- ⚠️ 引擎级的"无新写也能完成已发起轮次"没有独立用例，原因写在方案里：`on_commit` 记逻辑键数、
+  一片扫版本行数，纯写路径上两者近乎同比例，小库构造不出"账先花光而轮次还在半路"的形状。
+
 ### 第 1 项：LSM 跨源归并改成**源级延迟激活**（`LightMerge`）
 
 - 死因（先前一笔账写错过一次，这次是回源码核过的）：`light_iter_range` 只在**有上界**时才走

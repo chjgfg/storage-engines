@@ -412,10 +412,12 @@ mod tests {
         drop(reader);
         // ⚠️ 方案正文点名的这一条：**排空**，不是一次 begin/commit。一片只裁 `slice` 行，账可能有
         // 几十片。但"排空"的终点**不是 `pending_rows == 0`** —— `VacuumScheduler::take_tick`
-        // （`common/kernel.rs:154`）的门是 `pending < slice ⇒ 不裁`，所以不足一片的尾巴按设计留着，
-        // 等下一批写把它顶过阈值。首跑就是被这条判据绊红的：4000 次 tick 后 pending 恒在 6784
-        // = 400000 − 24×16384，`active_txns: 0`（没人挡），即"停在尾巴上"而不是"停在半路"。
-        // ⇒ 判据改成**跑到不再前进为止**，并钉住停下的位置：剩余账必须小于一整片。
+        // （`common/kernel.rs`）的门有两支：**开新一轮**看账（`pending >= slice`，取走 `slice` 行），
+        // **把已开的那轮推到尾**看游标（账不够也给许可，`charged = 0`）。所以停下来的正确形状是
+        // "账不足一片 **且** 游标已回到库头"，两条要一起判 —— 首跑只判了前一条，才把"停在尾巴"
+        // 和"停在半路"混成同一个数（4000 次 tick 后 pending 恒在 6784 = 400000 − 24×16384，
+        // `active_txns: 0`）。
+        // ⇒ 判据 = 跑到不再前进为止，并钉住停下的位置：剩余账小于一整片，且轮次已经走完。
         let slice = db.vacuum_auto_slice();
         let mut ticks = 0usize;
         let mut prev_removed = db.reclamation_status().unwrap().versions_removed;
@@ -428,6 +430,14 @@ mod tests {
                     "回收停在半路：还剩 {} 行账 ≥ 一片 {slice} 行，却没有再裁（active_txns={}）",
                     st.pending_rows,
                     st.active_txns
+                );
+                // M81 第 5 项后半的新判据：停下的位置必须是**一轮已经走完**，不是冻在半路。
+                // 旧形状（`take_tick` 只看账）在这里红 —— 账花光时游标还在库里，后半库没人认领。
+                assert!(
+                    !st.sweep_in_progress,
+                    "一轮走在半路却停了：游标不在库头、账又不足一片 ⇒ 后半库的垃圾无人回收 \
+                     （completed_slices={} versions_removed={prev_removed}）",
+                    st.completed_slices
                 );
                 break;
             }

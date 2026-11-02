@@ -62,6 +62,6 @@ pub use kernel::{
     fold_window, fold_window_emit, is_unfinished, search_page_build, search_page_from,
     search_page_from_with_total,
     visible_at, HealthFold,
-    VacuumScheduler, WalPolicy,
+    VacuumScheduler, VacuumTick, WalPolicy,
     WinCandidate,
 };

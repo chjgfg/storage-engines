@@ -74,6 +74,13 @@ pub struct ReclamationStatus {
     pub failed_slices: u64,
     pub versions_removed: u64,
     pub running: bool,
+    /// 一轮切片回收**是否还走在半路**（调度器游标不在库头）。
+    ///
+    /// 为什么单列一个数（M81 第 5 项后半）：`pending_rows` 回答的是"该不该**开**一轮"，
+    /// 而"已经开的那一轮走完没有"是另一件事 —— 旧形状把两件事压在同一个门（`pending < slice`）
+    /// 上，于是账花光时半轮的游标就冻在库里。排空守卫判"停在不足一片的尾巴上"必须**同时**
+    /// 看到这一条是 `false`，否则就是轮次半路停摆（那才是真缺陷，不是尾巴）。
+    pub sweep_in_progress: bool,
     pub active_txns: u64,
     /// 版本号，不是时间戳；用于定位长期阻塞回收的事务，库不会强制结束它。
     pub oldest_active_version: Option<u64>,
