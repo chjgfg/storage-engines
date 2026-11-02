@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::process::exit;
 
-use storage_engines::tools::migrate::{SnapshotFormat, import_from_dir};
+use storage_engines::tools::migrate::{SnapshotFormat, import_from_dir, import_skip_existing_from_dir};
 use storage_engines::EngineKind;
 
 pub struct Args {
@@ -29,6 +29,9 @@ pub struct Args {
     pub input: PathBuf,
     pub format: SnapshotFormat,
     pub wipe: bool,
+    /// 补齐模式：目标"见过"（含墓碑）的键一个字都不动，没见过的才插 —— 与 `tools::sync` 同一套
+    /// 判定，只是载体是文件。与 `--wipe` 互斥（清空之后再谈"见过"没有意义）。
+    pub skip_existing: bool,
 }
 
 pub fn usage() -> String {
@@ -45,6 +48,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
         input: PathBuf::new(),
         format: SnapshotFormat::Bin,
         wipe: false,
+        skip_existing: false,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -68,10 +72,14 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
                 };
             }
             "--wipe" => a.wipe = true,
+            "--skip-existing" => a.skip_existing = true,
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("未知参数: {other}\n{}", usage())),
         }
         i += 1;
+    }
+    if a.wipe && a.skip_existing {
+        return Err("--wipe 与 --skip-existing 不能同时给：清空之后没有键算'见过'，补齐会退化成全量导入".to_string());
     }
     if a.engine.is_empty() || a.dir.as_os_str().is_empty() || a.input.as_os_str().is_empty() {
         return Err(format!("缺参数：--engine / --dir / --in 三个都必给\n{}", usage()));
@@ -98,6 +106,27 @@ pub fn main() {
             exit(2);
         }
     };
+    if args.skip_existing {
+        match import_skip_existing_from_dir(kind, &args.dir, &args.input, args.format) {
+            Err(e) => {
+                eprintln!("补齐导入失败: {e}");
+                exit(1);
+            }
+            Ok(st) => {
+                println!(
+                    "补齐 {} ← {}：文件 {scanned} 行 ⇒ 插入 {ins}（带 TTL {ttl}）/ 已见过 {seen} / 过期未插 {exp}",
+                    kind.as_str(),
+                    args.input.display(),
+                    scanned = st.scanned,
+                    ins = st.inserted,
+                    ttl = st.inserted_with_ttl,
+                    seen = st.skipped_existing,
+                    exp = st.skipped_expired
+                );
+                exit(0);
+            }
+        };
+    }
     match import_from_dir(kind, &args.dir, &args.input, args.format, args.wipe) {
         Err(e) => {
             eprintln!("导入失败: {e}");
@@ -136,6 +165,22 @@ mod tests {
             assert_eq!(b.input.to_string_lossy().as_ref(), "./s.jsonl", "{name} 没被吃进来");
             assert!(b.wipe && b.format == SnapshotFormat::Jsonl);
         }
+    }
+
+    /// 旗标互斥：`--wipe` 之后再谈"见过"没有意义 ⇒ 解析层就挡住，不许悄悄退化成全量导入。
+    #[test]
+    fn parse_rejects_wipe_together_with_skip_existing() {
+        assert!(parse_args(&v(&[
+            "--engine", "bitcask", "--dir", "./d", "--in", "./s", "--wipe", "--skip-existing"
+        ]))
+        .is_err());
+        // 单独给其中任何一条都合法
+        assert!(parse_args(&v(&["--engine", "bitcask", "--dir", "./d", "--in", "./s", "--wipe"])).is_ok());
+        let a = parse_args(&v(&[
+            "--engine", "bitcask", "--dir", "./d", "--in", "./s", "--skip-existing",
+        ]))
+        .unwrap();
+        assert!(a.skip_existing && !a.wipe);
     }
 
     /// 三个必填各缺一次都要红；导出才有的旗标在这边也不许被默默吃下。

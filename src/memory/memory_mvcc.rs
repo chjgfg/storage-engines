@@ -124,13 +124,13 @@ impl MVCC {
         }
         const PAGE: usize = 1_000;
         let now = crate::common::codec::now_unix_secs();
-        let mut batch: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = Vec::with_capacity(PAGE);
+        let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)> = Vec::with_capacity(PAGE);
         let mut expired = 0usize;
         let mut err: Option<std::io::Error> = None;
         let stats = crate::common::kv_snapshot::read_bin_with(&path, &mut |rec| {
-            let Some(value) = rec.value else {
-                return true; // 快照不写墓碑：墓碑行从来不出导出（`include_deleted = false`）
-            };
+            // `value = None` = 墓碑行，照样进重放队列（重放成 `delete`）——
+            // 丢掉它就是"重启即失忆"：判据①的地基没了，后续同步能复活已删键。
+            let value = rec.value;
             if let Some(e) = rec.expire_unix_secs {
                 if e <= now {
                     expired += 1;
@@ -169,7 +169,7 @@ impl MVCC {
     /// 否则尾巴那半页会静默不写（本仓库收过这类账）。
     fn replay_page(
         mvcc: &MVCC,
-        batch: &mut Vec<(Vec<u8>, Vec<u8>, Option<u64>)>,
+        batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
         now: u64,
     ) -> Option<std::io::Error> {
         if batch.is_empty() {
@@ -178,10 +178,11 @@ impl MVCC {
         let tx = mvcc.begin_transaction();
         let mut bad: Option<Vec<u8>> = None;
         for (k, v, expire) in batch.drain(..) {
-            let ok = match expire {
+            let ok = match (v, expire) {
+                (None, _) => tx.delete(&k),
                 // 绝对时刻减 now：文件里躺过多久都不影响这一行还剩多少命（与 migrate 同式）
-                Some(e) => tx.set_with_ttl(&k, v, std::time::Duration::from_secs(e - now)),
-                None => tx.set(&k, v),
+                (Some(v), Some(e)) => tx.set_with_ttl(&k, v, std::time::Duration::from_secs(e - now)),
+                (Some(v), None) => tx.set(&k, v),
             };
             if !ok && bad.is_none() {
                 bad = Some(k);
@@ -198,50 +199,53 @@ impl MVCC {
 
     /// 写一次整库快照（`BPEXP003`）。只在 `Drop` 里调用 —— 运行期没有任何一条路会走到这里。
     ///
-    /// 两条口径：
-    /// - **流式**：走 `scan_page` 一页一页折，不 `export_latest_visible` 把整库摆进 `Vec`
-    ///   （M44 那条"导出不必再把整库摆进内存"对快照同样成立；20M 档那一格本来就要 GB 级）。
-    /// - TTL 逐行现读（`get_meta` 的 `expire_unix_secs`），与 `migrate` 同一件事：
-    ///   **TTL 在源侧读**，文件里存绝对时刻。少了这一步，走文件同步必丢 TTL（001/002 里没地方放）。
+    /// 三条口径：
+    /// - **流式**：走 `export_latest_visible_for_each` 交一行折一行，不把整库摆进 `Vec`
+    ///   （M44 那条纪律对快照同样成立；20M 档那一格本来就要 GB 级）。
+    /// - **带墓碑**（`include_deleted = true`）：`tools::sync` / `import --skip-existing` 的判据①
+    ///   是"目标见过这把键吗（含墓碑）"，快照里没墓碑 ⇒ 重启一次判据的地基就没了。
+    /// - TTL 从出口那一份 `ExportRecord::expire_unix_secs` 直接拿（0.5.0 起有这一格），
+    ///   文件里存**绝对**时刻 ⇒ 躺多久都不影响这一行还剩多少命。
     ///
     /// 写盘失败**不吞**：一路 `?` 交给 `Drop`，那里降成 `warn`（析构里不能抛）。
     fn write_snapshot(&self, path: &std::path::Path) -> std::io::Result<usize> {
-        const PAGE: usize = 1_000;
         use crate::common::kv_snapshot::{KvRecord, Sink};
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut sink = Sink::bin_v3(path)?;
-        let tx = self.begin_transaction();
         let mut written = 0usize;
-        let mut after: Option<Vec<u8>> = None;
-        loop {
-            let (rows, next) = tx.scan_page(after.as_deref(), PAGE);
-            if rows.is_empty() && next.is_none() {
-                break;
+        let mut err: Option<std::io::Error> = None;
+        // `include_deleted = true` ⇒ 墓碑也进快照（`value = None` 那一支）。
+        // 为什么必须带上：memory 当 `tools::sync` 的目标时，判据是"目标见过这把键吗"，
+        // 而"见过"含墓碑 —— 快照里没墓碑，重启一次之后"这把键被删过"就消失了，
+        // 后续同步能把已删键复活（`memory_snapshot_keeps_tombstones_alive` 钉这条）。
+        let handed = self.export_latest_visible_for_each(true, &mut |rec: ExportRecord| {
+            let mut kr = KvRecord::new(rec.key, rec.value);
+            if let Some(e) = rec.expire_unix_secs {
+                kr = kr.with_expire(e);
             }
-            for rec in rows {
-                let expire = tx.get_meta(&rec.key).and_then(|m| m.expire_unix_secs);
-                let mut kr = KvRecord::new(rec.key, rec.value);
-                if let Some(e) = expire {
-                    kr = kr.with_expire(e);
+            match sink.write(&kr) {
+                Ok(()) => {
+                    written += 1;
+                    true
                 }
-                sink.write(&kr)?;
-                written += 1;
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
             }
-            match next {
-                Some(c) => after = Some(c),
-                None => break,
-            }
+        });
+        if let Some(e) = err {
+            return Err(e);
         }
-        tx.commit();
         let stats = sink.finish()?;
-        if stats.records != written {
+        if stats.records != written || handed != written {
             // 不拿 assert：这条在 `Drop` 之路上，panic 会在已经 panic 的展开里再炸一次。
             // 两份账不一致 = 有行静默没落盘，必须报出去而不是"看起来成功了"。
             return Err(std::io::Error::other(format!(
-                "memory 快照写出 {written} 行，收尾账却是 {} 行",
-                stats.records
+                "memory 快照写出 {written} 行，收尾账却是 {} 行、出口交出 {} 行",
+                stats.records, handed
             )));
         }
         Ok(written)

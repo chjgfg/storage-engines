@@ -1704,6 +1704,9 @@ impl Bitcask {
                     .key_dir
                     .range::<[u8], _>((Included(lower.as_slice()), Unbounded))
                 {
+                    // ⚠️ 探针本身是 `#[cfg(test)]` ⇒ 调用点也要跟着门控，否则普通 `cargo check --lib`
+                    // （不开 test cfg）会找不到函数。上一轮只跑了 `cargo test`，这一格没暴露出来。
+                    #[cfg(test)]
                     if let KeyLoc::Live { file_id, len, .. } = loc {
                         merge_seg_note_live(*file_id, *len);
                     }

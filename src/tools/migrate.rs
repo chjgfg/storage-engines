@@ -613,6 +613,110 @@ pub fn import_from_dir(
     finish_import(&*dst, stats)
 }
 
+/// 文件版的"补齐"式导入（M81 第 6 项尾巴 A）：**目标"见过"的键一个字都不动，没见过的才插**。
+///
+/// 与 [`import_from_dir`] 的区别只在这一条判据上 —— 那条是覆盖语义（同键后者胜），这一条不覆盖、
+/// 不复活墓碑、也不刷新已有键的 TTL。三条口径与 [`sync`] **同一份**，不是又抄一遍判定：
+/// ① "见过" = `get_meta(...).is_some()`（含墓碑；用 `exists()` 会复活已删键）；
+/// ② 文件里的墓碑行**不进候选**（删除不传播 —— 与 `sync` 的 `include_deleted=false` 同一条）；
+/// ③ 新插入的键按文件里记的**绝对到期时刻**重打信封（v3 / JSONL 的 `expire`；001/002 文件里没这
+///    个字段 ⇒ 读回永久，见 `v1_snapshot_reads_back_as_permanent`）。
+///
+/// ⚠️ 走**普通事务**（一批一个事务）而不是 `begin_bulk`：判"见过"要按键读目标，而 bulk 那条门
+/// 是"绕过冲突检查"的，两件事凑一个句柄会把读到的快照与写入的可见性混成两套 —— 与 [`sync`] 同理由。
+pub fn import_skip_existing_from_dir(
+    engine: EngineKind,
+    dir: impl AsRef<Path>,
+    input: impl AsRef<Path>,
+    format: SnapshotFormat,
+) -> Result<SyncStats, String> {
+    let dst = open_target_at(engine, dir.as_ref(), false)?;
+    let mut stats = SyncStats::default();
+    let mut batch: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = Vec::with_capacity(BATCH);
+    let mut err: Option<String> = None;
+    let flush = |batch: &mut Vec<(Vec<u8>, Vec<u8>, Option<u64>)>, stats: &mut SyncStats| -> Result<(), String> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let drained = std::mem::replace(batch, Vec::with_capacity(BATCH));
+        let tx = dst.begin();
+        let now = now_unix_secs();
+        for (key, user, expire) in drained {
+            if tx.get_meta(&key).is_some() {
+                stats.skipped_existing += 1;
+                continue;
+            }
+            let ok = match expire {
+                Some(e) if e > now => {
+                    let ok = tx.set_with_ttl(&key, user, Duration::from_secs(e - now));
+                    if ok {
+                        stats.inserted_with_ttl += 1;
+                    }
+                    ok
+                }
+                Some(_) => {
+                    stats.skipped_expired += 1;
+                    continue;
+                }
+                None => tx.set_raw(&key, user),
+            };
+            if !ok {
+                return Err(format!(
+                    "补齐导入冲突（键 {:?}）⇒ 这一批不提交",
+                    String::from_utf8_lossy(&key)
+                ));
+            }
+            stats.inserted += 1;
+        }
+        tx.commit();
+        Ok(())
+    };
+    let on = &mut |rec: KvRecord| -> bool {
+        // 判据②：文件里的墓碑行不进候选（`value = None`）。它既不是"要插的东西"，
+        // 也不该被当成"目标缺这把键"的证据 —— 删除不传播。
+        let Some(user) = rec.value else {
+            return true;
+        };
+        stats.scanned += 1;
+        batch.push((rec.key, user, rec.expire_unix_secs));
+        if batch.len() >= BATCH {
+            if let Err(e) = flush(&mut batch, &mut stats) {
+                err = Some(e);
+                return false;
+            }
+        }
+        true
+    };
+    let read = match format {
+        SnapshotFormat::Jsonl => read_jsonl_with(input.as_ref(), on),
+        SnapshotFormat::Bin => read_bin_with(input.as_ref(), on),
+    };
+    if let Err(e) = read {
+        return Err(format!("读快照文件失败: {e}"));
+    }
+    if err.is_none() {
+        if let Err(e) = flush(&mut batch, &mut stats) {
+            err = Some(e);
+        }
+    }
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let judged = stats.inserted + stats.skipped_existing + stats.skipped_expired;
+    if judged != stats.scanned {
+        return Err(format!(
+            "文件交出 {} 行、目标判定 {judged} 行 ⇒ 有行被静默丢掉",
+            stats.scanned
+        ));
+    }
+    dst.flush().map_err(|e| format!("flush 失败: {e}"))?;
+    dst.checkpoint().map_err(|e| format!("checkpoint 失败: {e}"))?;
+    Ok(stats)
+}
+
+///
+/// ⚠️ 这里**只**挡"整批没落进去"这一格：`KvBulk::put` 没有返回值通道（见文件头那条已知局限），
+/// 超出一页载荷的行只能 `log::error!` 喊出来、传不上来。不做"回读条数 == 文件条数"的硬判据，
 /// 导入收尾：落盘、挡住"整批没落进去"，两个入口共用一份（这条判断抄两遍迟早有一份不判）。
 ///
 /// ⚠️ 这里**只**挡"整批没落进去"这一格：`KvBulk::put` 没有返回值通道（见文件头那条已知局限），
@@ -1074,9 +1178,9 @@ mod tests {
                 tx.commit();
             }
             // ⚠️ 用**同一个句柄**当目标，不再重开：重开对三家磁盘引擎等价，对 memory 却多一层
-            // 快照重启（而 memory 的启停快照今天不保存墓碑 —— 那件事单独记在
-            // `memory_snapshot_currently_drops_tombstones_characterization`，不许混进这条判据里，
-            // 否则"门选错了"和"重启丢墓碑"两件事会互相顶包）。
+            // 快照重启。memory 的启停快照**现在**会带上墓碑（尾巴 B 已做，守卫
+            // `memory_snapshot_keeps_tombstones_alive`），但这条判据仍然只用同一个句柄 ——
+            // 判"门选错了"不该顺带依赖"重启保真"，两件事混在一起红了分不清是谁。
             // 真跑一次同步：源里这把键是活值 ⇒ 目标必须原样不动（既不复活，也不刷新）
             let rs = root(&format!("sync_tomb_src_{}", kind.as_str()));
             seed_ttl(kind, &rs, &[(b"dead", b"resurrect", None), (b"fresh", b"new", None)]);
@@ -1169,16 +1273,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&r);
     }
 
-    /// 现状记录（和第 6 项前半同一条链，**待你定夺**的那一格）：memory 的启停快照不保存墓碑。
+    /// 尾巴 B（已做）：memory 的启停快照**要**保存墓碑 —— 本条以前是现状记录，今天按计划翻红后改写。
     ///
-    /// 链条：`write_snapshot` 折的是 `tx.scan_page(...)` 交出的**存活行**，`KvRecord` 那一行没有
-    /// "这是墓碑"的位置 ⇒ 重启之后"这把键被删过"这件事整个消失。对纯内存引擎这本来无害
-    /// （它连崩溃安全都没有），但它一旦当 sync 的目标用，skip-existing 的判据（判据①）
-    /// 就建立在"墓碑还在"上 —— 重启一次，判据的地基就没了，任何后续同步都能把已删键复活。
-    /// ⇒ 这条断言钉的是当前行为。修的动作有两个方向（快照里带上墓碑行 / 明写"memory 快照
-    /// 不适合做 sync 目标"），都改语义，等你点。修好之后本条必须翻红并改写成"墓碑要活过重启"。
+    /// 为什么这不是"内存引擎的洁癖"：`tools::sync` 与 `import --skip-existing` 的判据①是
+    /// "目标见过这把键吗（含墓碑）"。快照里没墓碑 ⇒ 重启一次之后"这把键被删过"整个消失 ⇒
+    /// 判据的地基没了，后续同步能把已删键复活。所以墓碑必须活过重启。
+    /// 活行那一半边一直是合格的，两条一起判才不空转。
     #[test]
-    fn memory_snapshot_currently_drops_tombstones_characterization() {
+    fn memory_snapshot_keeps_tombstones_alive() {
         let r = root("mem_snap_tombstone");
         let dir = r.join("memory");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1207,10 +1309,10 @@ mod tests {
         let db = open_engine_with(EngineKind::Memory, Some(&dir), &migrate_config()).unwrap();
         let tx = db.begin();
         assert_eq!(tx.get(b"stay").as_deref(), Some(&b"live"[..]), "活行要活过重启（这半边是合格的）");
-        assert!(
-            tx.get_meta(b"gone").is_none(),
-            "memory 快照开始保存墓碑了 ⇒ 本条要翻红，改写成'墓碑要活过重启'"
-        );
+        let m = tx.get_meta(b"gone");
+        assert!(m.is_some(), "memory 快照把墓碑丢了 ⇒ 重启后 sync 的判据①没有地基");
+        assert!(m.unwrap().deleted, "重放回来的那行必须是墓碑，不是活值");
+        assert_eq!(tx.get(b"gone"), None, "墓碑重放成活值了");
         tx.commit();
         drop(tx);
         drop(db);
@@ -1373,7 +1475,96 @@ mod tests {
             "migrate 把 TTL 弄丢了：到期时刻在出口被剥掉 ⇒ 键搬完变永久"
         );
         tx.commit();
+        drop(tx);
         let _ = std::fs::remove_dir_all(&rr);
+    }
+
+    /// 尾巴 A：文件版补齐 —— 同一份文件，`--skip-existing` 那条门与覆盖那条门**给出两个答案**，
+    /// 所以两条都要判：覆盖门照旧后到者胜，补齐门"见过的一个字不动"（含墓碑），并带上 TTL。
+    #[test]
+    fn import_skip_existing_door_differs_from_the_overwrite_door() {
+        let rs = root("sk_src");
+        let expire = now_unix_secs() + 3_600;
+        // 源：k1 新值、k2 活值、k3 带 TTL、k4 永久、k9 墓碑（只有带墓碑导出才会进文件）
+        seed_ttl(EngineKind::LsmTree, &rs, &[
+            (b"k1", b"new", None),
+            (b"k2", b"alive", None),
+            (b"k3", b"ttl", Some(expire)),
+            (b"k4", b"four", None),
+        ]);
+        let src = open_for_sync(EngineKind::LsmTree, &rs);
+        {
+            let tx = src.begin();
+            assert!(tx.set_raw(b"k9", b"gone".to_vec()));
+            tx.commit();
+        }
+        {
+            let tx = src.begin();
+            assert!(tx.delete(b"k9"));
+            tx.commit();
+        }
+        // 导出的门会自己再 open 一次 ⇒ 手上的 src 必须先放掉（LSM 的目录锁是独占的）
+        drop(src);
+        let snap = rs.join("s.bin");
+        // ⚠️ 文件那两侧要的是**引擎目录**（`display_path`），不是 root ——
+        // 传错就会对着一个空目录导出，读出 0 行还不报错（本条测试首跑就是这么红的）。
+        export_to_dir(EngineKind::LsmTree, &display_path(EngineKind::LsmTree, &rs), &snap, SnapshotFormat::Bin, true).unwrap();
+
+        // 目标：k1 = 旧值（已有）、k2 = 墓碑（"见过"）
+        let rt = root("sk_dst");
+        seed_ttl(EngineKind::Bitcask, &rt, &[(b"k1", b"old", None)]);
+        let d0 = open_for_sync(EngineKind::Bitcask, &rt);
+        {
+            let tx = d0.begin();
+            assert!(tx.set_raw(b"k2", b"will-die".to_vec()));
+            tx.commit();
+        }
+        {
+            let tx = d0.begin();
+            assert!(tx.delete(b"k2"));
+            tx.commit();
+        }
+        drop(d0);
+
+        // ① 补齐门
+        let dst_dir = display_path(EngineKind::Bitcask, &rt);
+        let st = import_skip_existing_from_dir(EngineKind::Bitcask, &dst_dir, &snap, SnapshotFormat::Bin).unwrap();
+        // 文件里 5 行活值（k1..k4 + k9 是墓碑 ⇒ 不进候选）
+        assert_eq!(st.scanned, 4, "候选集合该只数活行（墓碑不进）: {st:?}");
+        assert_eq!((st.inserted, st.skipped_existing), (2, 2), "该补 k3/k4、该挡 k1/k2: {st:?}");
+        assert_eq!(st.inserted_with_ttl, 1, "k3 该带着 TTL 插进去: {st:?}");
+        {
+            let db = open_for_sync(EngineKind::Bitcask, &rt);
+            let tx = db.begin();
+            assert_eq!(tx.get(b"k1").as_deref(), Some(&b"old"[..]), "补齐门把已有的键覆盖了");
+            assert_eq!(tx.get(b"k2"), None, "补齐门复活了已删键");
+            assert_eq!(tx.get(b"k3").as_deref(), Some(&b"ttl"[..]));
+            let m = tx.get_meta(b"k3").unwrap();
+            assert!(
+                m.expire_unix_secs.is_some() && m.expire_unix_secs.unwrap() >= expire,
+                "k3 的 TTL 没跟过来（{expire} vs {m:?}）"
+            );
+            assert_eq!(tx.get(b"k4").as_deref(), Some(&b"four"[..]));
+            assert!(tx.get_meta(b"k9").is_none(), "文件里的墓碑不该在目标留下任何痕迹（删除不传播）");
+            tx.commit();
+            drop(tx);
+            drop(db);
+            // 幂等：再补齐一次 ⇒ 0 插入（门自己会再 open 一次 ⇒ 手上的句柄得先放掉）
+            let again = import_skip_existing_from_dir(EngineKind::Bitcask, &dst_dir, &snap, SnapshotFormat::Bin).unwrap();
+            assert_eq!((again.scanned, again.inserted, again.skipped_existing), (4, 0, 4), "第二次不幂等: {again:?}");
+        }
+
+        // ② 覆盖门（对照）：同一份文件走老门，k1 必须被改成 new —— 两条门不一样才各自有意义
+        let rc = root("sk_overwrite");
+        seed_ttl(EngineKind::Bitcask, &rc, &[(b"k1", b"old", None)]);
+        import_from_dir(EngineKind::Bitcask, &display_path(EngineKind::Bitcask, &rc), &snap, SnapshotFormat::Bin, false).unwrap();
+        let db = open_for_sync(EngineKind::Bitcask, &rc);
+        let tx = db.begin();
+        assert_eq!(tx.get(b"k1").as_deref(), Some(&b"new"[..]), "覆盖门的语义不该被顺手改掉");
+        tx.commit();
+        let _ = std::fs::remove_dir_all(&rs);
+        let _ = std::fs::remove_dir_all(&rt);
+        let _ = std::fs::remove_dir_all(&rc);
     }
 
 }

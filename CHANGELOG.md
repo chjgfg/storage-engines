@@ -18,6 +18,28 @@
 
 ## 未发布：merge 从 vacuum 拆出 + merge 时间构成 + 大档回收守卫（2026-11-02，M81）
 
+### 第 6 项尾巴 A + B：`import --skip-existing`（文件版补齐）与 memory 快照保存墓碑
+
+- **A** 新增 `tools::import_skip_existing_from_dir(engine, dir, input, format) -> Result<SyncStats, String>`
+  （`import_from_dir` 的签名一字未动 ⇒ 覆盖语义那条老路不受影响）+ CLI 旗标 `--skip-existing`
+  （与 `--wipe` **互斥**，解析层就挡：清空之后没有键算"见过"，补齐会退化成全量导入）。
+  三条口径与 `tools::sync` **同一份**，不是又抄一遍判定：`get_meta(...).is_some()` 算见过（含墓碑）、
+  文件里的墓碑行不进候选（删除不传播）、新插的按文件里那个**绝对**到期时刻重打信封。
+  走普通事务而不是 `begin_bulk`（判"见过"要读，bulk 是绕过冲突检查的门）——与 `sync` 同理由。
+  守卫 `import_skip_existing_door_differs_from_the_overwrite_door`：同一份文件走两条门必须给出**两个答案**
+  （补齐门：k1 保持旧值 / k2 仍是死的 / k3 带 TTL 进来 / k9 不留任何痕迹 / 第二次 0 插入；
+  覆盖门：k1 必须被改成 new —— 老语义不该被顺手改掉）。
+- **B** memory 启停快照**开始保存墓碑**：写侧改走 `export_latest_visible_for_each(include_deleted = true)`
+  （仍是交一行折一行 ⇒ 流式没丢；TTL 直接从 `ExportRecord::expire_unix_secs` 拿，不再逐行 `get_meta`），
+  读侧把 `value = None` 重放成 `delete`。为什么这不是内存引擎的洁癖：`sync` 与 `--skip-existing` 的
+  判据①是"目标见过这把键吗（含墓碑）"，快照里没墓碑 ⇒ 重启一次判据的地基就没了，后续同步能复活已删键。
+  上一轮那条现状记录按计划翻红并改名 `memory_snapshot_keeps_tombstones_alive`
+  （活行照旧活过重启 + 墓碑读回来是 `deleted = true` 且 `get()` 仍是 `None`，两条一起判才不空转）。
+- ⚠️ 顺带修掉一处**只有非 test 构建才会暴露**的问题：merge 分段探针的调用点漏了 `#[cfg(test)]` ⇒
+  普通 `cargo check --lib` 报"找不到函数"，而 `cargo test` 一切正常。教训：`cfg(test)` 探针的
+  **调用点**也要门控，验收不能只跑 `cargo test`。
+- 测试数 **383 → 384**（lib）+ bin 内 4 + 4；`cargo check --lib`（不开 test）也过。
+
 ### 第 3 项：装上"按段增量"的尺子，并记一条方案没写的实现前置
 
 - 新探针（`src/bitcask/bitcask.rs`，吃同一个 `MERGE_TIME_SPLIT` 门控、只读不碰任何水位）：
@@ -65,8 +87,7 @@
   `migrate_carries_ttl_across_engines` —— 这正是它当初写成断言的目的。
 - 导入侧一条口径写死：文件里**已过期**的行照原样落库（到期时刻在过去 ⇒ 读出来是"不存在"，回收会带走），
   不在导入这一步替用户判过期 —— 那等于悄悄少搬几把键。
-- ⚠️ 仍**没做**的一件相关项：`import` 还是覆盖语义，没有 `--skip-existing`（"墓碑算见过"那三条口径
-  目前只在 `tools::sync` 里）。这条与 TTL 无关，等点名。
+- ⚠️ 当时没做的一件（**后来已做**，见本文最上面那条尾巴 A/B）：`import` 的 `--skip-existing`。
 
 ### 第 6 项收尾：八条 `<引擎>-{import,export}-kv` 删掉，搬运只剩一对 CLI
 
@@ -112,6 +133,7 @@
   `live_record_of_logical` 交用户字节、写侧一律 `pack_plain`，而 `ExportRecord` 里没有放 expire 的
   位置；真要修就得给公开结构体加字段 = 对下游破坏性变更，会把下一次发布抬成 0.5.0）；
   `memory_snapshot_currently_drops_tombstones_characterization` ⇒ memory 的启停快照**不保存墓碑**
+    （**本条后来被修掉**：尾巴 B 已做，守卫改名 `memory_snapshot_keeps_tombstones_alive`）
   （活行能活过重启，"这把键被删过"活不过），所以它作为 sync 目标时判据①的地基会在重启后消失。
 
 ### 第 6 项后半（下半）：统一 `export-kv` / `import-kv` 一对 CLI（靠 `--engine` 选家）
