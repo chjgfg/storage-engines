@@ -36,7 +36,7 @@ use std::time::Instant;
 use super::kv_snapshot::{
     read_bin_with, read_jsonl_with, ExportWriter, IoStats, KvRecord,
 };
-use crate::common::codec::{now_unix_secs, pack_plain};
+use crate::common::codec::{now_unix_secs, pack_plain, pack_ttl};
 use crate::engine::{open_engine_with, EngineConfig, EngineKind, KvEngine};
 use std::time::Duration;
 
@@ -247,7 +247,14 @@ fn pump(
         match rec.value {
             Some(v) => {
                 stats.live += 1;
-                batch.push((rec.key, pack_plain(&v)));
+                // 0.5.0：出口把 expire 一起交出来，这里就必须按它重打信封。
+                // 改前这一行一律 `pack_plain` ⇒ 带 TTL 的键搬完变永久（`migrate_currently_drops_ttl`
+                // 那条现状记录今天翻红，已改写成"必须保住 TTL"）。
+                let logical = match rec.expire_unix_secs {
+                    Some(e) => pack_ttl(&v, e),
+                    None => pack_plain(&v),
+                };
+                batch.push((rec.key, logical));
                 if batch.len() >= BATCH {
                     bulk.put_batch_owned(std::mem::take(&mut batch));
                     batch = Vec::with_capacity(BATCH);
@@ -390,11 +397,12 @@ pub struct SyncStats {
 ///    不是复制协议 —— 要"把 B 里多出来的键删掉"请走 `migrate`（覆盖 + wipe）或应用层自己管。
 /// ③ **TTL 跟着走，但不刷新已有的**：新插入的键按源里记的**绝对到期时刻**打 TTL 信封；
 ///    已存在的键（含墓碑）连 TTL 都不碰。
-///    ⚠️ 这里**没有**照 `migrate` 走，因为 `migrate` 根本没有 TTL 这条式子：它的源侧出口
-///    `live_record_of_logical`（`common/store.rs:475`）交出的是**用户字节**（信封已剥），
-///    写侧再 `pack_plain` 重新打 ⇒ 带 TTL 的键搬完一律变永久。`ExportRecord` 里也没有地方放
-///    expire。`sync` 不接这个锅：到期时刻从源侧 `get_meta(...).expire_unix_secs` 单独取
-///    （和 memory 启停快照同一扇门、同一个字段），所以同步过来的键该什么时候过期还是什么时候。
+///    到期时刻从源侧 `get_meta(...).expire_unix_secs` 单独取（和 memory 启停快照同一扇门、
+///    同一个字段）⇒ 同步过来的键该什么时候过期还是什么时候。
+///    ⚠️ 这里**曾经**只能自己取：出口 `live_record_of_logical` 交的是用户字节（信封已剥）、
+///    `ExportRecord` 里没有放 expire 的位置，所以 `migrate` 那时是 TTL 黑洞。0.5.0 起出口把
+///    到期时刻一起交出来、`migrate` 也按它重打信封（守卫 `migrate_carries_ttl_across_engines`），
+///    `sync` 这一支保留 `get_meta` 的取法不动 —— 它判"见过"本来就要读这一格，不多花一次。
 ///
 /// 写入走**普通事务**（一批一个事务），不走 `begin_bulk`：skip-existing 要按键读目标，
 /// 而 bulk 那条通道是"绕过冲突检查"的门，两件事凑在同一个句柄上会把"读到的快照"和"写入的可见性"
@@ -508,7 +516,9 @@ fn pump_out(
             ExportWriter::jsonl(out.as_ref()).map_err(|e| format!("建导出文件失败: {e}"))?
         }
         SnapshotFormat::Bin => {
-            ExportWriter::bin(out, false).map_err(|e| format!("建导出文件失败: {e}"))?
+            // 0.5.0 起改走 v3：001/002 里没有地方放到期时刻，而这条门是跨库载体。
+            // 读侧只认魔数 ⇒ 老文件照旧能导，新文件多 8 字节/行。
+            ExportWriter::bin_v3(out).map_err(|e| format!("建导出文件失败: {e}"))?
         }
     };
     let mut written = 0usize;
@@ -639,7 +649,15 @@ fn pump_file_in(dst: &dyn KvEngine, input: &Path, format: SnapshotFormat) -> Res
     let on = &mut |rec: KvRecord| -> bool {
         match rec.value {
             Some(v) => {
-                batch.push((rec.key, pack_plain(&v)));
+                // 文件里带 expire（v3 / JSONL 的 `expire` 字段）就按它重打信封；不带 = 永久。
+                // ⚠️ 已过期但仍在文件里的行**照原样落库**（到期时刻在过去 ⇒ 读出来是"不存在"，
+                // 回收会带走），不在这里做"顺手丢掉"的决定 —— 导入侧替用户判过期就等于
+                // 悄悄少搬了几把键。
+                let logical = match rec.expire_unix_secs {
+                    Some(e) => pack_ttl(&v, e),
+                    None => pack_plain(&v),
+                };
+                batch.push((rec.key, logical));
                 if batch.len() >= BATCH {
                     bulk.put_batch_owned(std::mem::take(&mut batch));
                     batch = Vec::with_capacity(BATCH);
@@ -1079,6 +1097,78 @@ mod tests {
         }
     }
 
+    /// 文件这一侧的 TTL 往返（0.5.0 的那件事）：导出 → 导入 → 到期时刻**逐键不变**。
+    /// 两种载体各测一次：`BPEXP003`（bin）与 JSONL 的可选 `expire` 字段。
+    ///
+    /// 判据为什么用绝对时刻而不是剩余时间：剩余时间是读出来的瞬时量，两次读之间就变；
+    /// 绝对时刻对齐才是"搬一次不改寿命"的说法。永久行也一并钉（`None` 不许变成 `Some`）。
+    #[test]
+    fn file_carries_ttl_through_export_and_import() {
+        for fmt in [SnapshotFormat::Bin, SnapshotFormat::Jsonl] {
+            let r = root("file_ttl");
+            let src_dir = r.join("lsm_tree");
+            let dst_dir = r.join("bitcask");
+            std::fs::create_dir_all(&src_dir).unwrap();
+            std::fs::create_dir_all(&dst_dir).unwrap();
+            let now = now_unix_secs();
+            let rows = [
+                (b"a".to_vec(), Some(now + 3_600)),
+                (b"b".to_vec(), None),
+                (b"c".to_vec(), Some(now + 86_400)),
+            ];
+            {
+                let db = open_engine_with(EngineKind::LsmTree, Some(&src_dir), &migrate_config()).unwrap();
+                let tx = db.begin();
+                for (k, e) in &rows {
+                    match e {
+                        Some(v) => assert!(tx.set_with_ttl(k, b"v".to_vec(), Duration::from_secs(v - now))),
+                        None => assert!(tx.set_raw(k, b"v".to_vec())),
+                    }
+                }
+                tx.commit();
+                db.flush().unwrap();
+                db.checkpoint().unwrap();
+            }
+            let snap = r.join(match fmt {
+                SnapshotFormat::Bin => "s.bin",
+                SnapshotFormat::Jsonl => "s.jsonl",
+            });
+            export_to_dir(EngineKind::LsmTree, &src_dir, &snap, fmt, false).unwrap();
+            import_from_dir(EngineKind::Bitcask, &dst_dir, &snap, fmt, false).unwrap();
+            let dst = open_engine_with(EngineKind::Bitcask, Some(&dst_dir), &migrate_config()).unwrap();
+            let tx = dst.begin();
+            for (k, want) in &rows {
+                let m = tx.get_meta(k).unwrap_or_else(|| panic!("{fmt:?}：键 {:?} 没搬过去", String::from_utf8_lossy(k)));
+                let got = m.expire_unix_secs;
+                assert_eq!(got, *want, "{fmt:?}：{:?} 的到期时刻变了（要 {want:?}，实得 {got:?}）", String::from_utf8_lossy(k));
+            }
+            tx.commit();
+            drop(tx);
+            let _ = std::fs::remove_dir_all(&r);
+        }
+    }
+
+    /// 反面：老格式文件（001，没有 expire 的位置）读回来一律永久 —— 读侧不许"猜"哪一行有 TTL。
+    #[test]
+    fn v1_snapshot_reads_back_as_permanent() {
+        use crate::common::ExportRecord;
+        let r = root("v1_permanent");
+        let dir = r.join("bitcask");
+        std::fs::create_dir_all(&dir).unwrap();
+        let snap = r.join("old.bin");
+        {
+            let mut w = ExportWriter::bin(&snap, false).unwrap();
+            assert!(w.push(ExportRecord::new(b"k".to_vec(), Some(b"v".to_vec()))));
+            w.finish().unwrap();
+        }
+        import_from_dir(EngineKind::Bitcask, &dir, &snap, SnapshotFormat::Bin, false).unwrap();
+        let db = open_engine_with(EngineKind::Bitcask, Some(&dir), &migrate_config()).unwrap();
+        let tx = db.begin();
+        assert_eq!(tx.get_meta(b"k").unwrap().expire_unix_secs, None, "001 文件里没这个字段，读侧不许凭空造一个到期时刻");
+        tx.commit();
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
     /// 现状记录（和第 6 项前半同一条链，**待你定夺**的那一格）：memory 的启停快照不保存墓碑。
     ///
     /// 链条：`write_snapshot` 折的是 `tx.scan_page(...)` 交出的**存活行**，`KvRecord` 那一行没有
@@ -1249,16 +1339,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&rr);
     }
 
-    /// 现状记录（**不是**合格判据，是待你定夺的那一格）：`migrate` 今天把 TTL 弄丢。
+    /// `migrate` 要保住 TTL（0.5.0 的那件事）。
     ///
-    /// 链条只有一处：源侧出口 `live_record_of_logical`（`common/store.rs:475`）交的是
-    /// **用户字节**（`m.user().to_vec()` ⇒ 信封已被剥），`pump` 写侧一律 `pack_plain` 重新打 ⇒
-    /// 带 TTL 的键搬完变永久。`ExportRecord{key, value}` 里也没有地方放 expire。
-    /// ⇒ 这条断言钉的是"当前行为"，真要修就得动 `ExportRecord`（公开结构体加字段对下游是
-    /// 破坏性变更，会把下一次发布抬成 0.5.0），所以**先如实记下来、不动语义**。
-    /// 修好之后这一条必须翻红并改写成"必须保住 TTL" —— 它不是给现状背书的。
+    /// 这条**以前是现状记录**：`migrate_currently_drops_ttl_characterization` 钉的是"当前会丢"，
+    /// 丢的链条只有一处 —— 源侧出口 `live_record_of_logical` 交用户字节（信封已剥）而写侧一律
+    /// `pack_plain` 重新打，`ExportRecord{key, value}` 里没有放 expire 的位置。
+    /// 出口加上 `expire_unix_secs` 之后本条按计划翻红 ⇒ 就地改写成"必须保住 TTL"（这正是当初
+    /// 把它写成断言而不是写成一段说明的目的）。永久行也在里面：`None` 不许被写成 `Some`。
     #[test]
-    fn migrate_currently_drops_ttl_characterization() {
+    fn migrate_carries_ttl_across_engines() {
         let rr = root("mig_ttl_probe_root");
         let src_dir = rr.join("lsm_tree");
         std::fs::create_dir_all(&src_dir).unwrap();
@@ -1279,9 +1368,9 @@ mod tests {
         .unwrap();
         let tx = dst.begin();
         let m = tx.get_meta(b"has-ttl").expect("这把键要搬过去");
-        assert_eq!(
-            m.expire_unix_secs, None,
-            "migrate 的 TTL 行为变了 ⇒ 本条要翻红，并改写成'必须保住 TTL'"
+        assert!(
+            m.expire_unix_secs.is_some(),
+            "migrate 把 TTL 弄丢了：到期时刻在出口被剥掉 ⇒ 键搬完变永久"
         );
         tx.commit();
         let _ = std::fs::remove_dir_all(&rr);

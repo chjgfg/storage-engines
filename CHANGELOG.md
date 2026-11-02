@@ -18,6 +18,31 @@
 
 ## 未发布：merge 从 vacuum 拆出 + merge 时间构成 + 大档回收守卫（2026-11-02，M81）
 
+### 破坏性变更（版本号要抬 0.5.0）：`ExportRecord` 多一个 `expire_unix_secs` —— 三条搬运门不再丢 TTL
+
+- 根因只有一处：源侧出口 `live_record_of_logical`（`common/store.rs`）以前只交 `m.user()`
+  （信封已剥），写侧一律 `pack_plain` 重新打 ⇒ **`migrate`、`export_to_file`、`export_to_dir`
+  与统一 CLI 全是 TTL 黑洞**：带 TTL 的键搬一次就变永久。`ExportRecord` 里根本没有放 expire 的位置，
+  所以这不是"格式没选对"，是那条链上唯一的出口漏了。
+- 选"加字段"而不是"继续丢"：`ExportRecord { key, value }` 这种字面量在下游是**编译不过**的 ⇒
+  语义化版本要抬 **0.5.0**（`Cargo.toml` 已改）。给了两条退出口：`ExportRecord::new(key, value)`
+  （老写法，永久）与 `#[derive(Default)]` ⇒ 不关心 TTL 的调用点写 `..ExportRecord::default()` 即可。
+- 文件侧改走**第三版** `BPEXP003`（001 字段序 + 每条 8 字节绝对到期时刻）：`ExportWriter::bin_v3`，
+  `tools::export_to_file` / `export_to_dir` 都走它。JSONL 走可选 `expire` 字段。
+  **读侧三个版本都认（只认魔数、不照内容猜）** ⇒ 老文件照旧能导；001/002 的字节形状一字未动
+  （`tools_bin_format_matches_downstream_bytes` 那把逐字节守卫继续绿）。
+- 判据一律用**绝对到期时刻**而不是剩余时间：剩余时间是读出来的瞬时量，两次读之间就变。
+  新守卫 `file_carries_ttl_through_export_and_import`（bin 与 jsonl 两种载体 × 三把键：TTL 键、
+  永久键、另一个 TTL 键逐键比对），反面 `v1_snapshot_reads_back_as_permanent`（001 文件里没有这个
+  字段 ⇒ 读侧不许凭空造一个到期时刻）。对照实验：把导出退回 `ExportWriter::bin(out,false)` ⇒
+  新守卫立刻红在 `"a" 的到期时刻变了（要 Some(1793600203)，实得 None）`。
+- `migrate_currently_drops_ttl_characterization`（上一节的现状记录）**今天翻红并已改写成**
+  `migrate_carries_ttl_across_engines` —— 这正是它当初写成断言的目的。
+- 导入侧一条口径写死：文件里**已过期**的行照原样落库（到期时刻在过去 ⇒ 读出来是"不存在"，回收会带走），
+  不在导入这一步替用户判过期 —— 那等于悄悄少搬几把键。
+- ⚠️ 仍**没做**的一件相关项：`import` 还是覆盖语义，没有 `--skip-existing`（"墓碑算见过"那三条口径
+  目前只在 `tools::sync` 里）。这条与 TTL 无关，等点名。
+
 ### 第 6 项收尾：八条 `<引擎>-{import,export}-kv` 删掉，搬运只剩一对 CLI
 
 - 删 `src/{bitcask,bplus_tree,lsm_tree,memory}/bin/{import_kv,export_kv}.rs` 八个文件 + `Cargo.toml`
@@ -76,12 +101,12 @@
   "12→8" 与 `Cargo.toml` 实际条数（含 `main` 共 **13** 条）对不上 —— 数错了的账不能照着执行。
   现在 `[[bin]]` 是 13 + 2 = 15 条，旧的八条继续可用，等你点名"删"再一次性收（那一刀要连
   README 的调用示例、`Cargo.toml` 头部注释与方案里的格子数一起改）。
-- 两个**没有点开的决定**记在这儿，不替用户拍：
-  ① 文件口子里今天**没有 TTL** —— 导出侧交的是用户字节（`ExportRecord` 里没地方放 expire），
-    而 `BPEXP003` 与 JSONL 的可选 `expire` 字段已经就位、读侧三个版本都认，缺的只是**导出侧没往里填**。
-    补上就是给 `export_to_dir` 逐键读 `get_meta` 并改走 v3 —— 换的是工具输出格式，不是库文件格式。
-  ② `import` 是覆盖语义、且不做"墓碑算见过" ⇒ 它不能当增量同步用；那套判定只在 `tools::sync` 里。
-    要不要给 import 加 `--skip-existing`（把 sync 的三条口径搬到文件版），也是同一个决定。
+- 当时记下的两个待定点，现在的状态：
+  ① 文件口子的 TTL —— **已做**（见本文最上一节"破坏性变更（版本号要抬 0.5.0）"：出口加
+    `ExportRecord::expire_unix_secs`、导出改走 `BPEXP003`、导入按绝对时刻重打信封）。
+    当时的说法"缺的只是导出侧没往里填"是对的，只是那一填要动公开结构体 ⇒ 抬版本。
+  ② `import` 仍是覆盖语义、不做"墓碑算见过" ⇒ **仍未做**，等点名（要的是给 import 加
+    `--skip-existing`，把 `tools::sync` 那三条口径搬到文件版）。
 
 ### 第 5 项后半：自动回收把"何时开一轮"与"这轮走完没有"拆成两件事
 

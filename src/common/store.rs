@@ -210,20 +210,23 @@ where
     // "墓碑记成 value=None" 由下面这份映射判 —— 与改前 `collect_rows_as` 的判据同一份。
     fold_rows_streaming(store, include_deleted, None, None, |key, _ver, value| {
         let rec = match value {
-            RowValue::Tombstone => Some(ExportRecord { key, value: None }),
-            RowValue::Value(bytes) => match unseal(bytes) {
-                Some(user) => Some(ExportRecord {
-                    key,
-                    value: Some(user),
-                }),
-                None => {
-                    if include_deleted {
-                        Some(ExportRecord { key, value: None })
-                    } else {
-                        None
+            RowValue::Tombstone => Some(ExportRecord::new(key, None)),
+            RowValue::Value(bytes) => {
+                // 出口必须把 TTL 一起带出去：只交用户字节 = 导入侧无从重打信封 ⇒ 键变永久。
+                // 多解一次信封（1 个标签字节 + 8 字节）换的是"搬一次少一批到期时刻"。
+                // ⚠️ 取账要在 `unseal(bytes)` 把字节交出去**之前** —— 那之后 `bytes` 就没了。
+                let expire = decode_value_meta(&bytes).expire_unix_secs();
+                match unseal(bytes) {
+                    Some(user) => Some(ExportRecord { key, value: Some(user), expire_unix_secs: expire }),
+                    None => {
+                        if include_deleted {
+                            Some(ExportRecord::new(key, None))
+                        } else {
+                            None
+                        }
                     }
                 }
-            },
+            }
             // 读不到与墓碑不是一回事：整行不参与
             RowValue::Missing => None,
         };
@@ -289,15 +292,16 @@ fn record_of<S: VersionedStore>(
 ) -> Option<ExportRecord> {
     match store.materialize(row) {
         RowValue::Missing => None,
-        RowValue::Tombstone => include_deleted.then_some(ExportRecord { key, value: None }),
+        RowValue::Tombstone => include_deleted.then_some(ExportRecord::new(key, None)),
         // 逻辑值还要剥一次信封；过期与墓碑同待（只在 include_deleted 时出现）
-        RowValue::Value(logical) => match logical_to_user(logical) {
-            Some(user) => Some(ExportRecord {
-                key,
-                value: Some(user),
-            }),
-            None => include_deleted.then_some(ExportRecord { key, value: None }),
-        },
+        RowValue::Value(logical) => {
+            // 取账要在 `logical_to_user` 收走字节之前（同上，`bytes`/`logical` 都是移动语义）
+            let expire = decode_value_meta(&logical).expire_unix_secs();
+            match logical_to_user(logical) {
+                Some(user) => Some(ExportRecord { key, value: Some(user), expire_unix_secs: expire }),
+                None => include_deleted.then_some(ExportRecord::new(key, None)),
+            }
+        }
     }
 }
 
@@ -408,6 +412,7 @@ pub fn search_page_walk<S: VersionedStore>(
             if items.len() < page_size {
                 items.push(ExportRecord {
                     key,
+                    expire_unix_secs: logical.as_ref().and_then(|l| decode_value_meta(l).expire_unix_secs()),
                     value: logical.and_then(logical_to_user),
                 });
                 return true;
@@ -448,6 +453,7 @@ pub fn scan_page<S: VersionedStore>(
         out.push(ExportRecord {
             key,
             value: Some(m.user().to_vec()),
+            expire_unix_secs: m.expire_unix_secs(),
         });
     }
     (out, if more { cursor } else { None })
@@ -475,6 +481,9 @@ pub fn live_record_of_logical(
     Some(ExportRecord {
         key,
         value: Some(m.user().to_vec()),
+        // ⚠️ 这一行就是 0.5.0 的那件事：这条门是 export / migrate / 快照文件**共用**的出口，
+        // 以前只交 `m.user()` ⇒ 到期时刻在出口就被丢掉，导出去再导回来一律变永久。
+        expire_unix_secs: m.expire_unix_secs(),
     })
 }
 

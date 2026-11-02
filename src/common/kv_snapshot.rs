@@ -393,13 +393,30 @@ impl ExportWriter {
         })
     }
 
+    /// 写**第三版** bin（`BPEXP003` = 001 的字段序 + 每条 8 字节绝对到期时刻）。
+    /// 快照文件是跨库载体 ⇒ `tools::export_to_file` / 统一 CLI 走这条：不带 TTL 的文件
+    /// 等于"搬一次少一批到期时刻"。读侧三个版本都认（只认魔数），所以老文件继续能导。
+    pub fn bin_v3(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            sink: Sink::bin_v3(path)?,
+            err: None,
+        })
+    }
+
     /// 交给导出回调的那一步：`true` = 接着折。已经错过就一律 `false`（一行都不再写）。
     ///
     /// 门面导出（`ExportRecord`：只有键与已剥壳的值）走这条；裸 LSM 引擎那条给的是
     /// `(键, 值, seq)` 三元组，用 [`Self::push_record`] —— 两者都只是行形状不同，
     /// 编码与"错过就收手"这套胶只有一份。
     pub fn push(&mut self, rec: ExportRecord) -> bool {
-        self.push_record(KvRecord::new(rec.key, rec.value))
+        let mut kv = KvRecord::new(rec.key, rec.value);
+        // ⚠️ TTL 必须在这一行过桥：以前这里把 `ExportRecord` 折成 `KvRecord` 时只搬键与值，
+        // 于是"文件里没地方放 expire"这件事被写成"这条门天生不带 TTL"。003 就位之后，
+        // 过桥时漏填才是唯一会丢的东西。
+        if let Some(e) = rec.expire_unix_secs {
+            kv = kv.with_expire(e);
+        }
+        self.push_record(kv)
     }
 
     /// [`Self::push`] 的通用版：行已经是 `KvRecord`（可以带 seq）时用这条。
@@ -870,10 +887,7 @@ mod tests {
             let mut g = ExportWriter::bin(&glued, false).unwrap();
             for r in &plain {
                 assert!(
-                    g.push(ExportRecord {
-                        key: r.key.clone(),
-                        value: r.value.clone(),
-                    }),
+                    g.push(ExportRecord::new(r.key.clone(), r.value.clone())),
                     "逐行推送中途被拒"
                 );
             }

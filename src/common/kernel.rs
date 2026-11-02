@@ -648,10 +648,7 @@ mod tests {
     fn search_page_kernel_distinguishes_unmeasured_from_exhausted() {
         use crate::common::{ExportRecord, KeyMatchMode, SearchQuery};
 
-        let rec = |i: usize| ExportRecord {
-            key: format!("k{i:02}").into_bytes(),
-            value: Some(vec![b'v']),
-        };
+        let rec = |i: usize| ExportRecord::new(format!("k{i:02}").into_bytes(), Some(vec![b'v']));
         let keys = |p: &crate::common::SearchPage| {
             p.items.iter().map(|r| r.key.clone()).collect::<Vec<_>>()
         };

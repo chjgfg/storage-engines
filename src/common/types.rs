@@ -6,11 +6,34 @@ use std::write;
 use std::writeln;
 
 /// 导出用的一条逻辑记录（已解码 blob，无 version 后缀）
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ⚠️ **0.5.0 起多了一个 `expire_unix_secs`**：在这之前，"导出/导入/migrate"这三条门都是
+/// **TTL 黑洞** —— 源侧出口把值信封剥掉交用户字节，写侧一律 `pack_plain` 重新打，于是带 TTL 的
+/// 键搬完一律变永久（`ExportRecord` 里根本没有放 expire 的地方）。这不是格式决定，是那条链
+/// 只有这一个洞：要么给公开结构体加字段（对下游 `ExportRecord { key, value }` 那种字面量是
+/// 破坏性变更 ⇒ 抬 0.5.0），要么 TTL 继续丢。选的加字段，理由写在 CHANGELOG。
+/// `Default` 是**故意 derive 的**：下游那些"我不关心 TTL"的构造点可以写
+/// `..ExportRecord::default()`，不必每个字段都补一遍。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExportRecord {
     pub key: Vec<u8>,
     /// `None` 表示 tombstone（仅当 include_deleted 时出现）
     pub value: Option<Vec<u8>>,
+    /// 绝对到期时刻（unix 秒）。`None` = 永久。
+    /// 与 `kv_snapshot::KvRecord::expire_unix_secs` 同一个含义、同一个编码（快照文件里 0 = 永久）。
+    pub expire_unix_secs: Option<u64>,
+}
+
+impl ExportRecord {
+    /// 两字段的老写法（键 + 用户值，永久）。留着是为了"不关心 TTL"的调用点不必改一行。
+    pub fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        Self { key, value, expire_unix_secs: None }
+    }
+
+    pub fn with_expire(mut self, expire_unix_secs: u64) -> Self {
+        self.expire_unix_secs = Some(expire_unix_secs);
+        self
+    }
 }
 
 /// vacuum 结果统计
