@@ -1,6 +1,12 @@
-//! 搬运数据层：跨引擎 `migrate` + 快照文件的 `export` / `import`。
+//! 搬运数据层：跨引擎 `migrate` / `sync` + 快照文件的 `export` / `import`。
 //!
 //! **不属于任何引擎核心**，只服务运维与换引擎那一次动作（停进程 → 搬 → 起进程）。
+//!
+//! ## 统一 CLI（M81 第 6 项）
+//! `bin/export-kv` / `bin/import-kv`（实体在 `src/tools/bin/`）只有一对，靠 `--engine` 选家；
+//! 它们调的就是 [`migrate::export_to_dir`] / [`migrate::import_from_dir`]，本身不含任何搬运逻辑。
+//! 跨库**补齐**（目标已有的一个字不动、TTL 跟着走、墓碑算"见过"）不在这个口子里 ——
+//! 那是 [`migrate::sync`]，库对库。
 //!
 //! ## 为什么要单独有这一层
 //! 在这之前，本仓库的"搬运"散在八个 `bin/*-import-kv` / `bin/*-export-kv` 里：每家一份

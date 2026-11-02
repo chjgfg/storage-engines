@@ -43,6 +43,14 @@ path = "src/main.rs"
 #   cargo run --release --bin lsm-import-kv     -- --dir ./lsm -i snap.bin
 
 [[bin]]
+name = "export-kv"
+path = "src/tools/bin/export_kv.rs"
+
+[[bin]]
+name = "import-kv"
+path = "src/tools/bin/import_kv.rs"
+
+[[bin]]
 name = "bitcask-bench-bulk"
 path = "src/bitcask/bin/bench_bulk.rs"
 

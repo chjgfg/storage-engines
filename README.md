@@ -54,12 +54,17 @@ cargo test                    # 跑全部测试
 
 `src/main.rs` 是一份可运行的完整示例,覆盖门面层所有能力(读写 / 批量 / 扫描 / TTL / 写冲突 / bulk 导入 / 维护操作)。
 
-另有 12 个命令行工具用于**跨引擎搬数据**和**压测**,详见 [命令行工具](#命令行工具数据搬运与压测):
+另有 15 个命令行工具用于**跨引擎搬数据**和**压测**,详见 [命令行工具](#命令行工具数据搬运与压测)。
+M81 起数据搬运有**统一的一对**（`--engine` 选家，四家同一条读写路径）：
 
 ```bash
-cargo run --release --bin bitcask-export-kv -- --dir ./data/bitcask --out snap.bin --format bin
-cargo run --release --bin lsm-import-kv     -- --input snap.bin --dir ./data/lsm --format bin
+cargo run --release --bin export-kv -- --engine bitcask --dir ./data/bitcask --out snap.bin
+cargo run --release --bin import-kv -- --engine lsm_tree --dir ./data/lsm --in snap.bin
+# 库对库补齐(目标"见过"的一个字不动、TTL 跟着走)走库内 API：storage_engines::tools::sync
 ```
+
+旧的按引擎命名的那一组（`bitcask-export-kv` / `lsm-import-kv` …）本轮**没有删**——删入口对运维脚本是
+破坏性动作，等你点名再一次性收。
 
 ### 核心用法
 
@@ -3972,9 +3977,21 @@ data.db.lock       单写者锁(内含 pid)
 
 ## 命令行工具:数据搬运与压测
 
-12 个可执行文件,分两类:**跨引擎搬数据**(`import_kv` / `export_kv`)和**压测**(`bench`)。
+15 个可执行文件,分两类:**跨引擎搬数据**(`import_kv` / `export_kv` / `sync` 走的是同一层)和**压测**(`bench`)。
 
-四个引擎各有一套同名工具,而 `[[bin]]` 的 name 必须全局唯一,所以统一加引擎前缀:
+M81 起搬数据有**统一的一对**：`--engine` 选家，四家同一条读写路径（外壳只解析参数，搬运逻辑仍在
+`tools::export_to_dir` / `tools::import_from_dir` 里，一份都不复制）：
+
+| 统一工具 | 干什么 | 例子 |
+|---|---|---|
+| `export-kv` | 引擎 → 快照文件（`bin` / `jsonl`） | `cargo run --release --bin export-kv -- --engine bitcask --dir ./data/bitcask --out snap.bin` |
+| `import-kv` | 快照文件 → 引擎（覆盖语义；`--wipe` 整库换掉） | `cargo run --release --bin import-kv -- --engine lsm_tree --dir ./data/lsm --in snap.bin` |
+
+⚠️ 库对库**补齐**（目标"见过"的一个字不动、TTL 跟着走、墓碑算"见过"）不走这两个 CLI，
+走库内 API `storage_engines::tools::sync(&src, &dst)` —— CLI 那两个口子今天仍是覆盖语义。
+
+下面这四个引擎各自的那一套（`bitcask-export-kv` … `memory-import-kv`）**本轮没有删**：删入口对
+运维脚本是破坏性动作，等点名再一次性收。四个引擎各有一套同名工具,而 `[[bin]]` 的 name 必须全局唯一,所以统一加引擎前缀:
 
 | 引擎 | 导出 | 导入 | 压测 |
 |---|---|---|---|

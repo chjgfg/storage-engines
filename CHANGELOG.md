@@ -20,6 +20,7 @@
 
 ### 第 6 项后半（上半）：`tools::sync` —— 跨库补齐，目标"见过"的一个字都不动
 
+
 - 新顶层函数 `storage_engines::tools::sync(from: &dyn KvEngine, to: &dyn KvEngine) -> Result<SyncStats, String>`
   （**不是 trait 方法** ⇒ 门面合同没动）。语义 = "把 A 里有而 B 里没有的补进 B"，幂等：同一份源
   同步两次，第二次 `inserted == 0`。与 `migrate` 的分工写进文档：migrate 是换布局的一次性搬运
@@ -43,6 +44,25 @@
   位置；真要修就得给公开结构体加字段 = 对下游破坏性变更，会把下一次发布抬成 0.5.0）；
   `memory_snapshot_currently_drops_tombstones_characterization` ⇒ memory 的启停快照**不保存墓碑**
   （活行能活过重启，"这把键被删过"活不过），所以它作为 sync 目标时判据①的地基会在重启后消失。
+
+### 第 6 项后半（下半）：统一 `export-kv` / `import-kv` 一对 CLI（靠 `--engine` 选家）
+
+- 新增 `bin/export-kv` / `bin/import-kv`（实体 `src/tools/bin/{export_kv,import_kv}.rs`，`[[bin]]` 显式
+  path 条目）。它们**不含任何搬运逻辑**，只是把 `--engine/--dir/--out|--in/--format/--wipe/
+  --include-deleted` 接到既有的 `tools::export_to_dir` / `tools::import_from_dir` 上 —— 原先四家
+  各有一份参数解析 + 格式分支 + 收尾数条数，调的却是同一个函数，那正是"基座被复制"的形状。
+- 实测往返（小库，逐字节核过）：`jsonl → bitcask → bin → lsm_tree → jsonl`，两把键
+  `k1=hello` / `k2=world` 原样回来；三条 CLI 输出各自的行数账（活/墓碑分列）。
+- ⚠️ **旧的八家 `*-import-kv` / `*-export-kv` 我没删**：删入口对运维脚本是破坏性动作，而且方案写的
+  "12→8" 与 `Cargo.toml` 实际条数（含 `main` 共 **13** 条）对不上 —— 数错了的账不能照着执行。
+  现在 `[[bin]]` 是 13 + 2 = 15 条，旧的八条继续可用，等你点名"删"再一次性收（那一刀要连
+  README 的调用示例、`Cargo.toml` 头部注释与方案里的格子数一起改）。
+- 两个**没有点开的决定**记在这儿，不替用户拍：
+  ① 文件口子里今天**没有 TTL** —— 导出侧交的是用户字节（`ExportRecord` 里没地方放 expire），
+    而 `BPEXP003` 与 JSONL 的可选 `expire` 字段已经就位、读侧三个版本都认，缺的只是**导出侧没往里填**。
+    补上就是给 `export_to_dir` 逐键读 `get_meta` 并改走 v3 —— 换的是工具输出格式，不是库文件格式。
+  ② `import` 是覆盖语义、且不做"墓碑算见过" ⇒ 它不能当增量同步用；那套判定只在 `tools::sync` 里。
+    要不要给 import 加 `--skip-existing`（把 sync 的三条口径搬到文件版），也是同一个决定。
 
 ### 第 5 项后半：自动回收把"何时开一轮"与"这轮走完没有"拆成两件事
 
