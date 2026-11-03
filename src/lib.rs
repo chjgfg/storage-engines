@@ -23,6 +23,10 @@ pub mod engine;
 pub mod maintenance;
 pub use maintenance::{Maintenance, MaintenanceConfig, MaintenanceHandle, MaintenanceStatus, start_maintenance};
 
+/// KV 终端命令解释器（`shell` / `web` 两个 bin 共用的一份壳内核心）。
+/// 库使用者也可以拿它给自己的运维界面接同一套命令面。
+pub mod terminal;
+
 pub mod bitcask;
 pub mod bplus_tree;
 pub mod lsm_tree;

@@ -1,6 +1,62 @@
 # 更新日志
 
-> 未发布的三节按时间先后排（`2026-10-31` 那份实现 → `2026-11-02` M81 这一轮 → `2026-11-03` M82）；发布时合并成一节。
+> 未发布的几节按时间先后排（`2026-10-31` 那份实现 → `2026-11-02` M81 这一轮 → `2026-11-03` M82 → `2026-11-04` M83）；发布时合并成一节。
+
+## 未发布：M83 —— KV 终端一对（`shell` REPL + `web` DOS 风格终端），一套命令面装进四个引擎（2026-11-04）
+
+### 起因：参照 sql-engine 的终端形态给门面层配"能上手玩"的入口
+
+- sql-engine 项目里有一对交互入口：`src/bin/shell.rs`（逐行 REPL）与 `src/bin/web.rs` +
+  `static/index.html`（axum + DOS 风格终端页，`GET /` 返回页面、`POST /execute` 执行）。
+  本仓库的卖点恰好是"运行时按名字切引擎"，一对 KV 终端正好把它变成看得见的东西 ——
+  同一串命令，四个引擎随便换。
+- 依赖抬到 8 个：`serde_json` / `tokio` / `axum` 直接进 `[dependencies]`（用户 11-04 定的，
+  不做可选 feature），库本体不用它们；README 的依赖说明同步。
+
+### 落地
+
+- **`src/terminal.rs`（新增，`pub mod terminal`）**：命令解释器只有这一份，shell / web 两个外壳
+  只做输入输出 —— 不复刻 sql-engine 那边 `split_statements` 抄两份的教训。解释器是纯函数
+  `run_line(&dyn KvEngine, &mut Option<Box<dyn KvTxn>>, line) -> LineOutcome`，引擎与挂起事务都
+  由调用方拿（事务借用引擎，解释器自己持不住）；`engine <名>` 切换返回 `Switch` 让外壳重建引擎，
+  **开着挂起事务时拒绝**。命令面：`get`/`set`/`setex`/`del`/`exists`/`meta`、`incr`/`decr`、
+  `mset`/`mget`、`scan`/`rscan`/`prefix`/`seek`/`seekprev`/`count`/`find`、TTL 四件套、
+  `begin`/`commit`/`rollback`、`info`/`health`/`vacuum`/`flush`/`checkpoint`/`merge`、
+  `engine`/`help`/`exit`。值含空格用引号包（成对引号 = 字面引号，与词法器同一套）；
+  `mset` 冲突整批回滚（batch_set 本身不回滚，回滚是这层做的）；`scan`/`prefix` 显示封顶 100 行。
+- **`src/bin/shell.rs`（新增）**：交互式 REPL。手写参数解析（沿 export-kv 的游标风格）：
+  `-e/--engine`（默认 memory）、`-d/--dir`（默认 `./data/<引擎名>`）、`-f/--fresh`（只清默认路径，
+  `-d` 给的目录不碰 —— 防手滑）、`-h`。表格用 CJK 感知的手写列宽（不加 unicode-width）；
+  退出时有挂起事务 → 自动回滚并提示（commit 是调用者显式的动作，退出不替他提交）。
+- **`src/bin/web.rs`（新增）**：axum 0.8，`GET /` 把 `static/index.html` 编译期嵌进 binary，
+  `POST /execute` 收 `{"input":...}` **按行切分**逐条跑（KV 的值里分号太常见，不按分号切）。
+  共享状态 `Arc<Mutex<Box<dyn KvEngine>>>`；「跑一批」收进 `run_batch` —— 挂起事务的整个
+  生命周期（含批末自动提交）关在函数体里，`Switch` 返回后借用交还，外层再换 `*guard`。
+  盘引擎默认目录 `./data/web/<引擎名>`，与 shell 互不踩。
+- **`static/index.html`（新增）**：DOS 风格终端页，视觉体系照 sql-engine 那份搬（纯黑三档、
+  等宽栈、隔行表格、"命令行即历史"、↑↓ 历史、侧边栏演示条目点执行/▶ 展开、divider 拖宽、
+  右下角拖角）。差异两处：标题栏加**引擎下拉框**（切换即 POST `engine <名>`，响应 `engine`
+  字段回填选中态与提示符）；侧边栏演示改六组（基础读写 / 批量扫描 / 计数器 TTL / MVCC 事务 /
+  引擎切换 / 维护面）。
+
+### 过程里抓到的一个真 bug（浏览器与 curl 各验证一遍）
+
+- 第一版 `run_batch` 在 `Switch` 时返回的是切换行的**下标 `i`**，外层 `idx += consumed` 后从
+  同一行重跑 —— 死循环：目录已被自己刚开的引擎锁住（fs4），第二次 `open` 必 err，而 err 分支
+  不 break，于是无限重开。修法 = consumed 含本行（`i + 1`），注释写死这条教训。
+- web 的 `exit` 提前返回时挂起事务曾直接 drop —— 四家 `Transaction` 的 `Drop` 都有"未终结即
+  自动回滚"的止血兜底（不会停摆回收），但那只是日志里的事；现在显式回滚并在输出里说出口。
+
+### 验证
+
+- `terminal` 单测 11 条（token 切分 / 读写往返 / 参数用法错误 / incr 非整数 / mset-mget-count-
+  scan-seek / 100 行封顶 / find 分页与下一页提示 / begin-commit-rollback / vacuum 因挂起事务整轮
+  跳过 / 切换被挂起事务拒绝 + 别名与目录 / TTL 四件套与 exit）。
+- shell 管道喂真命令冒烟（set/get/mset/prefix/begin-rollback/count/help/exit），
+  `engine lsm` 会话内切换实测 141 ms 落地。
+- web 用 curl 过了：多行批、`engine lsm` → `engine memory` 两次切换、`incr` 非整数错误路径、
+  `exit` 回滚提示；浏览器（内置 IAB）点演示条目执行、下拉框切换同步提示符、手输多行批、
+  health 表格渲染，截图核对视觉。
 
 ## 未发布：M82 —— 自动回收退回"扫描量与写入量 1:1"，半路的轮次交给维护器（2026-11-03）
 

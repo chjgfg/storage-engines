@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>storage-engines · KV Web Terminal</title>
+<style>
+  /* ============ 黑色主题（与 sql-engine 的终端同一套视觉体系） ============ */
+  :root {
+    --bg:      #000000;      /* 最外层纯黑 */
+    --bg-dark: #0d0d0d;      /* 面板/终端底 */
+    --bg-soft: #111111;      /* 略亮面板 */
+    --bg-hover:#1c1c1c;      /* 悬停 */
+    --bg-active:#242424;     /* 按下/选中 */
+    --text:    #e0e0e0;      /* 主文字 */
+    --text-strong:#ffffff;   /* 提示符/强调 */
+    --dim:     #8a8a8a;      /* meta/次要 */
+    --faint:   #5a5a5a;      /* 更弱 */
+    --accent:  #5fa8e0;      /* 引擎名/链接（降饱和蓝） */
+    --echo:    #8fb8d6;      /* 命令回显（低饱和蓝） */
+    --ok:      #8fce9f;      /* 维护面输出（不刺眼绿） */
+    --txn:     #b7a5d6;      /* 事务输出（低饱和紫） */
+    --err:     #cf8b83;      /* 错误（暗红） */
+    --border:  #262626;      /* 常规边框 */
+    --border-strong:#333;    /* 强化边框 */
+
+    --r:   6px;
+    --r-sm:4px;
+
+    --fs-lg: 15px;    /* logo */
+    --fs:    14px;    /* 终端正文 */
+    --fs-sm: 12px;    /* 表单/按钮/列表 */
+    --fs-xs: 11px;    /* 旁注 */
+
+    --sb-w: 10px;
+    --sb-h: 8px;
+    --sb-track: rgba(255,255,255,.06);
+    --sb-thumb: #3a3a3a;
+    --sb-thumb-hover:#4d4d4d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+
+  body {
+    font-family: "Cascadia Mono", "JetBrains Mono", Menlo, Consolas,
+                 "Courier New", ui-monospace, SFMono-Regular, monospace;
+    background: var(--bg);
+    color: var(--text);
+    font-size: var(--fs);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  *::-webkit-scrollbar { width: var(--sb-w); height: var(--sb-h); }
+  *::-webkit-scrollbar-track { background: var(--sb-track); border-radius: var(--r-sm); }
+  *::-webkit-scrollbar-thumb {
+    background: var(--sb-thumb);
+    border-radius: calc(var(--sb-w) / 2);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background-color: var(--sb-thumb-hover); }
+  * { scrollbar-width: thin; scrollbar-color: var(--sb-thumb) transparent; }
+
+  .screen {
+    position: relative;
+    width: min(1200px, 97vw);
+    height: min(680px, 94vh);
+    background: var(--bg-dark);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    box-shadow: 0 0 0 1px #101010, 0 10px 34px rgba(0,0,0,.9);
+    display: flex;
+    flex-direction: row;
+    overflow: hidden;
+  }
+  .term-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+  /* ---- 顶部标题栏 ---- */
+  .titlebar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    background: #151515;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+    font-weight: bold; letter-spacing: .5px;
+    font-size: var(--fs);
+    user-select: none;
+  }
+  .titlebar .dot { width: 10px; height: 10px; border-radius: 50%; background: #555; }
+  .titlebar .spacer { flex: 1; }
+  #status { color: var(--faint); font-weight: normal; font-size: var(--fs-sm); }
+  .sdot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #5fb87a;
+    box-shadow: 0 0 0 2px rgba(95,184,120,.18);
+  }
+  /* 引擎下拉框：标题栏里的切换器，是本页与 sql-engine 终端最大的不同 */
+  #engineSel {
+    font: inherit; font-size: var(--fs-sm); font-weight: normal;
+    color: var(--accent);
+    background: var(--bg-soft);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
+    padding: 3px 6px;
+    cursor: pointer;
+    outline: none;
+  }
+  #engineSel:hover { border-color: #444; }
+  #engineSel:focus { box-shadow: inset 0 0 0 1px rgba(102,180,255,.35); }
+  #engineSel option { background: var(--bg-dark); color: var(--text); }
+
+  /* ---- 终端区 ---- */
+  #term {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.78;
+    cursor: text;
+  }
+  .line { min-height: 1.2em; }
+  .line .prompt { color: var(--text-strong); font-weight: bold; }
+  .line .prompt .eng { color: var(--accent); }
+  .line.echo .cmdtext { color: var(--echo); }
+  .line.dim  { color: var(--dim); font-size: var(--fs-sm); }
+  .line.faint{ color: var(--faint); font-size: var(--fs-xs); }
+  .line.err  { color: var(--err); }
+  .line.txn  { color: var(--txn); }
+  .line.okg  { color: var(--ok); }
+  .line.engc { color: var(--accent); }
+  .line.help { color: var(--dim); }
+
+  /* 结果表：全边框 + 隔行底色 + hover */
+  table.result {
+    border-collapse: collapse;
+    margin: 4px 0;
+    font-size: var(--fs-sm);
+  }
+  table.result th, table.result td {
+    border: 1px solid var(--border-strong);
+    padding: 2px 10px;
+    text-align: left;
+  }
+  table.result th { background: #191919; color: #fff; font-weight: bold; }
+  table.result tbody tr:nth-child(odd)  { background: #141414; }
+  table.result tbody tr:nth-child(even) { background: var(--bg-dark); }
+  table.result tbody tr:hover { background: var(--bg-hover); }
+
+  /* 输入行：透明无边框 textarea，focus 蓝色微光，原生白色 caret */
+  .cmdline { display: flex; align-items: flex-start; gap: 8px; }
+  .cmdline .prompt { color: var(--text-strong); font-weight: bold; white-space: nowrap; }
+  .cmdline .prompt .eng { color: var(--accent); }
+  .cmdline textarea {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    resize: none;
+    color: var(--text);
+    font: inherit;
+    line-height: 1.78;
+    caret-color: #fff;
+    overflow: hidden;
+    min-height: 1.78em;
+  }
+  .cmdline:focus-within .prompt { text-shadow: 0 0 8px rgba(255,255,255,.25); }
+  .cmdline textarea:focus { box-shadow: inset 0 0 0 1px rgba(102,180,255,.35); border-radius: 3px; }
+
+  /* ---- 底部 helpbar ---- */
+  .helpbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px;
+    border-top: 1px solid var(--border);
+    background: #101010;
+    color: var(--faint);
+    font-size: var(--fs-xs);
+    user-select: none;
+  }
+  .helpbar button {
+    font: inherit; font-size: var(--fs-xs);
+    color: var(--dim);
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  .helpbar button:hover { color: var(--text); border-color: var(--border-strong); }
+  .helpbar .spacer { flex: 1; }
+
+  /* ---- 分隔拖拽热区（无可见竖线，光标提示） ---- */
+  #divider {
+    width: 6px;
+    cursor: col-resize;
+    background: transparent;
+    flex: 0 0 auto;
+  }
+  #divider:hover { background: rgba(95,168,224,.08); }
+
+  /* ---- 侧边栏 ---- */
+  aside#sideDemos {
+    width: 340px;
+    flex: 0 0 auto;
+    background: var(--bg-dark);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .side-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px;
+    background: #151515;
+    border-bottom: 1px solid var(--border);
+    font-weight: bold; font-size: var(--fs);
+    user-select: none;
+  }
+  .side-head .logo { color: var(--accent); }
+  .side-head .spacer { flex: 1; }
+  .side-head .hint { color: var(--faint); font-weight: normal; font-size: var(--fs-xs); }
+  .side-head .close {
+    color: var(--dim); cursor: pointer; font-weight: normal;
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    padding: 1px 7px; font-size: var(--fs-xs);
+  }
+  .side-head .close:hover { color: var(--text); border-color: var(--border-strong); }
+
+  #sideBody { flex: 1; overflow-y: auto; padding: 10px 12px 20px; }
+
+  /* 使用说明卡（可折叠） */
+  .side-banner {
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--bg-soft);
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    font-size: var(--fs-sm);
+    color: var(--dim);
+  }
+  .side-banner .btitle {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--text); font-weight: bold; cursor: pointer;
+  }
+  .side-banner .btitle .tri { color: var(--accent); font-size: var(--fs-xs); }
+  .side-banner .bbody { margin-top: 8px; line-height: 1.7; }
+  .side-banner .bbody.folded { display: none; }
+  .side-banner kbd {
+    display: inline-block;
+    padding: 0 5px;
+    border: 1px solid var(--border-strong);
+    border-bottom-width: 2px;
+    border-radius: 3px;
+    background: #1a1a1a;
+    color: var(--text);
+    font: inherit; font-size: var(--fs-xs);
+  }
+  .side-banner .ex { color: var(--echo); }
+
+  /* 演示列表 */
+  .dg h3 {
+    color: var(--text);
+    font-size: var(--fs-sm);
+    letter-spacing: .5px;
+    margin: 14px 0 2px;
+  }
+  .dg .g-note { color: var(--faint); font-size: var(--fs-xs); margin-bottom: 6px; }
+  .demos-item {
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg-soft);
+    padding: 6px 9px;
+    margin: 6px 0;
+    cursor: pointer;
+    font-size: var(--fs-sm);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .demos-item:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+  .demos-item.sel {
+    background: #18324a;
+    border-color: #2c5378;
+  }
+  .demos-item .idx { color: var(--faint); font-size: var(--fs-xs); }
+  .demos-item .t { flex: 1; min-width: 0; }
+  .demos-item .tri {
+    color: var(--dim);
+    transition: transform .12s;
+    font-size: var(--fs-xs);
+  }
+  .demos-item .tri:hover { transform: scale(1.2); color: var(--text); }
+  .demos-body {
+    display: none;
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 var(--r-sm) var(--r-sm);
+    background: #0a0a0a;
+    color: var(--echo);
+    font-size: var(--fs-xs);
+    padding: 8px 10px;
+    margin: -6px 0 6px;
+    white-space: pre-wrap;
+  }
+  .demos-body.open { display: block; }
+
+  /* 右下角拖拽手柄 */
+  #resizeCorner {
+    position: absolute;
+    right: 0; bottom: 0;
+    width: 16px; height: 16px;
+    cursor: nwse-resize;
+    color: var(--faint);
+    text-align: center; line-height: 14px;
+    font-size: 10px;
+    user-select: none;
+  }
+  #resizeCorner:hover { color: var(--text); }
+</style>
+</head>
+<body>
+<div class="screen" id="screen">
+  <div class="term-col">
+    <div class="titlebar">
+      <span class="dot"></span><span>KV ENGINE</span>
+      <select id="engineSel" title="切换引擎 —— 同一套命令面，四个引擎随便换">
+        <option value="memory">memory</option>
+        <option value="bitcask">bitcask</option>
+        <option value="bplus_tree">bplus_tree</option>
+        <option value="lsm_tree">lsm_tree</option>
+      </select>
+      <span class="spacer"></span>
+      <span id="status">ready</span>
+      <span class="sdot"></span>
+    </div>
+    <div id="term"></div>
+    <div class="helpbar">
+      <button id="histUp" title="上一条">↑</button>
+      <button id="histDown" title="下一条">↓</button>
+      <span>一行一条命令 · <kbd>Enter</kbd> 执行 · <kbd>Shift+Enter</kbd> 换行（事务多行一批）· 值含空格用引号</span>
+      <span class="spacer"></span>
+      <button id="toggleSide">📋 演示</button>
+    </div>
+  </div>
+  <div id="divider"></div>
+  <aside id="sideDemos">
+    <div class="side-head">
+      <span class="logo">▲</span><span>KV 演示</span>
+      <span class="hint">点条目执行；点 ▶ 看完整命令</span>
+      <span class="spacer"></span>
+      <span class="close" id="closeSide">✕</span>
+    </div>
+    <div id="sideBody">
+      <div class="side-banner" id="sideBanner"></div>
+      <div id="demoList"></div>
+    </div>
+  </aside>
+  <div id="resizeCorner">◢</div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const term = $("#term"), cmd = $("#cmd") || null;
+
+let engine = "memory";
+let hist = [], histIdx = -1, draft = "", busy = false;
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/* ── 终端输出：全部插在当前输入行之前（输入行永远在最底） ───────────── */
+function inputRow() { return $(".cmdline"); }
+function insertBeforeInput(node) {
+  term.insertBefore(node, inputRow());
+  term.scrollTop = term.scrollHeight;
+}
+function addHtml(html, cls) {
+  const d = document.createElement("div");
+  d.className = "line " + (cls || "");
+  d.innerHTML = html;
+  insertBeforeInput(d);
+  return d;
+}
+function addText(text, cls) {
+  text.split("\n").forEach(l => addHtml(esc(l) || "&nbsp;", cls));
+}
+
+/* ── 输入行 ────────────────────────────────────────────────────────── */
+function promptHtml() {
+  return '<span class="prompt">kv:<span class="eng">' + esc(engine) + '</span>&gt;</span>';
+}
+function addCmdLine() {
+  const row = document.createElement("div");
+  row.className = "cmdline";
+  row.innerHTML = promptHtml() + '<textarea id="cmd" rows="1" spellcheck="false"></textarea>';
+  term.appendChild(row);
+  const ta = row.querySelector("textarea");
+  ta.addEventListener("input", autosize);
+  ta.addEventListener("keydown", onKey);
+  ta.focus();
+  autosize.call(ta);
+}
+function autosize() {
+  this.style.height = "auto";
+  this.style.height = this.scrollHeight + "px";
+}
+
+/* ── 执行 ──────────────────────────────────────────────────────────── */
+async function runCmd(text) {
+  text = text.trim();
+  if (!text || busy) return;
+  busy = true;
+  $("#status").textContent = "running…";
+
+  hist.push(text);
+  histIdx = -1;
+  // 命令行即历史：旧行变回显行，底部补一条新输入行
+  const old = inputRow();
+  const oldVal = old.querySelector("textarea").value;
+  old.remove();
+  addHtml(promptHtml() + ' <span class="cmdtext">' + esc(text).replace(/\n/g, "<br>") + "</span>", "echo");
+  addCmdLine();
+
+  try {
+    const resp = await fetch("/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: text })
+    });
+    if (!resp.ok) {
+      addText("HTTP " + resp.status, "err");
+      return;
+    }
+    const data = await resp.json();
+    if (data.results) data.results.forEach(renderOne);
+    if (data.engine) setEngine(data.engine);
+  } catch (e) {
+    addText("网络错误: " + e.message, "err");
+  } finally {
+    busy = false;
+    $("#status").textContent = "ready";
+    if (oldVal && !text) {} // 保留草稿的口子（当前流程草稿随回显清掉）
+    inputRow().querySelector("textarea").focus();
+  }
+}
+
+function renderOne(r) {
+  if (r.ok === false) {
+    addText(r.message || "未知错误", "err");
+    return;
+  }
+  if (r.columns && r.rows) {
+    let html = '<table class="result"><thead><tr>' +
+      r.columns.map(c => "<th>" + esc(c) + "</th>").join("") + "</tr></thead><tbody>";
+    html += r.rows.map(row => "<tr>" +
+      r.columns.map((_, i) => "<td>" + esc(row[i] == null ? "NULL" : row[i]) + "</td>").join("") +
+      "</tr>").join("");
+    html += "</tbody></table>";
+    addHtml(html);
+    if (r.message) addText(footMs(r.message, r.ms), "dim");
+    return;
+  }
+  const cls = { ERROR: "err", TXN: "txn", MAINT: "okg", ENGINE: "engc", HELP: "help",
+                INFO: "help", EXIT: "dim", GET: "", OK: "" }[r.type] || "";
+  addText(footMs(r.message, r.ms), cls);
+}
+function footMs(msg, ms) {
+  return ms == null ? msg : msg + "  (" + Number(ms).toFixed(2) + " ms)";
+}
+
+/* ── 引擎同步 ──────────────────────────────────────────────────────── */
+function setEngine(name) {
+  if (name && name !== engine) engine = name;
+  const sel = $("#engineSel");
+  if ([...sel.options].some(o => o.value === engine)) sel.value = engine;
+  // 提示符里的引擎名全部跟着换
+  document.querySelectorAll(".prompt .eng").forEach(el => { el.textContent = engine; });
+}
+$("#engineSel").addEventListener("change", e => {
+  const name = e.target.value;
+  if (name === engine) return;
+  runCmd("engine " + name);
+});
+
+/* ── 键盘：Enter 执行；Shift/Ctrl+Enter 换行（多行一批）；↑↓ 翻历史 ── */
+function onKey(e) {
+  if (e.isComposing) return;
+  const ta = e.target;
+  if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey) {
+    e.preventDefault();
+    const v = ta.value;
+    ta.value = "";
+    autosize.call(ta);
+    runCmd(v);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    insertNewline(ta);
+  } else if (e.key === "ArrowUp" && !ta.value.includes("\n")) {
+    e.preventDefault(); histUp(ta);
+  } else if (e.key === "ArrowDown" && !ta.value.includes("\n")) {
+    e.preventDefault(); histDown(ta);
+  }
+}
+function insertNewline(ta) {
+  const p = ta.selectionStart;
+  ta.value = ta.value.slice(0, p) + "\n" + ta.value.slice(ta.selectionEnd);
+  ta.selectionStart = ta.selectionEnd = p + 1;
+  autosize.call(ta);
+}
+function setVal(ta, v) { ta.value = v; autosize.call(ta); ta.focus(); }
+function histUp(ta) {
+  if (histIdx === -1) { draft = ta.value; histIdx = hist.length - 1; }
+  else if (histIdx > 0) histIdx--;
+  if (histIdx >= 0) setVal(ta, hist[histIdx]);
+}
+function histDown(ta) {
+  if (histIdx === -1) return;
+  histIdx++;
+  if (histIdx >= hist.length) { histIdx = -1; setVal(ta, draft); }
+  else setVal(ta, hist[histIdx]);
+}
+$("#histUp").addEventListener("click", () => { const ta = inputRow().querySelector("textarea"); histUp(ta); });
+$("#histDown").addEventListener("click", () => { const ta = inputRow().querySelector("textarea"); histDown(ta); });
+term.addEventListener("click", e => {
+  if (e.target === term) inputRow().querySelector("textarea").focus();
+});
+
+/* ── 侧边栏：折叠 / 拖宽 / 拖角 ────────────────────────────────────── */
+const side = $("#sideDemos");
+function toggleSide(show) {
+  const on = show == null ? side.style.display === "none" : show;
+  side.style.display = on ? "flex" : "none";
+  $("#divider").style.display = on ? "block" : "none";
+}
+$("#toggleSide").addEventListener("click", () => toggleSide());
+$("#closeSide").addEventListener("click", () => toggleSide(false));
+
+$("#divider").addEventListener("mousedown", e => {
+  e.preventDefault();
+  const move = ev => {
+    const w = Math.min(640, Math.max(220, window.innerWidth - ev.clientX - 20));
+    side.style.width = w + "px";
+  };
+  const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+  window.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", up);
+});
+$("#resizeCorner").addEventListener("mousedown", e => {
+  e.preventDefault();
+  const screen = $("#screen");
+  const move = ev => {
+    screen.style.width = Math.min(97, Math.max(40, ev.clientX / window.innerWidth * 100)) + "vw";
+    screen.style.height = Math.min(94, Math.max(50, ev.clientY / window.innerHeight * 100)) + "vh";
+  };
+  const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+  window.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", up);
+});
+
+/* ── 使用说明卡 ────────────────────────────────────────────────────── */
+function banner() {
+  $("#sideBanner").innerHTML =
+    '<div class="btitle" id="bFold"><span class="tri">▼</span>使用说明</div>' +
+    '<div class="bbody">' +
+    "提示符 <span class='ex'>kv:memory&gt;</span> —— 冒号后是当前引擎，顶部下拉框随时换。<br>" +
+    "一行一条命令；<kbd>Shift+Enter</kbd> 换行，多行一批跑（事务演示就是这么做的）。<br>" +
+    "值里有空格用引号包：<span class='ex'>set k \"a b\"</span>；成对引号 = 字面引号。<br>" +
+    "示例：<span class='ex'>set name Alice</span> → <span class='ex'>get name</span>" +
+    " → <span class='ex'>begin / commit / rollback</span> → <span class='ex'>vacuum</span>。" +
+    "</div>";
+  $("#bFold").addEventListener("click", () => {
+    const b = document.querySelector("#sideBanner .bbody");
+    const folded = b.classList.toggle("folded");
+    document.querySelector("#bFold .tri").textContent = folded ? "▶" : "▼";
+  });
+}
+
+/* ── 演示列表 ──────────────────────────────────────────────────────── */
+const DEMOS = [
+  { g: "A · 基础读写", note: "写读删查 —— 值含空格用引号包", items: [
+    { t: "写入并读回", sql: "set name Alice\nget name" },
+    { t: "值里有空格和标点", sql: 'set slogan "KV 就是一张大 HashMap"\nget slogan' },
+    { t: "exists / del / 再读", sql: "exists name\ndel name\nget name" },
+    { t: "meta：看版本与墓碑", sql: "set k v\nmeta k\ndel k\nmeta k" },
+  ]},
+  { g: "B · 批量与扫描", note: "mset 整批原子；scan 区间 [起, 止)", items: [
+    { t: "mset 灌三个用户", sql: "mset u:01 张三 u:02 李四 u:03 王五" },
+    { t: "mget（含 miss）", sql: "mget u:01 u:02 u:99" },
+    { t: "prefix 前缀扫", sql: "prefix u:" },
+    { t: "scan / rscan", sql: "scan\nrscan" },
+    { t: "seek / seekprev 边界", sql: "seek u:02\nseekprev u:02" },
+    { t: "count 计数", sql: "count u:\ncount" },
+    { t: "find 模糊分页（按 key 找）", sql: "find u: 0 2\nfind :02" },
+  ]},
+  { g: "C · 计数器与 TTL", note: "值必须是十进制整数才能 incr", items: [
+    { t: "incr / decr", sql: "set visits 10\nincr visits 5\ndecr visits\nincr visits" },
+    { t: "非整数会怎样", sql: "set name Alice\nincr name" },
+    { t: "setex + ttl", sql: "setex captcha 60 42k9\nttl captcha" },
+    { t: "refresh / persist", sql: "refresh captcha 90\nttl captcha\npersist captcha\nttl captcha" },
+  ]},
+  { g: "D · MVCC 事务", note: "begin 之后，同批命令都走这条事务", items: [
+    { t: "提交一条事务", sql: "begin\nset cart 苹果\nget cart\ncommit" },
+    { t: "回滚一条事务", sql: "begin\nset cart 梨\nrollback\nget cart" },
+    { t: "自己写的自己可见", sql: "begin\nset cart 香蕉\nget cart\ncommit\nget cart" },
+    { t: "真空里 commit 会怎样", sql: "commit" },
+  ]},
+  { g: "E · 引擎切换", note: "同一批命令换个引擎再跑 —— 命令面不变", items: [
+    { t: "切到 lsm_tree", sql: "engine lsm" },
+    { t: "切到 bitcask（或点顶部下拉框）", sql: "engine bitcask" },
+    { t: "带目录切 bplus_tree", sql: "engine bplus_tree ./data/web/bplus_demo" },
+    { t: "看当前引擎", sql: "engine" },
+  ]},
+  { g: "F · 维护面", note: "merge 只有 bitcask 认；health 口径四家一致", items: [
+    { t: "info：引擎 / 路径 / 持久性 / 旋钮", sql: "info" },
+    { t: "health：版本链有多长", sql: "health" },
+    { t: "vacuum：回收旧版本", sql: "vacuum" },
+    { t: "flush / checkpoint", sql: "flush\ncheckpoint" },
+    { t: "merge（bitcask）", sql: "merge" },
+    { t: "purge：清过期键", sql: "purge" },
+  ]},
+];
+
+function renderDemos() {
+  const box = $("#demoList");
+  let n = 0;
+  box.innerHTML = "";
+  for (const d of DEMOS) {
+    const g = document.createElement("div");
+    g.className = "dg";
+    g.innerHTML = "<h3>" + esc(d.g) + "</h3>" +
+      '<div class="g-note">' + esc(d.note) + "</div>";
+    d.items.forEach(it => {
+      n++;
+      const item = document.createElement("div");
+      item.className = "demos-item";
+      item.innerHTML = '<span class="idx">' + String(n).padStart(2, "0") + "</span>" +
+        '<span class="t">' + esc(it.t) + "</span>" +
+        '<span class="tri">▶</span>';
+      item.addEventListener("click", () => {
+        box.querySelectorAll(".demos-item").forEach(x => x.classList.remove("sel"));
+        item.classList.add("sel");
+        runCmd(it.sql);
+      });
+      const tri = item.querySelector(".tri");
+      tri.addEventListener("click", ev => {
+        ev.stopPropagation();
+        let body = item.nextElementSibling;
+        if (body && body.classList.contains("demos-body")) {
+          body.classList.toggle("open");
+          tri.textContent = body.classList.contains("open") ? "▼" : "▶";
+          return;
+        }
+        body = document.createElement("div");
+        body.className = "demos-body open";
+        body.textContent = it.sql;
+        item.after(body);
+        tri.textContent = "▼";
+      });
+      g.appendChild(item);
+    });
+    box.appendChild(g);
+  }
+}
+
+/* ── 启动 ──────────────────────────────────────────────────────────── */
+banner();
+renderDemos();
+addText("KV Web Terminal —— 四个引擎，一套命令面。", "dim");
+addText("输入 help 看命令表；点右侧演示条目直接执行；顶部下拉框随时切引擎。", "dim");
+addCmdLine();
+</script>
+</body>
+</html>

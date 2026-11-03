@@ -39,7 +39,7 @@ storage-engines = "0.4"
 `cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M46 又想要版本号依赖,
 只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
 
-MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 5 个(`serde` / `bincode` / `memmap2` / `fs4` / `log`)。
+MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 8 个(`serde` / `bincode` / `memmap2` / `fs4` / `log` 是库本体的,`serde_json` / `tokio` / `axum` 三个是 `shell` / `web` 两个终端 bin 用的)。
 
 ---
 
@@ -54,7 +54,7 @@ cargo test                    # 跑全部测试
 
 `src/main.rs` 是一份可运行的完整示例,覆盖门面层所有能力(读写 / 批量 / 扫描 / TTL / 写冲突 / bulk 导入 / 维护操作)。
 
-另有 7 个命令行工具用于**跨引擎搬数据**和**压测**,详见 [命令行工具](#命令行工具数据搬运与压测)。
+另有 9 个命令行工具,分三件事:**跨引擎搬数据**、**压测**和**KV 终端**(交互式 REPL 与浏览器里的 DOS 风格终端,详见 [命令行工具](#命令行工具数据搬运与压测))。
 数据搬运只有一对（M81 收拢：`--engine` 选家，四家同一条读写路径）：
 
 ```bash
@@ -3974,7 +3974,7 @@ data.db.lock       单写者锁(内含 pid)
 
 ## 命令行工具:数据搬运与压测
 
-7 个可执行文件,分两类:**跨引擎搬数据**(一对:`export-kv` / `import-kv`)和**压测**(四家各一份 bench)。
+9 个可执行文件,分三类:**跨引擎搬数据**(一对:`export-kv` / `import-kv`)、**压测**(四家各一份 bench)和 **KV 终端**(一对:`shell` / `web`)。
 
 M81 之前这里有四套同名的 `import_kv` / `export_kv`（`bitcask-export-kv` … `memory-import-kv`），
 它们调的其实是**同一个** `tools::export_to_dir` / `tools::import_from_dir`，只是各自抄了一份参数解析
@@ -3998,6 +3998,31 @@ M81 之前这里有四套同名的 `import_kv` / `export_kv`（`bitcask-export-k
 
 > 本文下面的历史记述（M45 / M63 那几段事故）里出现的 `<引擎>-export-kv` / `-import-kv` 是**当时**的
 > 命令名，那八条已在 M81 收进上面这一对；`--demo` 旗标同名照用。事故结论一字未改，只是命令名换了。
+
+### KV 终端(shell / web)
+
+把四个引擎装进同一个命令面,交互着玩 —— 命令解释器只有一份(`terminal::run_line`),两个外壳各做各的输入输出:
+
+| 工具 | 形态 | 例子 |
+|---|---|---|
+| `shell` | 交互式 REPL(一行一条命令,CJK 对齐表格) | `cargo run --release --bin shell -- -e lsm -d ./data/lsm` |
+| `web` | 浏览器 DOS 风格终端(axum,页面编译期嵌进 binary) | `cargo run --release --bin web -- -p 8080` |
+
+命令面(repl 里 `help` 同款):基础读写 `get`/`set`/`setex`/`del`/`exists`/`meta`,计数器 `incr`/`decr`,
+批量 `mset`/`mget`,扫描 `scan`/`rscan`/`prefix`/`seek`/`seekprev`/`count`/`find`,TTL 四件套
+`ttl`/`refresh`/`persist`/`purge`,MVCC 事务 `begin`/`commit`/`rollback`,维护面
+`info`/`health`/`vacuum`/`flush`/`checkpoint`/`merge`。值含空格用引号包。
+
+两个都能**运行时切引擎**(`engine <名> [目录]`,web 页面顶部还有下拉框)—— 换的只是解释器背后的
+引擎,命令面一个字不变;开着挂起事务时切换会被拒绝(事务借用了引擎)。web 的盘引擎默认目录是
+`./data/web/<引擎名>`,与 shell 的 `./data/<引擎名>` 互不踩;请求内 `begin` 没收尾会自动提交并提示,
+shell 退出时有挂起事务则自动回滚 —— 两边的口径都写在 `terminal` 的模块文档里。
+
+```bash
+cargo run --release --bin shell -- -e memory          # 不落盘,进程退出即丢
+cargo run --release --bin shell -- -f                 # 只清默认路径 ./data/memory 再开(-d 给的目录不碰)
+cargo run --release --bin web -- -e lsm --port 8080   # 浏览器开 http://localhost:8080/
+```
 
 编译产物在 `target/release/`,可直接分发调用,不必每次都过 cargo。
 
