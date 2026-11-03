@@ -1,6 +1,156 @@
 # 更新日志
 
-> 未发布的两节按时间先后排（`2026-10-31` 那份实现 → `2026-11-02` M81 这一轮）；发布时合并成一节。
+> 未发布的三节按时间先后排（`2026-10-31` 那份实现 → `2026-11-02` M81 这一轮 → `2026-11-03` M82）；发布时合并成一节。
+
+## 未发布：M82 —— 自动回收退回"扫描量与写入量 1:1"，半路的轮次交给维护器（2026-11-03）
+
+### 起因：v0.5.0 五档总验收 `docs/test2.txt` 逐格对 `docs/test1.txt`（= 42ca438 那趟）
+
+- 验收本身五档全过：退出码 0、`SCALE_DONE engines=4`、四家各 33 格 = 132 格、四家 `migrate`
+  各 `rows+min(rows,1000)+1` 唯一键（20M = 20001001，含 B+）。
+- 五项目标都兑现（旧 → 新）：第 1 项 lsm `首页(免 total)` 600k 9.33→4.56 / 5M 18.81→**5.88** /
+  10M 52.52→8.68 / 20M 40.91→6.61 ms（五档 4.1~8.7 ms，行数 33× 单价不涨 ⇒ 税没了；5M 字面
+  ≤5 ms 差 0.9 ms，在本机 1.3~2.6× 噪声内，"5M 未复测"那条收口）；第 2 项 bitcask 20M `vacuum()`
+  166.9→50.9 s + `merge` 单格 123.7 s，两格和 174.6 vs 旧 280.4 ⇒ 省 106 s；第 4 项 lsm `末页(免 total)`
+  五档 0.8~1.2 ms；第 6 项 memory 20M 停 35.8 s / 起 208.6 s / 再起 242.8 s / 快照 2168.9 MB。
+- **但 20/20 格 `灌`/`更新` 全变慢**（20M `灌` bitcask 83.6→93.8、bplus 41.0→60.2、lsm 27.0→41.1、
+  memory 3.1→11.0 µs/行 ⇒ +1028 s；`更新 10%` +266 s），memory `冷重开` 600k 1.317→4.39 s，
+  memory 冷重开后每个单事务格多付 8~10 ms（`multi_get 全miss` 0.6→9.3 µs/键、`seek_prev`
+  24.5→15 516 µs）。20M 整档墙钟 9294.8→11112.7 s 的 +1818 s 里，新增格（三家末页 ~206 s、
+  memory 启停 ~490 s）与 vacuum 省下的 −183 s 之外，**~1100 s 就是这笔税**。
+- 根因回源码核定：`339a559`（M81 第 5 项后半）让 `VacuumScheduler::take_tick` 在"游标不在库头"
+  时对**每次 `begin()`** 都给一片许可（`charged = 0`），而写流里一轮永远开着（账一直攒、游标一绕完
+  立刻再开）⇒ 每个事务扫一整片：1000 行/事务放大 16×、500 行放大 33×、单行事务放大 16384×。
+  memory 冷重开也中招是因为重放走 `begin_transaction()` 每 1000 行一页；磁盘三家冷重开不写，所以
+  只有 memory 在重启后留着一个开着的轮次。
+
+### 改法（A：维护器推，`begin()` 退回 1:1 —— 用户 11-03 定的）
+
+- `take_tick` 拿掉游标那一支，退回"账攒够一片才取走一片"；`VacuumTick::charged` 自此**恒等于**
+  `slice`（结构体保留，归还合同要能从类型上读出来）；`round_open()` / `sweep_in_progress` 保留为
+  **状态**，不再是 `begin()` 扫不扫的依据。半路的轮次由 `Maintenance`（独立游标与间隔）推到库尾；
+  不跑维护器的普通 `open`，后半库的垃圾等下一次写或手动 `vacuum()` —— 有意的取舍，写进
+  `take_tick` 的文档与四家 `tick_auto_vacuum` 的注释。
+- **新守卫 `maintenance::tests::auto_vacuum_scanning_keeps_pace_with_writes_not_with_transactions`**
+  （计数，不看墙钟）：关着自动回收预灌 4096 行、开成 64 行/片、写 512 个**单行**事务，
+  判 `completed_slices × 64 ≤ 流前账 + 512 + 64`。339a559 那份实现四家各读 **275 片 ≈ 17 600 行**
+  ⇒ 红；改后 **71 片 ≈ 4 544 行** = 4096 预灌账 + 512 写入，正好 1:1。
+- kernel 两条单测按新口径改判：`scheduler_does_not_push_an_open_round_from_begin_without_debt`
+  （账 0 + 游标半路 ⇒ `None`，但 `sweep_in_progress` 照报 true；新写攒够后从同一游标续扫）、
+  `failed_slice_refunds_exactly_what_it_charged`（失败原样退 `charged`，不多不少，游标不动）。
+  对照：把游标那一支加回去 ⇒ 前者红在"不该给许可"、pace 守卫同红。
+- 规模守卫 `bplus_long_reader_does_not_lose_live_rows_at_scale` 改成两段：自动路径跑到不再前进
+  （**12 片裁 93 504 行，剩账 6784 < 一片，轮次停在半路**）→ 维护器从头走一整遍（**19 片再裁
+  106 496 行**，合计 200 000 = 全部旧版本）→ 逐键读回 + 手动 `vacuum()` 两道门照旧；27.0 s 通过。
+- README 自动回收那段补一句分工。
+
+### 600k 冒烟（M82 构建；对 test2 同档 / 42ca438）
+
+- `灌` bitcask 47.2→**28.2**（旧 18.5）/ bplus 64.3→**37.5**（40.6）/ lsm 37.6→**20.8**（22.0）/
+  memory 8.6→**2.9**（3.8）µs/行；`更新 10%` 33.9→**18.4** / 97.8→**49.1** / 42.8→**24.3** / 13.5→**4.3**。
+- memory `冷重开` 4.39→**1.55 s**、`再冷重开` 5.49→**1.56 s**；`multi_get 全miss` 9.3→**0.7** µs/键、
+  `seek_prev` 15 516→**36.6** µs。
+- `vacuum() 全库` 裁的行数回到 **36424**（test2 同档只裁 10000：其余被"每 begin 一片"提前裁掉了
+  ⇒ 那趟的 vacuum 格跨版本不可比，手册 §四 补了第三条注）。
+- 五项目标格不动：lsm `首页(免 total)` 4.51 ms、lsm `末页(免 total)` 0.59 ms、bitcask `vacuum` 1.84 s +
+  `merge` 2.04 s。墙钟 **290.3 → 212.3 s**（旧 221.6）。
+- 全量 `cargo test --offline --release --lib -- --test-threads=1`：**385 passed / 0 failed / 36 ignored**
+  （11-03 这一趟的数；加了 11-04 那两条守卫后是 387，见下"四项尾巴"）。
+
+### bin 归位：六个可执行文件全部搬进 `src/bin/`，走 Cargo 自动发现
+
+- `src/tools/bin/{export_kv,import_kv}.rs` 与四个 `src/<引擎>/bin/bench*.rs` 一起 `git mv` 到 `src/bin/`，
+  **文件名就是 bin 名**：`export-kv.rs` / `import-kv.rs` / `bitcask-bench-bulk.rs` / `bplus-bench.rs` /
+  `lsm-bench-bulk.rs` / `memory-bench.rs`（与原 `[[bin]] name` 逐字相同 ⇒ README/脚本里的 `--bin …` 一个不改）。
+  `Cargo.toml` 的 `[[bin]]` 从 7 条收成 **1 条**（`storage-engines` → `src/main.rs`），"Cargo 不认
+  `src/<模块>/bin/` 所以逐条声明"那条注释随之作废；五个空出来的 `bin/` 目录删掉。
+- 顺手改掉四个压测 bin 文档头里早就过期的 `--bin bench` / `--bin bench_bulk`（真名一直是带引擎前缀的那个）。
+- 验证：`cargo build --release --bins` 产出的 7 个 exe 名字不变；`cargo test --release --bins` 8 passed
+  （export-kv / import-kv 各 4 条参数解析）；`export-kv --engine memory --demo 300 → import-kv --engine lsm_tree →
+  export-kv` 往返 300 行逐行一致。lib 一行未动。
+
+### 四项尾巴（同一构建，2026-11-04）：三家末页反向原语 / 测试 scratch 全量 RAII / memory 快照零扫描 / 墓碑时限
+
+#### ① 三家 `search 末页(免 total)` 补上反向原语 —— "没做"清单第 1 条收口
+
+- 新原语 `common::store::back_n_with(max_raw, n, max_steps, prev_raw, live_of)`：从库尾起用
+  `seek_prev` 逐步退，凑够 n 行活记录为止。两个坑写在实现里：
+  **`bound` 推进必须用逻辑键（`raw`）而不是编码键（`enc`）** —— 用编码键会在同一把键的旧版本上
+  打转（方案第 4 项"坑 2"，末页 100 行全是重复键 + 旧值）；**不用 `\xFF` 哨兵** —— 字节空间里没有
+  最大值，哨兵会把"末尾键恰好以 `0xFF` 结尾"的库判错。
+- 退过 `LAST_PAGE_MAX_STEPS = 8 * 1024` 步仍凑不够页宽 ⇒ 返回 `None`，调用方退回原来那支
+  `reverse_scan` 截尾（正确但 O(库)）。这是**兜底不是静默退化**：`back_n_fallbacks` 计数把它暴露出来，
+  守卫要求四家恒为 0。
+- 三家 `kv_ops::search_last_page` 改走它（bplus 新增 `last_key()` 右路下降取库尾；bitcask/memory 各加
+  `last_meta_key()` / `last_key()`），`impl_engine!` 四家 `last_page: yes`（此前只有 lsm）。
+- 600k 冒烟同档同格（µs/次，括号里是 `docs/test3.txt` 那趟的旧台阶）：bitcask **2 283 567.6 → 432.1**、
+  bplus **1 296 165.2 → 1162.1**、memory **858 578.2 → 231.4**（lsm 779.4 → 631.8，它本来就走 SST 块读）。
+  同档 `末页(深翻)` 仍是 1.70 / 1.08 / 1.96 / 0.43 s ⇒ 新门比"数全库再截尾"便宜 **约 10³ 倍**，
+  常驻也不再 +67 MB / 峰值 +149 MB（旧台阶那三行）。
+- 守卫 `last_page_agrees_with_the_tail_and_stays_bounded` 从"两家"扩到四家两层判据：
+  ① 交出的 k 行必须逐字节等于 `scan(None, None)` 的末 k 行活记录（形状里塞了尾部墓碑 + 一把
+  "入库即已过期"的键 ⇒ 反向走时它们不计数但必须跳过）；② 三家 `back_n_candidates ≈ 页宽`
+  （实测 10~18）且 `back_n_fallbacks == 0`。变异：把 `bound = raw` 写回 `bound = enc` ⇒ 立刻红在重复键。
+
+#### ② 全量 `cargo test` 不再往 `%TEMP%` 堆 scratch（158 → **0**）
+
+- 新增 `common::ScratchPath`：`Deref<Target = Path>` 的 RAII 句柄。用例把它**声明在引擎之前**
+  即可 —— 析构按反向声明序走，引擎先关文件、scratch 后删目录；正常收尾与 **panic 展开**都删，
+  同名兄弟（`.wal`/`.dblwr`/`.freelist`/`.lock`/`.blob`/`.hint`/`.merge`…）按前缀一起删。
+  ⚠️ 别写成"挂在线程退出上的钩子"：libtest 收尾走 `process::exit`，线程局部量的析构**根本不跑**
+  （第一版就是这么写的，实测 TEMP scratch 14 → 456，作废）。
+- 接入点：`engine.rs` 的 `tmp_dir` / `open_all`（返回元组的第三个字段就是守卫）、10 个模块级
+  `tmp*` helper、`common/kv_snapshot.rs`、`bplus_tree::new` 的 15 个用例（新 `anon()` helper）、
+  `tools::migrate` 的 `root()`。**元组不能拆的地方要照顾析构序**：`open_all()` 的五个
+  `for (name, db, dir)` 改成 `for entry in open_all() { let (name, db) = (entry.0, &*entry.1); … }`
+  （元组字段按 0→1→2 析构；拆成 `let (a, b, c)` 会按反向声明序走、守卫先跑）。
+- 顺手拆掉一颗地雷：`bplus_tree_mvcc` 一条用例收尾写的是
+  `remove_dir_all(PathBuf::from(&path).parent().unwrap())`，而 `path` 是 `%TEMP%/<…>.db`
+  ⇒ 那行删的是 **`%TEMP%` 目录本身**（`let _ =` 静默；锁着的文件删不掉，所以表现为"随机删掉
+  `%TEMP%` 里的一部分东西"）。换守卫后该行删除。
+- 验证（计数，不看墙钟）：清空后跑全量 `--lib`（387 passed）**加**四个集成测试 ⇒ `%TEMP%` 里
+  我们的 scratch 条目 **0**（此前一轮 158~456），仓库 `data/` 也空。
+
+#### ③ memory 快照重放不再扫零（启停又便宜一截）
+
+- 重放走 `begin_transaction()`、每 1000 行一页，而重放期没有事务会撤销 ⇒ 那些"新行必然零垃圾"
+  白扫一遍（20M ≈ 1221 片）。`load_snapshot_from` 期间用 `AutoVacuumOff` 暂停切片记账（`Drop`
+  恢复原 slice），收尾 `discard_pending()` 丢掉重放攒下的账；**只影响重放这一趟**。
+- 600k 冒烟：memory `冷重开` 1.55 → **0.96 s**、`再冷重开` 1.56 → **1.02 s**
+  （`docs/test2.txt` 那趟 4.39 / 5.49 s）。
+- 新守卫 `memory_snapshot_replay_neither_scans_nor_accrues_debt`（2 万行）：重开后
+  `completed_slices == 0` 且 `pending_rows == 0`；**再补一句"重开后照常写仍然会攒账"** ——
+  证明这条是"重放期暂停"而不是"自动回收被关掉了"。
+
+#### ④ `sync` / `import --skip-existing` 的墓碑时限：写进合同 + 形状钉住
+
+- 合同是"目标库**见过**的键一个字都不动"，于是**被自动回收裁掉墓碑的键会复活**（回收之后
+  目标不再"见过"它）。这不是 bug 是取舍，但它有时限 —— 只在"墓碑还在"或"没开自动回收"时成立，
+  已写进 `sync` 的文档 ①。
+- 新 characterization 守卫 `sync_after_vacuum_resurrects_the_deleted_key_characterization`
+  （四家）：墓碑算"见过" → `vacuum()` 清掉 → 再 `sync` **复活**该键，断言如实钉住今天的行为。
+
+#### 本轮冒烟与全量（2026-11-04 构建）
+
+- 600k 四家 PASS，墙钟 **215.4 s**；`灌` 21.9 / 49.6 / 24.6 / 2.6 µs/行，`更新 10%` 18.6 / 51.5 / 26.6 / 2.8；
+  `vacuum() 全库` 四家都裁 **36424** 行（与 42ca438 同）；`health()` rows=637425（与 test1 同）；
+  四家 scale scratch 由 `ScaleScratch` 自动删净。
+- 全量 `cargo test --offline --release --lib -- --test-threads=1`：**387 passed / 0 failed / 36 ignored**
+  （106~110 s）；`--test test_{bitcask,bplus_tree,lsm_tree,memory}` 各 1 passed。
+
+### 没做 / 待点名
+
+- ~~三家 `末页(免 total)` 仍是 O(库)~~ **已收口（11-04，见上"四项尾巴"①）**：20M 档那
+  `test2` 87.9 / 54.6 / 63.8 s（`test3` 105.6 / 71.4 / 68.9 s）与常驻 +2147.5 MB、峰值 +4771 MB
+  已成历史读数，跨这条线比这一格没有意义。
+- ~~memory 快照重放仍按 1:1 扫零垃圾的新行（20M ≈ 1221 片，数秒量级）~~ **已收口（11-04，
+  见上"四项尾巴"③）**：重放期暂停切片记账 + 收尾清账。
+- `docs/test2.txt` 的 memory 10M 整块噪声（`冷重开` 374 s > 20M 的 208.6 s、再冷重开反而 188 s），
+  lsm 10M 也偏慢；要入表先重跑那一档。bitcask 20M `seek_prev` 158 ms（旧 64 µs）单次偶发，未归因。
+- 这趟仍是粘贴 txt（`test1.txt` = 旧 `docs/test.txt` 改名，内容逐字节相同），summary.json/CSV 仍未落。
+- 手册 §七 原先把 20M memory `seek_prev` 21 ms 归到"三家没有反向原语"是错的（旧构建同一原语 27.8 µs），
+  已改成上面那笔税。
+
 
 ## 未发布：长跑维护与资源合同（2026-10-31，验证进行中）
 
@@ -153,7 +303,7 @@
 
 ### 第 6 项后半（下半）：统一 `export-kv` / `import-kv` 一对 CLI（靠 `--engine` 选家）
 
-- 新增 `bin/export-kv` / `bin/import-kv`（实体 `src/tools/bin/{export_kv,import_kv}.rs`，`[[bin]]` 显式
+- 新增 `bin/export-kv` / `bin/import-kv`（实体当时在 `src/tools/bin/{export_kv,import_kv}.rs`，M82 起归到 `src/bin/{export-kv,import-kv}.rs`，`[[bin]]` 显式
   path 条目）。它们**不含任何搬运逻辑**，只是把 `--engine/--dir/--out|--in/--format/--wipe/
   --include-deleted` 接到既有的 `tools::export_to_dir` / `tools::import_from_dir` 上 —— 原先四家
   各有一份参数解析 + 格式分支 + 收尾数条数，调的却是同一个函数，那正是"基座被复制"的形状。
@@ -273,7 +423,7 @@
 ### 第 2 / 5 项与 merge 尺子
 
 - **bitcask `vacuum()` 不再自带 `merge()`**（方案第 2 项）。改前全库轮只要有回收就附送一次整库重写：
-  600k 台架同一趟付了两遍（`MERGE_TIME_SPLIT` 一手读数 3.564s + 3.216s），20M 档 `docs/test.txt` 里
+  600k 台架同一趟付了两遍（`MERGE_TIME_SPLIT` 一手读数 3.564s + 3.216s），20M 档 `docs/test1.txt` 里
   vacuum 166.9 s 内含一次 merge + `flush+merge` 113.5 s = 280.4 s。拆出后 600k 实测
   `vacuum() 全库` **3.862 s → 1.846 s**（裁掉行数同为 36424 ⇒ 工作量等、可比），`merge_time` 每趟
   **2 次 → 1 次**。⚠️ **语义变更**：硬删除腾出的空间不再当场归还，等调用方显式 `merge()`。

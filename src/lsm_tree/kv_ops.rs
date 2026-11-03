@@ -484,13 +484,15 @@ mod tests {
     use std::vec;
     use std::format;
     use std::matches;
-    use std::path::PathBuf;
+    use std::path::Path;
 
-    fn tmp(tag: &str) -> PathBuf {
-        crate::common::tmp_test_path("lsm_kv_ops", tag, "")
+    /// 返回 **RAII 句柄**（M82）：把它声明在引擎之前，用例结束（含 panic 展开）自动删，
+    /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
+    fn tmp(tag: &str) -> crate::common::ScratchPath {
+        crate::common::ScratchPath::new("lsm_kv_ops", tag, "")
     }
 
-    fn cleanup(path: &PathBuf) {
+    fn cleanup(path: &Path) {
         let _ = std::fs::remove_dir_all(path);
     }
 

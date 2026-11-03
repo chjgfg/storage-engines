@@ -289,6 +289,69 @@ mod tests {
         }
     }
 
+    /// 自动回收的扫描量必须跟**写入行数**走，不能跟**事务次数**走（M81 第 5 项后半的回归守卫）。
+    ///
+    /// 形状：先关着自动回收灌 `PREFILL` 行（库 ≫ 一片），再开成 `SLICE` 行/片，然后写 `WRITES` 个
+    /// **单行**事务 —— 下游 trading-system 逐条 `persist` 就是这个形状，台架的 `灌`/`更新` 是它的
+    /// 1000 行/500 行版本。
+    ///
+    /// 判据（计数，不看墙钟）：`completed_slices × SLICE ≤ 流前账 + WRITES + SLICE` ——
+    /// 写多少行就扫多少行（1:1：预灌时关着自动回收攒下的账也算"写过"，在流里照样 1:1 还掉），
+    /// 外加一片零头。没有"每个 begin 推一片"的额度：半路的轮次是维护器的活，不是事务的。
+    ///
+    /// 为什么要这条：`339a559` 让 `take_tick` 在"一轮开着"时对**每次 `begin()`** 都给一片许可
+    /// （`charged = 0` 那一支），而写流里一轮永远开着（账一直攒、游标一绕完就立刻再开）⇒ 单行事务
+    /// 每条都扫一整片 = `SLICE` 倍放大。`docs/test2.txt` 五档 20/20 格 `灌`/`更新` 变慢、
+    /// memory `冷重开` 1.3 s → 4.4 s（重放也是 1000 行/页的写流）都是这笔税。
+    /// 本条在那份实现上四家各读出 **275 片 ≈ 17 600 行**（上限 4 672）⇒ 红；M82 拿掉那一支后
+    /// 读出 71 片 ≈ 4 544 行 = 4096 预灌账 + 512 写入，正好 1:1。
+    #[test]
+    fn auto_vacuum_scanning_keeps_pace_with_writes_not_with_transactions() {
+        const SLICE: u64 = 64;
+        const PREFILL: u64 = SLICE * 64;
+        const WRITES: u64 = 512;
+        let mut red: Vec<String> = Vec::new();
+        for name in crate::engine::ENGINE_NAMES {
+            let scratch = Scratch::new(name);
+            let path = scratch.0.join("db");
+            let db = open_engine_with(*name, Some(&path), &EngineConfig {
+                vacuum_auto_slice_rows: Some(0), ..EngineConfig::default()
+            }).unwrap();
+            let tx = db.begin();
+            for i in 0..PREFILL {
+                assert!(tx.set_raw(format!("p{i:06}").as_bytes(), vec![b'x'; 16]), "{name}: 预灌第 {i} 行被拒");
+            }
+            tx.commit();
+            drop(tx);
+            db.set_vacuum_auto_slice(SLICE);
+            let before = db.reclamation_status().unwrap();
+            for i in 0..WRITES {
+                let tx = db.begin();
+                assert!(tx.set_raw(format!("w{i:06}").as_bytes(), vec![b'y'; 16]), "{name}: 第 {i} 条单行事务被拒");
+                tx.commit();
+            }
+            let after = db.reclamation_status().unwrap();
+            let slices = after.completed_slices - before.completed_slices;
+            let scanned = slices * SLICE;
+            // 预灌是关着自动回收写的，那 PREFILL 行的账还挂着，流里会按 1:1 还掉 ⇒ 算进上限
+            let allowed = before.pending_rows + WRITES + SLICE;
+            println!(
+                "[auto-vac pace] {name}: 流前账 {} 行 + 写 {WRITES} 行 / {WRITES} 事务 ⇒ 扫 {slices} 片 ≈ {scanned} 行（上限 {allowed}，跳过 {} 片）",
+                before.pending_rows,
+                after.skipped_active - before.skipped_active
+            );
+            if scanned > allowed {
+                red.push(format!("{name}: 扫了 ~{scanned} 行（{slices} 片）却只写了 {WRITES} 行（含流前账上限 {allowed}）"));
+            }
+        }
+        // 四家跑完再判，一次把所有红的引擎都点出来
+        assert!(
+            red.is_empty(),
+            "自动回收的扫描量跟着事务次数而不是写入行数走：\n  {}",
+            red.join("\n  ")
+        );
+    }
+
     #[test]
     fn full_maintenance_waits_for_interval_and_active_reader() {
         let scratch = Scratch::new("physical");
@@ -411,13 +474,13 @@ mod tests {
         reader.commit();
         drop(reader);
         // ⚠️ 方案正文点名的这一条：**排空**，不是一次 begin/commit。一片只裁 `slice` 行，账可能有
-        // 几十片。但"排空"的终点**不是 `pending_rows == 0`** —— `VacuumScheduler::take_tick`
-        // （`common/kernel.rs`）的门有两支：**开新一轮**看账（`pending >= slice`，取走 `slice` 行），
-        // **把已开的那轮推到尾**看游标（账不够也给许可，`charged = 0`）。所以停下来的正确形状是
-        // "账不足一片 **且** 游标已回到库头"，两条要一起判 —— 首跑只判了前一条，才把"停在尾巴"
-        // 和"停在半路"混成同一个数（4000 次 tick 后 pending 恒在 6784 = 400000 − 24×16384，
-        // `active_txns: 0`）。
-        // ⇒ 判据 = 跑到不再前进为止，并钉住停下的位置：剩余账小于一整片，且轮次已经走完。
+        // 几十片。"排空"的终点**不是 `pending_rows == 0`** —— `VacuumScheduler::take_tick`
+        // （`common/kernel.rs`）攒够一片才取一片，不足一片的尾巴按设计留着（实测停在
+        // 6784 = 400000 − 24×16384，`active_txns: 0`）。
+        // M82 的口径：`begin()` 的扫描量与写入量 1:1，账花完就停，**游标可以停在半路**
+        // （`sweep_in_progress` 如实报 true）—— 把它推到库尾是下面维护器的活，不是下一个事务的。
+        // M81 第 5 项后半曾让 begin() 续推半路的轮次，代价是写流里每个事务扫一整片（守卫
+        // `auto_vacuum_scanning_keeps_pace_with_writes_not_with_transactions`），已拿掉。
         let slice = db.vacuum_auto_slice();
         let mut ticks = 0usize;
         let mut prev_removed = db.reclamation_status().unwrap().versions_removed;
@@ -431,14 +494,6 @@ mod tests {
                     st.pending_rows,
                     st.active_txns
                 );
-                // M81 第 5 项后半的新判据：停下的位置必须是**一轮已经走完**，不是冻在半路。
-                // 旧形状（`take_tick` 只看账）在这里红 —— 账花光时游标还在库里，后半库没人认领。
-                assert!(
-                    !st.sweep_in_progress,
-                    "一轮走在半路却停了：游标不在库头、账又不足一片 ⇒ 后半库的垃圾无人回收 \
-                     （completed_slices={} versions_removed={prev_removed}）",
-                    st.completed_slices
-                );
                 break;
             }
             prev_removed = st.versions_removed;
@@ -446,12 +501,41 @@ mod tests {
             assert!(ticks < 4_000, "回收不收敛：{ticks} 次 tick 还在前进，已裁 {prev_removed} 行");
         }
         assert!(ticks > 1, "一次 tick 就排空 ⇒ 规模没到位、块边界根本没出现，这一条等于没测: ticks={ticks}");
+        let stopped = db.reclamation_status().unwrap();
         println!(
-            "自动回收：{ticks} 次 tick 裁掉 {prev_removed} 行（slice={slice}），停在不足一片的尾巴上，剩余账 {:?}",
-            db.reclamation_status().unwrap().pending_rows
+            "自动回收：{ticks} 次 tick 裁掉 {prev_removed} 行（slice={slice}），停在不足一片的尾巴上，剩余账 {}，轮次{}",
+            stopped.pending_rows,
+            if stopped.sweep_in_progress { "停在半路（交给维护器）" } else { "已走完" }
         );
 
-        // 判据一（自动路径）：逐键读回最新值 —— 丢任何一把（或读回旧值）就是静默丢活键。
+        // 半路的轮次由维护器推到库尾（M82 的分工）：独立游标、从头扫一整遍，直到它的游标回到库头。
+        // 这一遍不许被活跃事务挡（reader 已放开），也不许走全库重写（`full_vacuum_interval: None`）。
+        let mut driver = Maintenance::new(MaintenanceConfig {
+            interval: Duration::from_secs(1),
+            slice_rows: slice,
+            full_vacuum_interval: None,
+        }).unwrap();
+        let mut maint_ticks = 0usize;
+        loop {
+            driver.tick(db.as_ref()).unwrap();
+            maint_ticks += 1;
+            assert!(driver.status().blocked_for == Duration::ZERO, "维护器被不存在的活跃事务挡住");
+            if driver.cursor.is_none() {
+                break;
+            }
+            assert!(maint_ticks < 4_000, "维护器一轮走不完：{maint_ticks} 片");
+        }
+        assert!(
+            driver.status().slice_runs == maint_ticks as u64,
+            "维护器每次 tick 都该是一片有界回收（slice_runs={} ticks={maint_ticks}）",
+            driver.status().slice_runs
+        );
+        println!(
+            "维护器：{maint_ticks} 片走完一整遍，又裁 {} 行、扫 {} 行",
+            driver.status().versions_removed, driver.status().rows_scanned
+        );
+
+        // 判据一（自动路径 + 维护器收尾）：逐键读回最新值 —— 丢任何一把（或读回旧值）就是静默丢活键。
         let tx = db.begin();
         let mut lost: Vec<usize> = Vec::new();
         for i in 0..KEYS {

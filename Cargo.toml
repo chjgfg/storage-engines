@@ -30,48 +30,18 @@ codegen-units = 1
 
 # ── 可执行文件 ────────────────────────────────────────────────────────────
 #
-# 门面层示例
+# 门面层示例是唯一要显式声明的一条（入口在 src/main.rs）。
 [[bin]]
 name = "storage-engines"
 path = "src/main.rs"
 
-# 压测工具仍按引擎各留一份（它们的主体是各家自己的 bulk 灌法，没有可共用的外壳）。
-# Cargo 不认 src/<模块>/bin/ 这个路径，必须显式声明。
+# 其余可执行文件全在 `src/bin/`，走 Cargo 自动发现：**文件名就是 bin 名**（带连字符），
+# 不再写 `[[bin]] path = …`（M82：原先散在 `src/<模块>/bin/` 下，那种路径 Cargo 不认才逐条声明）。
 #
-# 数据搬运在 M81 收成**一对**：`--engine` 选家，四家同一条读写路径（实体在
-# `src/tools/bin/`）。原先那八条 `<引擎>-{import,export}-kv` 已删 —— 它们调的就是
-# 同一个 `tools::{export_to_dir, import_from_dir}`，参数解析各抄一份正是"基座被复制"。
+#   export-kv / import-kv       数据搬运，一对 CLI，`--engine` 选家，四家同一条读写路径
+#                                （搬运逻辑只有一份：`tools::{export_to_dir, import_from_dir}`）
+#   bitcask-bench-bulk / bplus-bench / lsm-bench-bulk / memory-bench
+#                                压测工具按引擎各留一份（主体是各家自己的 bulk 灌法，没有可共用的外壳）
 #
 #   cargo run --release --bin export-kv -- --engine bitcask --dir ./db --out snap.bin
 #   cargo run --release --bin import-kv -- --engine lsm_tree --dir ./lsm --in snap.bin
-
-[[bin]]
-name = "export-kv"
-path = "src/tools/bin/export_kv.rs"
-
-[[bin]]
-name = "import-kv"
-path = "src/tools/bin/import_kv.rs"
-
-[[bin]]
-name = "bitcask-bench-bulk"
-path = "src/bitcask/bin/bench_bulk.rs"
-
-
-
-[[bin]]
-name = "bplus-bench"
-path = "src/bplus_tree/bin/bench.rs"
-
-
-
-[[bin]]
-name = "lsm-bench-bulk"
-path = "src/lsm_tree/bin/bench_bulk.rs"
-
-
-
-[[bin]]
-name = "memory-bench"
-path = "src/memory/bin/bench.rs"
-

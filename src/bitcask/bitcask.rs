@@ -2144,6 +2144,14 @@ impl Bitcask {
         self.key_dir.iter()
     }
 
+    /// KeyDir 里**最大的一把编码键**（给"从库尾反向"当起点用，M82）。
+    ///
+    /// KeyDir 是 `BTreeMap` ⇒ `next_back` 是 O(log n)，不扫库。为什么不给调用方一个"足够大的
+    /// 哨兵"当上界：任意字节空间没有最大值，哨兵长度不够就会把更长的尾键整批漏掉。
+    pub fn last_meta_key(&self) -> Option<Vec<u8>> {
+        self.key_dir.keys().next_back().cloned()
+    }
+
     /// 从 `from`（**含**）起的 KeyDir 元数据升序视图，不读 value。
     ///
     /// 下界落在 enc 域（`raw_key ‖ version`），不是逻辑 key 域：以 `from` 为真前缀
@@ -2175,8 +2183,10 @@ mod tests {
     use std::panic;
     use std::eprintln;
 
-    fn tmp_log(tag: &str) -> PathBuf {
-        crate::common::tmp_test_path("bitcask_hint", tag, ".log")
+    /// 返回 **RAII 句柄**（M82）：把它声明在引擎之前，用例结束（含 panic 展开）自动删，
+    /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
+    fn tmp_log(tag: &str) -> crate::common::ScratchPath {
+        crate::common::ScratchPath::new("bitcask_hint", tag, ".log")
     }
 
     fn cleanup(path: &Path) {
@@ -2200,7 +2210,7 @@ mod tests {
     fn test_open_recovers_merge_left_behind_by_crashed_merge() {
         let path = tmp_log("merge_crash");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             for i in 0..20u8 {
                 eng.set(format!("k{i}").as_bytes(), vec![i; 32]).unwrap();
             }
@@ -2213,7 +2223,7 @@ mod tests {
         assert!(!path.exists() && merge.exists());
 
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             for i in 0..20u8 {
                 assert_eq!(
                     eng.get(format!("k{i}").as_bytes()).unwrap(),
@@ -2233,7 +2243,7 @@ mod tests {
     fn test_open_discards_merge_debris_when_log_survives() {
         let path = tmp_log("merge_debris");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.set(b"a", b"1".to_vec()).unwrap();
             eng.flush().unwrap();
         }
@@ -2241,7 +2251,7 @@ mod tests {
         std::fs::write(&merge, b"stale debris").unwrap();
 
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"a").unwrap(), Some(b"1".to_vec()));
         }
         assert!(!merge.exists(), "data.log 还在 ⇒ 残骸该被清掉，别留给下次 merge 追加");
@@ -2258,7 +2268,7 @@ mod tests {
         let path = tmp_log("stale_hint");
         {
             // 小分片上限 ⇒ 会 rotate，active 里是最后几行
-            let mut eng = Bitcask::with_max_file_bytes(path.clone(), 64).unwrap();
+            let mut eng = Bitcask::with_max_file_bytes(path.to_path_buf(), 64).unwrap();
             for i in 0..12u8 {
                 eng.set(format!("k{i}").as_bytes(), vec![i; 40]).unwrap();
             }
@@ -2273,7 +2283,7 @@ mod tests {
         write_hint_file(&hint, &kd, active_id, active_size).unwrap();
 
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             for i in 0..12u8 {
                 assert_eq!(
                     eng.get(format!("k{i}").as_bytes()).unwrap(),
@@ -2289,7 +2299,7 @@ mod tests {
     fn test_hint_roundtrip_and_fast_open() {
         let path = tmp_log("rt");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.set(b"a", b"1".to_vec()).unwrap();
             eng.set(b"b", b"2".to_vec()).unwrap();
             eng.set(b"c", b"3".to_vec()).unwrap();
@@ -2301,7 +2311,7 @@ mod tests {
         }
         // 再 open：应走 hint 快路径
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"a").unwrap(), Some(b"1".to_vec()));
             assert_eq!(eng.get(b"b").unwrap(), None);
             assert_eq!(eng.get(b"c").unwrap(), Some(b"3".to_vec()));
@@ -2314,7 +2324,7 @@ mod tests {
     fn test_hint_incremental_tail_scan() {
         let path = tmp_log("incr");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.set(b"k1", b"v1".to_vec()).unwrap();
             eng.set(b"k2", b"v2".to_vec()).unwrap();
             eng.flush().unwrap();
@@ -2322,7 +2332,7 @@ mod tests {
         }
         // 写更多数据但不更新 hint → open 应 hint + 扫尾部
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.set(b"k3", b"v3".to_vec()).unwrap();
             eng.set(b"k1", b"v1b".to_vec()).unwrap(); // 覆盖
             eng.flush().unwrap();
@@ -2330,7 +2340,7 @@ mod tests {
             drop(eng);
         }
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"k1").unwrap(), Some(b"v1b".to_vec()));
             assert_eq!(eng.get(b"k2").unwrap(), Some(b"v2".to_vec()));
             assert_eq!(eng.get(b"k3").unwrap(), Some(b"v3".to_vec()));
@@ -2343,7 +2353,7 @@ mod tests {
     fn test_merge_writes_hint() {
         let path = tmp_log("merge");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.set(b"a", b"1".to_vec()).unwrap();
             eng.set(b"a", b"2".to_vec()).unwrap();
             eng.set(b"b", b"3".to_vec()).unwrap();
@@ -2354,7 +2364,7 @@ mod tests {
             assert_eq!(eng.get(b"b").unwrap(), None);
         }
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"a").unwrap(), Some(b"2".to_vec()));
             assert_eq!(eng.len(), 1);
         }
@@ -2380,7 +2390,7 @@ mod tests {
         const KEYS: usize = 20_000;
         let path = tmp_log("merge_chunks");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             for i in 0..KEYS {
                 let k = format!("k{i:06}");
                 eng.set(k.as_bytes(), vec![b'v'; 16]).unwrap();
@@ -2413,7 +2423,7 @@ mod tests {
             }
         }
         {
-            let eng = Bitcask::new(path.clone()).unwrap();
+            let eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.len(), KEYS, "重开之后活键数不对 ⇒ 分块 merge 写坏了日志");
         }
         cleanup(&path);
@@ -2435,7 +2445,7 @@ mod tests {
         const KEYS: usize = 20_000;
         let path = tmp_log("merge_rescan");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             for i in 0..KEYS {
                 let k = format!("k{i:06}");
                 eng.set(k.as_bytes(), vec![b'v'; 16]).unwrap();
@@ -2487,7 +2497,7 @@ mod tests {
             }
         }
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.len(), KEYS - KEYS.div_ceil(7), "重开之后活键数不对");
             assert_eq!(
                 eng.get(b"k000000").unwrap(),
@@ -2516,7 +2526,7 @@ mod tests {
         const KEYS: usize = 4_000;
         let path = tmp_log("merge_bulk_door");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             for i in 0..KEYS {
                 eng.set(format!("k{i:06}").as_bytes(), vec![b'v'; 16])
                     .unwrap();
@@ -2539,7 +2549,7 @@ mod tests {
         }
         {
             // 重开一遍核对：批量建出来的索引落进 hint、再读回来，必须与内存里那一把一致
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.len(), KEYS, "重开之后活键数不对");
             assert_eq!(
                 eng.get(b"k000001").unwrap(),
@@ -2563,7 +2573,7 @@ mod tests {
         // ① 干净形状：升序、中间夹一把重复键（后到者胜）与一把软墓碑
         let path = tmp_log("bulk_agree");
         {
-            let mut log = Log::new(path.clone()).unwrap();
+            let mut log = Log::new(path.to_path_buf()).unwrap();
             for i in 0..600u32 {
                 let k = format!("k{i:04}");
                 log.write_entry(k.as_bytes(), Some(b"first")).unwrap();
@@ -2597,7 +2607,7 @@ mod tests {
         // ② 带硬删除的形状：必须整份退回逐条施加，并且结果与逐条那扇门一致
         let path2 = tmp_log("bulk_fallback");
         {
-            let mut log = Log::new(path2.clone()).unwrap();
+            let mut log = Log::new(path2.to_path_buf()).unwrap();
             for i in 0..200u32 {
                 let k = format!("k{i:04}");
                 log.write_entry(k.as_bytes(), Some(b"v")).unwrap();
@@ -2642,7 +2652,7 @@ mod tests {
         let path = tmp_log("quarantine");
         let hint = hint_path_for(&path);
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.set(b"a", b"1".to_vec()).unwrap();
             eng.merge().unwrap(); // 正常路径走完：此时索引完整、可读写
             eng.flush().unwrap();
@@ -2724,7 +2734,7 @@ mod tests {
             "带着隔离状态 drop 之后 hint 落盘了 ⇒ 下次 open 会把空索引当真"
         );
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(
                 eng.get(b"a").unwrap(),
                 Some(b"1".to_vec()),
@@ -2744,7 +2754,7 @@ mod tests {
     fn test_corrupt_hint_falls_back() {
         let path = tmp_log("bad");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.set(b"x", b"y".to_vec()).unwrap();
             eng.flush().unwrap();
             eng.dump_hint().unwrap();
@@ -2752,7 +2762,7 @@ mod tests {
         // 写坏 hint
         std::fs::write(hint_path_for(&path), b"GARBAGE!!").unwrap();
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"x").unwrap(), Some(b"y".to_vec()));
         }
         cleanup(&path);
@@ -2762,7 +2772,7 @@ mod tests {
     fn test_soft_tombstone_in_hint() {
         let path = tmp_log("soft");
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.insert(b"vkey".to_vec(), Some(b"val".to_vec()))
                 .unwrap();
             eng.insert(b"tomb".to_vec(), None).unwrap(); // 软 tomb
@@ -2772,7 +2782,7 @@ mod tests {
             assert_eq!(eng.get_entry(b"tomb").unwrap(), Some(None));
         }
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"vkey").unwrap(), Some(b"val".to_vec()));
             assert_eq!(eng.get_entry(b"tomb").unwrap(), Some(None));
             assert_eq!(eng.len(), 2);
@@ -2785,7 +2795,7 @@ mod tests {
         let path = tmp_log("rotate");
         {
             // 很小上限强制 rotate
-            let mut eng = Bitcask::with_max_file_bytes(path.clone(), 256).unwrap();
+            let mut eng = Bitcask::with_max_file_bytes(path.to_path_buf(), 256).unwrap();
             for i in 0..40u32 {
                 let k = format!("k{i:03}");
                 let v = format!("value-padding-{:03}-xxxxxxxx", i);
@@ -2805,7 +2815,7 @@ mod tests {
             assert_eq!(eng.get(b"k039").unwrap(), Some(b"value-padding-039-xxxxxxxx".to_vec()));
         }
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"k000").unwrap(), Some(b"value-padding-000-xxxxxxxx".to_vec()));
             assert_eq!(eng.get(b"k020").unwrap(), Some(b"value-padding-020-xxxxxxxx".to_vec()));
             assert_eq!(eng.get(b"k039").unwrap(), Some(b"value-padding-039-xxxxxxxx".to_vec()));
@@ -2813,7 +2823,7 @@ mod tests {
         }
         // merge 后应只剩 active
         {
-            let mut eng = Bitcask::new(path.clone()).unwrap();
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             eng.merge().unwrap();
             assert_eq!(eng.active_id(), 0);
             assert!(discover_sealed_ids(&path).is_empty());
@@ -2835,7 +2845,7 @@ mod tests {
     fn test_flush_fsyncs_only_when_something_was_written() {
         use crate::common::disk::{fsync_counts, fsync_counts_clear};
         let path = tmp_log("flush_fsync");
-        let mut kv = Bitcask::new(path.clone()).unwrap();
+        let mut kv = Bitcask::new(path.to_path_buf()).unwrap();
 
         // ① 什么都没写 ⇒ flush 不付 fsync
         fsync_counts_clear();
@@ -3137,7 +3147,7 @@ mod tests {
     fn test_write_buffer_is_allocated_lazily() {
         let path = tmp_log("lazy_buf");
         {
-            let mut log = Log::new(path.clone()).unwrap();
+            let mut log = Log::new(path.to_path_buf()).unwrap();
             assert_eq!(log.buf.capacity(), 0, "打开空库不该预留写缓冲");
             log.append_entry(b"k", Some(b"v"), false).unwrap();
             assert!(

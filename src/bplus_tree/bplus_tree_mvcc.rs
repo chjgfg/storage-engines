@@ -290,8 +290,11 @@ impl MVCC {
     /// `vacuum_bounded` 的「有活跃事务就整轮跳过」不会被自己的调用方踩中；而且每个
     /// 事务至少 begin 一次，攒账的节奏和写路径一样。
     ///
-    /// 触发量 = 切片宽度 ⇒ 攒够一片垃圾才扫一片；而一轮一旦发起，游标会把它推到库尾（账花完也继续推，走 `VacuumScheduler::take_tick` 里 `charged = 0` 那一支）。
-    /// 旧注释那句"回收速率与产生垃圾 1:1"不成立：一片只扫 `slice` 行，尾巴那半库靠的是"轮次未完"这一支，不是新写。；
+    /// 触发量 = 切片宽度 ⇒ 攒够一片垃圾才扫一片，扫描量与写入量 **1:1**，`begin()` 不付额外的税
+    /// （M82：M81 第 5 项后半那条"一轮开着就每个 begin 推一片"已拿掉 —— 它让写流里每个事务都扫
+    /// 一整片，`docs/test2.txt` 五档 `灌`/`更新` 全变慢）。账花完而一轮还在半路时，由
+    /// [`crate::maintenance::Maintenance`]（独立游标与间隔）把它推到库尾，不由下一个事务推；
+    /// 不跑维护器就等下一次写或手动 `vacuum()`。
     /// 一片的代价 = 走 `slice` 行叶子条目，锁也就按这么久。
     /// 游标回到库尾之后，下一片自动从头开始第二遍。
     fn tick_auto_vacuum(&self) {
@@ -1346,8 +1349,10 @@ mod tests {
     use std::matches;
     use crate::bplus_tree::storage::{dblwr_path, wal_path};
 
-    fn tmp_db(tag: &str) -> PathBuf {
-        crate::common::tmp_test_path("mvcc", tag, ".db")
+    /// 返回 **RAII 句柄**（M82）：把它声明在引擎之前，用例结束（含 panic 展开）自动删，
+    /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
+    fn tmp_db(tag: &str) -> crate::common::ScratchPath {
+        crate::common::ScratchPath::new("mvcc", tag, ".db")
     }
 
     fn cleanup(path: &Path) {
@@ -2658,7 +2663,6 @@ mod tests {
         assert!(tx.get(&big_key).is_none());
         tx.commit();
         drop(mvcc);
-        let _ = std::fs::remove_dir_all(&std::path::PathBuf::from(&path).parent().unwrap());
     }
 
     /// 0.057 页/行、1.7 µs/行（同一份 20000 行的库）。

@@ -451,4 +451,6 @@ fn test_bitcask() {
     }
 
     println!("\ndemo 完成（Bitcask + MVCC + kv_ops：批量 / 扫描 / 搜索 / TTL / vacuum / bulk）。");
+    cleanup_dir(db_dir);
+    // 收尾清掉本次 demo 目录：不清就会每跑一次往仓库 data/ 里积一份（M82）
 }

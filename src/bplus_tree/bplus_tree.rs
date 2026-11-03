@@ -2220,6 +2220,21 @@ impl BPlusTree {
         }
     }
 
+    /// 树上真实存在的**最大键**（一路取最右孩子下降到叶子）—— 给"从库尾反向"当起点用（M82）。
+    ///
+    /// 代价 = 树高次读页（O(log n)），与 `scan_entries_with` 那个"下降到最左叶子"对称。
+    /// 为什么不造 `\xFF…` 哨兵当上界：任意字节空间没有最大值，哨兵长度不够就会把更长的尾键整批漏掉。
+    pub fn last_key(&mut self) -> Option<Key> {
+        let mut current = self.root;
+        loop {
+            let data = self.page_manager.read_page(current)?;
+            match bincode::deserialize::<BTreeNode>(&data).ok()? {
+                BTreeNode::Internal { children, .. } => current = *children.last()?,
+                BTreeNode::Leaf { entries, .. } => return entries.last().map(|(k, _)| k.clone()),
+            }
+        }
+    }
+
     pub fn iter(&mut self) -> BPlusTreeIterator<'_> {
         // 找到最左边的叶子节点
         let mut current = self.root;
@@ -2333,6 +2348,15 @@ mod tests {
     use std::assert_eq;
     use std::eprintln;
 
+    /// `BPlusTree::new` 是"匿名临时库"的兼容接口：路径它自己造、**没人负责删**（公开 API
+    /// 不能偷偷改成 drop 即删）。测试要用它就得自己拎着守卫 —— 返回值必须**绑在变量上**，
+    /// 元组按字段序析构 ⇒ 引擎先落地、守卫后删目录（M82）。
+    fn anon(order: usize, max_cache_pages: usize) -> (crate::common::ScratchPath, BPlusTree) {
+        let dir = crate::common::ScratchPath::new("bplus_anon", "test", "");
+        let db = BPlusTree::open(dir.join("anon.db"), order, max_cache_pages);
+        (dir, db)
+    }
+
     fn rid(v: u8) -> RowId {
         RowId(Some(vec![v]))
     }
@@ -2347,7 +2371,7 @@ mod tests {
 
     #[test]
     fn test_insert_get_update_range() {
-        let mut tree = BPlusTree::new(4, 16);
+        let (_s, mut tree) = anon(4, 16);
         for n in [5u8, 10, 15, 20, 25, 30, 35] {
             tree.insert(key(n), rid(n));
         }
@@ -2368,7 +2392,7 @@ mod tests {
 
     #[test]
     fn test_delete_and_rebalance() {
-        let mut tree = BPlusTree::new(4, 32);
+        let (_s, mut tree) = anon(4, 32);
         // 插入足够多以触发多层
         let keys: Vec<u8> = (1..=30).collect();
         for &n in &keys {
@@ -2396,7 +2420,7 @@ mod tests {
 
     #[test]
     fn test_delete_missing_key() {
-        let mut tree = BPlusTree::new(4, 8);
+        let (_s, mut tree) = anon(4, 8);
         tree.insert(key(1), rid(1));
         assert!(!tree.delete(key(2)));
         assert!(tree.delete(key(1)));
@@ -2405,7 +2429,7 @@ mod tests {
 
     #[test]
     fn test_iter_order() {
-        let mut tree = BPlusTree::new(4, 16);
+        let (_s, mut tree) = anon(4, 16);
         for n in [35u8, 10, 25, 5, 30, 15, 20] {
             tree.insert(key(n), rid(n));
         }
@@ -2415,7 +2439,7 @@ mod tests {
 
     #[test]
     fn test_overwrite_on_insert() {
-        let mut tree = BPlusTree::new(4, 8);
+        let (_s, mut tree) = anon(4, 8);
         tree.insert(key(1), rid(1));
         tree.insert(key(1), rid(2));
         assert_eq!(tree.get(key(1)).unwrap().0, Some(vec![2]));
@@ -2441,7 +2465,7 @@ mod tests {
             RowId(Some(vec![b'x'; 60]))
         }
 
-        let mut tree = BPlusTree::new(64, 256);
+        let (_s, mut tree) = anon(64, 256);
         for i in 0..N {
             assert!(tree.insert(big_key(i), big_rid()), "插入第 {i} 个键失败");
         }
@@ -2476,7 +2500,7 @@ mod tests {
         fn k(i: usize) -> Key {
             format!("k{i:06}").into_bytes()
         }
-        let mut tree = BPlusTree::new(64, 512);
+        let (_s, mut tree) = anon(64, 512);
         for i in 0..N {
             assert!(tree.insert(k(i), RowId(Some(vec![b'v'; 60]))), "第 {i} 行没进去");
         }
@@ -2601,7 +2625,7 @@ mod tests {
     #[test]
     fn test_sequential_insert_descends_without_touching_pages() {
         const N: usize = 8000;
-        let mut tree = BPlusTree::new(64, 4096);
+        let (_s, mut tree) = anon(64, 4096);
         let k = |i: usize| -> Key {
             format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
         };
@@ -2638,7 +2662,7 @@ mod tests {
     #[test]
     fn test_child_location_is_binary_not_linear() {
         const N: usize = 6000;
-        let mut tree = BPlusTree::new(64, 4096);
+        let (_s, mut tree) = anon(64, 4096);
         let k = |i: usize| -> Key {
             format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
         };
@@ -2688,7 +2712,7 @@ mod tests {
             RowId(Some(vec![b'x'; 60]))
         }
 
-        let mut tree = BPlusTree::new(64, 4096);
+        let (_s, mut tree) = anon(64, 4096);
         for i in 0..N {
             assert!(tree.insert(big_key(i), big_rid()), "插入第 {i} 个键失败");
         }
@@ -2742,7 +2766,7 @@ mod tests {
     /// 合并后 free 再 allocate 复用同一个页号，都在这条里走一遍。
     #[test]
     fn test_node_cache_never_serves_stale_content() {
-        let mut tree = BPlusTree::new(4, 16);
+        let (_s, mut tree) = anon(4, 16);
         // ① 边插边读：分裂会不断改写既有页
         for n in 0..200u8 {
             assert!(tree.insert(key(n), rid(n)), "插入 {n} 失败");
@@ -2805,7 +2829,7 @@ mod tests {
             RowId(Some((n as u32).to_le_bytes().to_vec()))
         }
 
-        let mut tree = BPlusTree::new(12, 4096);
+        let (_s, mut tree) = anon(12, 4096);
         for i in 0..N {
             assert!(tree.insert(k(i), r(i)), "插入第 {i} 个键失败");
         }
@@ -2884,7 +2908,7 @@ mod tests {
         }
 
         // order=12 ⇒ 叶子满约 11 条；成块删一半 ⇒ 叶子成片空掉 ⇒ 必然走到借位/合并
-        let mut tree = BPlusTree::new(12, 4096);
+        let (_s, mut tree) = anon(12, 4096);
         for i in 0..N {
             assert!(tree.insert(k(i), r(i)), "插入第 {i} 个键失败");
         }
@@ -2992,12 +3016,14 @@ mod tests {
             RowId(Some((n as u64).to_le_bytes().to_vec()))
         }
         // order=12 ⇒ 一片叶子约 11 条；每 2 把删 1 把 ⇒ 同一片叶子里平均 5~6 行连续可删（k ≈ 5.5）
+        // 守卫跟着库一起交出去：库还要被量（写入、删除、读回），守卫若在闭包里析构，
+        // 目录会在引擎还开着的时候被删 —— Windows 上删不掉，就留在 `%TEMP%` 里（M82）
         let build = || {
-            let mut t = BPlusTree::new(12, 4096);
+            let (s, mut t) = anon(12, 4096);
             for i in 0..N {
                 assert!(t.insert(k(i), r(i)), "插入第 {i} 个键失败");
             }
-            t
+            (s, t)
         };
         let victims: Vec<Key> = (0..N).step_by(2).map(k).collect();
 
@@ -3048,11 +3074,11 @@ mod tests {
             }
         };
 
-        let mut per_row = build();
+        let (_s_row, mut per_row) = build();
         let (d_per_row, all_per_row, rows_a, runs_a, removed_a) = arm(&mut per_row, false);
         check_readable(&mut per_row, "逐行臂");
 
-        let mut batched = build();
+        let (_s_batch, mut batched) = build();
         let (d_batch, all_batch, rows_b, runs_b, removed_b) = arm(&mut batched, true);
         check_readable(&mut batched, "批量臂");
 
@@ -3109,7 +3135,7 @@ mod tests {
         }
 
         for (tag, step) in [("每3把删1把", 3usize), ("成块删一半", 2usize)] {
-            let mut tree = BPlusTree::new(64, 4096);
+            let (_s, mut tree) = anon(64, 4096);
             for i in 0..rows {
                 assert!(tree.insert(k(i), r(i)), "插入第 {i} 个键失败");
             }

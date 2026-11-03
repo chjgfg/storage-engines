@@ -193,31 +193,81 @@ impl Transaction {
         self.scan(Some(key), None).into_iter().next()
     }
 
+    /// 反向一步：编码键 `≤ bound` 的最大那一行属于哪把逻辑键
+    fn prev_raw(&self, bound: &[u8]) -> Option<Vec<u8>> {
+        let store = self.store.lock().unwrap();
+        store
+            .range_back(b"", bound, 1)
+            .into_iter()
+            .next()
+            .and_then(|(enc, _)| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+    }
+
+    /// 这把逻辑键对当前事务的可见行（墓碑/过期 ⇒ `None`）
+    fn live_of(&self, raw: &[u8]) -> Option<ExportRecord> {
+        let logical = self.latest_visible_raw(raw).and_then(|(_, v)| v);
+        crate::common::live_record_of_logical(raw.to_vec(), logical, now_unix_secs())
+    }
+
     /// 反向找"≤ key 的最大一把活着的键"：**逐步退，不物化前缀**（M20）。
     ///
     /// 循环与判定规则在 [`crate::common::seek_prev_with`]（四引擎共用的一份）；这里只给两个口子：
     /// 反向一步（`range_back` 取界内最大的一行）与该键的可见行（复用 `latest_visible_raw`）。
     /// 改之前是 `scan(None, Some(key‖0))` + `retain` + `pop` ⇒ 一次调用 O(库) 的时间和内存。
     pub fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
-        crate::common::seek_prev_with(
-            key,
-            |bound| {
-                let store = self.store.lock().unwrap();
-                store
-                    .range_back(b"", bound, 1)
-                    .into_iter()
-                    .next()
-                    .and_then(|(enc, _)| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+        crate::common::seek_prev_with(key, |bound| self.prev_raw(bound), |raw| self.live_of(raw))
+    }
+
+    /// 从库尾取 `page_size` 条逻辑键（免 total，升序交出）—— M82 补齐（M81 第 4 项只给了 lsm）。
+    ///
+    /// 改前这一格对三家是 trait 默认那支"`reverse_scan` 全库物化再截尾"：20M 档 memory
+    /// **68.9 s** + 常驻 2147.5 MB / 峰值 +4771.0 MB。现在 = `page_size` 次反向定位，
+    /// 每次 O(log n) 的 BTreeMap 定位 ⇒ **不随库大小涨**。
+    ///
+    /// 起点取表里真实存在的最大编码键（[`crate::memory::MemStore::last_key`]），**不造 `\xFF` 哨兵**。
+    /// 循环与推进规则在 [`crate::common::back_n_with`]（与 `seek_prev_with` 同源）。
+    pub fn search_last_page(&self, page_size: usize) -> SearchPage {
+        const LAST_PAGE_MAX_STEPS: usize = 8 * 1024;
+        let max_raw = || {
+            self.store
+                .lock()
+                .unwrap()
+                .last_key()
+                .and_then(|enc| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+        };
+        match crate::common::back_n_with(
+            page_size,
+            LAST_PAGE_MAX_STEPS,
+            max_raw,
+            |bound| self.prev_raw(bound),
+            |raw| self.live_of(raw),
+        ) {
+            Some(items) => SearchPage {
+                items,
+                total: None,
+                page: 0,
+                page_size,
+                total_pages: None,
+                has_next: false,
             },
-            |raw| {
-                let logical = self.latest_visible_raw(raw).and_then(|(_, v)| v);
-                crate::common::live_record_of_logical(
-                    raw.to_vec(),
-                    logical,
-                    now_unix_secs(),
-                )
-            },
-        )
+            // 库尾连着一大片死键：退过界就回退全库截尾（慢，但正确；这一支有守卫钉着"不该发生"）
+            None => self.last_page_by_full_scan(page_size),
+        }
+    }
+
+    /// 回退支：全库物化再截尾（= `KvTxn::search_last_page` 的 trait 默认实现）
+    fn last_page_by_full_scan(&self, page_size: usize) -> SearchPage {
+        let mut items = self.reverse_scan(None, None);
+        items.truncate(page_size);
+        items.reverse();
+        SearchPage {
+            items,
+            total: None,
+            page: 0,
+            page_size,
+            total_pages: None,
+            has_next: false,
+        }
     }
 
     // ── 模糊 / 前缀搜索 + 分页 ──

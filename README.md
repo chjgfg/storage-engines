@@ -166,7 +166,7 @@ cargo test --release --lib engine::tests::scale_bench::rows_10000000 -- --exact 
 | `scan_page(after, limit)` | 最多返回 limit 行，游标向前推进 | limit 是行数不是字节；大值、长键、版本组仍需内存 |
 | 四个内置引擎的流式导出 / `scan_foreach` | 不先收集整个结果，回调可提前停止 | 后端缓存/源状态/当前版本组另计；回调自行 collect 仍占整库；自定义 trait 的默认 fallback 可能物化 |
 | `search_keys` | `without_total()` 避免强制精确计数 | 精确 total 要遍历匹配范围；offset 深翻仍要跳过前面各行 |
-| `search_last_page(page_size)`（M81 第 4 项） | 从**库尾**取固定页宽、不数 total；`lsm_tree` 走反向逐步退 ⇒ 代价 = 页宽 × O(块)，**不随库大小涨** | 其余三家 = `reverse_scan` 截尾（O(库)，反向原语缺，读数如实）；`total`/`total_pages` 恒 `None`、`has_next` 恒 `false`；库尾连片墓碑/过期时退过界内改走全库截尾 |
+| `search_last_page(page_size)`（M81 第 4 项，11-04 起四家都走反向） | 从**库尾**取固定页宽、不数 total ⇒ 代价 ≈ 页宽 × O(一次点读)，**不随库大小涨**：`lsm_tree` 走反向逐步退（页宽 × O(块)），其余三家走 `back_n_with`（页宽把候选键反向退）；600k 档四家 0.23~1.16 ms，同档"数全库再截尾"那一格 0.43~1.96 s | `total`/`total_pages` 恒 `None`、`has_next` 恒 `false`；库尾连片墓碑/过期时退过 `LAST_PAGE_MAX_STEPS = 8 Ki` 步仍未凑够页宽 ⇒ **退回**全库截尾（正确但 O(库)，计数守卫钉四家 `fallbacks == 0`）；三家的这一格在 **11-04 之前的构建上仍是 O(库)**（20M 档 88~106 / 55~71 / 64~69 s、常驻 +2147.5 MB、峰值 +4771 MB），跨这条线比读数没有意义 |
 | `cache_budget_bytes` | 按样本槽价估算缓存容量，bplus 7000 B/页、lsm 10400 B/块 | **不是进程 RSS 或任意数据形状下的字节硬上限**；不含结果 Vec、memtable、写集、blob GC 等，极小预算仍至少一槽；0 是撤销预算，不是禁用缓存 |
 | 自动版本切片 | 默认 16 Ki 行提交账触发，一次只消费一片；阻塞/失败保留账和游标，无新写也可在下一次 begin 重试 | 完整键组可能超出预算；不是后台线程、不是时间上限，也不负责缩小物理日志 |
 | `health()` | 全库版本行/链长统计 | O(物理行数)，不能当高频轻量采样 |
@@ -823,7 +823,7 @@ fn is_visible(&self, version: u64) -> bool {
 - `begin_transaction()` 检查这笔账:攒够一个切片宽度,就当场裁**一片**同样宽度的行
 - 切片宽度默认 **16 Ki 行**,四引擎同一个值;`set_vacuum_auto_slice(0)` 关闭
 
-触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率 1:1,这是「跟得上」的下界。挂在 begin 而不是 commit:那一处还没有本线程的活跃事务,不会被自己的「有活跃事务就跳过」踩中。
+触发量 = 切片宽度 ⇒ 回收速率与产生垃圾的速率 1:1,这是「跟得上」的下界。挂在 begin 而不是 commit:那一处还没有本线程的活跃事务,不会被自己的「有活跃事务就跳过」踩中。账花完而一轮还停在半路时(`ReclamationStatus::sweep_in_progress`),`begin()` **不会**替它续推——那是 `Maintenance` 的活(独立游标与间隔);不跑维护器就等下一次写或手动 `vacuum()`。M82 定的分工:曾让每个 `begin()` 续推半路轮次,代价是写流里每个事务都扫一整片。
 
 一片的代价是读 16 Ki 行元数据(不物化 value),单核机器上亚毫秒级,锁也只按这么久。**有界轮次不做全库收尾**(Bitcask 的 blob 重写与 `merge()`、B+ 树的 blob 清空、LSM 的 `set_mvcc_xmin_filter`)——判据是「这次调用是不是全库扫描」(`budget_rows == u64::MAX`),而不是「游标有没有回到库尾」:一把 key 的小库任何一片都正好读到库尾,用游标判断会让自动回收每轮都重写一遍库。
 

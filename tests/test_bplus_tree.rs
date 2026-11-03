@@ -437,4 +437,6 @@ fn test_bplus_tree() {
         }
     }
     println!("\ndemo 完成。数据文件在 `./{DEMO_DIR}/`，不会再写到仓库根目录。");
+    let _ = fs::remove_dir_all(DEMO_DIR);
+    // 收尾清掉本次 demo 目录：不清就会每跑一次往仓库 data/ 里积一份（M82）
 }

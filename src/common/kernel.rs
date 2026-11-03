@@ -99,12 +99,12 @@ pub struct VacuumScheduler {
     versions_removed: AtomicU64,
 }
 
-/// 一片回收的**许可**（M81 第 5 项后半：把"何时开一轮"与"这轮走完没有"分开之后才有这两个数）。
+/// 一片回收的**许可**。
 ///
 /// - `slice`：这一片扫多少行（= 切片宽度，恒定）。
-/// - `charged`：从"新增版本行账"里真取走了多少行。**开新一轮** = `slice`；
-///   **把已发起的轮次往前推** = `0`（账不够正是它要接着走的原因，不是它不该走的理由）。
-///   租约归还的是 `charged` 而不是 `slice` ⇒ 续跑那一支不会凭空造出一笔触发账。
+/// - `charged`：从"新增版本行账"里真取走了多少行。自 M82 起**恒等于 `slice`** —— `begin()`
+///   只在账攒够一片时才扫一片（见 [`VacuumScheduler::take_tick`]），没有"不取账也扫"的许可。
+///   字段保留是因为租约归还的必须是 `charged` 而不是别的数，这条合同要能从类型上读出来。
 pub struct VacuumTick {
     pub slice: u64,
     pub charged: u64,
@@ -162,41 +162,53 @@ impl VacuumScheduler {
         }
     }
 
-    /// 该裁一片了吗。**两件事分开**（M81 第 5 项的后半）：
-    /// ①「什么时候**开**一轮」= 新增版本行账 `pending` 攒够一片 ⇒ 取走这笔账（`charged = slice`）；
-    /// ②「这一轮**走完没有**」= 游标不在库头 ⇒ 一轮还在半途，即使账已经花完也必须把它推到尾，
-    ///    这一片**不再取账**（`charged = 0`）。
+    /// 丢掉"新增版本行账"里还没被消费的部分，返回丢掉的行数（M82，快照重放用）。
     ///
-    /// 为什么必须有②（实测缺口，不是假想）：旧写法只有① ⇒ 一片把 `pending` 扣到不足阈值，
-    /// 游标却还停在库中段，此后没有新写就**永远不再推进** —— 已发起的那趟扫描走不到库尾，
-    /// 后半库的垃圾无人认领。⚠️ 别把这件事读成"12 片只裁了 47.6% 的垃圾 ⇒ 链越长越差"：
-    /// 那个比值是**删除行数 ÷ 扫描预算行数**（两版组扫 2 删 1，完整 N 版组扫 N 删 N−1，
-    /// 链越长这个数反而越接近 100%），分母不是"全部垃圾"。
+    /// 为什么可以丢：这笔账的语义是"**攒了多少待回收的旧版本**"，而重放出来的行每把键只有一版
+    /// —— 一行垃圾都没有。留着它只会让重放刚结束就来一整轮空扫（`slice` 行/次）：20M 档实测
+    /// 1221 片 ≈ 十几秒，600k 档 `冷重开` 1.3 s → 4.4 s。⚠️ 只该在"新写入行确定不是垃圾"的场合用
+    /// （今天只有快照重放这一处），别拿它当"清账"的通用口子。
+    pub fn discard_pending(&self) -> u64 {
+        self.pending.swap(0, Ordering::SeqCst)
+    }
+
+    /// 该裁一片了吗：**新增版本行账攒够一片才取走一片**，否则 `None`。
+    ///
+    /// 这条口径是 M82 定的，把 M81 第 5 项后半加进来的"游标不在库头 ⇒ 账不够也给许可（`charged = 0`）"
+    /// 那一支**拿掉了**。那一支想解决的事是真的（一片把账扣到不足阈值、游标停在库中段，没有新写
+    /// 就永远不再推进 ⇒ 后半库的垃圾无人认领），但它把代价挂到了 `begin()` 热路径上：写流里一轮
+    /// 永远开着（账一直攒、游标一绕完就立刻再开），于是**每个事务**的 `begin()` 都扫一整片 ——
+    /// 1000 行/事务放大 16×、单行事务放大 16384×。`docs/test2.txt` 五档 20/20 格 `灌`/`更新`
+    /// 变慢、memory `冷重开` 1.3 s → 4.4 s、冷重开后每个单事务读格多付 8~10 ms，全是这笔税；
+    /// 守卫 `maintenance::tests::auto_vacuum_scanning_keeps_pace_with_writes_not_with_transactions`
+    /// 在那份实现上读出 275 片 ≈ 17 600 行（写了 512 行）。
+    ///
+    /// 现在的分工：`begin()` 的扫描量与写入量 1:1（攒多少扫多少，不多不少）；"账花完而一轮还在半路"
+    /// 由 [`crate::maintenance::Maintenance`] 兜 —— 它有自己的游标和间隔，本来就是干这个的，
+    /// 不在任何事务的路径上。普通 `open` 不跑维护器时，后半库的垃圾等下一次写或手动 `vacuum()`，
+    /// 这是有意的取舍，不是漏。`sweep_in_progress`（= 游标不在库头）照旧如实报告，好让调用方
+    /// 知道该不该去推一把。
     pub fn take_tick(&self) -> Option<VacuumTick> {
         let slice = self.slice.load(Ordering::SeqCst);
         if slice == 0 {
             return None;
         }
         let seen = self.pending.load(Ordering::SeqCst);
-        if seen >= slice {
-            // 只取一片，不能把大事务剩余的账清零；下一次 begin 继续偿还积压。
-            return match self
-                .pending
-                .compare_exchange(seen, seen - slice, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => Some(VacuumTick { slice, charged: slice }),
-                Err(_) => None,
-            };
+        if seen < slice {
+            return None;
         }
-        // 账不够 ⇒ 只有"一轮还在半途"才给许可，而且不碰账（账不够正是它要接着走的原因）。
-        if self.cursor.lock().unwrap().is_some() {
-            Some(VacuumTick { slice, charged: 0 })
-        } else {
-            None
+        // 只取一片，不能把大事务剩余的账清零；下一次 begin 继续偿还积压。
+        match self
+            .pending
+            .compare_exchange(seen, seen - slice, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Some(VacuumTick { slice, charged: slice }),
+            Err(_) => None,
         }
     }
 
     /// 一轮是否走在半路（游标不在库头）。维护器与守卫都读这一个口子，不许自己猜。
+    /// 自 M82 起它只是**状态**，不再是 `begin()` 要不要扫一片的依据。
     pub fn round_open(&self) -> bool {
         self.cursor.lock().unwrap().is_some()
     }
@@ -212,8 +224,7 @@ impl VacuumScheduler {
             return Ok(());
         }
         let mut lease = VacuumLease { scheduler: self, reserved: 0 };
-        // ⚠️ 这里**不再**预检 `pending < slice`：那正是"已发起的轮次推不到库尾"的根因。
-        // 能不能取一片由 `take_tick` 一处回答（开新轮看账，续半轮看游标）。
+        // 能不能取一片由 `take_tick` 一处回答（账够一片才给），这里不另设预检。
         let Some(tick) = self.take_tick() else { return Ok(()) };
         lease.reserved = tick.charged;
         let cursor = self.cursor();
@@ -772,13 +783,15 @@ mod tests {
         assert_eq!((t.slice, t.charged), (8, 8));
     }
 
-    /// 第 5 项后半的核心：**账不足一片**只该挡住"开新一轮"，不该挡住"把已经开的那一轮推到尾"。
+    /// M82 的口径：**账不足一片 ⇒ `begin()` 不扫**，哪怕一轮还开在半路。
     ///
-    /// 旧形状在这里直接 `None` ⇒ 游标永远停在库中段，后半库的垃圾无人认领。
-    /// 摘掉 `round_open` 那一支（退回 `pending < slice ⇒ None`）本条立即红，且红在"续跑取不到许可"
-    /// 这一句上，不会误红在别处。
+    /// 这是 M81 第 5 项后半那条"游标不在库头也给许可（`charged = 0`）"的**反面**——那一支让写流里
+    /// 每个事务都扫一整片（守卫 `auto_vacuum_scanning_keeps_pace_with_writes_not_with_transactions`
+    /// 钉的就是它）。半路的轮次由 `Maintenance` 推，不由下一个事务推；但 `sweep_in_progress`
+    /// 必须照实报 true，调用方才知道有一轮没走完。
+    /// 把 `take_tick` 里那一支加回来（账不够而游标非空 ⇒ `Some`）⇒ 本条立即红在"不该给许可"上。
     #[test]
-    fn scheduler_continues_an_open_round_without_new_writes() {
+    fn scheduler_does_not_push_an_open_round_from_begin_without_debt() {
         let s = VacuumScheduler::new(8);
         let sweep = || s.status(&Registry::new()).sweep_in_progress;
         s.on_commit(8);
@@ -793,29 +806,37 @@ mod tests {
         s.set_cursor(Some(b"mid".to_vec()));
         assert!(s.round_open());
         assert!(sweep(), "账已经花光而一轮还在半路 ⇒ 这一格必须报 true");
-        // 账为 0、也没有任何新写 ⇒ 仍要给许可，且**不取账**（charged=0 ⇒ 归还 0，不造出假账）
-        let t = s.take_tick().expect("已发起的轮次不许因为账花完就停摆");
-        assert_eq!((t.slice, t.charged), (8, 0));
-        assert_eq!(s.pending.load(Ordering::SeqCst), 0, "续跑那一支不许从账里取数");
+        // 账为 0 ⇒ **不给许可**：半路的轮次不是 begin() 的活
+        assert!(s.take_tick().is_none(), "账不足一片时 begin() 不许扫，哪怕一轮开着（M82）");
+        assert_eq!(s.pending.load(Ordering::SeqCst), 0);
+        assert!(sweep(), "没推进 ⇒ 状态照旧报'半路'，不许因为没扫就假装走完");
 
-        // 推到库尾：游标归 None ⇒ 没有新写就再也不该触发
+        // 新写把账攒够 ⇒ 从同一个游标接着扫，不从头
+        s.on_commit(8);
+        let t = s.take_tick().expect("账够了必须给许可");
+        assert_eq!((t.slice, t.charged), (8, 8));
+        assert_eq!(s.cursor().as_deref(), Some(&b"mid"[..]), "续扫要从停下的地方接着走");
+
+        // 推到库尾：游标归 None ⇒ 没有新写就不该触发
         s.set_cursor(None);
         assert!(s.take_tick().is_none(), "一轮走完了、账又不够 ⇒ 不该空转");
         assert!(!sweep());
     }
 
-    /// 续跑那一支失败/跳过时归还的必须是 `charged`(=0)，不是 `slice` —— 否则长跑里每失败一片
-    /// 就往账里塞 8 行，凭空开出下一轮，回收速率被写成"比产生垃圾快"。
+    /// 一片失败/跳过时归还的必须正好是取走的那 `charged` 行：既不少（账不许被失败吃掉），
+    /// 也不多（不许凭空造账开出下一轮）。游标在半路时也一样。
     #[test]
-    fn open_round_refunds_only_what_it_borrowed() {
+    fn failed_slice_refunds_exactly_what_it_charged() {
         let s = VacuumScheduler::new(8);
         s.set_cursor(Some(b"mid".to_vec()));
         let pending = || s.pending.load(Ordering::SeqCst);
+        s.on_commit(8);
         let fail: Result<(), &str> = s.run_pending(|_, _| Err("disk error"));
         assert_eq!(fail, Err("disk error"));
-        assert_eq!(pending(), 0, "续跑失败不许把 slice 记成新增版本行");
+        assert_eq!(pending(), 8, "失败要把取走的 8 行原样退回");
         let _: Result<(), &str> = s.run_pending(|_, _| Err("disk error"));
-        assert_eq!(pending(), 0, "连着失败也不许把账越堆越高");
+        assert_eq!(pending(), 8, "连着失败也只是原样退回，不许越堆越高");
+        assert_eq!(s.cursor().as_deref(), Some(&b"mid"[..]), "失败不许动游标");
     }
 
     #[test]

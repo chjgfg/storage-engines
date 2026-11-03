@@ -340,10 +340,11 @@ pub trait KvTxn: Send {
     /// 每拿到一把逻辑键就把上界收紧成**它本身**，而版本行合同 `raw ‖ version_be > raw`
     /// 让那一组整体自动出局 ⇒ 代价 = `page_size` 次反向定位、每次 O(块)，**不随库大小涨**。
     ///
-    /// 默认实现 = [`KvTxn::reverse_scan`] 截尾（O(库)，但**正确** —— bplus/bitcask/memory 停在
-    /// 这里，读数是"反向也陪跑整库"的形状）；`lsm_tree` 覆盖成逐步退。⚠️ 别把默认实现改成
-    /// "用 offset 翻到最后一页"：免 total 时根本没有末页下标可算，`skip = usize::MAX` 那种写法
-    /// 是一行都进不了窗口、还照样走完全库。
+    /// 默认实现 = [`KvTxn::reverse_scan`] 截尾（O(库)，但**正确**）。⚠️ **M82 起四家内置引擎都
+    /// 覆盖了它**（各家的 `kv_ops::search_last_page` 走反向逐步退：KeyDir/叶/BTreeMap 的尾键当起点，
+    /// 循环在 [`crate::common::back_n_with`]）；这一支默认只留给将来新加的引擎，那时它就是那个引擎
+    /// 的**诚实读数**，不是量具坏了。别把默认实现改成"用 offset 翻到最后一页"：免 total 时根本
+    /// 没有末页下标可算，`skip = usize::MAX` 那种写法是一行都进不了窗口、还照样走完全库。
     ///
     /// `total` / `total_pages` 恒 `None`（没数），`has_next` 恒 `false` —— 已在库尾，后面没有东西；
     /// 合同看 [`SearchPage::has_next`]，它问的是"**后面**还有没有"，别拿"前面还有"冒充它。
@@ -879,8 +880,10 @@ fn canonical_name(name: &str) -> Option<&'static str> {
 ///   （memory 没有 WAL，"设了阈值"这件事对它没有意义，不能假装成功）
 /// - `path: $method` → 取库路径的方法名；`none` → 纯内存
 /// - `merge: yes` → 转发 `merge`；`no` → 用 trait 默认（`Unsupported`）
-/// - `last_page: yes` → 转发 `search_last_page`（M81 第 4 项：lsm 有逐步退的反向定位）；
-///   `no` → 用 trait 默认（= `reverse_scan` 截尾，O(库) 但正确）
+/// - `last_page: yes` → 转发 `search_last_page`（反向逐步退，O(页宽)）；
+///   `no` → 用 trait 默认（= `reverse_scan` 截尾，O(库) 但正确）。
+///   ⚠️ M82 起**四家都是 `yes`**：`no` 这一支只留给将来新加的引擎（那时它就是那个引擎的
+///   诚实读数，不是量具坏了）
 macro_rules! impl_engine {
     (
         engine_struct: $engine:ident,
@@ -1080,7 +1083,7 @@ macro_rules! impl_engine {
                 self.inner.search_keys(query)
             }
 
-            // M81 第 4 项：`search_last_page` 只有 lsm 有逐步退的实现，其余三家留 trait 默认
+            // M82：四家都覆盖了 `search_last_page`（反向逐步退）；`no` 只留给将来的新引擎
             impl_engine!(@last_page $last_page);
 
             fn key_count(&self, prefix: &[u8]) -> usize {
@@ -1327,7 +1330,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: yes,
-    last_page: no,
+    last_page: yes,
     cache: no,
 }
 
@@ -1344,7 +1347,7 @@ impl_engine! {
     durable: yes,
     wal: yes,
     merge: no,
-    last_page: no,
+    last_page: yes,
     cache: yes,
 }
 
@@ -1378,7 +1381,7 @@ impl_engine! {
     durable: no,
     wal: no,
     merge: no,
-    last_page: no,
+    last_page: yes,
     cache: no,
 }
 
@@ -1400,23 +1403,23 @@ mod tests {
 
     /// 在临时目录里跑一遍所有磁盘引擎 + memory
     ///
-    /// 计数器不可省：Windows 上 `SystemTime` 的粒度约 15.6ms，而 `open_all()` 生成的
-    /// 目录名只带 tag —— 并发跑的两个用同一 tag 的测试会拿到**同一个目录、同一把 .lock**，
-    /// 后来者直接 `WouldBlock`（表现为随机的偶发红）。
-    fn tmp_dir(tag: &str) -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("se_engine_{tag}_{nanos}_{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// 唯一性交给 [`crate::common::ScratchPath`]（pid + 纳秒 + **进程内序号**）：Windows 上
+    /// `SystemTime` 的粒度约 15.6ms，只靠 tag 会让并发跑的两个同 tag 用例拿到同一个目录、
+    /// 同一把 `.lock`，后来者 `WouldBlock`（表现为随机的偶发红）。
+    ///
+    /// 返回的是 **RAII 句柄**（M82）：用例把它声明在引擎**之前**即可 —— 析构按反向声明序走，
+    /// 引擎先关文件、scratch 后删目录；正常收尾与 panic 展开都会删（此前靠人记得写 `cleanup`，
+    /// 而"引擎还开着就删目录"在 Windows 上静默失败 ⇒ 一次全量跑往 `%TEMP%` 漏 158 个条目）。
+    fn tmp_dir(tag: &str) -> crate::common::ScratchPath {
+        crate::common::ScratchPath::new("se_engine", tag, "")
     }
 
-    fn open_all() -> Vec<(&'static str, Box<dyn KvEngine>, Option<PathBuf>)> {
-        let mut out: Vec<(&'static str, Box<dyn KvEngine>, Option<PathBuf>)> = Vec::new();
+    /// 四个引擎（含 memory）。第三条是 scratch 守卫：**元组的字段按 0→1→2 析构**，
+    /// 所以 `db` 一定先于 `dir` 落地 —— 别把这个元组拆成 `let (a, b, c)`（那样按反向声明序
+    /// 走，守卫会先跑，Windows 上文件还开着就删不掉）。
+    fn open_all() -> Vec<(&'static str, Box<dyn KvEngine>, Option<crate::common::ScratchPath>)> {
+        let mut out: Vec<(&'static str, Box<dyn KvEngine>, Option<crate::common::ScratchPath>)> =
+            Vec::new();
         for name in ["bitcask", "bplus_tree", "lsm_tree"] {
             let dir = tmp_dir(name);
             let db = open_engine(name, Some(&dir)).expect("open disk engine");
@@ -1426,7 +1429,7 @@ mod tests {
         out
     }
 
-    fn cleanup(dirs: Vec<Option<PathBuf>>) {
+    fn cleanup(dirs: Vec<Option<crate::common::ScratchPath>>) {
         for d in dirs.into_iter().flatten() {
             let _ = std::fs::remove_dir_all(&d);
         }
@@ -1441,13 +1444,21 @@ mod tests {
     ///   末页会全是重复键 + 旧值 ⇒ 这条立刻红。
     ///   形状里故意塞了**尾部墓碑**与一把"**入库时就已过期**"的键：反向走时它们不计数但必须跳过，
     ///   漏判任何一支就是短页（少一行）或把死键交出去。
-    /// ② **有界性**（只有 lsm 覆盖了这条门，故只测它）：取末页花的块读/轻量访问数不许随库涨。
-    ///   钉计数不钉墙钟（本机跨轮漂 1.3~2.6×）；改前那一格是 `scan` 全库再截尾（20M 档 80.7 s）。
+    /// ② **有界性**（四家都要过）：取末页的代价不许随库涨。钉**计数**不钉墙钟（本机跨轮漂
+    ///   1.3~2.6×）；改前那一格是 `scan` 全库再截尾（三家 20M 档 68.9~105.6 s + 常驻 2.1 GB）。
+    ///   - lsm：`block_reads` / `light_visits`（它那条走 SST 块读）
+    ///   - 其余三家：`back_n_candidates`（反向退过的候选键数）必须 ≈ 页宽，且
+    ///     `back_n_fallbacks == 0` —— 回退那一支是"退过 8192 步、改走全库截尾"，它一旦被踩中，
+    ///     这一格就悄悄回到 O(库)。两个计数一人盯一种退化形状（M82）。
     #[test]
     fn last_page_agrees_with_the_tail_and_stays_bounded() {
         const N: usize = 3_000;
         const PAGE: usize = 10;
-        for (name, db, _dir) in open_all() {
+        for entry in open_all() {
+            // 整条 `entry` 不拆开：元组字段按 0→1→2 析构 ⇒ 引擎先落地、scratch 守卫后删目录。
+            // 拆成 `for (name, db, dir)` 会按反向声明序走、守卫先跑 —— 而 Windows 上引擎还开着的
+            // `.log`/`.lock` 那时删不掉，目录就白留在 `%TEMP%` 里（M82）。
+            let (name, db) = (entry.0, &*entry.1);
             {
                 let tx = db.begin();
                 for i in 0..N {
@@ -1477,14 +1488,18 @@ mod tests {
                 let take = all.len().min(PAGE);
                 all.split_off(all.len() - take)
             };
-            let (blocks, visits, page) = {
+            let (blocks, visits, cands, fallbacks, page) = {
                 let tx = db.begin();
                 let s0 = crate::lsm_tree::sst::block_reads();
                 let v0 = crate::lsm_tree::sst::light_visits();
+                let c0 = crate::common::back_n_candidates();
+                let f0 = crate::common::back_n_fallbacks();
                 let page = tx.search_last_page(PAGE);
                 let out = (
                     crate::lsm_tree::sst::block_reads() - s0,
                     crate::lsm_tree::sst::light_visits() - v0,
+                    crate::common::back_n_candidates() - c0,
+                    crate::common::back_n_fallbacks() - f0,
                     page,
                 );
                 tx.commit();
@@ -1500,6 +1515,20 @@ mod tests {
                 // 而"物化全库"那一支在这个库上是几千次 ⇒ 松界也咬得住。
                 assert!(blocks <= 400, "{name}: 取 {PAGE} 行末页读了 {blocks} 块 ⇒ 不像 O(页) 的走法");
                 assert!(visits <= 400, "{name}: 取 {PAGE} 行末页轻量访问 {visits} 次 ⇒ 不像 O(页) 的走法");
+            } else {
+                // 三家走 `back_n_with`：候选键数只该是"页宽 + 尾巴上那几把死键"（这里 6 把），
+                // 与库里的 3000 把无关；回退那一支一次都不许被踩中（踩中 = 悄悄退回 O(库)）。
+                // 下界那一头也钉住：`cands == 0` 说明这一家根本没走 `back_n_with`（把宏臂翻回
+                // `last_page: no`、退回 trait 默认的全库截尾），那时上界是过得去的 ⇒ 会漏检。
+                assert!(
+                    cands >= PAGE as u64,
+                    "{name}: 取 {PAGE} 行末页只退了 {cands} 个候选键 ⇒ 没走反向逐步退（宏臂翻回 no 了？）"
+                );
+                assert!(
+                    cands <= (PAGE + 8) as u64,
+                    "{name}: 取 {PAGE} 行末页退了 {cands} 个候选键（库里有 {N} 把）⇒ 不像 O(页宽) 的走法"
+                );
+                assert_eq!(fallbacks, 0, "{name}: 末页走了'退太多 ⇒ 全库截尾'的回退支 ⇒ 这一格又成了 O(库)");
             }
             // 页宽超过库存量 ⇒ 如实交出短页，不 panic、不补空行
             let wide = {
@@ -1688,7 +1717,11 @@ mod tests {
     fn txn_kernel_agrees_across_engines() {
         let mut finals: Vec<(&str, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = Vec::new();
         let mut actives: Vec<(&str, u64)> = Vec::new();
-        for (name, db, dir) in open_all() {
+        for entry in open_all() {
+            // 整条 `entry` 不拆开：元组字段按 0→1→2 析构 ⇒ 引擎先落地、scratch 守卫后删目录。
+            // 拆成 `for (name, db, dir)` 会按反向声明序走、守卫先跑 —— 而 Windows 上引擎还开着的
+            // `.log`/`.lock` 那时删不掉，目录就白留在 `%TEMP%` 里（M82）。
+            let (name, db) = (entry.0, &*entry.1);
             // ① 两条事务抢同一把 key：后来者拒写，且那一行不许留在库里
             let t1 = db.begin();
             let t2 = db.begin();
@@ -1751,9 +1784,6 @@ mod tests {
             tx.commit();
             finals.push((name, rows));
             actives.push((name, db.health().active_txns));
-            if let Some(d) = dir {
-                let _ = std::fs::remove_dir_all(&d);
-            }
         }
         let want = &finals[0];
         for got in &finals[1..] {
@@ -1801,7 +1831,11 @@ mod tests {
         let answer = format!("k{:05}", dead_start - 1);
         let probe = format!("k{:05}", N - 1);
 
-        for (name, db, dir) in open_all() {
+        for entry in open_all() {
+            // 整条 `entry` 不拆开：元组字段按 0→1→2 析构 ⇒ 引擎先落地、scratch 守卫后删目录。
+            // 拆成 `for (name, db, dir)` 会按反向声明序走、守卫先跑 —— 而 Windows 上引擎还开着的
+            // `.log`/`.lock` 那时删不掉，目录就白留在 `%TEMP%` 里（M82）。
+            let (name, db) = (entry.0, &*entry.1);
             {
                 let tx = db.begin();
                 for i in 0..N {
@@ -1926,9 +1960,6 @@ mod tests {
                 Some(&b"v"[..]),
                 "{name}: seek_prev 交出来的 value 不该是信封裸字节"
             );
-            if let Some(d) = dir {
-                let _ = std::fs::remove_dir_all(&d);
-            }
         }
     }
 
@@ -1952,7 +1983,11 @@ mod tests {
     #[test]
     fn write_set_registration_costs_a_hash_not_a_walk() {
         const K: usize = 2000;
-        for (name, db, dir) in open_all() {
+        for entry in open_all() {
+            // 整条 `entry` 不拆开：元组字段按 0→1→2 析构 ⇒ 引擎先落地、scratch 守卫后删目录。
+            // 拆成 `for (name, db, dir)` 会按反向声明序走、守卫先跑 —— 而 Windows 上引擎还开着的
+            // `.log`/`.lock` 那时删不掉，目录就白留在 `%TEMP%` 里（M82）。
+            let (name, db) = (entry.0, &*entry.1);
             let s0 = crate::common::txn::write_set_scans();
             {
                 let tx = db.begin();
@@ -2036,9 +2071,6 @@ mod tests {
                 control >= K as u64,
                 "{name}: 对照的慢算法只走了 {control} 把键 ⇒ 这把尺子空转，断言等于没测"
             );
-            if let Some(d) = dir {
-                let _ = std::fs::remove_dir_all(&d);
-            }
         }
     }
 
@@ -2110,6 +2142,56 @@ mod tests {
             dirs.push(dir);
         }
         cleanup(dirs);
+    }
+
+    /// M82：快照重放**不扫、也不记账** —— 重放出来的行每把键只有一版，一行垃圾都没有。
+    ///
+    /// 判据（计数，不看墙钟）：重开一个 N 行的快照之后，`completed_slices == 0` 且
+    /// `pending_rows == 0`。改前那一版：重放是"每 1000 行一个事务"的写流 ⇒ 每 16.4 个事务扫一整片
+    /// （1:1 跟着"写"的量走），并且留下 N 行触发账（重开后的头 N/16384 个事务每个都要扫一片）。
+    /// 600k 档 `冷重开` **1.317 s**（`65b9aa6` 实测）→ **4.39 s**（`docs/test2.txt`）就是这笔；
+    /// 20M 档白扫一整库。
+    /// 对照实验：摘掉 `AutoVacuumOff::pause` 或 `discard_pending` ⇒ 本条红在 `completed_slices`
+    /// 或 `pending_rows` 上（两处各管一半）。
+    #[test]
+    fn memory_snapshot_replay_neither_scans_nor_accrues_debt() {
+        const N: usize = 20_000; // ≫ 一片（16 Ki），否则"扫过"与"没扫"分不出来
+        let dir = tmp_dir("memory_snapshot_quiet");
+        {
+            let db = open_engine("memory", Some(&dir)).unwrap();
+            let tx = db.begin();
+            for i in 0..N {
+                assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}").into_bytes()), "灌第 {i} 把");
+            }
+            tx.commit();
+            drop(tx);
+            drop(db); // 停止落盘
+        }
+        let db = open_engine("memory", Some(&dir)).unwrap();
+        let st = db.reclamation_status().expect("memory 必须能报回收状态");
+        assert_eq!(
+            st.completed_slices, 0,
+            "重放期间扫了 {} 片 —— 新写入的行没有旧版本可回收",
+            st.completed_slices
+        );
+        assert_eq!(
+            st.pending_rows, 0,
+            "重放留下 {} 行触发账 ⇒ 重开后的头几个事务要替它白扫一整轮",
+            st.pending_rows
+        );
+        // 别把"安静"做成"停摆"：重放之后自动回收必须照常工作（账照记、片照扫）
+        let tx = db.begin();
+        for i in 0..N {
+            assert!(tx.set(format!("k{i:05}").as_bytes(), format!("v{i}b").into_bytes()), "更新第 {i} 把");
+        }
+        tx.commit();
+        drop(tx);
+        assert!(
+            db.reclamation_status().unwrap().pending_rows > 0,
+            "重放之后自动回收必须还在工作（新写入要照常记账）"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// M81 第 6 项：memory 的启停快照 —— **只在启停各碰一次文件**。四条判据各钉一件事，
@@ -2187,7 +2269,7 @@ mod tests {
     fn disk_engines_expose_their_path() {
         let dir = tmp_dir("path");
         let db = open_engine("bitcask", Some(&dir)).unwrap();
-        assert_eq!(db.path(), Some(dir.as_path()));
+        assert_eq!(db.path(), Some(&*dir));  // 守卫只 Deref 到 `Path`，不装 `PathBuf`
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2195,7 +2277,7 @@ mod tests {
     #[test]
     fn engine_is_object_safe_in_collections() {
         // 关键回归：Box<dyn KvEngine> 必须能放进容器并统一驱动
-        let dirs: Vec<PathBuf> = vec![tmp_dir("obj1")];
+        let dirs = vec![tmp_dir("obj1")];
         let mut engines: Vec<Box<dyn KvEngine>> = Vec::new();
         engines.push(open_engine("memory", None).unwrap());
         engines.push(open_engine("lsm", Some(&dirs[0])).unwrap());
@@ -2307,7 +2389,7 @@ mod tests {
         let base = tmp_dir("storage_cfg");
         let cfg = StorageConfig {
             kind: EngineKind::BPlusTree,
-            data_dir: base.clone(),
+            data_dir: base.to_path_buf(),
             engine: EngineConfig {
                 order: 16,
                 max_cache_pages: 32,
@@ -2349,9 +2431,8 @@ mod tests {
         ];
 
         let engines = open_all();
-        let mut dirs = Vec::new();
         for (name, db, dir) in engines {
-            dirs.push(dir.clone());
+            // 真正的清理交给守卫，这里登记的只是兜底副本
             for (idx, (tag, bytes)) in cases.iter().enumerate() {
                 let key = format!("raw{idx}").into_bytes();
                 {
@@ -2421,11 +2502,10 @@ mod tests {
                     }
                     tx.commit();
                 }
-                // 路径已在循环开头登记过，这里只放句柄（文件锁要放开才能删目录）
+                // 先放句柄，循环末尾那条 scratch 守卫才删得动目录
                 drop(reopened);
             }
         }
-        cleanup(dirs);
     }
 
     /// `migrate` 的验收：跨引擎**环**一圈（bitcask → lsm → bplus → memory → bitcask），
@@ -2436,7 +2516,6 @@ mod tests {
     #[test]
     fn migrate_walks_a_ring_of_engines_byte_for_byte() {
         let ring = ["bitcask", "lsm_tree", "bplus_tree", "memory"];
-        let mut dirs: Vec<Option<PathBuf>> = Vec::new();
 
         // 四种形状各一条：普通、`0x00` 打头、`0x01` 打头（看着像 TTL 信封）、带 TTL
         let seed: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = vec![
@@ -2451,6 +2530,10 @@ mod tests {
             (b"ttl".to_vec(), b"expires-later".to_vec(), Some(3600)),
         ];
 
+        // 守卫比 `prev`/`base` 先声明 ⇒ 后析构（反向声明序）：环上最后一家的引擎放掉之后
+        // 才轮到删目录。这里不能像别的用例那样"守卫活到迭代末" —— 每一跳都要把上一家的库
+        // **再当一次源**读，迭代末删掉会让它读不到自己的日志。
+        let mut guards: Vec<crate::common::ScratchPath> = Vec::new();
         let mut base: Option<Vec<(Vec<u8>, Option<Vec<u8>>)>> = None;
         let mut prev: Option<Box<dyn KvEngine>> = None;
         for (idx, name) in ring.iter().enumerate() {
@@ -2461,9 +2544,9 @@ mod tests {
                 let _ = std::fs::create_dir_all(&dir);
                 Some(dir.join("bplus.db"))
             } else {
-                Some(dir.clone())
+                Some(dir.to_path_buf())
             };
-            dirs.push(path.clone());
+            guards.push(dir);
             let db = open_engine(*name, path.as_deref()).expect("开目标引擎");
             if let Some(src) = prev.take() {
                 let stats = migrate(&*src, &*db, 2).expect("migrate 失败");
@@ -2502,7 +2585,8 @@ mod tests {
             }
             prev = Some(db);
         }
-        cleanup(dirs);
+        // 最后一家的引擎还在 `prev` 里；先放掉它，守卫才删得动
+        drop(prev.take());
     }
 
     /// 门面层：`without_total()` 在四家必须给出**同一页的同一份内容**，而 `total` 如实是 `None`。
@@ -2622,11 +2706,9 @@ mod tests {
     /// 也有 `open_engine`。
     #[test]
     fn engine_config_knobs_reach_the_engine_and_are_readable_back() {
-        let mut dirs: Vec<PathBuf> = Vec::new();
 
         // ---- bplus_tree：order / max_cache_pages（只有这一家吃）----
         let dir = tmp_dir("knob_bplus");
-        dirs.push(dir.clone());
         let db = open_engine_with(
             "bplus_tree",
             Some(&dir),
@@ -2642,7 +2724,6 @@ mod tests {
         assert_eq!(t.get("max_cache_pages"), Some("32"), "{t}");
 
         let ddir = tmp_dir("default_bplus");
-        dirs.push(ddir.clone());
         let dflt = open_engine("bplus_tree", Some(&ddir)).expect("默认档 B+ 树");
         let d = dflt.tuning();
         assert_eq!(d.get("order"), Some("64"), "默认档必须是另一个数，上面的断言才不是空转");
@@ -2650,7 +2731,6 @@ mod tests {
 
         // ---- bitcask：分片上限（open 时就定死了，之后 rotate 按它走）----
         let dir = tmp_dir("knob_bitcask");
-        dirs.push(dir.clone());
         let db = open_engine_with(
             EngineKind::Bitcask,
             Some(&dir),
@@ -2665,7 +2745,6 @@ mod tests {
         assert_eq!(db.tuning().get("max_file_bytes"), Some("4096"));
 
         let ddir = tmp_dir("default_bitcask");
-        dirs.push(ddir.clone());
         let dflt = open_engine("bitcask", Some(&ddir)).expect("默认档 bitcask");
         assert_eq!(
             dflt.tuning().get("max_file_bytes"),
@@ -2675,7 +2754,6 @@ mod tests {
 
         // ---- lsm_tree：整份 LSMTreeOptions 补丁 ----
         let dir = tmp_dir("knob_lsm");
-        dirs.push(dir.clone());
         let db = open_engine_with(
             EngineKind::LsmTree,
             Some(&dir),
@@ -2696,7 +2774,6 @@ mod tests {
         assert_eq!(t.get("l0_compact_threshold"), Some("8"), "MVCC 档的 L0 阈值不该被顺手改回 4");
 
         let ddir = tmp_dir("default_lsm");
-        dirs.push(ddir.clone());
         let dflt = open_engine("lsm_tree", Some(&ddir)).expect("默认档 lsm_tree");
         let d = dflt.tuning();
         assert_eq!(d.get("block_cache_blocks"), Some("256"), "for_mvcc 的块缓存是 256");
@@ -2705,7 +2782,6 @@ mod tests {
         // ---- 跨引擎两条：WAL 阈值 + 自动回收切片 ----
         for name in ["bitcask", "bplus_tree", "lsm_tree"] {
             let dir = tmp_dir("knob_wal");
-            dirs.push(dir.clone());
             let db = open_engine_with(
                 name,
                 Some(&dir),
@@ -2744,7 +2820,6 @@ mod tests {
         let mem_default = open_engine("memory", None).expect("默认档 memory");
         assert_eq!(mem_default.vacuum_auto_slice(), 16 * 1024, "四引擎默认切片同一个值");
 
-        cleanup(dirs.into_iter().map(Some).collect());
     }
 
     /// 缓存自动档的**顶**这颗旋钮：两家里调得动、另外两家当场说不行（M32 的门面侧守卫）。
@@ -2760,12 +2835,10 @@ mod tests {
     /// lsm `test_block_cache_auto_max_is_raisable_and_coverage_is_readable`。
     #[test]
     fn cache_auto_max_knob_routes_to_two_engines_and_is_refused_by_the_other_two() {
-        let mut dirs: Vec<PathBuf> = Vec::new();
 
         // ---- 能调的两家：默认顶读得回来，压/抬之后读回来的是新值，tuning 里连着分母 ----
         for (name, default_ceil) in [("bplus_tree", 2048usize), ("lsm_tree", 1024)] {
             let dir = tmp_dir(&format!("cache_max_{name}"));
-            dirs.push(dir.clone());
             let db = open_engine(name, Some(&dir)).expect("默认档");
             assert_eq!(db.cache_auto_max().unwrap(), default_ceil, "{name}: 默认顶要读得回来");
 
@@ -2797,7 +2870,6 @@ mod tests {
         // ---- `EngineConfig.cache_auto_max` 那条路：打开时就带上顶 ----
         for (name, ceil) in [("bplus_tree", 4096usize), ("lsm_tree", 3000)] {
             let dir = tmp_dir(&format!("cache_max_cfg_{name}"));
-            dirs.push(dir.clone());
             let db = open_engine_with(
                 name,
                 Some(&dir),
@@ -2813,7 +2885,6 @@ mod tests {
         // ---- 没有"缓存槽数"这个概念的两家：热调与带配置打开都要**当场失败** ----
         for name in ["bitcask", "memory"] {
             let dir = tmp_dir(&format!("cache_max_bad_{name}"));
-            dirs.push(dir.clone());
             let db = open_engine(name, Some(&dir)).expect("默认档");
             let e = db
                 .set_cache_auto_max(4096)
@@ -2832,7 +2903,6 @@ mod tests {
 
             // 带配置打开也不能静默忽略（"以为设了顶、其实跑的是默认档"就是这个洞的形状）
             let cfg_dir = tmp_dir(&format!("cache_max_cfg_bad_{name}"));
-            dirs.push(cfg_dir.clone());
             let bad = open_engine_with(
                 name,
                 Some(&cfg_dir),
@@ -2849,7 +2919,6 @@ mod tests {
             );
         }
 
-        cleanup(dirs.into_iter().map(Some).collect());
     }
 
     /// 缓存**内存预算**这颗旋钮：两家里调得动、另外两家当场说不行（M76 的门面侧守卫）。
@@ -2866,11 +2935,9 @@ mod tests {
     /// （热调 / 带配置打开）都真的进了引擎，且读回来的是给的那个字节数。
     #[test]
     fn cache_budget_knob_routes_to_two_engines_and_is_refused_by_the_other_two() {
-        let mut dirs: Vec<PathBuf> = Vec::new();
 
         for name in ["bplus_tree", "lsm_tree"] {
             let dir = tmp_dir(&format!("cache_budget_{name}"));
-            dirs.push(dir.clone());
             let db = open_engine(name, Some(&dir)).expect("默认档");
             // 没设过预算 ⇒ 读回 0，而不是"看起来像个数"
             assert_eq!(db.cache_budget_bytes().unwrap(), 0, "{name}: 默认档不该像设过预算");
@@ -2899,7 +2966,6 @@ mod tests {
 
             // 带配置打开：那条路也必须真的进引擎（"以为配过了"是这个洞的形状）
             let cfg_dir = tmp_dir(&format!("cache_budget_cfg_{name}"));
-            dirs.push(cfg_dir.clone());
             let db2 = open_engine_with(
                 name,
                 Some(&cfg_dir),
@@ -2919,7 +2985,6 @@ mod tests {
         // 没有"缓存槽数"这个概念的两家：热调与带配置打开都要**当场失败**
         for name in ["bitcask", "memory"] {
             let dir = tmp_dir(&format!("cache_budget_bad_{name}"));
-            dirs.push(dir.clone());
             let db = open_engine(name, Some(&dir)).expect("默认档");
             let e = db
                 .set_cache_budget_bytes(8_000_000)
@@ -2941,7 +3006,6 @@ mod tests {
             drop(db);
 
             let cfg_dir = tmp_dir(&format!("cache_budget_cfg_bad_{name}"));
-            dirs.push(cfg_dir.clone());
             let bad = open_engine_with(
                 name,
                 Some(&cfg_dir),
@@ -2958,7 +3022,6 @@ mod tests {
             );
         }
 
-        cleanup(dirs.into_iter().map(Some).collect());
     }
 
     /// LSM 档里 `enable_mem_wal` / `enable_bg_compact` 传 `true` 也**必须**是 `false`。
@@ -3921,7 +3984,11 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(20000);
         let edge = rows.min(200);
-        for (name, db, dir) in open_all() {
+        for entry in open_all() {
+            // 整条 `entry` 不拆开：元组字段按 0→1→2 析构 ⇒ 引擎先落地、scratch 守卫后删目录。
+            // 拆成 `for (name, db, dir)` 会按反向声明序走、守卫先跑 —— 而 Windows 上引擎还开着的
+            // `.log`/`.lock` 那时删不掉，目录就白留在 `%TEMP%` 里（M82）。
+            let (name, db) = (entry.0, &*entry.1);
             let tx = db.begin();
             let mut head = 0u128;
             let mut tail = 0u128;
@@ -3951,9 +4018,6 @@ mod tests {
                 "{name}: 一个事务里第 {rows} 行的单价 {tail_us:.1} µs 比第 1 行 {head_us:.1} µs 贵这么多 ⇒ \
                  写集登记又在随写集长度涨（O(写集²) 回来了）"
             );
-            if let Some(d) = dir {
-                let _ = std::fs::remove_dir_all(&d);
-            }
         }
     }
 
@@ -4040,7 +4104,7 @@ mod tests {
                 } else if is_bplus {
                     Some(d.join("bplus.db"))
                 } else {
-                    Some(d.clone())
+                    Some(d.to_path_buf())
                 };
                 fsync_counts_clear();
                 file_opens_clear();
@@ -4074,7 +4138,7 @@ mod tests {
             } else if is_bplus {
                 Some(dir.join("bplus.db"))
             } else {
-                Some(dir.clone())
+                Some(dir.to_path_buf())
             };
             let arg = arg.as_deref();
             {
@@ -4210,7 +4274,7 @@ mod tests {
             let arg = match kind {
                 EngineKind::Memory => None,
                 EngineKind::BPlusTree => Some(dir.join("bplus.db")),
-                _ => Some(dir.clone()),
+                _ => Some(dir.to_path_buf()),
             };
             let arg = arg.as_deref();
             let db = open_engine(kind, arg).unwrap();
@@ -4358,7 +4422,7 @@ mod tests {
             let dir = tmp_dir(&format!("cache_price_{label}"));
             let arg = match kind {
                 EngineKind::BPlusTree => Some(dir.join("bplus.db")),
-                _ => Some(dir.clone()),
+                _ => Some(dir.to_path_buf()),
             };
             let arg = arg.as_deref();
             {
@@ -4509,7 +4573,7 @@ mod tests {
             let dir = tmp_dir(&format!("cache_budget_accept_{label}"));
             let arg = match kind {
                 EngineKind::BPlusTree => Some(dir.join("bplus.db")),
-                _ => Some(dir.clone()),
+                _ => Some(dir.to_path_buf()),
             };
             let arg = arg.as_deref();
             {
@@ -4639,7 +4703,7 @@ mod tests {
             let arg = match kind {
                 EngineKind::Memory => None,
                 EngineKind::BPlusTree => Some(dir.join("bplus.db")),
-                _ => Some(dir.clone()),
+                _ => Some(dir.to_path_buf()),
             };
             let db = open_engine(kind, arg.as_deref()).unwrap();
             for base in (0..rows).step_by(1000) {
@@ -5220,12 +5284,15 @@ mod tests {
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", last_page, page_size))
             });
             line(label, "search 末页(深翻)", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", deep.total.unwrap_or_default()));
-            // M81 第 4 项：末页的**免 total** 那一支 = 反向逐步退，代价 = 页宽 × O(块)。
+            // M81 第 4 项：末页的**免 total** 那一支，代价 = 页宽 × O(一次点读)，四家都不随库涨。
             // ⚠️ 不许与上面那格直接对拍：`search 末页(深翻)` 要精确 total（数全库那一遍是主导，
             // 20M 档 80.7 s），这一格恒取 `page_size` 行、不数；两格行数也不同（深翻那格是
             // `total % page_size`，尾巴不齐时更少）⇒ 只比 µs/次，别折成 µs/行。
-            // 覆盖情况：只有 lsm 走逐步退；其余三家停在 trait 默认（`reverse_scan` 截尾 = O(库)），
-            // 这一格对它们是"如实付反向原语的缺"，不是读数坏了。
+            // 覆盖情况（11-04 起）：`lsm_tree` 走反向逐步退（SST 块读）；其余三家走
+            // `common::store::back_n_with`（bplus/memory 先右路下降取库尾）。**11-04 之前的构建里
+            // 三家停在 trait 默认**（`reverse_scan` 截尾 = O(库)：20M 档 88~106 / 55~71 / 64~69 s、
+            // 常驻 +2147.5 MB、峰值 +4771 MB）——跨这条线比这一格没有意义；那支现在只剩
+            // "退过 8 Ki 步仍凑不够页宽"的兜底，由四家 `back_n_fallbacks == 0` 的计数守卫看着。
             let (d, live, peak, last_nt) = timed(|| {
                 let tx = db.begin();
                 tx.search_last_page(page_size)
@@ -5302,7 +5369,7 @@ mod tests {
                  &format!("扫 {} 行、裁 {} 行（预算 2048）", vr.stats.rows_scanned, vr.stats.versions_removed));
 
             // M81（方案第 2 项）：`flush+merge` 拆成 `flush` + `merge` 两格。
-            // 原先合成一格时 bitcask 那一格里几乎全是 merge（`docs/test.txt`：5M 同格 21.4s，
+            // 原先合成一格时 bitcask 那一格里几乎全是 merge（`docs/test1.txt`：5M 同格 21.4s，
             // 而 bplus 同格 18.5µs ⇒ flush 那一半在 bitcask 上是零头）。拆格本身一秒不省，
             // 它的作用是让"merge 已从 vacuum 拆出去"那笔省下的时间在下一格露出来。
             let (d, live, peak, ()) = timed(|| db.flush().unwrap());

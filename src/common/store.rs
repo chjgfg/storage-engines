@@ -641,3 +641,77 @@ pub fn seek_prev_with(
         bound = raw;
     }
 }
+
+// 测试专用：`back_n_with` 走过的候选键数 / "退太多、让调用方回退"的次数。
+//
+// 为什么钉这两个计数而不是墙钟：`search_last_page` 的代价必须**不随库涨**，而"跟着库涨"这件事
+// 只有两种落地形状 —— 候选键退了一大堆（墓碑尾巴），或整条路径退化回全库物化再截尾（回退那一支）。
+// 这两个计数正好一人盯一种，且与本机跨轮 1.3~2.6× 的墙钟噪声无关。
+#[cfg(test)]
+thread_local! {
+    static BACK_N_CANDIDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BACK_N_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 本线程 `back_n_with` 走过的候选键数（测试探针用）
+#[cfg(test)]
+pub fn back_n_candidates() -> u64 {
+    BACK_N_CANDIDATES.with(|c| c.get())
+}
+
+/// 本线程 `back_n_with` 退过头、让调用方回退到全库截尾的次数（测试探针用）
+#[cfg(test)]
+pub fn back_n_fallbacks() -> u64 {
+    BACK_N_FALLBACKS.with(|c| c.get())
+}
+
+/// 从库尾反向收集 `n` 条**逻辑键**（升序交出）—— `KvTxn::search_last_page` 的逐步退实现（M82）。
+///
+/// 与 [`seek_prev_with`] 同源（那条是"取 1 条"），推进规则也一样：每拿到一把键，就把**它本身**
+/// 当下一轮的上界 —— 版本键合同 `raw ‖ version_be > raw` ⇒ 同一把键的整组自动出局，不会在同一把
+/// 键的旧版本上打转（`find_back` 的 `excluded` 记的是**编码键**，按它拦不住同键旧版本）。
+///
+/// - `max_raw()`：库里**真实存在**的最大 raw_key（`None` = 空库 ⇒ 空页）。
+///   ⚠️ **不造 `\xFF…` 哨兵**：任意字节空间没有最大值，一个"足够长的 0xFF"上界在键更长时就会把
+///   库尾的键整批漏掉。让引擎交出自己索引里的尾键才是对的（三家都是 O(log n)：BTreeMap 的
+///   `next_back`、B+ 树的最右下降）。
+/// - `prev_raw(bound)` / `live(raw)`：与 [`seek_prev_with`] 的两个口子同义，**含端点**（`≤ bound`）。
+/// - 退过 `max_steps` 个候选还凑不满 `n` ⇒ 返回 `None`，调用方回退到 `reverse_scan` 截尾
+///   （慢，但正确）。这一支是给"库尾连着一大片墓碑/过期键"准备的形状，与 lsm 那条
+///   `LAST_PAGE_MAX_STEPS` 同一类问题、同一个界。
+pub fn back_n_with(
+    n: usize,
+    max_steps: usize,
+    max_raw: impl FnOnce() -> Option<Vec<u8>>,
+    mut prev_raw: impl FnMut(&[u8]) -> Option<Vec<u8>>,
+    mut live: impl FnMut(&[u8]) -> Option<ExportRecord>,
+) -> Option<Vec<ExportRecord>> {
+    let mut out: Vec<ExportRecord> = Vec::with_capacity(n.min(4096));
+    let Some(tail) = max_raw() else { return Some(out) };
+    // 第一轮上界含端点：`version_key_upper_bound` 让它覆盖尾键**自己那一组**（语义是"≤ 尾键"）
+    let mut bound = crate::common::version_key_upper_bound(&tail);
+    let mut steps = 0usize;
+    while out.len() < n {
+        let raw = prev_raw(&bound)?;
+        steps += 1;
+        #[cfg(test)]
+        BACK_N_CANDIDATES.with(|c| c.set(c.get() + 1));
+        if steps > max_steps {
+            #[cfg(test)]
+            BACK_N_FALLBACKS.with(|c| c.set(c.get() + 1));
+            return None;
+        }
+        if let Some(rec) = live(&raw) {
+            out.push(rec);
+            bound = raw;
+            continue;
+        }
+        if raw.as_slice() >= bound.as_slice() {
+            // 同 seek_prev_with：`prev_raw` 没按界排除整组时的兜底，宁可收尾也不原地打转
+            break;
+        }
+        bound = raw;
+    }
+    out.reverse(); // 收集是降序，`SearchPage::items` 的合同是升序
+    Some(out)
+}

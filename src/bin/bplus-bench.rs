@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! # 普通事务路径
-//! cargo run --release --bin bench -- --n 100000 --order 128 --cache 2048 --batch 5000
+//! cargo run --release --bin bplus-bench -- --n 100000 --order 128 --cache 2048 --batch 5000
 //!
 //! # bulk load（关 WAL，冲千万）
-//! cargo run --release --bin bench -- --n 10000000 --order 256 --cache 8192 --bulk --value-size 16
+//! cargo run --release --bin bplus-bench -- --n 10000000 --order 256 --cache 8192 --bulk --value-size 16
 //! ```
 
 use std::assert;

@@ -688,7 +688,7 @@ mod tests {
     ///    （静默丢掉一个 TTL，就是让那把键活得比它该有的样子久）。
     #[test]
     fn bin_v3_carries_expire_and_all_three_versions_read_back() {
-        let dir = crate::common::tmp_test_path("kv_snapshot", "v3", "");
+        let dir = crate::common::ScratchPath::new("kv_snapshot", "v3", "");
         std::fs::create_dir_all(&dir).unwrap();
         let recs = vec![
             KvRecord::new(b"k1".to_vec(), Some(b"v1".to_vec())),

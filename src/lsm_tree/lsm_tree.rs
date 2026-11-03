@@ -2619,10 +2619,9 @@ mod tests {
     use std::println;
     use std::eprintln;
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let p = crate::common::tmp_test_path("lsm", tag, "");
-        let _ = fs::remove_dir_all(&p);
-        p
+    /// 返回 **RAII 句柄**（M82）：声明在引擎之前即可，用例结束（含 panic 展开）自动删目录。
+    fn tmp_dir(tag: &str) -> crate::common::ScratchPath {
+        crate::common::ScratchPath::new("lsm", tag, "")
     }
 
     fn pruning_options() -> LSMTreeOptions {

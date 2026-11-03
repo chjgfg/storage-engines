@@ -393,6 +393,13 @@ pub struct SyncStats {
 ///    复活已删键比漏同步严重一个量级。四家在这条上的行为由 `sync_tombstone_counts_as_seen_in_every_engine`
 ///    逐家实测 —— 那一条同时钉住 `exists()` 在墓碑上是 `false`（也就是"用它当判据会复活"），
 ///    所以这条判据不是假设，是量出来的。
+///    ⚠️ **这条判据有时效（M82 记）**：墓碑是"见过"的证据，而**回收会把孤墓碑整键删掉**
+///    （四家的 `vacuum_plan_group` 都是"xmin 之前最终是墓碑且无更新版本 ⇒ 整 key 删"）⇒ 回收走过
+///    那把键之后，"见过"就没了，同一份**旧**源再 sync 会把已删键复活。这是"墓碑不该永久占位"与
+///    "见过要有据可查"两条合同的交点，不是 `sync` 的缺陷：要长期防复活，就在回收之前同步完，
+///    或由应用层自己记删除（或走 `migrate` 的覆盖语义）。现状由
+///    `sync_after_vacuum_resurrects_the_deleted_key_characterization` 钉成会翻红的断言 ——
+///    哪天给墓碑加了保留策略，那一条要按新语义改写，而不是悄悄变绿。
 /// ② **删除不传播**：源里的墓碑根本不进候选（`include_deleted = false`）。这是**快照补齐**，
 ///    不是复制协议 —— 要"把 B 里多出来的键删掉"请走 `migrate`（覆盖 + wipe）或应用层自己管。
 /// ③ **TTL 跟着走，但不刷新已有的**：新插入的键按源里记的**绝对到期时刻**打 TTL 信封；
@@ -794,15 +801,11 @@ mod tests {
     use std::vec;
     use crate::common::kv_snapshot::{b64_encode, read_bin, read_jsonl, write_bin, write_jsonl};
 
-    fn root(tag: &str) -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let d = std::env::temp_dir().join(format!("se_tools_{tag}_{nanos}_{n}"));
-        let _ = std::fs::remove_dir_all(&d);
+    /// 用例的 scratch 根：返回 **RAII 句柄**（M82），声明在引擎之前即可，用例结束
+    /// （含 panic 展开）自动连旁挂文件一起删 —— 此前靠每个用例末尾手写 `remove_dir_all`，
+    /// 而"引擎还开着就删"在 Windows 上静默失败，一次全量跑就漏一批 `se_tools_*`。
+    fn root(tag: &str) -> crate::common::ScratchPath {
+        let d = crate::common::ScratchPath::new("se_tools", tag, "");
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1198,6 +1201,68 @@ mod tests {
             drop(db);
             let _ = std::fs::remove_dir_all(&rs);
             let _ = std::fs::remove_dir_all(&r);
+        }
+    }
+
+    /// 判据①的**时效**（M82 记一条现状，不是缺陷报告）：墓碑是"见过"的证据，而回收会把**孤墓碑
+    /// 整键删掉**（四家 `vacuum_plan_group` 的规则）⇒ 回收走过那把键之后"见过"就没了，同一份旧源
+    /// 再 sync 会把已删键**复活**。
+    ///
+    /// 这不是 `sync` 的 bug，是两条合同的交点（"墓碑不该永久占位" × "见过要有据可查"）。钉成会翻红的
+    /// 现状：哪天有人给墓碑加保留策略，这一条要按新语义改写，而不是悄悄变绿。
+    /// 三条断言各钉一件事：① 前置——回收**之前**墓碑算见过（判据①成立的地基）；
+    /// ② 机理——`vacuum()` 之后墓碑已被带走（这一条红了说明"孤墓碑会被回收"这个前提变了）；
+    /// ③ 现状——同一份源再 sync，`inserted == 1` 且已删键读回活值（**这就是时效**）。
+    #[test]
+    fn sync_after_vacuum_resurrects_the_deleted_key_characterization() {
+        for kind in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree, EngineKind::Memory] {
+            let tag = kind.as_str();
+            let target = root(&format!("sync_gc_target_{tag}"));
+            let source = root(&format!("sync_gc_source_{tag}"));
+            seed_ttl(kind, &target, &[(b"dead", b"was-here", None)]);
+            let db = open_for_sync(kind, &target);
+            {
+                let tx = db.begin();
+                assert!(tx.delete(b"dead"), "{kind}: 删不掉");
+                tx.commit();
+            }
+            {
+                let tx = db.begin();
+                let meta = tx.get_meta(b"dead");
+                tx.commit();
+                assert!(meta.is_some_and(|m| m.deleted), "{kind}: 前置：墓碑此刻必须算'见过'（判据①的地基）");
+            }
+            db.vacuum().unwrap_or_else(|e| panic!("{kind}: vacuum 失败 {e}"));
+            {
+                let tx = db.begin();
+                let meta = tx.get_meta(b"dead");
+                tx.commit();
+                assert!(
+                    meta.is_none(),
+                    "{kind}: 回收之后墓碑应当已被整键带走 —— 这一条红了说明本测试的机理前提变了，\
+                     判据①的时效结论要跟着重写"
+                );
+            }
+            seed_ttl(kind, &source, &[(b"dead", b"resurrect", None)]);
+            let src = open_for_sync(kind, &source);
+            let st = sync(&*src, &*db).unwrap();
+            assert_eq!(
+                st.inserted, 1,
+                "{kind}: 现状：墓碑被回收之后，同一份源再 sync 会把它当'没见过'插入（账 {st:?}）"
+            );
+            {
+                let tx = db.begin();
+                assert_eq!(
+                    tx.get(b"dead").as_deref(),
+                    Some(&b"resurrect"[..]),
+                    "{kind}: 现状：已删键被复活（判据①的时效 —— 见 `sync` 的文档）"
+                );
+                tx.commit();
+            }
+            drop(src);
+            drop(db);
+            let _ = std::fs::remove_dir_all(&source);
+            let _ = std::fs::remove_dir_all(&target);
         }
     }
 

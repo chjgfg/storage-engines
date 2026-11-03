@@ -154,6 +154,14 @@ impl MemStore {
         self.data.keys()
     }
 
+    /// 表里**最大的一把编码键**（给"从库尾反向"当起点用，M82）。
+    ///
+    /// BTreeMap 的 `next_back` ⇒ O(log n)，不扫库。为什么不给调用方一个"足够大的哨兵"：
+    /// 任意字节空间没有最大值，哨兵长度不够就会把更长的尾键整批漏掉。
+    pub fn last_key(&self) -> Option<Vec<u8>> {
+        self.data.keys().next_back().cloned()
+    }
+
     /// `[from, to)` 内的键有序遍历（都不给 ⇒ 等价于 [`Self::iter_keys`]）。
     ///
     /// 界打在**版本键**的字节序上（`from` 含、`to` 不含），所以调用方要自己兜住

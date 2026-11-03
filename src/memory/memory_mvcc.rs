@@ -62,6 +62,30 @@ pub struct MVCC {
 /// 快照文件名（放在门面给的引擎目录里：`data_dir/memory/snapshot.bxp`）
 pub const SNAPSHOT_FILE: &str = "snapshot.bxp";
 
+/// 重放期间把自动回收**临时关掉**（切片宽度置 0），`Drop` 时还原（M82）。
+///
+/// 为什么用 RAII 而不是"进去设 0、出来设回来"：`load_snapshot_from` 有三条提前返回
+/// （快照读失败、重放被引擎拒收、尾巴半页出错），漏掉任何一条都会把自动回收**永久关掉** ——
+/// 那种坏法不崩、不报错，只是版本链从此只增不减。析构里还原，panic 展开也兜得住。
+struct AutoVacuumOff<'a> {
+    vac: &'a VacuumScheduler,
+    saved: u64,
+}
+
+impl<'a> AutoVacuumOff<'a> {
+    fn pause(vac: &'a VacuumScheduler) -> Self {
+        let saved = vac.slice();
+        vac.set_slice(0);
+        Self { vac, saved }
+    }
+}
+
+impl Drop for AutoVacuumOff<'_> {
+    fn drop(&mut self) {
+        self.vac.set_slice(self.saved);
+    }
+}
+
 /// 普通 MVCC 事务
 ///
 /// 事务语义那部分（版本、活跃快照、写集、回收记账、冲突判定、回滚）在
@@ -122,6 +146,11 @@ impl MVCC {
         if !path.exists() {
             return Ok(());
         }
+        // 重放期间关掉自动回收，收尾把账也丢掉（M82）：重放出来的行每把键只有一版 ⇒ **一行垃圾
+        // 都没有**，而重放走的是"每 1000 行一个事务"的写流 ⇒ 不关的话每个事务的 `begin()` 都要
+        // 扫一片（1:1 跟着"写"的量走）：600k 档 `冷重开` 1.3 s → 4.4 s、20M 档白扫一整库。
+        // ⚠️ 还原走 RAII：下面三条提前返回（读失败、重放被拒收）都不许把自动回收永久关掉。
+        let _vac_paused = AutoVacuumOff::pause(&self.vac);
         const PAGE: usize = 1_000;
         let now = crate::common::codec::now_unix_secs();
         let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)> = Vec::with_capacity(PAGE);
@@ -158,6 +187,13 @@ impl MVCC {
             expired,
             path.display()
         );
+        // 收尾把重放攒下的触发账丢掉：那些行不是垃圾（见上面那段注释）。
+        // ⚠️ 位置在还原切片宽度**之前**也无所谓（`take_tick` 只看账与游标），但要紧的是：
+        // 这个口子只在这儿用 —— 别的地方丢账就是把"该回收"写成"不用回收"。
+        let dropped = self.vac.discard_pending();
+        if dropped > 0 {
+            log::debug!("memory: 快照重放丢弃 {dropped} 行触发账（新写入的行没有旧版本可回收）");
+        }
         Ok(())
     }
 
@@ -267,8 +303,11 @@ impl MVCC {
     /// `vacuum_bounded` 的「有活跃事务就整轮跳过」不会被自己的调用方踩中；而且每个
     /// 事务至少 begin 一次，攒账的节奏和写路径一样。
     ///
-    /// 触发量 = 切片宽度 ⇒ 攒够一片垃圾才扫一片；而一轮一旦发起，游标会把它推到库尾（账花完也继续推，走 `VacuumScheduler::take_tick` 里 `charged = 0` 那一支）。
-    /// 旧注释那句"回收速率与产生垃圾 1:1"不成立：一片只扫 `slice` 行，尾巴那半库靠的是"轮次未完"这一支，不是新写。。
+    /// 触发量 = 切片宽度 ⇒ 攒够一片垃圾才扫一片，扫描量与写入量 **1:1**，`begin()` 不付额外的税
+    /// （M82：M81 第 5 项后半那条"一轮开着就每个 begin 推一片"已拿掉 —— 它让写流里每个事务都扫
+    /// 一整片，`docs/test2.txt` 五档 `灌`/`更新` 全变慢）。账花完而一轮还在半路时，由
+    /// [`crate::maintenance::Maintenance`]（独立游标与间隔）把它推到库尾，不由下一个事务推；
+    /// 不跑维护器就等下一次写或手动 `vacuum()`。
     fn tick_auto_vacuum(&self) {
         let _: Result<(), std::convert::Infallible> = self.vac.run_pending(|after, rows| {
             Ok(self.vacuum_bounded(after, rows))

@@ -2061,8 +2061,10 @@ mod tests {
     use std::format;
     use std::matches;
 
-    fn tmp(tag: &str) -> PathBuf {
-        crate::common::tmp_test_path("sst", tag, ".sst")
+    /// 返回 **RAII 句柄**（M82）：把它声明在引擎之前，用例结束（含 panic 展开）自动删，
+    /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
+    fn tmp(tag: &str) -> crate::common::ScratchPath {
+        crate::common::ScratchPath::new("sst", tag, ".sst")
     }
 
     /// M42 的**格式钉子**：同一批条目必须产出**逐字节相同**的 SST。
@@ -2107,7 +2109,8 @@ mod tests {
     /// 表现为"慢了 3%"，没人会往这里查。
     #[test]
     fn test_builder_estimated_bytes_matches_slow_scan() {
-        let mut b = SstBuilder::with_options(1, tmp("est_parity"), 64, false);
+        let scratch = tmp("est_parity");
+        let mut b = SstBuilder::with_options(1, scratch.to_path_buf(), 64, false);
         assert_eq!(b.estimated_bytes(), 0, "空表两边都该是 0");
         // M42 之后 builder 不再握着整张表（攒满一块就落盘）⇒ 慢口径改在**调用方自己那份输入**上算。
         // 对拍的性质一点没变：同一个口径、同一批条目，比的还是"增量账 vs 逐条慢算"。
@@ -2133,7 +2136,8 @@ mod tests {
             (b"b".to_vec(), StoredEntry::drop_at(2)),
             (b"cccc".to_vec(), StoredEntry::put(3, Some(b"xyz".to_vec()))),
         ];
-        let mut t = SstBuilder::with_options(2, tmp("est_tomb"), 64, false);
+        let scratch = tmp("est_tomb");
+        let mut t = SstBuilder::with_options(2, scratch.to_path_buf(), 64, false);
         for (k, se) in tomb.iter().cloned() {
             t.add(k, se);
         }
@@ -2153,7 +2157,8 @@ mod tests {
     #[test]
     fn test_builder_size_check_does_not_walk_entries_per_add() {
         const N: usize = 4000;
-        let mut b = SstBuilder::with_options(1, tmp("est_hot"), 64, false);
+        let scratch = tmp("est_hot");
+        let mut b = SstBuilder::with_options(1, scratch.to_path_buf(), 64, false);
         let s0 = builder_size_walks();
         // M42：builder 不再握着整张表 ⇒ 慢口径改在调用方自己那份输入上算（对拍性质不变）
         let mut fed: Vec<(Vec<u8>, StoredEntry)> = Vec::with_capacity(N);
@@ -2285,10 +2290,16 @@ mod tests {
         ];
         let mut id = 0u64;
         let s0 = builder_size_walks();
+        // 压出来的 SST 由守卫持有：`with_options` 收的是**路径**，文件要到压实时才写出来，
+        // 守卫必须活过 `merge_to_ssts` 那一趟（先声明、再借进闭包）
+        let mut sst_guards: Vec<crate::common::ScratchPath> = Vec::new();
         // target 给 64 KiB ⇒ 6000 行该切出好几个文件（"每行问一次判定"这一步真的被走到）
         let files = merge_to_ssts(vec_inputs(sources), |_, _| true, || {
             id += 1;
-            SstBuilder::with_options(id, tmp(&format!("est_merge_{id}")), 64, false)
+            let p = tmp(&format!("est_merge_{id}"));
+            let owned = p.to_path_buf();
+            sst_guards.push(p);
+            SstBuilder::with_options(id, owned, 64, false)
         }, 64 * 1024)
         .unwrap();
         let walks = builder_size_walks() - s0;

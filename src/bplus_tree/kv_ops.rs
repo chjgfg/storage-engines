@@ -230,23 +230,74 @@ impl Transaction {
     /// 循环与判定在 [`crate::common::seek_prev_with`]（四引擎共用）；反向一步走
     /// [`BPlusTree::find_back`]（本来就是点读的热路径，跨叶反向有进度守卫），单键可见行走
     /// `latest_visible_raw`。改之前是 `scan(None, Some(key‖0))` + `retain` + `pop`。
+    /// 反向一步：编码键 `≤ bound` 的最大那一行属于哪把逻辑键
+    fn prev_raw(&self, bound: &[u8]) -> Option<Vec<u8>> {
+        let mut kv = self.kv.lock().unwrap();
+        kv.find_back(b"", bound, |_| true)
+            .and_then(|(enc, _)| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+    }
+
+    /// 这把逻辑键对当前事务的可见行（墓碑/过期 ⇒ `None`）
+    fn live_of(&self, raw: &[u8]) -> Option<ExportRecord> {
+        let logical = self.latest_visible_raw(raw).and_then(|(_, v)| v);
+        crate::common::live_record_of_logical(raw.to_vec(), logical, now_unix_secs())
+    }
+
+    /// 定位 **≤ key** 的最后一条存活记录（逐步退，不物化前缀 —— M20）
     pub fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
-        crate::common::seek_prev_with(
-            key,
-            |bound| {
-                let mut kv = self.kv.lock().unwrap();
-                kv.find_back(b"", bound, |_| true)
-                    .and_then(|(enc, _)| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+        crate::common::seek_prev_with(key, |bound| self.prev_raw(bound), |raw| self.live_of(raw))
+    }
+
+    /// 从库尾取 `page_size` 条逻辑键（免 total，升序交出）—— M82 补齐（M81 第 4 项只给了 lsm）。
+    ///
+    /// 改前这一格对三家是 trait 默认那支"`reverse_scan` 全库物化再截尾"：20M 档 bplus
+    /// **71.4 s** + 常驻 2147.5 MB / 峰值 +4772.2 MB。现在 = `page_size` 次反向定位，
+    /// 每次 O(树高) 的叶定位 ⇒ **不随库大小涨**。
+    ///
+    /// 起点取树上真实存在的最大键（[`crate::bplus_tree::BPlusTree::last_key`]，最右下降），
+    /// **不造 `\xFF` 哨兵**。循环与推进规则在 [`crate::common::back_n_with`]。
+    pub fn search_last_page(&self, page_size: usize) -> SearchPage {
+        const LAST_PAGE_MAX_STEPS: usize = 8 * 1024;
+        let max_raw = || {
+            self.kv
+                .lock()
+                .unwrap()
+                .last_key()
+                .and_then(|enc| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+        };
+        match crate::common::back_n_with(
+            page_size,
+            LAST_PAGE_MAX_STEPS,
+            max_raw,
+            |bound| self.prev_raw(bound),
+            |raw| self.live_of(raw),
+        ) {
+            Some(items) => SearchPage {
+                items,
+                total: None,
+                page: 0,
+                page_size,
+                total_pages: None,
+                has_next: false,
             },
-            |raw| {
-                let logical = self.latest_visible_raw(raw).and_then(|(_, v)| v);
-                crate::common::live_record_of_logical(
-                    raw.to_vec(),
-                    logical,
-                    now_unix_secs(),
-                )
-            },
-        )
+            // 库尾连着一大片死键：退过界就回退全库截尾（慢，但正确；这一支有守卫钉着"不该发生"）
+            None => self.last_page_by_full_scan(page_size),
+        }
+    }
+
+    /// 回退支：全库物化再截尾（= `KvTxn::search_last_page` 的 trait 默认实现）
+    fn last_page_by_full_scan(&self, page_size: usize) -> SearchPage {
+        let mut items = self.reverse_scan(None, None);
+        items.truncate(page_size);
+        items.reverse();
+        SearchPage {
+            items,
+            total: None,
+            page: 0,
+            page_size,
+            total_pages: None,
+            has_next: false,
+        }
     }
 
     // ── 模糊 / 前缀搜索 + 分页 ──
@@ -433,8 +484,10 @@ mod tests {
     use std::format;
     use std::path::{Path, PathBuf};
 
-    fn tmp(tag: &str) -> PathBuf {
-        crate::common::tmp_test_path("kv_ops", tag, ".db")
+    /// 返回 **RAII 句柄**（M82）：把它声明在引擎之前，用例结束（含 panic 展开）自动删，
+    /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
+    fn tmp(tag: &str) -> crate::common::ScratchPath {
+        crate::common::ScratchPath::new("kv_ops", tag, ".db")
     }
 
     fn cleanup(path: &Path) {

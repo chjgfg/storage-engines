@@ -1,8 +1,8 @@
 //! 简单压测：纯内存 MVCC 写入 / 读取吞吐
 //!
 //! ```bash
-//! cargo run --release --bin bench -- --n 100000
-//! cargo run --release --bin bench -- --n 100000 --bulk
+//! cargo run --release --bin memory-bench -- --n 100000
+//! cargo run --release --bin memory-bench -- --n 100000 --bulk
 //! ```
 
 use std::assert;
