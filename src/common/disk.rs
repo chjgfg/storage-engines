@@ -550,10 +550,11 @@ impl Drop for FileLock {
 
 #[cfg(unix)]
 unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
-    extern "C" {
+    // edition 2024：extern 块必须 unsafe、unsafe fn 体内不再隐式 unsafe。
+    unsafe extern "C" {
         fn flock(fd: i32, op: i32) -> i32;
     }
-    flock(fd, op)
+    unsafe { flock(fd, op) }
 }
 
 #[cfg(test)]
