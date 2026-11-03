@@ -13,8 +13,13 @@ categories = ["database-implementations", "data-structures"]
 exclude = [
     "data/",
     ".claude/",
+    ".zcode/",
     "bitcask_mvcc_demo/",
     "lsm_mvcc_demo/",
+    # 本地工作笔记，不进发布包（git 里仍未跟踪，想入库另说）
+    "findings.md",
+    "progress.md",
+    "task_plan.md",
 ]
 
 [dependencies]
