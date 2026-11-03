@@ -4,3 +4,9 @@ data/*
 .claude/
 backups/m-serial/
 .omc
+
+# 本地工作笔记与会话数据，不入库、不进发布包
+.zcode/
+findings.md
+progress.md
+task_plan.md
