@@ -4,7 +4,7 @@
 //!       计数器 incr / incr_with_ttl · 范围 scan / prefix / seek
 //!       模糊搜索分页 · 元数据 · TTL · 快照隔离 · bulk · vacuum · 重启校验
 //!
-//! 用法：`cargo run` 或 `cargo run --release`
+//! 用法：`cargo test --test test_bitcask`
 
 // use bitcask::{kv_ops, SearchQuery, MVCC};
 use std::{format, fs};
@@ -30,14 +30,12 @@ fn show_val(v: Option<&[u8]>) -> String {
     }
 }
 
-fn cleanup_dir(dir: &str) {
-    let _ = fs::remove_dir_all(dir);
-}
+mod support;
 
 #[test]
 fn test_bitcask() {
-    let db_dir = "./data/bitcask";
-    cleanup_dir(db_dir);
+    let db_guard = support::TestDir::new("bitcask");
+    let db_dir = db_guard.path().to_str().unwrap();
 
     let large_key = {
         let mut k = b"user:profile:".to_vec();
@@ -451,6 +449,6 @@ fn test_bitcask() {
     }
 
     println!("\ndemo 完成（Bitcask + MVCC + kv_ops：批量 / 扫描 / 搜索 / TTL / vacuum / bulk）。");
-    cleanup_dir(db_dir);
+
     // 收尾清掉本次 demo 目录：不清就会每跑一次往仓库 data/ 里积一份（M82）
 }

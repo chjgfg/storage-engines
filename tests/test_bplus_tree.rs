@@ -6,48 +6,10 @@
 
 use storage_engines::bplus_tree::{kv_ops, MVCC, SearchQuery};
 use std::{format, fs};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-/// demo 数据目录（所有 data.db* 落在此目录下，不污染仓库根）
-const DEMO_DIR: &str = "./data/bplus_tree";
-const DEMO_DB_NAME: &str = "./data.db";
-
-fn demo_db_path() -> PathBuf {
-    Path::new(DEMO_DIR).join(DEMO_DB_NAME)
-}
-
-/// 清理某一库路径及其 sidecar（.wal / .dblwr / .lock / .blob / .freelist）
-fn remove_db_files(db_path: &Path) {
-    for suf in ["", ".dblwr", ".wal", ".freelist", ".lock", ".blob"] {
-        let p = if suf.is_empty() {
-            db_path.to_path_buf()
-        } else {
-            PathBuf::from(format!("{}{suf}", db_path.display()))
-        };
-        let _ = fs::remove_file(&p);
-    }
-}
-
-/// 准备 demo 目录：创建 data/，清空其中旧库，并尽量删掉仓库根上遗留的旧文件
-fn prepare_demo_dir() -> PathBuf {
-    let _ = fs::create_dir_all(DEMO_DIR);
-    let db = demo_db_path();
-    remove_db_files(&db);
-
-    // 根目录历史遗留：旧 demo 的 data.db*、一次性导入的 from_lsm.*、临时快照
-    remove_db_files(Path::new("data.db"));
-    remove_db_files(Path::new("from_lsm.db"));
-    for junk in [
-        "snap_mig.bin",
-        "snapshot.bin",
-        "snapshot.json",
-        "verify.bin",
-    ] {
-        let _ = fs::remove_file(junk);
-    }
-    db
-}
+mod support;
 
 fn show_key(k: &[u8]) -> String {
     if k.len() > 40 {
@@ -69,9 +31,10 @@ fn show_val(v: Option<&[u8]>) -> String {
 
 #[test]
 fn test_bplus_tree() {
-    let db_path = prepare_demo_dir();
+    let db_guard = support::TestDir::new("bplus_tree");
+    let db_path = db_guard.join("data.db");
     let db_path_str = db_path.to_string_lossy().into_owned();
-    println!("demo 数据目录: {DEMO_DIR}/  库文件: {db_path_str}");
+    println!("测试库文件: {db_path_str}");
 
     let large_key = {
         let mut k = b"user:profile:".to_vec();
@@ -425,7 +388,7 @@ fn test_bplus_tree() {
         tx.commit();
     }
 
-    println!("\n—— 磁盘文件（均在 {DEMO_DIR}/ 下）——");
+    println!("\n—— 测试目录中的磁盘文件 ——");
     for suf in ["", ".wal", ".dblwr", ".lock", ".blob", ".freelist"] {
         let p = if suf.is_empty() {
             db_path.clone()
@@ -436,7 +399,6 @@ fn test_bplus_tree() {
             println!("  {:28} {:>8} B", p.display(), m.len());
         }
     }
-    println!("\ndemo 完成。数据文件在 `./{DEMO_DIR}/`，不会再写到仓库根目录。");
-    let _ = fs::remove_dir_all(DEMO_DIR);
+    println!("\ndemo 完成，测试目录由守卫清理。");
     // 收尾清掉本次 demo 目录：不清就会每跑一次往仓库 data/ 里积一份（M82）
 }

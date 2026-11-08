@@ -144,6 +144,10 @@ pub fn main() {
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/mod.rs"]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::assert_eq;
@@ -205,9 +209,7 @@ mod tests {
         use storage_engines::tools::migrate::export_to_dir;
         use storage_engines::{EngineConfig, open_engine_with};
 
-        let root = std::env::temp_dir().join("se_cli_pair");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = test_support::TestDir::new("cli_pair");
         let src = root.join("lsm_tree");
         let dst = root.join("bitcask");
         let snap = root.join("s.bin");
@@ -227,6 +229,5 @@ mod tests {
         let st = import_from_dir(EngineKind::Bitcask, &dst, &snap, SnapshotFormat::Bin, false).unwrap();
         assert_eq!((st.records, st.live), (5, 5));
         assert_eq!(read_bin(&snap).unwrap().0.len(), 5, "文件比库少行");
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

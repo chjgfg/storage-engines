@@ -149,6 +149,10 @@ pub fn main() {
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/mod.rs"]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::assert_eq;
@@ -212,10 +216,8 @@ mod tests {
     fn demo_then_export_produces_a_readable_snapshot() {
         use storage_engines::common::kv_snapshot::read_bin;
         for kind in [EngineKind::Memory, EngineKind::LsmTree] {
-            let dir = std::env::temp_dir().join(format!("se_cli_demo_{}", kind.as_str()));
+            let dir = test_support::TestDir::new("cli_export");
             let snap = dir.join("snap.bin");
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
             seed_demo(kind, &dir, 7).unwrap();
             let st = export_to_dir(kind, &dir, &snap, SnapshotFormat::Bin, false).unwrap();
             assert_eq!((st.records, st.live, st.deleted), (7, 7, 0), "{kind}：样例行数不对");
@@ -223,7 +225,6 @@ mod tests {
             assert_eq!(recs.len(), 7, "{kind}：文件比库少行");
             assert_eq!(recs[6].key, b"demo-000006#/x".to_vec());
             assert_eq!(recs[6].value.as_deref(), Some(&b"v6"[..]));
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

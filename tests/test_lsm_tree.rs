@@ -4,7 +4,7 @@
 //!       计数器 incr / incr_with_ttl · 范围 scan / prefix / seek
 //!       模糊搜索分页 · 元数据 · TTL · 重启校验
 //!
-//! 用法：`cargo run --release --bin lsm-tree`
+//! 用法：`cargo test --test test_lsm_tree`
 
 use storage_engines::lsm_tree::{kv_ops, MVCC, SearchQuery};
 use std::{format, fs};
@@ -28,14 +28,12 @@ fn show_val(v: Option<&[u8]>) -> String {
     }
 }
 
-fn cleanup_dir(dir: &str) {
-    let _ = fs::remove_dir_all(dir);
-}
+mod support;
 
 #[test]
 fn test_lsm_tree() {
-    let db_dir = "./data/lsm_tree";
-    cleanup_dir(db_dir);
+    let db_guard = support::TestDir::new("lsm_tree");
+    let db_dir = db_guard.path().to_str().unwrap();
 
     let large_key = {
         let mut k = b"user:profile:".to_vec();
@@ -423,6 +421,6 @@ fn test_lsm_tree() {
     }
 
     println!("\ndemo 完成（MVCC + kv_ops：批量 / 扫描 / 搜索 / TTL / 元数据）。");
-    cleanup_dir(db_dir);
+
     // 收尾清掉本次 demo 目录：不清就会每跑一次往仓库 data/ 里积一份（M82）
 }
