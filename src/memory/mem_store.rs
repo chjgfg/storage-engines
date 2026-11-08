@@ -113,6 +113,16 @@ impl MemStore {
         rows
     }
 
+    /// Borrow the reverse key range; clone only the first accepted key.
+    pub(crate) fn find_key_back(&self, low: &[u8], high: &[u8], mut accept: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
+        self.data.range::<[u8], _>((Bound::Included(low), Bound::Included(high)))
+            .rev().find_map(|(key, _)| {
+                #[cfg(test)]
+                count_rows(1);
+                accept(key).then(|| key.clone())
+            })
+    }
+
     /// 全表有序遍历，按**引用**把 `(键, value)` 交给回调 —— 一个 value 都不克隆。
     ///
     /// 给「只需要版本号 + 是不是墓碑」的调用方用（vacuum 就是），

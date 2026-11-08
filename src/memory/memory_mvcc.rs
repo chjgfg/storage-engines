@@ -197,7 +197,7 @@ impl MVCC {
     }
 
     /// 把攒好的一页交进库里，一事务一页。**返回 `Err` 而不是 `Result` 是有意的**：调用方在
-    /// `read_bin_with` 的回调里，那里没有 `?` 可用，只能把错递出去。
+    /// `read_snapshot_with` 的回调里，那里没有 `?` 可用，只能把错递出去。
     ///
     /// 为什么单独抽出来：回调里要同时用 `&MVCC`（开事务）与 `&mut batch`，写成内联块会让
     /// 借用检查在两件事之间反复；而"攒满一页就冲"与"收尾把剩的冲掉"必须是**同一份**代码，
@@ -654,12 +654,6 @@ impl WriteSide for MemStore {
 /// 内存引擎没有 WAL：收尾两条都用默认实现（空 impl 就是"什么都不做"的声明）。
 impl crate::common::WalTail for MemStore {}
 
-/// 链尾反向查找的首轮预算，不够再翻倍重试。
-///
-/// 常态下一个逻辑 key 只有个位数版本，32 足够一次命中；翻倍只在
-/// 「整条链没有一个满足条件」的退化场景才付到 O(链长)，与旧的整链扫描同阶。
-const VERSION_BACK_STEP: usize = 32;
-
 /// M37：一次 `vacuum_bounded` 走查的**块大小**（物理行）—— 与 bitcask / lsm 同值，
 /// 各家钉各家（守卫同名同形：`test_vacuum_deletes_in_bounded_chunks`）。
 /// 这一家改的收益最小（600k 档 `vacuum()` 瞬时 4.0 MB），改它的理由是**同根因不留三家**：
@@ -904,7 +898,7 @@ impl Transaction {
 
     /// 从链尾往回找本 key 第一个被 `accept` 的版本，返回它的版本键。
     ///
-    /// 版本键大端有序 ⇒ 同一 key 的版本相邻且按版本号升序 ⇒ **链尾就是最新版本**。
+    /// 同一 key 的编码按版本号升序，但可能被二进制前缀交错；借用反向迭代只复制命中键。
     /// `raw_key` 仍是 `key` 前缀的其它逻辑 key 会落进同一个字节区间（版本号首字节 0x00
     /// 小于任何 ASCII 字节），所以只能**跳过**而不是「见到别的 key 就停」。
     fn find_version_back(
@@ -914,22 +908,9 @@ impl Transaction {
     ) -> Option<Vec<u8>> {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        let mut budget = VERSION_BACK_STEP;
-        loop {
-            let rows = store.range_back(&low, &high, budget);
-            let reached_bottom = rows.len() < budget;
-            for (enc, _) in rows {
-                if let Some(vk) = decode_key(&enc) {
-                    if vk.raw_key.as_slice() == key && accept(vk.version) {
-                        return Some(enc);
-                    }
-                }
-            }
-            if reached_bottom {
-                return None;
-            }
-            budget = budget.saturating_mul(2);
-        }
+        store.find_key_back(&low, &high, |enc| {
+            decode_key(enc).is_some_and(|vk| vk.raw_key.as_slice() == key && accept(vk.version))
+        })
     }
 }
 

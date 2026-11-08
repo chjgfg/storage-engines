@@ -9,6 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{VersionedKey, WinCandidate, decode_key, encode_key};
 
+#[cfg(test)]
+std::thread_local! {
+    static TAIL_BUFFER_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn note_tail_buffer(rows: usize) { TAIL_BUFFER_PEAK.with(|c| c.set(c.get().max(rows))); }
+#[cfg(test)]
+pub(crate) fn take_tail_buffer_peak() -> usize { TAIL_BUFFER_PEAK.with(|c| c.replace(0)) }
+
 /// Smallest logical key that an encoded key >= `enc` can represent.
 /// A logical key smaller than `enc` must be one of its prefixes; its largest
 /// possible encoding is that prefix followed by `max_version`.
@@ -174,6 +183,41 @@ pub(crate) enum ReverseOutcome {
     BudgetExceeded { physical_steps: usize },
 }
 
+/// Scan physical predecessors and retain only the largest n live logical keys.
+/// Physical order may interleave binary prefixes, so finalize by logical order.
+/// Memory is O(n records + current key); time can include a full physical walk
+/// and repeated point lookups for interleaved histories. Callers must supply a
+/// bounded-memory point lookup. Consecutive versions share one lookup.
+pub(crate) fn reverse_tail_bounded(
+    n: usize,
+    mut bound: Option<Vec<u8>>,
+    mut prev_encoded: impl FnMut(&[u8]) -> Option<Vec<u8>>,
+    mut live: impl FnMut(&[u8]) -> Option<super::ExportRecord>,
+) -> Vec<super::ExportRecord> {
+    let mut tail = BTreeMap::<Vec<u8>, super::ExportRecord>::new();
+    let mut last_checked = None;
+    if n == 0 { return Vec::new(); }
+    while let Some(enc) = bound.as_deref().and_then(&mut prev_encoded) {
+        // A remaining raw key is a prefix of its encoded key, hence <= enc.
+        if tail.len() == n && tail.first_key_value().is_some_and(|(key, _)| &enc <= key) { break; }
+        if let Some(vk) = decode_key(&enc) {
+            let raw = vk.raw_key;
+            let eligible = tail.len() < n || tail.first_key_value().is_some_and(|(key, _)| &raw > key);
+            if eligible && !tail.contains_key(&raw) && last_checked.as_ref() != Some(&raw) {
+                if let Some(record) = live(&raw) {
+                    if tail.len() == n { tail.pop_first(); }
+                    tail.insert(raw.clone(), record);
+                    #[cfg(test)]
+                    note_tail_buffer(tail.len());
+                }
+                last_checked = Some(raw);
+            }
+        }
+        bound = Some(enc);
+    }
+    tail.into_values().collect()
+}
+
 pub(crate) struct LogicalHealth {
     groups: KeyWindow<u64>,
     max_version: u64,
@@ -276,6 +320,37 @@ pub(crate) fn reverse_window(
 mod tests {
     use super::*;
     use std::{assert, assert_eq, vec};
+
+    #[test]
+    fn bounded_tail_handles_interleaved_versions_and_empty_answers() {
+        let mut physical = BTreeMap::new();
+        let mut logical = BTreeMap::new();
+        for i in 0u16..256 {
+            let mut raw = vec![97];
+            raw.extend_from_slice(&i.to_be_bytes());
+            for version in [1, 2, 255, 256, u64::MAX] {
+                physical.insert(encode_key(&raw, version), ());
+            }
+            logical.insert(raw.clone(), super::super::ExportRecord::new(raw, Some(vec![i as u8])));
+        }
+        for raw in [vec![], vec![97], vec![97, 0], vec![255]] {
+            for version in [0, 1, 256, u64::MAX] { physical.insert(encode_key(&raw, version), ()); }
+            logical.insert(raw.clone(), super::super::ExportRecord::new(raw, Some(vec![0])));
+        }
+        let bound = physical.last_key_value().map(|(key, _)| { let mut b = key.clone(); b.push(0); b });
+        for n in [0, 1, 7, 300] {
+            take_tail_buffer_peak();
+            let rows = reverse_tail_bounded(n, bound.clone(),
+                |b| physical.range::<[u8], _>((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(b))).next_back().map(|(key, _)| key.clone()),
+                |raw| logical.get(raw).cloned());
+            let want: Vec<_> = logical.values().rev().take(n).rev().cloned().collect();
+            assert_eq!(rows, want);
+            assert!(take_tail_buffer_peak() <= n);
+        }
+        assert!(reverse_tail_bounded(7, bound,
+            |b| physical.range::<[u8], _>((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(b))).next_back().map(|(key, _)| key.clone()),
+            |_| None).is_empty());
+    }
 
     #[test]
     fn binary_order_bounds_cover_prefixes_and_all_version_bytes() {

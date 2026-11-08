@@ -3,13 +3,13 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M88 为未发布修复**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M93 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
-- 本轮库测试 **409 passed / 0 failed / 36 ignored**；集成测试 5 项、CLI 测试 8 项、文档测试 6 项通过；
-  `web` feature 另有 2 项测试通过。
-  36 项库专项/大规模台架与 1 项文档示例默认忽略，本轮不将其计为通过。
+- 本轮库测试 **418 passed / 0 failed / 38 ignored**；集成测试 5 项、CLI 测试 8 项、文档测试 6 项通过。
+  Windows / Linux 全目标 all-features 编译检查通过；Linux 未运行测试。
+  默认忽略的台架中，本轮单独运行了快照读取内存探针和 Bitcask 5M checkpoint 探针，详见更新日志。
 - 许可证：MIT 或 Apache-2.0 任选。
 
 入口：[快速开始](#快速开始) · [下游接入](#下游接入使用说明) · [项目结构](#项目结构) ·
@@ -18,6 +18,8 @@ LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现�
 本轮重点：二进制键的扫描、分页和 vacuum 保持逻辑顺序；提交失败经 `try_commit` 返回；
 集成测试不再删除固定 `data/` 或仓库根快照。二进制前缀重叠时缓冲窗口最坏 O(库)，
 提交不确定时必须重开恢复并对账；这些边界见下文事务说明与 CHANGELOG。
+M89–M93 修复 memory 快照字节往返、完整性与读取内存；三家末页回退仅缓存一页。
+Bitcask checkpoint 的 5M 实测已分段计量，默认触发阈值与持久化顺序保持现有合同。
 
 ## 引入方式
 
@@ -163,7 +165,7 @@ cargo test --release --lib engine::tests::scale_bench::rows_10000000 -- --exact 
 | `scan_page(after, limit)` | 最多返回 limit 行，游标向前推进 | limit 是行数不是字节；大值、长键、版本组仍需内存 |
 | 四个内置引擎的流式导出 / `scan_foreach` | 不先收集整个结果，回调可提前停止 | 后端缓存/源状态/前缀重叠窗口另计，最坏 O(库)；回调自行 collect 仍占整库；自定义 trait 的默认 fallback 可能物化 |
 | `search_keys` | `without_total()` 避免强制精确计数 | 精确 total 要遍历匹配范围；offset 深翻仍要跳过前面各行 |
-| `search_last_page(page_size)`（M81 第 4 项，11-04 起四家都走反向） | 从**库尾**取固定页宽、不数 total ⇒ 代价 ≈ 页宽 × O(一次点读)，**不随库大小涨**：`lsm_tree` 走反向逐步退（页宽 × O(块)），其余三家走 `back_n_with`（页宽把候选键反向退）；600k 档四家 0.23~1.16 ms，同档"数全库再截尾"那一格 0.43~1.96 s | `total`/`total_pages` 恒 `None`、`has_next` 恒 `false`；库尾连片墓碑/过期时退过 `LAST_PAGE_MAX_STEPS = 8 Ki` 步仍未凑够页宽 ⇒ **退回**全库截尾（正确但 O(库)，计数守卫钉四家 `fallbacks == 0`）；三家的这一格在 **11-04 之前的构建上仍是 O(库)**（20M 档 88~106 / 55~71 / 64~69 s、常驻 +2147.5 MB、峰值 +4771 MB），跨这条线比读数没有意义 |
+| `search_last_page(page_size)` | 从库尾取固定页宽，不数 total；LSM 使用反向块遍历，其余三家先进行最多 8192 步的物理反向查找 | M93：三家预算耗尽后仍可能遍历全库并点查，但结果缓存最多一页，不物化全库；普通快路径、二进制前缀及长链回退均有守卫。页宽和键值大小决定结果内存。旧 test3 的数十秒 / 4.77 GB 读数不代表当前构建 |
 | `cache_budget_bytes` | 按样本槽价估算缓存容量，bplus 7000 B/页、lsm 10400 B/块 | **不是进程 RSS 或任意数据形状下的字节硬上限**；不含结果 Vec、memtable、写集、blob GC 等，极小预算仍至少一槽；0 是撤销预算，不是禁用缓存 |
 | 自动版本切片 | 默认 16 Ki 行提交账触发，一次只消费一片；阻塞/失败保留账和游标，无新写也可在下一次 begin 重试 | 完整前缀重叠窗口可能超出预算，最坏 O(库)；不是后台线程、不是时间上限，也不负责缩小物理日志 |
 | `health()` | 全库版本行/链长统计 | O(物理行数)，不能当高频轻量采样 |

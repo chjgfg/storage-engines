@@ -1794,6 +1794,57 @@ mod tests {
     }
 
     #[test]
+    fn last_page_fallback_bounds_results_with_dead_tail_and_binary_keys() {
+        use std::collections::BTreeMap;
+        const PAGE: usize = 7;
+        for name in ["memory", "bitcask", "bplus_tree"] {
+            let dir = tmp_dir("last_page_fallback");
+            let db = open_engine(name, Some(&dir)).unwrap();
+            db.set_vacuum_auto_slice(0);
+            let mut expected = BTreeMap::new();
+            {
+                let tx = db.begin();
+                for i in 0u16..512 {
+                    let mut key = vec![b'a'];
+                    key.extend_from_slice(&i.to_be_bytes());
+                    let value = i.to_le_bytes().to_vec();
+                    tx.try_set_raw(&key, value.clone()).unwrap();
+                    expected.insert(key, value);
+                }
+                tx.try_set_raw(b"a", vec![0, 65]).unwrap();
+                expected.insert(b"a".to_vec(), vec![0, 65]);
+                for i in 0..9000 {
+                    let key = format!("z{i:05}");
+                    if i % 2 == 0 { tx.try_delete(key.as_bytes()).unwrap(); }
+                    else { tx.try_set(key.as_bytes(), crate::common::pack_ttl(b"expired", 1)).unwrap(); }
+                }
+                tx.try_commit().unwrap();
+            }
+            let tx = db.begin();
+            // This snapshot must not see the new versions of the binary prefix.
+            for _ in 0..70 {
+                let writer = db.begin();
+                writer.try_set_raw(b"a", b"new".to_vec()).unwrap();
+                writer.try_commit().unwrap();
+            }
+            crate::common::order::take_tail_buffer_peak();
+            let control = tx.search_last_page(20_000);
+            assert_eq!(crate::common::order::take_tail_buffer_peak(), expected.len());
+            assert_eq!(control.items.len(), expected.len());
+            assert_eq!(control.items.iter().map(|r| (r.key.clone(), r.value.clone().unwrap())).collect::<BTreeMap<_, _>>(), expected);
+            drop(control);
+            let want: Vec<_> = expected.iter().rev().take(PAGE).rev().map(|(k,v)| (k.clone(),v.clone())).collect();
+            let f0 = crate::common::back_n_fallbacks();
+            let page = tx.search_last_page(PAGE);
+            assert_eq!(crate::common::back_n_fallbacks() - f0, 1, "{name}: fallback was not exercised");
+            assert_eq!(page.items.iter().map(|r| (r.key.clone(), r.value.clone().unwrap())).collect::<Vec<_>>(), want);
+            let peak = crate::common::order::take_tail_buffer_peak();
+            assert_eq!(peak, PAGE, "{name}: fallback retained {peak} records");
+            assert_eq!(tx.get(b"a"), Some(vec![0, 65]), "old snapshot lost its version");
+        }
+    }
+
+    #[test]
     fn canonical_name_accepts_aliases() {
         assert_eq!(canonical_name("LSM"), Some("lsm_tree"));
         assert_eq!(canonical_name("bplus-tree"), Some("bplus_tree"));

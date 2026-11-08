@@ -198,8 +198,7 @@ impl Transaction {
     // Strict physical predecessor; logical reordering is shared in common::order.
     fn prev_encoded(&self, bound: &[u8]) -> Option<Vec<u8>> {
         let store = self.store.lock().unwrap();
-        store.range_back(b"", bound, 2).into_iter()
-            .find(|(enc, _)| enc.as_slice() < bound).map(|(enc, _)| enc)
+        store.find_key_back(b"", bound, |enc| enc < bound)
     }
 
     fn live_of(&self, raw: &[u8]) -> Option<ExportRecord> {
@@ -218,20 +217,18 @@ impl Transaction {
     }
 
     /// Reverse physical walk with logical-key ordering. Binary prefixes and long
-    /// histories count against the same 8192-step budget; fallback is explicit.
+    /// histories count against the same 8192-step budget; fallback retains one page.
     pub fn search_last_page(&self, page_size: usize) -> SearchPage {
-        use crate::common::order::{ReverseOutcome, reverse_window};
+        use crate::common::order::{ReverseOutcome, reverse_window, reverse_tail_bounded};
         const MAX_STEPS: usize = 8 * 1024;
         let bound = (self.store.lock().unwrap().last_key()).map(|mut enc| { enc.push(0); enc });
-        let items = match reverse_window(page_size, MAX_STEPS, bound, None,
+        let items = match reverse_window(page_size, MAX_STEPS, bound.clone(), None,
             |bound| self.prev_encoded(bound), |raw| self.live_of(raw)) {
             ReverseOutcome::Complete(rows) => rows,
             ReverseOutcome::BudgetExceeded { physical_steps } => {
                 debug_assert_eq!(physical_steps, MAX_STEPS);
-                let mut rows = self.reverse_scan(None, None);
-                rows.truncate(page_size);
-                rows.reverse();
-                rows
+                reverse_tail_bounded(page_size, bound,
+                    |bound| self.prev_encoded(bound), |raw| self.live_of(raw))
             }
         };
         SearchPage { items, total: None, page: 0, page_size,

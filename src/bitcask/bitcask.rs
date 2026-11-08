@@ -2119,6 +2119,13 @@ impl Bitcask {
             .collect()
     }
 
+    /// Borrow KeyDir while walking a version range; retain only the winner key.
+    pub(crate) fn find_meta_back(&self, low: &[u8], high: &[u8], mut accept: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
+        use std::ops::Bound;
+        self.key_dir.range::<[u8], _>((Bound::Included(low), Bound::Included(high)))
+            .rev().find_map(|(key, _)| accept(key).then(|| key.clone()))
+    }
+
     /// 全量扫描（含软 tombstone）
     pub fn iter(&mut self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
         self.usable()?;

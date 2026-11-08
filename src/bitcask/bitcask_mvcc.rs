@@ -100,12 +100,6 @@ pub struct BulkLoader {
 /// `crate::bitcask::encode_key` 这个既有路径不中断。
 pub use crate::common::{decode_key, encode_key, VersionedKey};
 
-/// 链尾反向查找的首轮预算，不够再翻倍重试。
-///
-/// 常态下一个逻辑 key 只有个位数版本，32 足够一次命中；翻倍只在
-/// 「整条链没有一个可见」的退化场景才付到 O(链长)，与旧的整链扫描同阶。
-const VERSION_BACK_STEP: usize = 32;
-
 /// M37：一次全库 `vacuum()` 走查的**块大小**（物理行）。
 ///
 /// 为什么要有块：`iter_meta_from` 按 `&self` 借住 KeyDir，而删除与读值都要 `&mut kv` ⇒
@@ -1265,23 +1259,9 @@ impl Transaction {
     ) -> Option<Vec<u8>> {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
-        let mut budget = VERSION_BACK_STEP;
-        loop {
-            // 只取索引元数据，不碰 value；条数不足预算即说明已扫到区间下界
-            let rows = kv.range_meta_back(&low, &high, budget);
-            let reached_bottom = rows.len() < budget;
-            for (enc, _) in rows {
-                if let Some(vk) = decode_key(&enc) {
-                    if vk.raw_key.as_slice() == key && accept(vk.version) {
-                        return Some(enc);
-                    }
-                }
-            }
-            if reached_bottom {
-                return None;
-            }
-            budget = budget.saturating_mul(2);
-        }
+        kv.find_meta_back(&low, &high, |enc| {
+            decode_key(enc).is_some_and(|vk| vk.raw_key.as_slice() == key && accept(vk.version))
+        })
     }
 
     fn latest_version_of(kv: &mut Bitcask, key: &[u8]) -> Option<u64> {
