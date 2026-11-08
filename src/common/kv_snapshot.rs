@@ -5,7 +5,8 @@
 //! - **JSONL**：每行 `{"key":"<base64>","value":"<base64>"|null[,"seq":N]}`
 //! - **二进制**：magic + 重复 `(key_len, key, val_len|tombstone, value?[, seq])`
 //!
-//! 二进制有两个魔数：`BPEXP001` 不带 seq，`BPEXP002` 每条多 8 字节 seq。
+//! `BPEXP001` 不带元数据，`BPEXP002` 带 seq，`BPEXP003` 带 TTL。
+//! memory 启停使用 `BPEXP004`（003 的记录形状 + 完整性尾部）；通用导出仍为 003。
 //! [`write_bin`] 按记录里是否有 `seq` 自动选择，所以不带 seq 的导出与
 //! 旧版 `BPEXP001` **逐字节一致**；[`read_bin`] 两种都认。
 
@@ -27,6 +28,9 @@ pub const BIN_MAGIC_V2: &[u8; 8] = b"BPEXP002";
 /// 有意义，带着它跨库互导就是埋漂移）⇒ 与其造一个没人读的四种组合，不如一条版号一件事。
 /// ⚠️ 001 的字节形状**一个字都不许变**：`test_bin_format_matches_downstream_bytes` 钉着它。
 pub const BIN_MAGIC_V3: &[u8; 8] = b"BPEXP003";
+/// Memory snapshots: v3 records followed by MAX:u32, count:u64, CRC32:u32.
+/// The checksum covers the magic and all records. Legacy export bytes stay unchanged.
+pub const BIN_MAGIC_V4: &[u8; 8] = b"BPEXP004";
 pub const TOMBSTONE_LEN: u32 = u32::MAX;
 
 /// 一条快照记录。`value: None` 是 tombstone。
@@ -185,6 +189,7 @@ pub struct BinWriter {
     stats: IoStats,
     with_seq: bool,
     with_expire: bool,
+    checksum: Option<u32>,
 }
 
 impl BinWriter {
@@ -207,7 +212,6 @@ impl BinWriter {
             ));
         }
         let f = File::create(path)?;
-        let mut w = BufWriter::new(f);
         let magic: &[u8; 8] = if with_seq {
             BIN_MAGIC_V2
         } else if with_expire {
@@ -215,39 +219,95 @@ impl BinWriter {
         } else {
             BIN_MAGIC
         };
+        Self::from_file(f, magic, with_seq, with_expire, false)
+    }
+
+    fn from_file(f: File, magic: &[u8; 8], with_seq: bool, with_expire: bool,
+        checked: bool) -> std::io::Result<Self> {
+        let mut w = BufWriter::new(f);
         w.write_all(magic)?;
         Ok(Self {
             w,
             stats: IoStats::default(),
             with_seq,
             with_expire,
+            checksum: checked.then(|| crate::common::disk::crc32(magic)),
         })
     }
 
+    fn bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.w.write_all(bytes)?;
+        if let Some(crc) = &mut self.checksum {
+            *crc = crate::common::disk::crc32_extend(*crc, bytes);
+        }
+        Ok(())
+    }
+
     pub fn write(&mut self, rec: &KvRecord) -> std::io::Result<()> {
-        self.w.write_all(&(rec.key.len() as u32).to_le_bytes())?;
-        self.w.write_all(&rec.key)?;
+        if rec.key.len() >= u32::MAX as usize || rec.value.as_ref().is_some_and(|v| v.len() >= u32::MAX as usize) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "snapshot record too large"));
+        }
+        self.bytes(&(rec.key.len() as u32).to_le_bytes())?;
+        self.bytes(&rec.key)?;
         match &rec.value {
             Some(v) => {
-                self.w.write_all(&(v.len() as u32).to_le_bytes())?;
-                self.w.write_all(v)?;
+                self.bytes(&(v.len() as u32).to_le_bytes())?;
+                self.bytes(v)?;
             }
-            None => self.w.write_all(&TOMBSTONE_LEN.to_le_bytes())?,
+            None => self.bytes(&TOMBSTONE_LEN.to_le_bytes())?,
         }
         if self.with_seq {
-            self.w.write_all(&rec.seq.unwrap_or(0).to_le_bytes())?;
+            self.bytes(&rec.seq.unwrap_or(0).to_le_bytes())?;
         }
         if self.with_expire {
-            self.w.write_all(&rec.expire_unix_secs.unwrap_or(0).to_le_bytes())?;
+            self.bytes(&rec.expire_unix_secs.unwrap_or(0).to_le_bytes())?;
         }
         self.stats.push(&rec.value);
         Ok(())
     }
 
     pub fn finish(mut self) -> std::io::Result<IoStats> {
+        if let Some(crc) = self.checksum {
+            self.w.write_all(&u32::MAX.to_le_bytes())?;
+            self.w.write_all(&(self.stats.records as u64).to_le_bytes())?;
+            self.w.write_all(&crc.to_le_bytes())?;
+        }
         self.w.flush()?;
+        if self.checksum.is_some() {
+            self.w.get_ref().sync_all()?;
+        }
         Ok(self.stats)
     }
+}
+
+/// Publish a complete memory snapshot on the same filesystem. Any error before
+/// rename leaves the previous snapshot intact. Unix also syncs the parent directory.
+pub(crate) fn atomic_write_bin_v4(path: &Path,
+    write: impl FnOnce(&mut BinWriter) -> std::io::Result<()>) -> std::io::Result<IoStats> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    struct Staging(std::path::PathBuf);
+    impl Drop for Staging {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+    let (staging, file) = loop {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let staging = std::path::PathBuf::from(name);
+        match File::options().write(true).create_new(true).open(&staging) {
+            Ok(file) => break (Staging(staging), file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let mut writer = BinWriter::from_file(file, BIN_MAGIC_V4, false, true, true)?;
+    write(&mut writer)?;
+    let stats = writer.finish()?;
+    // Never remove the destination first: rename performs replacement.
+    std::fs::rename(&staging.0, path)?;
+    #[cfg(unix)]
+    File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?.sync_all()?;
+    Ok(stats)
 }
 
 /// jsonl 导出的**逐行**写口，与 [`BinWriter`] 同一条理由。
@@ -342,7 +402,7 @@ impl Sink {
         Ok(Self::Bin(BinWriter::create(path, with_seq)?))
     }
 
-    /// `BPEXP003`（带 expire）的流式写口 —— memory 快照走这条：整库不另攒一份 `Vec`
+    /// `BPEXP003`（带 expire）的流式导出写口：整库不另攒一份 `Vec`
     /// （M44 那条"导出不必再把整库摆进内存"的教训，对快照同样是账）。
     pub fn bin_v3(path: &Path) -> std::io::Result<Self> {
         Ok(Self::Bin(BinWriter::create_v3(path)?))
@@ -458,6 +518,16 @@ pub fn read_bin_with(
     path: &Path,
     on: &mut dyn FnMut(KvRecord) -> bool,
 ) -> std::io::Result<IoStats> {
+    read_bin_policy(path, on, false)
+}
+
+pub(crate) fn read_snapshot_with(path: &Path,
+    on: &mut dyn FnMut(KvRecord) -> bool) -> std::io::Result<IoStats> {
+    read_bin_policy(path, on, true)
+}
+
+fn read_bin_policy(path: &Path, on: &mut dyn FnMut(KvRecord) -> bool,
+    strict: bool) -> std::io::Result<IoStats> {
     let data = std::fs::read(path)?;
     if data.len() < 8 {
         return Err(std::io::Error::new(
@@ -467,20 +537,32 @@ pub fn read_bin_with(
     }
     // 读侧三版都认（M81 第 6 项）：版号只从魔数判，不看内容猜 —— 猜出来的形状会让一个截断的
     // 001 被读成 003 的前缀，那比报"非法魔数"坏得多。
+    let checked = &data[..8] == BIN_MAGIC_V4;
+    let expected = if checked {
+        if data.len() < 24 { return Err(snapshot_invalid("missing snapshot footer")); }
+        let footer = data.len() - 16;
+        if data[footer..footer + 4] != u32::MAX.to_le_bytes() ||
+            crate::common::disk::crc32(&data[..footer]) != u32::from_le_bytes(data[footer + 12..].try_into().unwrap()) {
+            return Err(snapshot_invalid("snapshot checksum/footer mismatch"));
+        }
+        Some(u64::from_le_bytes(data[footer + 4..footer + 12].try_into().unwrap()))
+    } else { None };
+    let data = if checked { &data[..data.len() - 16] } else { &data[..] };
     let (with_seq, with_expire) = if &data[..8] == BIN_MAGIC {
         (false, false)
     } else if &data[..8] == BIN_MAGIC_V2 {
         (true, false)
-    } else if &data[..8] == BIN_MAGIC_V3 {
+    } else if &data[..8] == BIN_MAGIC_V3 || checked {
         (false, true)
     } else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "非法导出文件魔数（期望 BPEXP001/BPEXP002/BPEXP003）",
+            "非法导出文件魔数（期望 BPEXP001/BPEXP002/BPEXP003/BPEXP004）",
         ));
     };
     let mut off = 8usize;
     let mut stats = IoStats::default();
+    let mut delivered = 8;
     while off + 4 <= data.len() {
         let key_len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
@@ -524,16 +606,24 @@ pub fn read_bin_with(
             None
         };
         stats.push(&value);
+        delivered = off;
         if !on(KvRecord {
             key,
             value,
             seq,
             expire_unix_secs,
         }) {
-            break;
+            return Ok(stats);
         }
     }
+    if (strict || checked) && (delivered != data.len() || expected.is_some_and(|n| n != stats.records as u64)) {
+        return Err(snapshot_invalid("incomplete snapshot record/count mismatch"));
+    }
     Ok(stats)
+}
+
+fn snapshot_invalid(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
 /// **流式**读 JSONL：与 [`read_jsonl`] 同一份行解析（`parse_jsonl_line` + `b64_decode`），
@@ -665,6 +755,62 @@ fn parse_jsonl_line(line: &str) -> Result<(String, Option<String>), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn atomic_snapshot_preserves_previous_on_write_or_publish_failure() {
+        use super::*;
+        let dir = crate::common::ScratchPath::new("snapshot", "atomic", "");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot.bxp");
+        let old = KvRecord::new(b"old".to_vec(), Some(b"good".to_vec()));
+        atomic_write_bin_v4(&path, |w| w.write(&old)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(atomic_write_bin_v4(&path, |w| {
+            w.write(&KvRecord::new(b"partial".to_vec(), Some(vec![7; 20000])))?;
+            Err(std::io::Error::other("injected write failure"))
+        }).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(read_bin(&path).unwrap().0, vec![old]);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "staging leaked");
+        let blocked = dir.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), b"keep").unwrap();
+        assert!(atomic_write_bin_v4(&blocked, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(blocked.join("keep")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "staging leaked");
+    }
+
+    #[test]
+    fn strict_snapshot_keeps_legacy_formats_and_import_tolerance() {
+        use super::*;
+        let path = crate::common::ScratchPath::new("snapshot", "legacy", ".bxp");
+        for version in 1..=3 {
+            let mut record = KvRecord::new(b"k".to_vec(), Some(vec![0, 1, 2]));
+            if version == 2 { record.seq = Some(42); }
+            if version == 3 { record.expire_unix_secs = Some(123); }
+            let mut writer = if version == 3 { BinWriter::create_v3(&path) }
+                else { BinWriter::create(&path, version == 2) }.unwrap();
+            writer.write(&record).unwrap();
+            writer.finish().unwrap();
+            let mut back = Vec::new();
+            read_snapshot_with(&path, &mut |r| { back.push(r); true }).unwrap();
+            assert_eq!(back, vec![record]);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.pop();
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_snapshot_with(&path, &mut |_| true).is_err());
+            assert_eq!(read_bin(&path).unwrap().1.records, 0, "legacy import must tolerate partial tail");
+        }
+    }
+
+    #[test]
+    fn snapshot_crc_chunks_match_whole_file() {
+        let bytes: Vec<u8> = (0..=255).cycle().take(1027).collect();
+        for chunk in [1, 7, 8, 9, 64, 1024] {
+            let mut crc = 0;
+            for part in bytes.chunks(chunk) { crc = crate::common::disk::crc32_extend(crc, part); }
+            assert_eq!(crc, crate::common::disk::crc32(&bytes));
+        }
+    }
     use super::*;
     use std::assert;
     use std::assert_eq;

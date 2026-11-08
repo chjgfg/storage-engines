@@ -70,7 +70,12 @@ const fn make_crc32_slices() -> [[u32; 256]; 8] {
 /// `crc32_slice_by_8_matches_bytewise_everywhere` 按多种长度与随机内容钉住 ——
 /// 校验和算错不是"慢一点"，是每一页每个块都判成坏页。
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
+    crc32_extend(0, data)
+}
+
+/// Extend an IEEE CRC32 without retaining the preceding bytes.
+pub(crate) fn crc32_extend(previous: u32, data: &[u8]) -> u32 {
+    let mut crc = !previous;
     let mut chunks = data.chunks_exact(8);
     for c in &mut chunks {
         // 小端加载：与逐字节版"先吃低位字节"的顺序一致，所以两者可比

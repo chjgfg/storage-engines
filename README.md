@@ -31,7 +31,10 @@ storage-engines = { path = "../storage-engines" }
 ```
 
 Cargo 版本号与已发布内容是两件事：历史版本及破坏性变更见 [CHANGELOG.md](CHANGELOG.md)。
-0.5.0 起 `ExportRecord` 增加 TTL 字段，快照格式为 `BPEXP003`；
+0.5.0 起 `ExportRecord` 增加 TTL 字段，通用导出格式为 `BPEXP003`；
+未发布 M90 的 memory 启停快照使用 `BPEXP004`，增加记录数与 CRC32，写入同目录新文件、同步后替换。
+读侧兼容 001–003，旧版本程序无法读取 004；通用导出仍为 003，可用于旧版互导。
+旧格式只能检查半条尾记录，无法识别记录边界截断；新格式缺尾部、计数错误或 CRC 不符均拒绝打开。
 旧结构体字面量需改用 `ExportRecord::new(k, v)` 或 `..Default::default()`。
 本轮未执行 crates.io 发布。
 
@@ -515,7 +518,7 @@ use storage_engines::{EngineError, EngineKind};
 // 从配置字符串解析:`EngineKind` 是同一套别名规则,不认识就 Err(不退回默认值)
 let kind = EngineKind::parse("lsm").ok_or_else(|| EngineError::UnknownEngine("lsm".into()))?;
 if !kind.is_production_ok() {
-    // 只有 memory 是 false:它没有任何持久化(无事务 WAL、无校验和),是对照实验,
+    // 只有 memory 是 false:它没有事务 WAL；启停快照的 CRC 不等于运行期崩溃恢复,
     // 不是"更快的选项"。上实盘之前就把它挡住,别等掉电。
     return Err(EngineError::Unsupported { engine: kind.as_str(), op: "production use" });
 }

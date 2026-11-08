@@ -2495,6 +2495,32 @@ mod tests {
     }
 
     #[test]
+    fn memory_snapshot_rejects_damage_without_rewriting_source() {
+        let dir = tmp_dir("memory_snapshot_damage");
+        {
+            let db = open_engine("memory", Some(&dir)).unwrap();
+            let tx = db.begin();
+            assert!(tx.set_raw(b"a", vec![0, 65]));
+            assert!(tx.set_raw(b"b", vec![1; 10]));
+            tx.try_commit().unwrap();
+        }
+        let path = dir.join("snapshot.bxp");
+        let original = std::fs::read(&path).unwrap();
+        for cut in 0..original.len() {
+            std::fs::write(&path, &original[..cut]).unwrap();
+            assert!(open_engine("memory", Some(&dir)).is_err(), "accepted cut at {cut}");
+            assert_eq!(std::fs::read(&path).unwrap(), original[..cut], "rewrote failed open");
+        }
+        for offset in 0..original.len() {
+            let mut damaged = original.clone();
+            damaged[offset] ^= 1;
+            std::fs::write(&path, &damaged).unwrap();
+            assert!(open_engine("memory", Some(&dir)).is_err(), "accepted damage at {offset}");
+            assert_eq!(std::fs::read(&path).unwrap(), damaged, "rewrote failed open");
+        }
+    }
+
+    #[test]
     fn memory_snapshot_round_trips_only_at_open_and_stop() {
         let dir = tmp_dir("memory_snapshot");
         let snap = dir.join("snapshot.bxp");

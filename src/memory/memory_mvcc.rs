@@ -155,7 +155,7 @@ impl MVCC {
         let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)> = Vec::with_capacity(PAGE);
         let mut expired = 0usize;
         let mut err: Option<std::io::Error> = None;
-        let stats = crate::common::kv_snapshot::read_bin_with(&path, &mut |rec| {
+        let stats = crate::common::kv_snapshot::read_snapshot_with(&path, &mut |rec| {
             // `value = None` = 墓碑行，照样进重放队列（重放成 `delete`）——
             // 丢掉它就是"重启即失忆"：判据①的地基没了，后续同步能复活已删键。
             let value = rec.value;
@@ -231,7 +231,7 @@ impl MVCC {
         })
     }
 
-    /// 写一次整库快照（`BPEXP003`）。只在 `Drop` 里调用 —— 运行期没有任何一条路会走到这里。
+    /// 写一次带完整性校验的整库快照（`BPEXP004`），同步后原子替换旧文件。
     ///
     /// 三条口径：
     /// - **流式**：走 `export_latest_visible_for_each` 交一行折一行，不把整库摆进 `Vec`
@@ -243,13 +243,13 @@ impl MVCC {
     ///
     /// 写盘失败**不吞**：一路 `?` 交给 `Drop`，那里降成 `warn`（析构里不能抛）。
     fn write_snapshot(&self, path: &std::path::Path) -> std::io::Result<usize> {
-        use crate::common::kv_snapshot::{KvRecord, Sink};
+        use crate::common::kv_snapshot::{KvRecord, atomic_write_bin_v4};
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut sink = Sink::bin_v3(path)?;
         let mut written = 0usize;
         let mut err: Option<std::io::Error> = None;
+        let stats = atomic_write_bin_v4(path, |sink| {
         // `include_deleted = true` ⇒ 墓碑也进快照（`value = None` 那一支）。
         // 为什么必须带上：memory 当 `tools::sync` 的目标时，判据是"目标见过这把键吗"，
         // 而"见过"含墓碑 —— 快照里没墓碑，重启一次之后"这把键被删过"就消失了，
@@ -273,15 +273,16 @@ impl MVCC {
         if let Some(e) = err {
             return Err(e);
         }
-        let stats = sink.finish()?;
-        if stats.records != written || handed != written {
+        if handed != written {
             // 不拿 assert：这条在 `Drop` 之路上，panic 会在已经 panic 的展开里再炸一次。
             // 两份账不一致 = 有行静默没落盘，必须报出去而不是"看起来成功了"。
             return Err(std::io::Error::other(format!(
-                "memory 快照写出 {written} 行，收尾账却是 {} 行、出口交出 {} 行",
-                stats.records, handed
+                "memory 快照写出 {written} 行、出口交出 {handed} 行"
             )));
         }
+        Ok(())
+        })?;
+        debug_assert_eq!(stats.records, written);
         Ok(written)
     }
 
@@ -384,7 +385,7 @@ impl MVCC {
     /// 崩溃安全画像：**全空，这是设计而非疏漏**。
     ///
     /// ⚠️ M81 第 6 项之后"全空"的含义要说准：它**没有崩溃安全**（进程被杀 / `exit` 都不跑析构，
-    /// 启停快照写不出来），也仍然没有事务 WAL、没有校验和 —— 这几条一个都没变。
+    /// 启停快照写不出来），仍然没有事务 WAL。BPEXP004 快照有 CRC，但不提供运行期持久提交。
     /// 变的是：给了快照目录的 `open_engine("memory", Some(dir))` 现在**优雅停止不丢**
     /// （`Drop` 写整库快照、下次 open 读回）。这不改变它"对照实验"的定位：
     /// 快照既不是 WAL 也不带校验和，扛不住掉电。
