@@ -1435,6 +1435,141 @@ mod tests {
         }
     }
 
+    fn binary_key_regression(name: &str) {
+        let dir = tmp_dir(name);
+        let db = open_engine(name, (name != "memory").then_some(dir.as_ref())).unwrap();
+        db.set_vacuum_auto_slice(0);
+        let nested = [b'a', 0, 0, 0, 0, 0, 0, 0, 2];
+        {
+            let tx = db.begin();
+            assert!(tx.set_raw(b"a", b"old".to_vec()));
+            tx.commit();
+        }
+        {
+            let tx = db.begin();
+            assert!(tx.set_raw(&nested, b"other".to_vec()));
+            tx.commit();
+        }
+        {
+            let tx = db.begin();
+            assert!(tx.delete(b"a"));
+            tx.commit();
+        }
+        {
+            let tx = db.begin();
+            assert_eq!(tx.get(b"a"), None);
+            let keys: Vec<_> = tx.scan(None, None).into_iter().map(|r| r.key).collect();
+            assert_eq!(keys, vec![nested.to_vec()], "{name}: scan resurrected a deleted version");
+            tx.commit();
+        }
+        assert_eq!(db.health().live_keys, 2, "{name}: logical key count");
+        assert_eq!(db.health().max_chain, 2, "{name}: version chain count");
+        db.vacuum().unwrap();
+        let tx = db.begin();
+        assert_eq!(tx.get(b"a"), None, "{name}: vacuum resurrected a deleted version");
+        assert_eq!(tx.get(&nested), Some(b"other".to_vec()));
+        tx.commit();
+        drop(tx);
+        db.checkpoint().unwrap();
+        drop(db);
+        if name != "memory" {
+            let reopened = open_engine(name, Some(dir.as_ref())).unwrap();
+            let tx = reopened.begin();
+            assert_eq!(tx.get(b"a"), None, "{name}: reopen resurrected a deleted version");
+            assert_eq!(tx.get(&nested), Some(b"other".to_vec()));
+            tx.commit();
+        }
+    }
+
+    #[test]
+    fn binary_key_bitcask() { binary_key_regression("bitcask"); }
+    #[test]
+    fn binary_key_bplus() { binary_key_regression("bplus_tree"); }
+    #[test]
+    fn binary_key_lsm() { binary_key_regression("lsm_tree"); }
+    #[test]
+    fn binary_key_memory() { binary_key_regression("memory"); }
+
+    #[test]
+    fn binary_key_views_match_a_logical_map() {
+        use std::collections::BTreeMap;
+        let mut keys = vec![Vec::new(), vec![b'a', 0, 0, 0, 0, 0, 0, 0, 2]];
+        for a in [0, 1, b'a', 255] {
+            keys.push(vec![a]);
+            for b in [0, 1, b'a', 255] {
+                keys.push(vec![a, b]);
+                for c in [0, 1, b'a', 255] { keys.push(vec![a, b, c]); }
+            }
+        }
+        keys.sort();
+        for entry in open_all() {
+            let (name, db) = (entry.0, &*entry.1);
+            db.set_vacuum_auto_slice(0);
+            let mut expected = BTreeMap::new();
+            for (i, key) in keys.iter().enumerate() {
+                let tx = db.begin();
+                assert!(tx.set_raw(key, key.clone()));
+                expected.insert(key.clone(), key.clone());
+                tx.commit();
+                if i % 3 == 0 {
+                    let tx = db.begin();
+                    assert!(tx.set_raw(key, b"updated".to_vec()));
+                    expected.insert(key.clone(), b"updated".to_vec());
+                    tx.commit();
+                }
+                if i % 5 == 0 {
+                    let tx = db.begin();
+                    assert!(tx.delete(key));
+                    expected.remove(key);
+                    tx.commit();
+                }
+            }
+            let expected_rows: Vec<_> = expected.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let check = || {
+                let tx = db.begin();
+                let pairs = |rows: Vec<ExportRecord>| rows.into_iter()
+                    .map(|r| (r.key, r.value.unwrap())).collect::<Vec<_>>();
+                assert_eq!(pairs(tx.scan(None, None)), expected_rows, "{name}: full scan");
+                for key in &keys {
+                    assert_eq!(tx.get(key), expected.get(key).cloned(), "{name}: point {key:?}");
+                    let prev = expected.range(..=key.clone()).next_back().map(|(k, _)| k.clone());
+                    assert_eq!(tx.seek_prev(key).map(|r| r.key), prev, "{name}: previous {key:?}");
+                    let prefix: Vec<_> = expected_rows.iter().filter(|(k, _)| k.starts_with(key)).cloned().collect();
+                    assert_eq!(pairs(tx.prefix_scan(key)), prefix, "{name}: prefix {key:?}");
+                    let below: Vec<_> = expected_rows.iter().filter(|(k, _)| k < key).cloned().collect();
+                    assert_eq!(pairs(tx.scan(None, Some(key))), below, "{name}: upper bound {key:?}");
+                }
+                for limit in [1, 2, 7, 100] {
+                    let mut cursor = None;
+                    let mut seen = Vec::new();
+                    for _ in 0..=keys.len() {
+                        let (page, next) = tx.scan_page(cursor.as_deref(), limit);
+                        seen.extend(pairs(page));
+                        if next.is_none() { break; }
+                        assert_ne!(next, cursor, "{name}: cursor stalled");
+                        cursor = next;
+                    }
+                    assert_eq!(seen, expected_rows, "{name}: page width {limit}");
+                    let tail = &expected_rows[expected_rows.len().saturating_sub(limit)..];
+                    assert_eq!(pairs(tx.search_last_page(limit).items), tail, "{name}: last page {limit}");
+                }
+                tx.commit();
+            };
+            check();
+            let mut cursor = None;
+            for round in 0..=keys.len() {
+                let result = db.vacuum_bounded(cursor.as_deref(), 1).unwrap();
+                if result.next_cursor.is_none() { break; }
+                assert!(round < keys.len(), "{name}: vacuum did not converge");
+                assert_ne!(result.next_cursor, cursor);
+                cursor = result.next_cursor;
+            }
+            check();
+            db.vacuum().unwrap();
+            check();
+        }
+    }
+
     /// 末页(免 total) 的**对拍 + 有界性**守卫（M81 第 4 项）。两层判据缺一不可：
     ///
     /// ① **对拍**（四家都要过）：`search_last_page(k)` 交出的 k 行必须逐字节等于

@@ -32,16 +32,10 @@ pub fn visible_at(v: u64, my_version: u64, active_xid: &HashSet<u64>) -> bool {
     v <= my_version
 }
 
-/// 把「按 enc 升序到达的版本行」折成 [`MvccHealth`] 的累加器。
-///
-/// 依赖的唯一事实：`encode_key` 是大端版本号接在 raw_key 后面 ⇒ 同一把逻辑 key 的行
-/// 在键序里相邻成块，所以**顺序一遍**就能数出链长，不需要真的建 `BTreeMap<raw, Vec<..>>`
-/// （那会变成 O(全库) 的额外内存）。
-///
-/// ⚠️ 「相邻」对**真前缀嵌套**的 key 会破（`"a"` 与 `"a\0…"` 的版本区间能互相穿插）：
-/// 那时同一个 raw_key 会被数成两段，`max_chain` 于是**偏小**。这里刻意不为了它建全图 ——
-/// 版本号要涨到 `0x31_0000_0000_0000_000` 量级才可能撞上，而把链数少只会让告警变迟钝，
-/// 不会导致裁错版本（裁错的守卫在 [`crate::common::vacuum_plan`] 那侧）。
+/// 对已经按逻辑键分组的输入计数；保留给现有外部调用者。
+/// 不能直接喂物理版本键序：二进制前缀在版本 1、2、3 就能打断分组。
+/// 四个内置引擎改用 `common::order::LogicalHealth` 等待完整逻辑组。
+/// 修订（2026-11-09）：此前“需要极大版本号才会交错”的说明不成立。
 #[derive(Debug, Clone, Default)]
 pub struct HealthFold {
     prev_raw: Option<Vec<u8>>,

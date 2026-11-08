@@ -21,9 +21,8 @@ use std::{
 pub use crate::common::{
     DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
-use crate::common::{HealthFold, VacuumScheduler};
+use crate::common::VacuumScheduler;
 use crate::common::vacuum_plan_group;
-use crate::common::version_key_upper_bound;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WriteSide};
 use crate::memory::mem_store::MemStore;
 
@@ -412,14 +411,10 @@ impl MVCC {
         // 嵌套持有会和 [`MVCC::vacuum`]（`active_txn → store`）构成反向嵌套。
         let active_txns = self.active_txn.lock().unwrap().len() as u64;
         let store = self.store.lock().unwrap();
-        // 分组折叠用四引擎共用的 [`HealthFold`]：按 enc 升序 ⇒ 同 key 相邻成块 ⇒ 一趟数得出链长
-        let mut fold = HealthFold::default();
-        // BTreeMap 按 enc 升序 ⇒ 同一逻辑 key 的版本块相邻
+        // Count complete logical groups, including interleaved binary prefixes.
+        let mut fold = crate::common::order::LogicalHealth::new(self.next_version.load(Ordering::SeqCst));
         store.scan_entries_with(|enc, _val| {
-            let Some(vk) = decode_key(enc) else {
-                return;
-            };
-            fold.push(&vk.raw_key);
+            fold.push(&enc);
         });
         fold.finish(active_txns)
     }
@@ -463,13 +458,13 @@ impl MVCC {
         //
         // M36：**只攒当前这一把键的那一组**，看到后继就把上一组交出去判 ⇒ 瞬时内存从
         // O(全库物理行)（600k 档实测 +89.4 MB，比要裁的东西大两个数量级）降到
-        // O(最长那条链)。版本键按 `raw ‖ version_be` 升序到达，同一把键的行必然连续。
+        // O(最长那条链)。版本键按 `raw ‖ version_be` 升序到达，同一把键的行可能被二进制前缀打断，按公共 KeyWindow 等待完整组。
         // M37：再按块走 —— 走查持读锁、删除要写锁 ⇒ 每块读完就**放掉读锁**再删这一块，
         // 于是 `to_delete` 从 O(全库) 变成 O(一块)（这一家实测基数小：600k 档 `vacuum()`
         // 瞬时 4.0 MB，改完是 O(块)；改它的理由是"同根因不留三家"，不是那 4 MB）。
         // 块间下界 `enc ‖ 0x00`：enc 域的严格后继方向，与 bitcask/lsm 同一个理由。
         let budget_rows = budget_rows.max(1);
-        let mut group: Vec<(u64, Vec<u8>, bool, ())> = Vec::new();
+        let mut groups: crate::common::order::KeyWindow<Vec<(u64, Vec<u8>, bool, ())>> = crate::common::order::KeyWindow::new();
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
         let mut removed = 0usize;
         let mut scanned = 0u64;
@@ -489,22 +484,20 @@ impl MVCC {
                     if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
                         return false;
                     }
-                    let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
-                    if at_group_start && scanned >= budget_rows {
-                        // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）⇒ 游标就是它
-                        // （`group` 正是那一组，收摊时在块尾判掉）
+                    while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
+                        let (d, k) = vacuum_plan_group(&mut group, xmin);
+                        to_delete.extend(d);
+                        let _ = k;
+                        cur_raw = Some(key);
+                    }
+                    // Stop only after the complete overlapping prefix window is finalized.
+                    if groups.is_empty() && scanned >= budget_rows {
                         truncated = true;
                         done = true;
                         return true;
                     }
-                    if at_group_start {
-                        // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]
-                        let (d, _kept) = vacuum_plan_group(&mut group, xmin);
-                        to_delete.extend(d);
-                        cur_raw = Some(vk.raw_key.clone());
-                    }
                     scanned += 1;
-                    group.push((vk.version, enc.to_vec(), val.is_none(), ()));
+                    groups.entry(vk.raw_key).push((vk.version, enc.to_vec(), val.is_none(), ()));
                     chunk_rows += 1;
                     if chunk_rows >= VAC_CHUNK_ROWS {
                         let mut bound = enc.to_vec();
@@ -516,9 +509,12 @@ impl MVCC {
                 });
             }
             if done || next_lower.is_none() {
-                // 最后一块：挂在 `group` 里的那一组判掉（它不会再有后继了）
-                let (d, _kept) = vacuum_plan_group(&mut group, xmin);
-                to_delete.extend(d);
+                while let Some((key, mut group)) = groups.pop_first() {
+                    let (d, k) = vacuum_plan_group(&mut group, xmin);
+                    to_delete.extend(d);
+                    let _ = k;
+                    cur_raw = Some(key);
+                }
             }
             #[cfg(test)]
             note_vac_pending(to_delete.len());
@@ -798,83 +794,26 @@ impl Transaction {
     /// （版本大端接在 key 后面 ⇒ 组内升序）。在半截组上收手会把旧版本当成最新行。
     /// 返回的 `bool` = 是否已走到界尾（`false` = 是被 `budget` 拦下的，还能续跑）。
     pub(crate) fn scan_candidates(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        accept: Option<&dyn Fn(&[u8]) -> bool>,
-        after: Option<&[u8]>,
-        budget: usize,
+        &self, start: Option<&[u8]>, end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
     ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
-        let hi_enc = end.map(version_key_upper_bound);
-        // 游标下推：`after` 不只是过滤器，它同时抬高迭代起点（M21，否则翻每页都从库头重走）
+        let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
         let lo = crate::common::fold_lower_bound(start, after);
+        let mut fold = crate::common::order::CandidateFold::new(
+            start, end, after, accept, self.core.version, budget);
         let store = self.store.lock().unwrap();
-        let mut out: Vec<crate::common::WinCandidate<Option<Vec<u8>>>> = Vec::new();
-        let mut winners: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
-        let mut pending: Option<Vec<u8>> = None;
-        // 组边界处理写成一个嵌套 fn：闭包会把 `winners`/`out` 一直借在手里，
-        // 循环体里就再也插不进去（E0499，借用检查器在这里是对的）。
-        fn hand_off(
-            out: &mut Vec<crate::common::WinCandidate<Option<Vec<u8>>>>,
-            winners: &mut BTreeMap<Vec<u8>, (u64, Vec<u8>)>,
-            store: &MemStore,
-            accept: Option<&dyn Fn(&[u8]) -> bool>,
-            key: Vec<u8>,
-        ) {
-            let Some((ver, win_enc)) = winners.remove(&key) else {
-                return;
-            };
-            if accept.is_some_and(|f| !f(&key)) {
-                return;
-            }
-            // 刚还在 winners 里的行不见了：单写者模型下不会发生，宁可跳过这组也不猜
-            let Some(row) = store.get(&win_enc).cloned() else {
-                return;
-            };
-            out.push(crate::common::WinCandidate {
-                key,
-                version: ver,
-                row,
-            });
-        }
-
-        let mut stopped_by_budget = false;
-        for enc in store.iter_keys_in(lo, hi_enc.as_deref()) {
+        for enc in store.iter_keys_in(lo, hi.as_deref()) {
             #[cfg(test)]
             FOLD_KEYS.with(|c| c.set(c.get() + 1));
-            let Some(vk) = decode_key(enc) else {
-                continue;
-            };
-            if start.is_some_and(|s| vk.raw_key.as_slice() < s) {
-                continue;
-            }
-            if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
-                continue;
-            }
-            if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
-                continue; // 上一轮已经交出去的那组
-            }
-            if !self.is_visible(vk.version) {
-                continue;
-            }
-            if pending.as_deref() != Some(vk.raw_key.as_slice()) {
-                if let Some(key) = pending.take() {
-                    hand_off(&mut out, &mut winners, &store, accept, key);
-                    if out.len() >= budget {
-                        stopped_by_budget = true;
-                        break;
-                    }
-                }
-                pending = Some(vk.raw_key.clone());
-            }
-            winners.insert(vk.raw_key.clone(), (vk.version, enc.to_vec()));
+            if fold.push(enc, |v| self.is_visible(v), || enc.clone()) { break; }
         }
-        if !stopped_by_budget {
-            if let Some(key) = pending {
-                hand_off(&mut out, &mut winners, &store, accept, key);
-            }
-        }
-        (out, !stopped_by_budget)
+        let (rows, complete) = fold.finish();
+        let rows = rows.into_iter().filter_map(|c| {
+            store.get(&c.row).cloned().map(|row| crate::common::WinCandidate {
+                key: c.key, version: c.version, row,
+            })
+        }).collect();
+        (rows, complete)
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {

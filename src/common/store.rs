@@ -665,6 +665,17 @@ pub fn back_n_fallbacks() -> u64 {
     BACK_N_FALLBACKS.with(|c| c.get())
 }
 
+#[cfg(test)]
+pub(crate) fn note_reverse_candidate() {
+    BACK_N_CANDIDATES.with(|c| c.set(c.get() + 1));
+    SEEK_PREV_STEPS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn note_reverse_fallback() {
+    BACK_N_FALLBACKS.with(|c| c.set(c.get() + 1));
+}
+
 /// 从库尾反向收集 `n` 条**逻辑键**（升序交出）—— `KvTxn::search_last_page` 的逐步退实现（M82）。
 ///
 /// 与 [`seek_prev_with`] 同源（那条是"取 1 条"），推进规则也一样：每拿到一把键，就把**它本身**

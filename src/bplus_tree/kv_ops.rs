@@ -25,6 +25,7 @@
 //! 旧数据无 tag 时按「永久裸 value」兼容。
 //! 读路径（`get` / scan / multi_get / search）自动剥信封并丢弃已过期条目。
 
+use std::{debug_assert_eq, unreachable};
 use std::time::Duration;
 
 use crate::bplus_tree::bplus_tree_mvcc::{MVCC, Transaction};
@@ -231,90 +232,48 @@ impl Transaction {
     /// [`BPlusTree::find_back`]（本来就是点读的热路径，跨叶反向有进度守卫），单键可见行走
     /// `latest_visible_raw`。改之前是 `scan(None, Some(key‖0))` + `retain` + `pop`。
     /// 反向一步：编码键 `≤ bound` 的最大那一行属于哪把逻辑键
-    fn prev_raw(&self, bound: &[u8]) -> Option<Vec<u8>> {
-        let mut kv = self.kv.lock().unwrap();
-        kv.find_back(b"", bound, |_| true)
-            .and_then(|(enc, _)| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+    // Strict physical predecessor; logical reordering is shared in common::order.
+    fn prev_encoded(&self, bound: &[u8]) -> Option<Vec<u8>> {
+        self.kv.lock().unwrap().find_back(b"", bound, |enc| enc < bound)
+            .map(|(enc, _)| enc)
     }
 
-    /// 这把逻辑键对当前事务的可见行（墓碑/过期 ⇒ `None`）
     fn live_of(&self, raw: &[u8]) -> Option<ExportRecord> {
         let logical = self.latest_visible_raw(raw).and_then(|(_, v)| v);
         crate::common::live_record_of_logical(raw.to_vec(), logical, now_unix_secs())
     }
 
-    /// 定位 **≤ key** 的最后一条存活记录（逐步退，不物化前缀 —— M20）
     pub fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
-        crate::common::seek_prev_with(key, |bound| self.prev_raw(bound), |raw| self.live_of(raw))
+        use crate::common::order::{ReverseOutcome, range_end, reverse_window};
+        match reverse_window(1, usize::MAX,
+            Some(range_end(key, self.core.version, true)), Some(key),
+            |bound| self.prev_encoded(bound), |raw| self.live_of(raw)) {
+            ReverseOutcome::Complete(mut rows) => rows.pop(),
+            ReverseOutcome::BudgetExceeded { .. } => unreachable!("unlimited reverse walk"),
+        }
     }
 
-    /// 从库尾取 `page_size` 条逻辑键（免 total，升序交出）—— M82 补齐（M81 第 4 项只给了 lsm）。
-    ///
-    /// 改前这一格对三家是 trait 默认那支"`reverse_scan` 全库物化再截尾"：20M 档 bplus
-    /// **71.4 s** + 常驻 2147.5 MB / 峰值 +4772.2 MB。现在 = `page_size` 次反向定位，
-    /// 每次 O(树高) 的叶定位 ⇒ **不随库大小涨**。
-    ///
-    /// 起点取树上真实存在的最大键（[`crate::bplus_tree::BPlusTree::last_key`]，最右下降），
-    /// **不造 `\xFF` 哨兵**。循环与推进规则在 [`crate::common::back_n_with`]。
+    /// Reverse physical walk with logical-key ordering. Binary prefixes and long
+    /// histories count against the same 8192-step budget; fallback is explicit.
     pub fn search_last_page(&self, page_size: usize) -> SearchPage {
-        const LAST_PAGE_MAX_STEPS: usize = 8 * 1024;
-        let max_raw = || {
-            self.kv
-                .lock()
-                .unwrap()
-                .last_key()
-                .and_then(|enc| crate::common::decode_key(&enc).map(|vk| vk.raw_key))
+        use crate::common::order::{ReverseOutcome, reverse_window};
+        const MAX_STEPS: usize = 8 * 1024;
+        let bound = (self.kv.lock().unwrap().last_key()).map(|mut enc| { enc.push(0); enc });
+        let items = match reverse_window(page_size, MAX_STEPS, bound, None,
+            |bound| self.prev_encoded(bound), |raw| self.live_of(raw)) {
+            ReverseOutcome::Complete(rows) => rows,
+            ReverseOutcome::BudgetExceeded { physical_steps } => {
+                debug_assert_eq!(physical_steps, MAX_STEPS);
+                let mut rows = self.reverse_scan(None, None);
+                rows.truncate(page_size);
+                rows.reverse();
+                rows
+            }
         };
-        match crate::common::back_n_with(
-            page_size,
-            LAST_PAGE_MAX_STEPS,
-            max_raw,
-            |bound| self.prev_raw(bound),
-            |raw| self.live_of(raw),
-        ) {
-            Some(items) => SearchPage {
-                items,
-                total: None,
-                page: 0,
-                page_size,
-                total_pages: None,
-                has_next: false,
-            },
-            // 库尾连着一大片死键：退过界就回退全库截尾（慢，但正确；这一支有守卫钉着"不该发生"）
-            None => self.last_page_by_full_scan(page_size),
-        }
+        SearchPage { items, total: None, page: 0, page_size,
+            total_pages: None, has_next: false }
     }
 
-    /// 回退支：全库物化再截尾（= `KvTxn::search_last_page` 的 trait 默认实现）
-    fn last_page_by_full_scan(&self, page_size: usize) -> SearchPage {
-        let mut items = self.reverse_scan(None, None);
-        items.truncate(page_size);
-        items.reverse();
-        SearchPage {
-            items,
-            total: None,
-            page: 0,
-            page_size,
-            total_pages: None,
-            has_next: false,
-        }
-    }
-
-    // ── 模糊 / 前缀搜索 + 分页 ──
-
-    /// 按 key **模糊/前缀**搜索，并分页。
-    ///
-    /// - 在「最新可见」逻辑键上过滤（与 `export_latest_visible` 同一可见性）
-    /// - `KeyMatchMode::Contains`：子串匹配（模糊）
-    /// - `KeyMatchMode::Prefix`：前缀匹配
-    /// - `page` 从 0 起；结果按 key 字典序
-    /// - 会剥 TTL；过期默认不可见（`include_deleted` 时以 tombstone 给出）
-    /// - 当前实现扫全树后过滤（教学清晰；大规模可再做索引/前缀 range 优化）
-    ///
-    /// ```ignore
-    /// let page = tx.search_keys(&SearchQuery::contains(b"user:", 0, 20));
-    /// for rec in &page.items { ... }
-    /// ```
     pub fn search_keys(&self, query: &SearchQuery) -> SearchPage {
         // M35：整条实现收进 [`crate::common::search_page`]（四家一份）。要精确 total 时
         // 不再把界内命中全物化成 `Vec`，改成"只数一遍 + 只取那一页"。

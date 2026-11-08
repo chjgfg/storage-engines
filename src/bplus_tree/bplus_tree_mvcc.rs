@@ -31,10 +31,9 @@ use crate::bplus_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{
     DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
-use crate::common::{HealthFold, VacuumScheduler};
+use crate::common::VacuumScheduler;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
 use crate::common::vacuum_plan_group;
-use crate::common::version_key_upper_bound;
 
 /// MVCC 存储引擎
 /// M37：一次 `vacuum_bounded` 走查的**块大小**（物理行）—— 与 bitcask / lsm / memory 同值，
@@ -519,14 +518,10 @@ impl MVCC {
         // 嵌套持有会和 [`MVCC::vacuum`]（`active_txn → kv → blob`）构成反向嵌套。
         let active_txns = self.active_txn.lock().unwrap().len() as u64;
         let mut kv = self.kv.lock().unwrap();
-        // 分组折叠用四引擎共用的 [`HealthFold`]：按 enc 升序 ⇒ 同 key 相邻成块 ⇒ 一趟数得出链长
-        let mut fold = HealthFold::default();
-        // 叶子沿 next_leaf 升序 ⇒ 同一逻辑 key 的版本块相邻
+        // Count complete logical groups, including interleaved binary prefixes.
+        let mut fold = crate::common::order::LogicalHealth::new(self.next_version.load(Ordering::SeqCst));
         kv.scan_keys_with(|enc| {
-            let Some(vk) = decode_key(enc) else {
-                return;
-            };
-            fold.push(&vk.raw_key);
+            fold.push(&enc);
         });
         fold.finish(active_txns)
     }
@@ -589,7 +584,7 @@ impl MVCC {
         //    = O(全库物理行)，600k 档 +89.4 MB 那个形状），版本键按 `raw ‖ version_be`
         //    升序到达 ⇒ 判完一组就地并进 `to_delete`。
         let budget_rows = budget_rows.max(1);
-        let mut group: Vec<(u64, Vec<u8>, bool, bool)> = Vec::new();
+        let mut groups: crate::common::order::KeyWindow<Vec<(u64, Vec<u8>, bool, bool)>> = crate::common::order::KeyWindow::new();
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
         let mut removed = 0usize;
         let mut has_blob_ref = false;
@@ -624,29 +619,24 @@ impl MVCC {
                 if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
                     return false;
                 }
-                let at_group_start = cur_raw.as_deref() != Some(vk.raw_key.as_slice());
-                if at_group_start && scanned >= budget_rows {
-                    // 破在这里时 `cur_raw` 那一组已经收齐（刚看到它的后继）⇒ 游标就是它
-                    // （`group` 正是那一组，收摊时在块尾判掉）
+                while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
+                    let (d, k) = vacuum_plan_group(&mut group, xmin);
+                    to_delete.extend(d);
+                    has_blob_ref |= k.iter().any(|(_, refs_blob)| *refs_blob);
+                    cur_raw = Some(key);
+                }
+                // Stop only after the complete overlapping prefix window is finalized.
+                if groups.is_empty() && scanned >= budget_rows {
                     truncated = true;
                     done = true;
                     return true;
-                }
-                if at_group_start {
-                    // 「留哪一版」是四引擎共用的判定，内核在 [`crate::common::vacuum_plan_group`]；
-                    // 这里把「保留行是否引用 blob」当作附带信息 R 一起带出来 —— Blob GC 的判据
-                    // 因此仍然在同一次遍历里凑齐，不用为它再走一遍全库。
-                    let (d, kept) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    has_blob_ref |= kept.iter().any(|(_, refs_blob)| *refs_blob);
-                    cur_raw = Some(vk.raw_key.clone());
                 }
                 scanned += 1;
                 let is_tomb = row.is_none();
                 let refs_blob = row
                     .as_ref()
                     .is_some_and(|s| s.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB));
-                group.push((vk.version, enc.to_vec(), is_tomb, refs_blob));
+                groups.entry(vk.raw_key).push((vk.version, enc.to_vec(), is_tomb, refs_blob));
                 chunk_rows += 1;
                 if chunk_rows >= vac_chunk_limit() {
                     let mut bound = enc.to_vec();
@@ -657,10 +647,12 @@ impl MVCC {
                 false
             });
             if done || next_lower.is_none() {
-                // 最后一块：挂在 `group` 里的那一组判掉（它不会再有后继了）
-                let (d, kept) = vacuum_plan_group(&mut group, xmin);
-                to_delete.extend(d);
-                has_blob_ref |= kept.iter().any(|(_, refs_blob)| *refs_blob);
+                while let Some((key, mut group)) = groups.pop_first() {
+                    let (d, k) = vacuum_plan_group(&mut group, xmin);
+                    to_delete.extend(d);
+                    has_blob_ref |= k.iter().any(|(_, refs_blob)| *refs_blob);
+                    cur_raw = Some(key);
+                }
             }
             #[cfg(test)]
             note_vac_pending(to_delete.len());
@@ -669,6 +661,7 @@ impl MVCC {
             // ⚠️ 对照臂（门控 `BPLUS_BATCH_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）逐行删除，
             //   同一份库、同一批键 ⇒ 比值只归因于"合批 vs 不合批"这一件事。
             if !to_delete.is_empty() {
+                to_delete.sort();
                 let planned = to_delete.len();
                 #[cfg(test)]
                 let per_row = std::env::var("BPLUS_BATCH_OLD_SHAPE").is_ok();
@@ -1038,83 +1031,19 @@ impl Transaction {
     /// ⚠️ 交出一组只能在组边界：全表按 enc 升序 ⇒ 同一 raw_key 的版本块连续，
     /// 最后一次覆盖才是最大可见版本；在半截组上收手会把旧版本当新的交出去。
     pub(crate) fn scan_candidates(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        accept: Option<&dyn Fn(&[u8]) -> bool>,
-        after: Option<&[u8]>,
-        budget: usize,
+        &self, start: Option<&[u8]>, end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
     ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
-        let hi_enc = end.map(version_key_upper_bound);
-        // 候选按组边界依次成型，两个 Vec 用索引配对（闭包不能把 `out` 同时借走，
-        // 见 memory 引擎同名方法里的说明）
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        let mut rows: Vec<Option<Vec<u8>>> = Vec::new();
-        let mut versions: Vec<u64> = Vec::new();
-        let mut stopped_by_budget = false;
-        {
-            let mut kvengine = self.kv.lock().unwrap();
-            let mut winners: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)> = BTreeMap::new();
-            let mut pending: Option<Vec<u8>> = None;
-            let accept: Option<&dyn Fn(&[u8]) -> bool> = accept;
-            kvengine.scan_entries_break_from(crate::common::fold_lower_bound(start, after), |enc, row| {
-                if hi_enc.as_deref().is_some_and(|h| enc >= h) {
-                    return true; // 按 enc 定界 ⇒ 有序迭代后面只会更大，可以真停
-                }
-                let Some(vk) = decode_key(enc) else {
-                    return false;
-                };
-                // 界判在原始 key 上，逐条兜（前缀交错的边角）
-                if start.is_some_and(|s| vk.raw_key.as_slice() < s) {
-                    return false;
-                }
-                if end.is_some_and(|e| vk.raw_key.as_slice() >= e) {
-                    return false;
-                }
-                if after.is_some_and(|a| vk.raw_key.as_slice() <= a) {
-                    return false; // 上一轮已经交出去的那组
-                }
-                if !self.is_visible(vk.version) {
-                    return false;
-                }
-                if pending.as_deref() != Some(vk.raw_key.as_slice()) {
-                    if let Some(key) = pending.take() {
-                        if let Some((ver, stored)) = winners.remove(&key) {
-                            if accept.is_none_or(|f| f(&key)) {
-                                keys.push(key);
-                                versions.push(ver);
-                                rows.push(stored);
-                                if keys.len() >= budget {
-                                    stopped_by_budget = true;
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                    pending = Some(vk.raw_key.clone());
-                }
-                winners.insert(vk.raw_key.clone(), (vk.version, row.clone()));
-                false
-            });
-            if !stopped_by_budget {
-                if let Some(key) = pending {
-                    if let Some((ver, stored)) = winners.remove(&key) {
-                        if accept.is_none_or(|f| f(&key)) {
-                            keys.push(key);
-                            versions.push(ver);
-                            rows.push(stored);
-                        }
-                    }
-                }
-            }
-        }
-        let out = keys
-            .into_iter()
-            .zip(versions)
-            .zip(rows)
-            .map(|((key, version), row)| crate::common::WinCandidate { key, version, row })
-            .collect();
-        (out, !stopped_by_budget)
+        let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
+        let lo = crate::common::fold_lower_bound(start, after);
+        let mut fold = crate::common::order::CandidateFold::new(
+            start, end, after, accept, self.core.version, budget);
+        let mut kv = self.kv.lock().unwrap();
+        kv.scan_entries_break_from(lo, |enc, row| {
+            if hi.as_deref().is_some_and(|h| enc >= h) { return true; }
+            fold.push(enc, |v| self.is_visible(v), || row.clone())
+        });
+        fold.finish()
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, RowId> {
