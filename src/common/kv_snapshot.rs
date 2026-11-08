@@ -508,7 +508,8 @@ impl ExportWriter {
 
 // ─── 读 ─────────────────────────────────────────────────────────────────────
 
-/// **流式**读二进制快照：解出一条就交给 `on`，`on` 返回 `false` 当场收手（不等读完）。
+/// **流式**读二进制快照：解出一条就交给 `on`，`on` 返回 `false` 当场停止解码。
+/// 004 在回调前用固定缓冲预验整份文件 CRC；001–003 不需要这次预读。
 ///
 /// 存在的理由与 [`crate::KvEngine::export_latest_visible_for_each`] 同一件事的两端：
 /// `import_kv` 那侧要的是"边读边写进引擎"，把整份文件先摆进 `Vec` 只是为等着被逐条丢掉
@@ -528,96 +529,119 @@ pub(crate) fn read_snapshot_with(path: &Path,
 
 fn read_bin_policy(path: &Path, on: &mut dyn FnMut(KvRecord) -> bool,
     strict: bool) -> std::io::Result<IoStats> {
-    let data = std::fs::read(path)?;
-    if data.len() < 8 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "文件过短",
-        ));
-    }
-    // 读侧三版都认（M81 第 6 项）：版号只从魔数判，不看内容猜 —— 猜出来的形状会让一个截断的
-    // 001 被读成 003 的前缀，那比报"非法魔数"坏得多。
-    let checked = &data[..8] == BIN_MAGIC_V4;
-    let expected = if checked {
-        if data.len() < 24 { return Err(snapshot_invalid("missing snapshot footer")); }
-        let footer = data.len() - 16;
-        if data[footer..footer + 4] != u32::MAX.to_le_bytes() ||
-            crate::common::disk::crc32(&data[..footer]) != u32::from_le_bytes(data[footer + 12..].try_into().unwrap()) {
+    use std::io::{Read, Seek, SeekFrom};
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    if length < 8 { return Err(snapshot_invalid("文件过短")); }
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    let (with_seq, with_expire) = match &magic {
+        BIN_MAGIC => (false, false),
+        BIN_MAGIC_V2 => (true, false),
+        BIN_MAGIC_V3 | BIN_MAGIC_V4 => (false, true),
+        _ => return Err(snapshot_invalid("非法导出文件魔数")),
+    };
+    // Checked snapshots are verified before the first callback. This bounded
+    // prepass prevents an importer from committing a corrupt file's prefix.
+    let checked = &magic == BIN_MAGIC_V4;
+    let (body_len, expected) = if checked {
+        if length < 24 { return Err(snapshot_invalid("missing snapshot footer")); }
+        reader.seek(SeekFrom::Start(0))?;
+        let mut remaining = length - 16;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut crc = 0;
+        while remaining > 0 {
+            let n = remaining.min(buffer.len() as u64) as usize;
+            reader.read_exact(&mut buffer[..n])?;
+            crc = crate::common::disk::crc32_extend(crc, &buffer[..n]);
+            remaining -= n as u64;
+        }
+        let mut footer = [0u8; 16];
+        reader.read_exact(&mut footer)?;
+        if footer[..4] != u32::MAX.to_le_bytes() ||
+            crc != u32::from_le_bytes(footer[12..].try_into().unwrap()) {
             return Err(snapshot_invalid("snapshot checksum/footer mismatch"));
         }
-        Some(u64::from_le_bytes(data[footer + 4..footer + 12].try_into().unwrap()))
-    } else { None };
-    let data = if checked { &data[..data.len() - 16] } else { &data[..] };
-    let (with_seq, with_expire) = if &data[..8] == BIN_MAGIC {
-        (false, false)
-    } else if &data[..8] == BIN_MAGIC_V2 {
-        (true, false)
-    } else if &data[..8] == BIN_MAGIC_V3 || checked {
-        (false, true)
-    } else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "非法导出文件魔数（期望 BPEXP001/BPEXP002/BPEXP003/BPEXP004）",
-        ));
-    };
-    let mut off = 8usize;
-    let mut stats = IoStats::default();
-    let mut delivered = 8;
-    while off + 4 <= data.len() {
-        let key_len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        if off + key_len + 4 > data.len() {
-            break;
-        }
-        let key = data[off..off + key_len].to_vec();
-        off += key_len;
-        let val_len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        off += 4;
-        let value = if val_len == TOMBSTONE_LEN {
-            None
-        } else {
-            let vl = val_len as usize;
-            if off + vl > data.len() {
-                break;
+        reader.seek(SeekFrom::Start(8))?;
+        (length - 24, Some(u64::from_le_bytes(footer[4..12].try_into().unwrap())))
+    } else { (length - 8, None) };
+    read_bin_records(&mut reader, body_len, with_seq, with_expire, strict || checked, expected, on)
+}
+
+enum RecordRead {
+    End,
+    Truncated,
+    Record(KvRecord),
+}
+
+struct RecordInput<R> {
+    reader: R,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> RecordInput<R> {
+    fn fixed<const N: usize>(&mut self) -> std::io::Result<Option<[u8; N]>> {
+        if self.remaining < N as u64 { return Ok(None); }
+        let mut bytes = [0; N];
+        self.reader.read_exact(&mut bytes)?;
+        self.remaining -= N as u64;
+        Ok(Some(bytes))
+    }
+
+    fn bytes(&mut self, len: u32) -> std::io::Result<Option<Vec<u8>>> {
+        if len as u64 > self.remaining { return Ok(None); }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len as usize).map_err(std::io::Error::other)?;
+        bytes.resize(len as usize, 0);
+        self.reader.read_exact(&mut bytes)?;
+        self.remaining -= len as u64;
+        Ok(Some(bytes))
+    }
+
+    fn record(&mut self, with_seq: bool, with_expire: bool) -> std::io::Result<RecordRead> {
+        if self.remaining == 0 { return Ok(RecordRead::End); }
+        let Some(len) = self.fixed::<4>()? else { return Ok(RecordRead::Truncated); };
+        let Some(key) = self.bytes(u32::from_le_bytes(len))? else { return Ok(RecordRead::Truncated); };
+        let Some(len) = self.fixed::<4>()? else { return Ok(RecordRead::Truncated); };
+        let value = match u32::from_le_bytes(len) {
+            TOMBSTONE_LEN => None,
+            len => {
+                let Some(value) = self.bytes(len)? else { return Ok(RecordRead::Truncated); };
+                Some(value)
             }
-            let v = data[off..off + vl].to_vec();
-            off += vl;
-            Some(v)
         };
         let seq = if with_seq {
-            if off + 8 > data.len() {
-                break;
-            }
-            let s = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-            off += 8;
-            Some(s)
-        } else {
-            None
-        };
+            let Some(bytes) = self.fixed::<8>()? else { return Ok(RecordRead::Truncated); };
+            Some(u64::from_le_bytes(bytes))
+        } else { None };
         let expire_unix_secs = if with_expire {
-            if off + 8 > data.len() {
-                break;
+            let Some(bytes) = self.fixed::<8>()? else { return Ok(RecordRead::Truncated); };
+            let expire = u64::from_le_bytes(bytes);
+            (expire != 0).then_some(expire)
+        } else { None };
+        Ok(RecordRead::Record(KvRecord { key, value, seq, expire_unix_secs }))
+    }
+}
+
+fn read_bin_records(reader: &mut impl std::io::Read, length: u64, with_seq: bool,
+    with_expire: bool, strict: bool, expected: Option<u64>,
+    on: &mut dyn FnMut(KvRecord) -> bool) -> std::io::Result<IoStats> {
+    let mut input = RecordInput { reader, remaining: length };
+    let mut stats = IoStats::default();
+    loop {
+        match input.record(with_seq, with_expire)? {
+            RecordRead::End => break,
+            RecordRead::Truncated if strict => return Err(snapshot_invalid("incomplete snapshot record")),
+            RecordRead::Truncated => break,
+            RecordRead::Record(record) => {
+                stats.push(&record.value);
+                if !on(record) { return Ok(stats); }
             }
-            let e = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-            off += 8;
-            // 0 = 永久（文件里没有一个"空的 Option"这种写法，读回来才不用猜）
-            (e != 0).then_some(e)
-        } else {
-            None
-        };
-        stats.push(&value);
-        delivered = off;
-        if !on(KvRecord {
-            key,
-            value,
-            seq,
-            expire_unix_secs,
-        }) {
-            return Ok(stats);
         }
     }
-    if (strict || checked) && (delivered != data.len() || expected.is_some_and(|n| n != stats.records as u64)) {
-        return Err(snapshot_invalid("incomplete snapshot record/count mismatch"));
+    if expected.is_some_and(|n| n != stats.records as u64) {
+        return Err(snapshot_invalid("snapshot record count mismatch"));
     }
     Ok(stats)
 }
@@ -755,6 +779,62 @@ fn parse_jsonl_line(line: &str) -> Result<(String, Option<String>), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "allocator peak probe; run alone with --test-threads=1"]
+    fn snapshot_streaming_memory_probe() {
+        use super::*;
+        let path = crate::common::ScratchPath::new("snapshot", "stream_peak", ".bxp");
+        let rows = 200_000;
+        atomic_write_bin_v4(&path, |w| {
+            for i in 0u64..rows {
+                w.write(&KvRecord::new(i.to_be_bytes().to_vec(), Some(vec![0; 64])))?;
+            }
+            Ok(())
+        }).unwrap();
+        let file_bytes = std::fs::metadata(&path).unwrap().len();
+        let measure = |whole_file: bool| {
+            let baseline = crate::mem_probe::reset_peak();
+            let control = whole_file.then(|| std::fs::read(&path).unwrap());
+            let mut seen = 0u64;
+            read_snapshot_with(&path, &mut |r| {
+                assert_eq!(r.key, seen.to_be_bytes());
+                assert_eq!(r.value.as_deref(), Some([0u8; 64].as_slice()));
+                seen += 1;
+                true
+            }).unwrap();
+            assert_eq!(seen, rows);
+            std::hint::black_box(&control);
+            crate::mem_probe::peak() - baseline
+        };
+        let control = measure(true);
+        let streaming = measure(false);
+        eprintln!("SNAPSHOT_READ rows={rows} file_bytes={file_bytes} whole_file_peak={control} streaming_peak={streaming}");
+        assert!(control >= file_bytes, "control did not hold the whole file");
+        assert!(streaming < 256 * 1024, "reader retained more than a buffer and current record");
+    }
+
+    #[test]
+    fn snapshot_streaming_stops_before_the_next_record() {
+        use super::*;
+        struct FirstOnly(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for FirstOnly {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.position() == self.0.get_ref().len() as u64 {
+                    return Err(std::io::Error::other("read past first record"));
+                }
+                std::io::Read::read(&mut self.0, out)
+            }
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes()); body.push(b'k');
+        body.extend_from_slice(&1u32.to_le_bytes()); body.push(b'v');
+        let length = body.len() as u64 + 1000;
+        let mut reader = FirstOnly(std::io::Cursor::new(body.clone()));
+        assert_eq!(read_bin_records(&mut reader, length, false, false, false, None, &mut |_| false).unwrap().records, 1);
+        let mut reader = FirstOnly(std::io::Cursor::new(body));
+        assert!(read_bin_records(&mut reader, length, false, false, false, None, &mut |_| true).is_err());
+    }
+
     #[test]
     fn atomic_snapshot_preserves_previous_on_write_or_publish_failure() {
         use super::*;

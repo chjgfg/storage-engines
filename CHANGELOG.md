@@ -22,7 +22,18 @@
 - `cargo test --offline --lib snapshot -- --nocapture`：**27 passed / 0 failed**。
   未执行物理断电实验；Windows 目录元数据断电持久性未据此作保证。
 
+### M91：二进制快照逐记录读取
+
+- 用 BufReader 和当前记录替代整文件 `fs::read`；长度先与文件剩余字节核对，再申请当前字段。
+  004 在回调前用 64 KiB 栈缓冲预验 CRC，再逐记录解码，需要两遍读文件；不承诺恢复耗时减少。
+  001–003 的格式、宽容导入及 memory 严格尾部判定保留。
+- `cargo test --offline --lib snapshot`：27 项通过（新增探针前）。
+  `cargo test --offline --lib snapshot_streaming -- --include-ignored --nocapture --test-threads=1`：2 项通过。
+  20 万条 / 17,600,024 B 文件：保留整文件对照峰值 **17,608,288 B**，实际流式读峰值 **8,264 B**。
+  这是读取器堆增量，不包括恢复后的存储树；提前停止对照也证明不会继续读下一条记录。
+
 ### M85：二进制键的逻辑排序与完整版本组
+
 
 - 触发：依次写 `a=old`、写键 `610000000000000002`、删除 `a`。
   旧实现四家均在 scan 返回旧值，vacuum 后点读也复活；版本号只需 1、2、3。
