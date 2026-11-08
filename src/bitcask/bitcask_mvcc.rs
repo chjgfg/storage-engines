@@ -193,14 +193,26 @@ fn run_checkpoint(
     wal: &Mutex<Wal>,
     next_version: &AtomicU64,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    let _checkpoint = super::checkpoint_probe::Timer::start(super::checkpoint_probe::Stage::Checkpoint);
     wal.lock().unwrap().ensure_healthy()?;
     let mut kv = kv.lock().unwrap();
     let mut blob = blob.lock().unwrap();
     let mut wal = wal.lock().unwrap();
-    kv.flush()?;
-    blob.sync()?;
-    kv.dump_hint()?;
+    {
+        #[cfg(test)]
+        let _flush = super::checkpoint_probe::Timer::start(super::checkpoint_probe::Stage::Flush);
+        kv.flush()?;
+        blob.sync()?;
+    }
+    {
+        #[cfg(test)]
+        let _hint = super::checkpoint_probe::Timer::start(super::checkpoint_probe::Stage::Hint);
+        kv.dump_hint()?;
+    }
     let next_ver = next_version.load(Ordering::SeqCst);
+    #[cfg(test)]
+    let _wal = super::checkpoint_probe::Timer::start(super::checkpoint_probe::Stage::Wal);
     seal_wal_checkpoint(&mut wal, next_ver)?;
     Ok(())
 }
@@ -1170,6 +1182,8 @@ impl Transaction {
     }
 
     pub fn try_commit_with_options(&self, flush_data: bool) -> Result<(), crate::CommitError> {
+        #[cfg(test)]
+        let _commit = super::checkpoint_probe::Timer::start(super::checkpoint_probe::Stage::Commit);
         // WAL 收尾成功后才销账与回收记账，统一走 [`TxnCore::try_commit`]。
         // 收尾只交 wal 守卫：fsync 期间不许握着 kv/blob 把读者挡在门外。
         {
@@ -1353,6 +1367,86 @@ impl WalTail for WalOnly<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkpoint_probe_counts_real_hint_work_and_obeys_gate() {
+        use crate::bitcask::checkpoint_probe::{Scope, Timer, Stage};
+        assert!(Timer::start(Stage::Commit).is_none());
+        let dir = tmp_db("checkpoint_probe");
+        let db = MVCC::try_open(&dir).unwrap();
+        db.set_wal_checkpoint_limit(1);
+        let scope = Scope::start();
+        for i in 0u64..2 {
+            let tx = db.begin_transaction();
+            tx.try_set_raw(&i.to_be_bytes(), vec![0; 16]).unwrap();
+            tx.try_commit().unwrap();
+        }
+        let stats = scope.stats();
+        assert_eq!(stats.checkpoints, 2);
+        assert_eq!(stats.commit_ns.len(), 2);
+        assert_eq!(stats.hint_rows, 3, "full index rewritten at each checkpoint");
+        assert_eq!(stats.hint_bytes, 2 * 40 + 3 * (24 + 16));
+        assert_eq!(std::fs::metadata(hint_path(&dir)).unwrap().len(), 40 + 2 * (24 + 16));
+        assert!(stats.checkpoint_ns >= stats.flush_ns + stats.hint_ns + stats.wal_ns);
+        drop(scope);
+        assert!(Timer::start(Stage::Commit).is_none());
+        let scope = Scope::start();
+        db.set_wal_checkpoint_limit(0);
+        let tx = db.begin_transaction();
+        tx.try_set_raw(b"control", vec![1]).unwrap();
+        tx.try_commit().unwrap();
+        assert_eq!(scope.stats().checkpoints, 0);
+        assert_eq!(scope.stats().hint_rows, 0);
+    }
+
+    #[test]
+    #[ignore = "5M targeted checkpoint cost probe; run release, single thread"]
+    fn checkpoint_cost_5m() {
+        use crate::bitcask::checkpoint_probe::Scope;
+        const ROWS: usize = 5_000_000;
+        fn key(i: usize) -> Vec<u8> { format!("{i:08}#/worldquant/datafields/x.json").into_bytes() }
+        fn val(i: usize) -> Vec<u8> { format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes() }
+        let dir = tmp_db("checkpoint_cost_5m");
+        let db = MVCC::try_open(&dir).unwrap();
+        for (phase, rows) in [("insert", ROWS), ("update", ROWS / 10)] {
+            let scope = Scope::start();
+            let start = std::time::Instant::now();
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows) {
+                    let value = if phase == "insert" { val(i) } else { b"updated".to_vec() };
+                    tx.try_set(&key(i), value).unwrap();
+                }
+                tx.try_commit().unwrap();
+                if (base + 1000) % 250_000 == 0 {
+                    eprintln!("CHECKPOINT_PROGRESS phase={phase} rows={} elapsed_s={:.3}", base + 1000, start.elapsed().as_secs_f64());
+                }
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            let mut stats = scope.stats();
+            stats.commit_ns.sort_unstable();
+            let quantile = |p: usize| stats.commit_ns[(stats.commit_ns.len() * p).div_ceil(100) - 1] as f64 / 1e6;
+            eprintln!("CHECKPOINT_COST phase={phase} rows={rows} wall_s={elapsed:.6} us_per_row={:.3} checkpoints={} checkpoint_s={:.6} flush_s={:.6} hint_s={:.6} wal_s={:.6} hint_rows={} hint_bytes={} commit_p95_ms={:.3} commit_p99_ms={:.3} commit_max_ms={:.3}",
+                elapsed * 1e6 / rows as f64, stats.checkpoints, stats.checkpoint_ns as f64 / 1e9,
+                stats.flush_ns as f64 / 1e9, stats.hint_ns as f64 / 1e9, stats.wal_ns as f64 / 1e9,
+                stats.hint_rows, stats.hint_bytes, quantile(95), quantile(99), quantile(100));
+            assert!(stats.checkpoints > 0);
+            assert!(stats.hint_rows > rows as u64);
+        }
+        db.try_checkpoint().unwrap();
+        drop(db);
+        let db = MVCC::try_open(&dir).unwrap();
+        let tx = db.begin_transaction();
+        let mut seen = 0;
+        tx.export_latest_visible_for_each(false, |r| {
+            assert_eq!(r.key, key(seen));
+            assert_eq!(r.value, Some(if seen < ROWS / 10 { b"updated".to_vec() } else { val(seen) }));
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, ROWS);
+        eprintln!("CHECKPOINT_REOPEN verified_rows={seen}");
+    }
+
     use super::*;
     use std::assert;
     use std::assert_eq;

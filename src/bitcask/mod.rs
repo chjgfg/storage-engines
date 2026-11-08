@@ -6,6 +6,8 @@
 //! - [`wal`] / [`storage`] / [`error`]
 
 pub mod bitcask;
+#[cfg(test)]
+pub(crate) mod checkpoint_probe;
 pub mod error;
 pub mod kv_ops;
 pub mod bitcask_mvcc;

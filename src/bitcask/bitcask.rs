@@ -741,6 +741,8 @@ pub fn write_hint_file(
     active_id: u32,
     active_log_size: u64,
 ) -> Result<()> {
+    #[cfg(test)]
+    let mut measured_bytes = HINT_HEADER_SIZE_V2 as u64;
     let tmp = {
         let mut p = path.as_os_str().to_os_string();
         p.push(".tmp");
@@ -769,6 +771,8 @@ pub fn write_hint_file(
         w.write_all(&hdr)?;
 
         for (key, loc) in key_dir.iter() {
+            #[cfg(test)]
+            { measured_bytes += HINT_RECORD_FIXED_BYTES_V2 + key.len() as u64; }
             let (flag, file_id, pos, len) = match loc {
                 KeyLoc::Live {
                     file_id,
@@ -798,6 +802,8 @@ pub fn write_hint_file(
         let _ = std::fs::remove_file(path);
     }
     std::fs::rename(&tmp, path)?;
+    #[cfg(test)]
+    super::checkpoint_probe::hint_written(key_dir.len() as u64, measured_bytes);
     Ok(())
 }
 
