@@ -2,6 +2,7 @@
 name = "storage-engines"
 version = "0.5.1"
 edition = "2024"
+default-run = "storage-engines"
 description = "四个教学用 KV 存储引擎(LSM 树 / B+ 树 / Bitcask / 纯内存),共享同一套 MVCC 事务层与统一 trait 门面,可在运行时按名字切换引擎。Four educational key-value storage engines behind one MVCC transaction layer and a runtime-selectable trait facade."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/chjgfg/storage-engines"
@@ -9,7 +10,7 @@ readme = "README.md"
 keywords = ["storage-engine", "lsm-tree", "btree", "bitcask", "mvcc"]
 categories = ["database-implementations", "data-structures"]
 
-# 发布包里不带演示产物与本地配置。data/ 由 tests/ 自行生成。
+# 发布包里不带演示产物与本地配置。测试目录位于 target/test-data/。
 exclude = [
     "data/",
     ".claude/",
@@ -22,16 +23,20 @@ exclude = [
     "task_plan.md",
 ]
 
+[features]
+default = []
+web = ["dep:serde_json", "dep:tokio", "dep:axum"]
+
 [dependencies]
 log = "0.4.21"
 fs4 = "0.8.2"
 bincode = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 memmap2 = "0.9"
-# 终端工具（shell / web 两个 bin）用；库本体不用它们
-serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-axum = { version = "0.8", features = ["json"] }
+# 仅 Web 外壳使用；默认库与 shell 不编译 HTTP/异步运行时。
+serde_json = { version = "1.0", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
+axum = { version = "0.8", features = ["json"], optional = true }
 
 [profile.release]
 lto = true
@@ -39,10 +44,15 @@ codegen-units = 1
 
 # ── 可执行文件 ────────────────────────────────────────────────────────────
 #
-# 门面层示例是唯一要显式声明的一条（入口在 src/main.rs）。
+# 门面示例为默认运行入口；Web 入口需要显式启用 feature。
 [[bin]]
 name = "storage-engines"
 path = "src/main.rs"
+
+[[bin]]
+name = "web"
+path = "src/bin/web.rs"
+required-features = ["web"]
 
 # 其余可执行文件全在 `src/bin/`，走 Cargo 自动发现：**文件名就是 bin 名**（带连字符），
 # 不再写 `[[bin]] path = …`（M82：原先散在 `src/<模块>/bin/` 下，那种路径 Cargo 不认才逐条声明）。
@@ -57,4 +67,4 @@ path = "src/main.rs"
 #   cargo run --release --bin export-kv -- --engine bitcask --dir ./db --out snap.bin
 #   cargo run --release --bin import-kv -- --engine lsm_tree --dir ./lsm --in snap.bin
 #   cargo run --release --bin shell    -- --engine lsm --dir ./data/lsm
-#   cargo run --release --bin web      -- --engine memory --port 8080
+#   cargo run --release --features web --bin web      -- --engine memory --port 8080

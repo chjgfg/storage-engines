@@ -10,12 +10,11 @@
 //!
 //! // 编译期就知道自己用哪个引擎
 //! let db = open_engine(EngineKind::LsmTree, Some(Path::new("./data/lsm")))?;
-//! // 引擎名来自配置/环境变量时
-//! let db = open_engine("lsm", Some(Path::new("./data/lsm")))?;
+//! // 也可把上面的 EngineKind::LsmTree 换成配置字符串 "lsm"。
 //! let tx = db.begin();
-//! tx.set(b"k", b"v".to_vec());
-//! tx.commit();
-//! # Ok::<(), storage_engines::engine::EngineError>(())
+//! tx.try_set_raw(b"k", b"v".to_vec())?;
+//! tx.try_commit()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! # 设计要点
@@ -239,15 +238,18 @@ impl Default for EngineConfig {
 pub trait KvTxn: Send {
     /// Checked APIs refuse to claim a contract a third-party implementation
     /// has not implemented. The four built-in engines override these methods.
+    /// 写已封装的逻辑值；原始用户字节使用 try_set_raw。
     fn try_set(&self, _key: &[u8], _value: Vec<u8>) -> std::result::Result<(), crate::WriteError> {
         Err(crate::WriteError::Unsupported)
     }
+    /// 写原始字节，由引擎添加值信封。
     fn try_set_raw(&self, _key: &[u8], _value: Vec<u8>) -> std::result::Result<(), crate::WriteError> {
         Err(crate::WriteError::Unsupported)
     }
     fn try_delete(&self, _key: &[u8]) -> std::result::Result<(), crate::WriteError> {
         Err(crate::WriteError::Unsupported)
     }
+    /// 提交成功后才发布；Indeterminate 必须重开对账，CommittedMaintenance 已提交。
     fn try_commit(&self) -> std::result::Result<(), crate::CommitError> {
         Err(crate::CommitError::Unsupported)
     }
@@ -418,6 +420,7 @@ pub trait KvTxn: Send {
         handed
     }
 
+    /// 兼容接口：内置引擎在提交失败时 panic。需要恢复处理时使用 try_commit。
     fn commit(&self);
 
     fn rollback(&self);

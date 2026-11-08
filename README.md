@@ -1,60 +1,55 @@
 # storage-engines
 
-四个从零手写的 KV 存储引擎 + 一层统一 trait 门面。**教学 / 学习性质**,不是生产级数据库。
+四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
+LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-同一套 MVCC 事务语义(快照隔离、写冲突检测、vacuum 回收)跑在四种截然不同的存储结构上,可以直观对比 **LSM Tree / B+ Tree / Bitcask / 纯内存** 在读写放大、范围扫描、崩溃恢复上的取舍。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M88 为未发布修复**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
+  浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
+- edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
+- 本轮库测试 **409 passed / 0 failed / 36 ignored**；集成测试 5 项、CLI 测试 8 项、文档测试 6 项通过；
+  `web` feature 另有 2 项测试通过。
+  36 项库专项/大规模台架与 1 项文档示例默认忽略，本轮不将其计为通过。
+- 许可证：MIT 或 Apache-2.0 任选。
 
-- 约 2.3 万行 Rust,edition 2024(需要 rustc ≥ 1.85)
-- 依赖只有 5 个:`serde` / `bincode` / `memmap2` / `fs4` / `log` —— B+ 树、SST、Bloom、WAL、双写缓冲、CRC32 全部自己实现
-- 384 个普通单元测试 + 36 个默认忽略的专项/规模测试 + 4 个集成测试（2026-11-03 M81 之后实测：lib **384 passed / 0 failed / 36 ignored**、集成四个各 1 条、bin 内 7 条（统一 CLI 的参数解析与一条真往返）、文档测试 **6 passed / 2 ignored**，0 失败；规模五档与大档回收守卫默认忽略，需显式单跑）
-- 当前版本 **0.5.0**（工作树，未发布）:三条搬运门（`migrate` / `export_to_file` / `export_to_dir`）不再丢 TTL —— `ExportRecord` 多一个 `expire_unix_secs`、快照文件改走 `BPEXP003`。**这一处对下游是破坏性变更**（`ExportRecord { key, value }` 字面量编译不过 ⇒ 退出口：`ExportRecord::new(k, v)` 或 `..Default::default()`），所以版本号从 0.4.0 抬到 0.5.0；破坏性变更与升级要点见 [CHANGELOG.md](CHANGELOG.md)。⚠️ crates.io 上的 0.4.0 是 **2026-10-15** 发的那版,它**不含** 10-16 起的 **M10–M78**(M47 起的逐条清单见 CHANGELOG；下面这条只写到 M46：LSM 点查常驻句柄、窗口 scan 界下推、bplus 读路径与丢页修复、配置旋钮、bulk/事务内核合并、`migrate`/`scan_page`、灌行 O(N²)、`seek_prev`、游标下推、页缓存与块缓存自动档、写集哈希、WAL `Begin` 不落盘、层内重叠真折+先记 MANIFEST 再删文件、全库折叠流式化、重开不再自带压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、一次页读少一次系统调用且 CRC 快 4.3 倍、缓存自动档的顶交给调用方且覆盖率分母可读、压实的输入改流式源(一次压实瞬时内存 156.8 → 6.3 MB)、bplus 写侧下降改走解析缓存且写完的页直接回填(裸 insert 单价 2.4×、页读/行 2.94 → 0.00)、四家 vacuum 的保留判定改成逐组流式(bplus 瞬时 +3.9 MB / memory +4.0 MB；bitcask 仍 +171.4 MB——先前那对 89.4/56.7 是坏量具读数，M38 已作废)、大库台架的内存量具修好(`timed()` 每段前 `reset_peak`，此前"峰值"列只看得见超过历史最高点的部分)、lsm health() 不再把每个源整篇物化(600k 档瞬时 126.1 → 0.1 MB)、bitcask vacuum 改按块走查(瞬时 171.4 → 115.7 MB，① 段 106.0 → 0.5 MB)、另外三家同一刀(lsm 101.2 → 45.5 / memory 4.0 → 0.3 / bplus 3.9 → 0.9 MB)、bitcask `merge()` 的走查也按块(④ 段 115.0 → 87.9 MB、外层 `vacuum()` 115.7 → 87.2 MB；剩下那 87.9 MB 是**替换用的新索引**本身，不是瞬时账)、lsm 的 flush 不再把整张 memtable 克隆进 Vec 再排序 + memtable 的 flush 判定改读真内存(600k 键×2 版那档 `vacuum()` 的 ① 段 158.6 → 33.1 MB)、`SstBuilder` 攒满一块就落盘(一次压实瞬时 6.3 → 3.1 MB、单文件握住条目 18333 → 64；输出的 SST 逐字节不变，有 golden 钉着)、`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化(600k 档峰值 +123.7 MB → 0.6~1.2 MB；四家 `search_keys`/`scan_foreach` 的复制各合成一份、bitcask `merge()` 不再另建第二把索引而是重扫新日志(④ 段 87.9 → 12.6 MB，代价是多一段"重扫窗口"，里面能报错的门一律报错、导出不必再把整库摆进内存(新增流式出口 `export_latest_visible_for_each`，`export_latest_visible` 改成它的收集壳；20k 档一次导出的常驻 3.5~3.9 MB → **0.0 MB**；三个 `export_kv` 工具不再把全库装两遍、`JSONL` 导入不再静默丢数据(`b64_decode` 在非 3 倍数长度上掉 1~2 字节，事故形状是 11 字节的键全被截成同一把 ⇒ 互相覆盖：301 行进库只剩 32 把；端到端修到 301→301→301，、裸 LSM 引擎的"全库归并"把源也改成惰性(600k 档导出瞬时 100.4 → 0.4 MB、顺手快 1.53×，四家 `export_kv` 到这才算齐)bin 格式从来不受影响)、search 要精确 total 合成一趟折叠(600k 末页 5.21 → 2.40 s，M75b)、缓存档可按**内存预算**给(`cache_budget_bytes`，实测常驻 ≤ 给的字节，M76)、hint 载入的预留一次到位(bitcask 冷重开 337.6 → 214.7 ms，M77))—— 要那些得走 path/git 依赖,见[引入方式](#引入方式)
-- 许可证:MIT 或 Apache-2.0 任选
+入口：[快速开始](#快速开始) · [下游接入](#下游接入使用说明) · [项目结构](#项目结构) ·
+[命令行工具](#命令行工具数据搬运与压测) · [更新日志](CHANGELOG.md)
 
----
+本轮重点：二进制键的扫描、分页和 vacuum 保持逻辑顺序；提交失败经 `try_commit` 返回；
+集成测试不再删除固定 `data/` 或仓库根快照。二进制前缀重叠时缓冲窗口最坏 O(库)，
+提交不确定时必须重开恢复并对账；这些边界见下文事务说明与 CHANGELOG。
 
 ## 引入方式
 
-⚠️ **先看这条(2026-10-17 用 crates.io API 实测,不是凭印象)**:架上最新是 **0.4.0**
-(发布于 2026-10-15,未 yank)。**这一版已经包含**七条"随 uptime 恶化"通道的修复与 M9 的门面
-改造(`KvEngine: Send + Sync`、类型化选型、`EngineName`)⇒ 版本号依赖就能拿到。
-
-但 0.4.0 那个发布件**不含 10-16 之后的 M10–M41**:LSM 点查的常驻文件句柄与稀疏索引二分
-(下游实测单次点查 0.86 ms 那条就是它)、四引擎窗口/前缀 scan 的界下推、bitcask 懒分配写缓冲、
-B+ 树 delete 路径的静默丢页修复 + 读路径三项、`EngineConfig` 的配置旋钮与 `tuning()`、四引擎
-事务内核合成一份、`migrate` + `scan_page`、LSM 灌行 O(N²)、`seek_prev` 整段物化、游标未下推、
-B+ 树页缓存与 LSM 块缓存的自动档、单事务写集查重 O(写集²)、WAL 里那条零信息的 `Begin`、LSM 层内重叠的真折与「先记 MANIFEST 再删文件」、全库折叠改流式、重开不再自己触发压实、有界回收一片改惰性归并、压实的尺寸判定改成增量账、页读路径与 CRC32 提速、**缓存自动档的顶可以由调用方抬（`set_cache_auto_max`）且覆盖率的分母可读**、**压实的输入改流式源（一次压实瞬时内存 156.8 MB → 6.3 MB）**、**四家 `vacuum()` 与 bitcask `merge()` 的走查改按块**（bitcask 那一家的整段瞬时 171.4 MB → 87.2 MB）、**大库台架的内存量具修好**（此前 `峰值` 列只看得见"超过历史最高点的部分"，排在后面的操作一律报 +0.0）、**lsm 的 `flush()` 改流式吐 memtable，且 memtable 的 flush 阈值改读真内存**（600k 键 × 2 版那档 `vacuum()` 的 ① 段 158.6 MB → **33.1 MB**；"mem 32 MB"这句从此才算数）、**`SstBuilder` 攒满一块就落盘**（一次压实的瞬时 6.3 MB → **3.1 MB**、单文件握住的未落盘条目 18 333 条 → **64 条**；输出的 SST **逐字节不变**，由 golden 钉着）、**`key_count` 与"要精确 total 的 `search_keys`"改成只数不物化**（600k 档瞬时内存 +123.7 MB → **0.6~1.2 MB**；四家 `search_keys` 与四家 `scan_foreach` 的复制各合成一份）。
-磁盘格式这三十八批**一个都没动**,所以不是"换了就得重建库"——是同一份库,行为与代价不同。
+获取本轮未发布修复使用本地路径或 Git 依赖：
 
 ```toml
-# (a) 同机项目:path 依赖 —— 拿当前 master,含 M10–M46
 storage-engines = { path = "../storage-engines" }
 
-# (b) 走远端:git 依赖(gitee 与 github 内容一致)
-storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branch = "master" }
-
-# (c) crates.io —— 0.4.0:事故修复齐全,但没有 10-16 之后的读路径/配置改动
-storage-engines = "0.4"
+# 或选择 Git；可用 rev 固定已经核验的提交。
+# storage-engines = { git = "https://github.com/chjgfg/storage-engines.git", branch = "master" }
 ```
 
-`cargo install storage-engines` 装到的同样只是已发布的 0.4.0。要 M10–M46 又想要版本号依赖,
-只能发 0.4.1 —— 发布不可逆(只能 yank),由作者手动执行。
-
-MSRV:edition 2024,需要 **rustc ≥ 1.85**。依赖只有 8 个(`serde` / `bincode` / `memmap2` / `fs4` / `log` 是库本体的,`serde_json` / `tokio` / `axum` 三个是 `shell` / `web` 两个终端 bin 用的)。
+Cargo 版本号与已发布内容是两件事：历史版本及破坏性变更见 [CHANGELOG.md](CHANGELOG.md)。
+0.5.0 起 `ExportRecord` 增加 TTL 字段，快照格式为 `BPEXP003`；
+旧结构体字面量需改用 `ExportRecord::new(k, v)` 或 `..Default::default()`。
+本轮未执行 crates.io 发布。
 
 ---
 
 ## 快速开始
 
 ```bash
-cargo run                     # 默认 memory 引擎,不落盘
-cargo run -- lsm              # 库建在 ./data/lsm
-cargo run -- bitcask ./mydb   # 自己指定目录
-cargo test                    # 跑全部测试
+cargo run --bin storage-engines                  # memory 示例，不落盘；也可直接 cargo run
+cargo run --bin storage-engines -- lsm           # 库建在 ./data/lsm
+cargo run --bin storage-engines -- bitcask ./mydb # 自己指定目录
+cargo test                                      # 默认库、CLI、集成与文档测试
+cargo run --features web --bin web               # 浏览器终端，默认端口 8083
 ```
 
 `src/main.rs` 是一份可运行的完整示例,覆盖门面层所有能力(读写 / 批量 / 扫描 / TTL / 写冲突 / bulk 导入 / 维护操作)。
 
-另有 9 个命令行工具,分三件事:**跨引擎搬数据**、**压测**和**KV 终端**(交互式 REPL 与浏览器里的 DOS 风格终端,详见 [命令行工具](#命令行工具数据搬运与压测))。
+另有 8 个命令行工具,分三件事:**跨引擎搬数据**、**压测**和**KV 终端**(交互式 REPL 与浏览器里的 DOS 风格终端,详见 [命令行工具](#命令行工具数据搬运与压测))。
 数据搬运只有一对（M81 收拢：`--engine` 选家，四家同一条读写路径）：
 
 ```bash
@@ -73,12 +68,11 @@ use std::path::Path;
 
 // 编译期就定死用哪家
 let db = open_engine(EngineKind::LsmTree, Some(Path::new("./data/lsm")))?;
-// 引擎名来自配置文件/环境变量时,同一个入口换成字符串
-let db = open_engine("lsm", Some(Path::new("./data/lsm")))?;
+// 引擎名来自配置时，将上面的 EngineKind::LsmTree 换成 "lsm" 即可。
 
 let tx = db.begin();
-tx.set(b"key", b"value".to_vec());
-tx.commit();
+tx.try_set_raw(b"key", b"value".to_vec())?;
+tx.try_commit()?;
 ```
 
 起库之外还要知道的:目录形状、事务的冲突/回滚语义、跨线程能做什么不能做什么、长跑进程的观测面,
@@ -164,11 +158,11 @@ cargo test --release --lib engine::tests::scale_bench::rows_10000000 -- --exact 
 |---|---|---|
 | `scan` / `reverse_scan` / `prefix_scan` / 物化 `export` | 返回完整结果 | 不是有界内存，结果 Vec 按用户字节增长 |
 | `scan_page(after, limit)` | 最多返回 limit 行，游标向前推进 | limit 是行数不是字节；大值、长键、版本组仍需内存 |
-| 四个内置引擎的流式导出 / `scan_foreach` | 不先收集整个结果，回调可提前停止 | 后端缓存/源状态/当前版本组另计；回调自行 collect 仍占整库；自定义 trait 的默认 fallback 可能物化 |
+| 四个内置引擎的流式导出 / `scan_foreach` | 不先收集整个结果，回调可提前停止 | 后端缓存/源状态/前缀重叠窗口另计，最坏 O(库)；回调自行 collect 仍占整库；自定义 trait 的默认 fallback 可能物化 |
 | `search_keys` | `without_total()` 避免强制精确计数 | 精确 total 要遍历匹配范围；offset 深翻仍要跳过前面各行 |
 | `search_last_page(page_size)`（M81 第 4 项，11-04 起四家都走反向） | 从**库尾**取固定页宽、不数 total ⇒ 代价 ≈ 页宽 × O(一次点读)，**不随库大小涨**：`lsm_tree` 走反向逐步退（页宽 × O(块)），其余三家走 `back_n_with`（页宽把候选键反向退）；600k 档四家 0.23~1.16 ms，同档"数全库再截尾"那一格 0.43~1.96 s | `total`/`total_pages` 恒 `None`、`has_next` 恒 `false`；库尾连片墓碑/过期时退过 `LAST_PAGE_MAX_STEPS = 8 Ki` 步仍未凑够页宽 ⇒ **退回**全库截尾（正确但 O(库)，计数守卫钉四家 `fallbacks == 0`）；三家的这一格在 **11-04 之前的构建上仍是 O(库)**（20M 档 88~106 / 55~71 / 64~69 s、常驻 +2147.5 MB、峰值 +4771 MB），跨这条线比读数没有意义 |
 | `cache_budget_bytes` | 按样本槽价估算缓存容量，bplus 7000 B/页、lsm 10400 B/块 | **不是进程 RSS 或任意数据形状下的字节硬上限**；不含结果 Vec、memtable、写集、blob GC 等，极小预算仍至少一槽；0 是撤销预算，不是禁用缓存 |
-| 自动版本切片 | 默认 16 Ki 行提交账触发，一次只消费一片；阻塞/失败保留账和游标，无新写也可在下一次 begin 重试 | 完整键组可能超出预算；不是后台线程、不是时间上限，也不负责缩小物理日志 |
+| 自动版本切片 | 默认 16 Ki 行提交账触发，一次只消费一片；阻塞/失败保留账和游标，无新写也可在下一次 begin 重试 | 完整前缀重叠窗口可能超出预算，最坏 O(库)；不是后台线程、不是时间上限，也不负责缩小物理日志 |
 | `health()` | 全库版本行/链长统计 | O(物理行数)，不能当高频轻量采样 |
 | `reclamation_status()` | 待处理账、完成/阻塞/失败轮数、自动裁行数、活跃数与最老 xid；不扫描库 | O(活跃事务数)，xid 不是事务年龄；返回 None 表示第三方引擎未接线 |
 
@@ -317,37 +311,36 @@ assert_eq!(t.get("wal_checkpoint_bytes"), Some("16777216")); // memory 上这条
 ### 2. 读写:事务是唯一入口
 
 ```rust
-use std::time::Duration;
-
-let tx = db.begin();                       // Box<dyn KvTxn + '_>,借用 db
-if !tx.set(b"order:1", b"payload".to_vec()) {
-    tx.rollback();                         // false = 这一行没进去(冲突,或引擎拒收)
-}
+let tx = db.begin();
+tx.try_set_raw(b"order:1", b"payload".to_vec())?;
 let token = b"session-token".to_vec();
-tx.set_with_ttl(b"session:abc", token, Duration::from_secs(600));
-let _ = tx.get(b"order:1");                // 已剥 TTL 信封;过期/已删/不存在都是 None
-tx.commit();                               // 落 WAL + fsync(只读事务两者都不做)
+let expire = storage_engines::common::now_unix_secs().saturating_add(600);
+tx.try_set(b"session:abc", storage_engines::common::pack_ttl(&token, expire))?;
+let _ = tx.get(b"order:1"); // 已剥 TTL 信封；过期/已删/不存在均为 None
+tx.try_commit()?;          // 必须按 CommitError 的类别处理失败，不能一律重试
 ```
 
-四条必须知道的语义:
+事务返回值与恢复语义：
 
-- `set` / `delete` 返回 `false`、`batch_set` / `batch_delete` 返回 `Err(key)` **都表示"这行没进去"**，
-  应该 `rollback()` 整个事务重试，而不是继续写。两种成因要分清：
-  ① **写冲突**（别的事务在你之后改了同一个 key）—— 四引擎都会给出；
-  ② **引擎拒收**（仅 B+ 树）：单个逻辑键 > **一页载荷 4080 B**（版本键还要 +8 B，所以实际上限
-  ≈ 4 KB）⇒ 这一行装不进任何一页。此时**一字未写**，`log::error!` 点名是哪把键，
-  WAL 里也不会留下这条 `Write`（判据是 `BPlusTree::row_fits`，在 append WAL **之前**问）。
-  值不受这条限制：超过 256 B 的 value 走 blob 旁路，树里只放指针。
-- **不用保证收尾**:事务对象丢弃而未 `commit` ⇒ 自动回滚。这条是刻意设计的 —— 一次疏忽若留下
-  "漏网活跃事务",`vacuum` 就会从此整轮跳过,垃圾永久累积。
-- **只读事务不写 WAL、`commit` 不 fsync**(实测 2265.8µs/次 → 15.8µs/次)。所以"每 tick 做一次
-  快照读"这种用法不会把磁盘拖成瓶颈。
-- `value` 是打过信封的**逻辑值**:直接存裸字节会踩坑(`0x00` 打头少 1 字节、`0x01` 打头被当 TTL 信封)。
-  存二进制/序列化字节请用 **`tx.set_raw(key, value)`** —— 信封由引擎打,`get` 一字不差还回来;
-  要自己打也行(`use storage_engines::common::pack_plain;`),两条等价。`set_with_ttl` 内部已打信封。
+- 推荐 `try_set_raw` / `try_set` / `try_delete` / `try_commit`。
+  `WriteError` 区分 `Conflict`、`RowTooLarge`、值编码、WAL 和存储写失败、事务已关闭。
+  旧 bool/批量接口只能表示写失败，不能据此认定“一字未写”；部分存储修改需要回滚清理。
+  B+ 超大键在 WAL 前拒收；大值走 blob，不受同一行内联容量限制。
+- `CommitError::Indeterminate` 表示 Commit 追加或 fsync 失败：本进程内对其他事务保持不可见，
+  WAL 拒绝继续写入/截断，vacuum 被阻挡。关闭全部句柄、重开恢复并按业务键对账后再决定是否重试。
+  普通重开可能恢复这笔提交；错误不等于“确定未提交”。
+- `CommitError::CommittedMaintenance` 表示 WAL **已经提交**，但随后可选 flush/checkpoint 失败；
+  只能处理维护故障，不能重复业务写。`WriteFailed` 表示先前写失败阻止了提交，须回滚。
+  旧 `commit()` 在失败时 panic，现有调用者应迁移到 checked 接口。
+- Active 事务未收尾而 Drop 时自动回滚；Indeterminate 例外，保留记录等待重开恢复。
+  活跃事务存在时磁盘引擎的 checked checkpoint 返回 `WouldBlock`，自动 checkpoint 等待空表。
+- 只读事务不写事务 WAL、没有提交 fsync；磁盘引擎的可选维护仍可能返回维护错误。
+- `try_set` / `set` 收已封装的逻辑值；原始字节使用 `try_set_raw` / `set_raw`。
+  `set_with_ttl` 内部已打信封，但仍是 bool 兼容接口。
+
 - **读一段区间就交给区间,别读全库再筛**。`scan(start,end)` / `prefix_scan(prefix)` 把界下推到
   引擎的有序结构(KeyDir seek / BTreeMap range / 下降到 containing 叶子 / SST 稀疏索引定位块),
-  所以代价随**窗口宽度**走;release + 20k 行实测(每行 µs,窗口 = 1% 即 200 行):
+  普通文本键代价随**窗口宽度**走；二进制重叠前缀需完整窗口，最坏 O(库)。以下为历史 release + 20k 行实测(每行 µs,窗口 = 1% 即 200 行):
 
   | 引擎 | 一次全量 scan | 1% 窗口 scan(改前) | 1% 窗口 scan(改后) |
   |---|---|---|---|
@@ -708,14 +701,14 @@ src/
 ├── common/            四引擎共享:字节级文件工具(disk)、版本键与 vacuum 判定(version)、
 │                      事务内核共用件(kernel)、WAL(wal)、TTL/快照编解码
 ├── main.rs            使用示例
+├── bin/               8 个 CLI：搬运、压测、shell、可选 Web
 │
 ├── lsm_tree/          LSM 树:MemTable + 分层 SST + leveled compaction
 ├── bplus_tree/        B+ 树:4KB 页 + 双写缓冲 + 页缓存
 ├── bitcask/           Bitcask:append-only 日志 + 全内存 KeyDir
 └── memory/            纯内存:BTreeMap,无持久化
-    └── bin/           命令行工具(import_kv / export_kv / bench)
 
-tests/                 四个引擎的集成测试(会在 ./data/ 下建演示库)
+tests/                 四引擎集成测试与目录隔离守卫(独占 target/test-data/ 子目录)
 backups/m-serial/      M 系列各轮改动前的源码/脚本快照(git-ignored,唯一副本,清理时跳过)
 ```
 
@@ -727,7 +720,7 @@ backups/m-serial/      M 系列各轮改动前的源码/脚本快照(git-ignored
 | `<引擎名>_mvcc.rs` | MVCC 事务层(四引擎同构) |
 | `kv_ops.rs` | 批量 / 扫描 / 搜索分页 / 元数据 / TTL |
 | `wal.rs` `storage.rs` | 预写日志、文件锁、大 value 外置 |
-| `bin/` | 命令行工具:`import_kv` / `export_kv` / `bench` |
+| `src/bin/`（共享入口） | 搬运 CLI、压测、shell 与可选 Web，不在各引擎目录下 |
 
 快照编解码不在引擎目录里,四引擎共用 `src/common/kv_snapshot.rs` 一份。
 
@@ -769,7 +762,9 @@ backups/m-serial/      M 系列各轮改动前的源码/脚本快照(git-ignored
 enc_key = raw_key ‖ version.to_be_bytes()
 ```
 
-**大端是必须的** —— 保证同一个 key 的多个版本在字节序索引里按版本号升序相邻。用小端的话 `version=10` 会排在 `version=2` 前面。
+版本号用大端，保证固定 raw key 的版本按数值升序。但不同长度二进制键的物理记录可能交错，
+不能假定同一 key 的版本相邻。M85 使用 `common/order.rs` 的完整逻辑窗口折叠；
+磁盘编码保持不变。小端也不保证跨字节进位的数值顺序，例如 256 会排在 255 前。
 
 ### 快照隔离
 
@@ -3490,13 +3485,13 @@ WAL 有 5 种记录:`Begin` / `Write` / `Commit` / `Abort` / `Checkpoint`,帧格
 
 ```
 写:       append WAL Write → 改内存结构
-commit:   移出活跃表 → append Commit → fsync WAL   ← 持久化点
+commit:   append Commit → fsync WAL → 移出活跃表（M86：成功后才发布）
 rollback: append Abort → fsync → 物理删本事务版本行
 ```
 
 恢复时 `analyze_recovery` 单趟扫描分出两个集合:有 `Commit` 的 **REDO**,有 `Abort` 的和崩溃时进行中的 **UNDO**(无提交记录即视为回滚)。REDO 靠版本键天然幂等(同键覆盖),重放多次结果一致。
 
-WAL 不需要手动收口:增长到阈值(默认 16 MiB,`set_wal_checkpoint_limit` 可改,设 0 关闭)就在**下一次提交后**自动 checkpoint——写回一条 `Checkpoint` 记录并截断文件。`memory` 引擎无 WAL。阈值触发和手动 `checkpoint()` 走同一份实现,顺序都是「先落数据/页,最后才截 WAL」:WAL 一旦被截,未落盘的行就再无重放来源。
+WAL 不需要手动收口:增长到阈值(默认 16 MiB,`set_wal_checkpoint_limit` 可改,设 0 关闭)就在**下一次提交后且活跃表为空时**自动 checkpoint——写回一条 `Checkpoint` 记录并截断文件。`memory` 引擎无 WAL。阈值触发和手动 `checkpoint()` 走同一份实现,顺序都是「先落数据/页,最后才截 WAL」:WAL 一旦被截,未落盘的行就再无重放来源。
 
 ---
 
@@ -3620,7 +3615,7 @@ blob:   [0x01] offset(u64 LE) len(u32 LE)   —— 共 13 字节
 两条**必须**遵守的上界(都是被下游真实需求逼出来的,不是设计洁癖):
 
 - `KvEngine: Send + Sync`、`KvTxn: Send`(不要求 `Sync`)。少了前者,`Box<dyn KvEngine>` 进不了 `Arc`、也搬不到别的线程,而交易进程的常态就是"开库线程 + 心跳线程 checkpoint + 工作线程读写"。事务刻意不要求 `Sync`:内部有 `Cell`(WAL 是否已开)与写集,跨线程共享一个事务对象本身没有语义。
-- 选型是类型: [`EngineKind`](`parse`/`as_str`/`needs_disk`/`is_production_ok`) + [`StorageConfig`](`STORAGE_ENGINE` / `STORAGE_DATA_DIR`,落盘 `data_dir/<engine>/`),入口 [`open_from_env()`]。**`STORAGE_ENGINE` 写了但不认识时报错**,不静默退回默认值 —— "以为在跑 bitcask、其实跑的是 memory"不能靠默认值发生。入口 [`open_engine`] 的引擎名走 [`EngineName`] trait:枚举和字符串两种写法都收(`EngineKind::LsmTree` / `"lsm"` / `String` / `&String`),拿枚举不用自己 `.as_str()`。这是**自由函数**上的泛型,`KvEngine` trait 依然对象安全。
+- 选型是类型: `EngineKind`（`parse` / `as_str` / `needs_disk` / `is_production_ok`） + `StorageConfig`（`STORAGE_ENGINE` / `STORAGE_DATA_DIR`，落盘 `data_dir/<engine>/`）,入口 [`open_from_env()`]。**`STORAGE_ENGINE` 写了但不认识时报错**,不静默退回默认值 —— "以为在跑 bitcask、其实跑的是 memory"不能靠默认值发生。入口 [`open_engine`] 的引擎名走 [`EngineName`] trait:枚举和字符串两种写法都收(`EngineKind::LsmTree` / `"lsm"` / `String` / `&String`),拿枚举不用自己 `.as_str()`。这是**自由函数**上的泛型,`KvEngine` trait 依然对象安全。
 
 对象安全的代价是:所有方法都用 `&[u8]` / `Vec<u8>`,不能用 `impl AsRef<[u8]>` 这类泛型参数。
 
@@ -4006,7 +4001,7 @@ M81 之前这里有四套同名的 `import_kv` / `export_kv`（`bitcask-export-k
 | 工具 | 形态 | 例子 |
 |---|---|---|
 | `shell` | 交互式 REPL(一行一条命令,CJK 对齐表格) | `cargo run --release --bin shell -- -e lsm -d ./data/lsm` |
-| `web` | 浏览器 DOS 风格终端(axum,页面编译期嵌进 binary) | `cargo run --release --bin web -- -p 8080` |
+| `web` | 浏览器 DOS 风格终端(axum,页面编译期嵌进 binary) | `cargo run --release --features web --bin web -- -p 8080` |
 
 命令面(repl 里 `help` 同款):基础读写 `get`/`set`/`setex`/`del`/`exists`/`meta`,计数器 `incr`/`decr`,
 批量 `mset`/`mget`,扫描 `scan`/`rscan`/`prefix`/`seek`/`seekprev`/`count`/`find`,TTL 四件套
@@ -4021,7 +4016,7 @@ shell 退出时有挂起事务则自动回滚 —— 两边的口径都写在 `t
 ```bash
 cargo run --release --bin shell -- -e memory          # 不落盘,进程退出即丢
 cargo run --release --bin shell -- -f                 # 只清默认路径 ./data/memory 再开(-d 给的目录不碰)
-cargo run --release --bin web -- -e lsm --port 8080   # 浏览器开 http://localhost:8080/
+cargo run --release --features web --bin web -- -e lsm --port 8080   # 浏览器开 http://localhost:8080/
 ```
 
 编译产物在 `target/release/`,可直接分发调用,不必每次都过 cargo。

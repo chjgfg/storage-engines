@@ -27,6 +27,7 @@
 //! - Checkpoint 的 `root_page_id` / `next_page_id` 固定写 0
 //! - 数据目录：`dir/CURRENT.snap` + `dir/lsm.wal` + `dir/lsm.lock`
 
+#[cfg(test)]
 use std::eprintln;
 #[cfg(test)]
 use std::thread_local;

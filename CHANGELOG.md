@@ -48,6 +48,27 @@
   `target/test-data/` 收尾为空。目录隔离守卫覆盖同名测试并存、panic 清理与邻居保留。
 
 
+### M88：可选 Web 依赖与当前入口文档
+
+- `web` feature 显式启用 axum / tokio / serde_json，Web bin 声明 required-features；
+  默认库与 shell 只保留 5 个直接依赖。依赖树实测默认 5 个、启用 Web 后 8 个。
+- 设置 default-run 为 memory 门面示例，修正 Web 命令的 feature 参数；
+  帮助端口与现有默认值 8083 对齐，帮助请求返回成功，非法参数仍返回非零。
+- README 入口与 Cargo 0.5.1 对齐，M85–M88 标为未发布；移除过时的架上最新版本断言。
+  当前事务说明、架构图、二进制键物理交错说明与 M85/M86 合同同步。
+  示例改用 checked API，并移除同一目录连续打开两次的示例写法。
+  更新工具/测试目录，核验本地链接与入口锚点。旧性能表保留历史口径。
+- `cargo test --offline --quiet`：库 **409 passed / 36 ignored**、CLI **8 passed**、
+  集成 **5 passed**、文档 **6 passed / 1 ignored**，零失败。
+  `cargo test --offline --features web --bin web --quiet`：**2 passed**。
+- Windows 与 `x86_64-unknown-linux-gnu` 的
+  `cargo check --offline --all-targets --all-features` 均通过且无警告；
+  Linux 为交叉编译检查，未在 Linux 运行测试。
+  `cargo run --offline --quiet` 实际输出“全部示例跑完”；
+  `cargo run --offline --quiet --features web --bin web -- --help` 退出码 0。
+- 本轮未运行百万级性能台架或物理断电实验，未发布 crate。
+
+
 > 0.5.1 之前的四节（**0.5.0** 的内容，2026-11-04 随 0.5.0 上线）按时间先后排：
 > `2026-10-31` 那份实现 → `2026-11-02` M81 这一轮 → `2026-11-03` M82 → `2026-11-04` M83；四节待合并成一节。
 

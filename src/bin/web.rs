@@ -1,8 +1,8 @@
 //! Web 版 KV 终端（axum）：把命令解释器交给 HTTP，页面是 DOS 风格终端。
 //!
 //! ```text
-//! cargo run --bin web                       # memory，浏览器开 http://localhost:8080/
-//! cargo run --bin web -- -e lsm --port 8080 # 盘引擎，库在 ./data/web/lsm_tree
+//! cargo run --features web --bin web                       # memory，浏览器开 http://localhost:8083/
+//! cargo run --features web --bin web -- -e lsm --port 8080 # 盘引擎，库在 ./data/web/lsm_tree
 //! ```
 //!
 //! 路由：
@@ -54,13 +54,18 @@ pub fn usage() -> String {
 用法: web [-e 引擎] [-d 目录] [-p 端口] [-h]
   -e, --engine <名>   memory | bitcask | bplus_tree | lsm_tree（含别名，默认 memory）
   -d, --dir <目录>    盘引擎的库目录（默认 ./data/web/<引擎名>）
-  -p, --port <端口>   监听端口（默认 8080）
+  -p, --port <端口>   监听端口（默认 8083）
   -h, --help          本帮助"
         .to_string()
 }
 
+enum Startup {
+    Run(Opts),
+    Help,
+}
+
 /// 与 shell 的 parse_args 同一手写游标风格（多个 -p / --port）
-fn parse_args(argv: &[String]) -> Result<Opts, String> {
+fn parse_args(argv: &[String]) -> Result<Startup, String> {
     let mut o = Opts {
         engine: "memory".to_string(),
         dir: None,
@@ -84,12 +89,12 @@ fn parse_args(argv: &[String]) -> Result<Opts, String> {
                     .parse()
                     .map_err(|_| format!("--port 要 1~65535 的整数，收到 {v:?}"))?;
             }
-            "-h" | "--help" => return Err(usage()),
+            "-h" | "--help" => return Ok(Startup::Help),
             other => return Err(format!("未知参数: {other}\n{}", usage())),
         }
         i += 1;
     }
-    Ok(o)
+    Ok(Startup::Run(o))
 }
 
 // ── 引擎开关（启动与 `engine` 切换共用） ────────────────────────────────────
@@ -129,7 +134,11 @@ fn open(kind: &str, dir: Option<&Path>) -> Result<Box<dyn KvEngine>, String> {
 async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let opts = match parse_args(&argv) {
-        Ok(o) => o,
+        Ok(Startup::Run(o)) => o,
+        Ok(Startup::Help) => {
+            println!("{}", usage());
+            return;
+        }
         Err(e) => {
             eprintln!("{e}");
             exit(2);
@@ -322,9 +331,8 @@ fn split_lines(input: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::split_lines;
-    use std::assert_eq;
+    use std::{assert, assert_eq};
     use std::vec;
-    use std::vec::Vec;
 
     #[test]
     fn splits_by_line_and_tolerates_crlf_and_blanks() {
