@@ -158,13 +158,15 @@ fn seal_wal_checkpoint(wal: &mut Wal, next_version: u64) -> std::io::Result<()> 
 ///
 /// 顺序不能换：先 flush（mem→L0，必要时 compact）再收口 WAL —— WAL 一旦被截断，
 /// 未落盘的内存表就再无重放来源。`MVCC.NEXT` 最后写，它是 WAL 之外的那份起点保险。
-fn run_checkpoint(kv: &Mutex<LSMTree>, wal: &Mutex<Wal>, next_version: &AtomicU64, db_dir: &Path) {
+fn run_checkpoint(kv: &Mutex<LSMTree>, wal: &Mutex<Wal>, next_version: &AtomicU64, db_dir: &Path) -> std::io::Result<()> {
+    wal.lock().unwrap().ensure_healthy()?;
     let mut kv = kv.lock().unwrap();
     let mut wal = wal.lock().unwrap();
-    let _ = kv.flush();
+    kv.flush()?;
     let next_ver = next_version.load(Ordering::SeqCst);
-    let _ = seal_wal_checkpoint(&mut wal, next_ver);
+    seal_wal_checkpoint(&mut wal, next_ver)?;
     persist_mvcc_next(db_dir, next_ver);
+    Ok(())
 }
 
 /// MVCC 档里**不容下游改动**的两个字段：钉回 `false`，无论传进来的是什么。
@@ -457,11 +459,23 @@ impl MVCC {
     }
 
     pub fn checkpoint(&self) {
-        run_checkpoint(&self.kv, &self.wal, &self.next_version, &self.db_dir);
+        if let Err(e) = self.try_checkpoint() { log::error!("checkpoint failed: {e}"); }
+    }
+
+    pub fn try_checkpoint(&self) -> std::io::Result<()> {
+        let active = self.active_txn.lock().unwrap();
+        if !active.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "active transactions prevent checkpoint"));
+        }
+        run_checkpoint(&self.kv, &self.wal, &self.next_version, &self.db_dir)
     }
 
     pub fn flush(&self) {
-        let _ = self.kv.lock().unwrap().flush();
+        if let Err(e) = self.try_flush() { log::error!("flush failed: {e}"); }
+    }
+
+    pub fn try_flush(&self) -> std::io::Result<()> {
+        self.kv.lock().unwrap().flush()
     }
 
     pub fn db_dir(&self) -> &Path {
@@ -1009,15 +1023,15 @@ impl WriteSide for TxnSide<'_, '_> {
     }
 }
 
-/// 收尾两条：`Commit` + fsync、`Abort` + fsync。
-///
-/// fsync 失败只喊出来（与改前一致）：事务此刻已从活跃表摘除、行也已落库，没有能回退的通道。
+/// Commit 追加与 fsync 的错误返回内核；成功后才能从活跃表销账。
+/// Abort 保留原兼容接口；失败会封锁 WAL，后续提交和截断均被拒绝。
 impl WalTail for TxnSide<'_, '_> {
+    fn try_wal_commit(&mut self, xid: u64) -> std::io::Result<()> {
+        self.wal.commit_transaction(xid)
+    }
+
     fn wal_commit(&mut self, xid: u64) {
-        let _ = self.wal.append(WalRecord::Commit { xid });
-        if let Err(e) = self.wal.sync() {
-            eprintln!("WAL fsync 失败: {e}");
-        }
+        self.try_wal_commit(xid).expect("WAL commit failed");
     }
 
     fn wal_abort(&mut self, xid: u64) {
@@ -1027,11 +1041,12 @@ impl WalTail for TxnSide<'_, '_> {
 }
 
 impl WalTail for WalOnly<'_> {
+    fn try_wal_commit(&mut self, xid: u64) -> std::io::Result<()> {
+        self.wal.commit_transaction(xid)
+    }
+
     fn wal_commit(&mut self, xid: u64) {
-        let _ = self.wal.append(WalRecord::Commit { xid });
-        if let Err(e) = self.wal.sync() {
-            eprintln!("WAL fsync 失败: {e}");
-        }
+        self.try_wal_commit(xid).expect("WAL commit failed");
     }
 }
 
@@ -1087,13 +1102,29 @@ impl Transaction {
         self.write(key, None)
     }
 
+    pub fn try_set(&self, key: &[u8], value: Vec<u8>) -> Result<(), crate::WriteError> {
+        self.try_write(key, Some(value))
+    }
+
+    pub fn try_set_raw(&self, key: &[u8], value: Vec<u8>) -> Result<(), crate::WriteError> {
+        self.try_set(key, crate::common::pack_plain(&value))
+    }
+
+    pub fn try_delete(&self, key: &[u8]) -> Result<(), crate::WriteError> {
+        self.try_write(key, None)
+    }
+
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> bool {
+        self.try_write(key, value).is_ok()
+    }
+
+    fn try_write(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<(), crate::WriteError> {
         // 锁序：活跃表 → wal → kv（内核要的就是这两把守卫，序列它在 [`TxnCore::write`] 里）
         let mut reg = self.core.lock_registry();
         let mut wal = self.wal.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
         self.core
-            .write(&mut reg, &mut TxnSide { wal: &mut wal, kv: &mut kv }, key, value)
+            .try_write(&mut reg, &mut TxnSide { wal: &mut wal, kv: &mut kv }, key, value)
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -1205,34 +1236,46 @@ impl Transaction {
     /// 大批量导入请用 [`MVCC::begin_bulk`]。需要把 mem 落成 SST 时用
     /// [`commit_with_options`]`(true)` 或事后 [`MVCC::flush`]。
     pub fn commit(&self) {
-        self.commit_with_options(false);
+        self.try_commit().expect("transaction commit failed");
     }
 
     /// `flush_pages`：commit 后是否 `LSMTree::flush`（mem→L0 + 可能 compact）。
     ///
     /// 频繁 `flush_pages=true` 会显著变慢；批量提交后再 `mvcc.flush()` 更合适。
     /// L0 堆积时可用 `kv.compact_l0_until(...)` 或后台 compact 收口。
+    pub fn try_commit(&self) -> Result<(), crate::CommitError> {
+        self.try_commit_with_options(false)
+    }
+
     pub fn commit_with_options(&self, flush_pages: bool) {
-        // 销账 + 回收记账 + WAL 收尾（`Commit` + fsync）在 [`TxnCore::commit`] 一份。
+        self.try_commit_with_options(flush_pages).expect("transaction commit failed");
+    }
+
+    pub fn try_commit_with_options(&self, flush_pages: bool) -> Result<(), crate::CommitError> {
+        // WAL 收尾成功后才销账与回收记账，统一走 [`TxnCore::try_commit`]。
         // 收尾只交 wal 守卫：fsync 期间不许把 kv 锁着 —— 那会把读者全挡在门外。
         {
             let mut reg = self.core.lock_registry();
             let mut wal = self.wal.lock().unwrap();
-            self.core.commit(&mut reg, &mut WalOnly { wal: &mut wal });
+            self.core.try_commit(&mut reg, &mut WalOnly { wal: &mut wal })?;
         }
         if flush_pages {
-            let _ = self.kv.lock().unwrap().flush();
+            self.kv.lock().unwrap().flush().map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
         }
 
         // WAL 超阈值就顺带 checkpoint。放在提交之后是因为此刻本事务已持久、
         // 也已从活跃表摘除，checkpoint 记到的 next_version 是干净的。
         let limit = self.wal_limit.load(Ordering::SeqCst);
         if limit > 0 {
-            let size = self.wal.lock().unwrap().size_bytes().unwrap_or(0);
+            let size = self.wal.lock().unwrap().size_bytes().map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
             if size >= limit {
-                run_checkpoint(&self.kv, &self.wal, &self.next_version, &self.db_dir);
+                let active = self.core.lock_registry();
+                if active.is_empty() {
+                    run_checkpoint(&self.kv, &self.wal, &self.next_version, &self.db_dir).map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
+                }
             }
         }
+        Ok(())
     }
 
     pub fn rollback(&self) {

@@ -35,6 +35,7 @@ pub mod memory;
 pub mod tools;
 
 pub use common::{
+    CommitError, WriteError,
     DurabilityProfile, EngineTuning, ExportRecord, IncrError, KeyMatchMode, KeyMeta, MvccHealth,
     ReclamationStatus, SearchPage, SearchQuery, TuningEntry, VacuumRound, VacuumStats, ValueMeta,
 };

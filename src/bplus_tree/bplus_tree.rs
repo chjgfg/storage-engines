@@ -319,11 +319,16 @@ impl BPlusTree {
 
     /// 刷盘所有脏页 + meta，并 fsync
     pub fn flush_all(&mut self) {
+        if let Err(e) = self.try_flush_all() { log::error!("flush_all failed: {e}"); }
+    }
+
+    pub fn try_flush_all(&mut self) -> std::io::Result<()> {
         self.page_manager.set_root_page_id(self.root);
-        self.page_manager.flush_all();
+        self.page_manager.try_flush_all()?;
         // 自动档要在每次刷盘后重新评估：库是会长大的，只在 open 时定一次容量，
         // 等于"导入完就再也没调过旋钮"—— 而那正是这次要修的那个洞。
         self.reevaluate_cache_capacity();
+        Ok(())
     }
 
     /// 重算页缓存的**生效容量**：`min(自动档/显式档, 预算换算出的槽数)`，就地改上限、不重建缓存。

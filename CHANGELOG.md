@@ -16,6 +16,27 @@
   原有末页有界性守卫通过。未重跑百万级台架，不声明大档耗时改善。
 
 
+### M86：提交错误返回与 WAL 失败隔离
+
+- 新增四家 Transaction / KvTxn 的 `try_set`、`try_set_raw`、`try_delete`、
+  `try_commit`，以 `WriteError` / `CommitError` 区分冲突、容量、存储失败与提交不确定。
+  旧 bool 写接口仍保留；旧 `commit()` 失败改为 panic，调用方应迁移到 checked API。
+- Commit 追加及 fsync 成功后才从活跃表销账。失败返回 `Indeterminate`：
+  保留不可见性与回收阻塞；WAL 封锁后续写入和截断。关闭全部句柄并重开恢复后对账，
+  不能把错误理解成“确定未提交”而直接重试。
+- WAL 已提交而可选 flush/checkpoint 失败返回 `CommittedMaintenance`，数据已提交，
+  不能重复执行业务写。编码/WAL/存储写失败阻止当前事务提交，部分存储修改纳入回滚写集。
+- 活跃事务存在时 checked checkpoint 返回 `WouldBlock`，自动 checkpoint 等待空表；
+  B+ 刷盘错误沿 checked flush/checkpoint 返回，避免失败后继续截断日志。
+- 终端显式/隐式提交、Web 批末提交与增量迁移入口传递失败，不再报告假成功。
+  `bulk`、旧 bool 批量接口及旧 void 维护接口不因此获得完整的 I/O 错误分类合同。
+- 验证：`cargo test --offline --lib --quiet` 为 **409 passed / 0 failed / 36 ignored**。
+  5 个 checked 守卫覆盖三家磁盘引擎的 Commit 前失败、Commit 后 sync 前失败、
+  正常提交对照、重开恢复、部分写失败回滚、活跃 checkpoint 与终端错误输出。
+  临时吞掉 Bitcask WAL 提交错误后守卫报 `bitcask: Ok(())`，恢复传播后全绿。
+  故障注入覆盖错误分支与普通重开，不等同于物理断电验证。
+
+
 > 0.5.1 之前的四节（**0.5.0** 的内容，2026-11-04 随 0.5.0 上线）按时间先后排：
 > `2026-10-31` 那份实现 → `2026-11-02` M81 这一轮 → `2026-11-03` M82 → `2026-11-04` M83；四节待合并成一节。
 

@@ -139,11 +139,11 @@ enum TxnEnd {
 
 /// 数据命令统一走这里：挂起事务开着就复用它（归调用方继续持有），否则隐式开一条、
 /// 跑完按 `f` 给的收尾方式提交或回滚。`begin` 显式开的事务**不**在这里提交 —— 那正是挂起的含义。
-fn with_tx<'e, R>(
+fn with_tx<'e>(
     engine: &'e dyn KvEngine,
     txn: &mut Option<Box<dyn KvTxn + 'e>>,
-    f: impl FnOnce(&dyn KvTxn) -> (R, TxnEnd),
-) -> R {
+    f: impl FnOnce(&dyn KvTxn) -> (Out, TxnEnd),
+) -> Out {
     let auto = txn.is_none();
     if auto {
         *txn = Some(engine.begin());
@@ -155,7 +155,9 @@ fn with_tx<'e, R>(
     if auto {
         if let Some(t) = txn.take() {
             match r.1 {
-                TxnEnd::Commit => t.commit(),
+                TxnEnd::Commit => {
+                    if let Err(e) = t.try_commit() { return Out::err(e.to_string()); }
+                },
                 TxnEnd::Rollback => t.rollback(),
             }
         }
@@ -261,10 +263,9 @@ fn cmd_set(tx: &dyn KvTxn, args: &[String]) -> (Out, TxnEnd) {
         Ok(v) => v,
         Err(e) => return (e, TxnEnd::Commit),
     };
-    if tx.set(k.as_bytes(), v.as_bytes().to_vec()) {
-        (Out::msg("OK", "OK"), TxnEnd::Commit)
-    } else {
-        (Out::err("写冲突（有别的事务先改了这个 key）"), TxnEnd::Rollback)
+    match tx.try_set_raw(k.as_bytes(), v.as_bytes().to_vec()) {
+        Ok(()) => (Out::msg("OK", "OK"), TxnEnd::Commit),
+        Err(e) => (Out::err(e.to_string()), TxnEnd::Rollback),
     }
 }
 
@@ -279,7 +280,7 @@ fn cmd_setex(tx: &dyn KvTxn, args: &[String]) -> (Out, TxnEnd) {
     if tx.set_with_ttl(k.as_bytes(), v.as_bytes().to_vec(), std::time::Duration::from_secs(secs)) {
         (Out::msg("OK", format!("OK（{secs}s 后过期）")), TxnEnd::Commit)
     } else {
-        (Out::err("写冲突（有别的事务先改了这个 key）"), TxnEnd::Rollback)
+        (Out::err("写入失败（可能是冲突、容量限制或存储错误）"), TxnEnd::Rollback)
     }
 }
 
@@ -288,10 +289,9 @@ fn cmd_del(tx: &dyn KvTxn, args: &[String]) -> (Out, TxnEnd) {
         Ok(v) => v,
         Err(e) => return (e, TxnEnd::Commit),
     };
-    if tx.delete(k.as_bytes()) {
-        (Out::msg("OK", "OK（写墓碑）"), TxnEnd::Commit)
-    } else {
-        (Out::err("写冲突（有别的事务先改了这个 key）"), TxnEnd::Rollback)
+    match tx.try_delete(k.as_bytes()) {
+        Ok(()) => (Out::msg("OK", "OK（写墓碑）"), TxnEnd::Commit),
+        Err(e) => (Out::err(e.to_string()), TxnEnd::Rollback),
     }
 }
 
@@ -370,7 +370,7 @@ fn cmd_incr(tx: &dyn KvTxn, args: &[String], is_incr: bool) -> (Out, TxnEnd) {
         ),
         Err(IncrError::Overflow) => (Out::err("i64 溢出"), TxnEnd::Rollback),
         Err(IncrError::WriteConflict) => {
-            (Out::err("写冲突（有别的事务先改了这个 key）"), TxnEnd::Rollback)
+            (Out::err("写入失败（可能是冲突、容量限制或存储错误）"), TxnEnd::Rollback)
         }
     }
 }
@@ -387,7 +387,7 @@ fn cmd_mset(tx: &dyn KvTxn, args: &[String]) -> (Out, TxnEnd) {
         Ok(()) => (Out::msg("OK", format!("OK（{} 键）", items.len())), TxnEnd::Commit),
         Err(bad) => (
             Out::err(format!(
-                "写冲突于 {} —— 未提交部分已整体回滚（batch_set 本身不回滚，回滚是这一层做的）",
+                "写入失败于 {} —— 未提交部分已整体回滚（batch_set 本身不回滚，回滚是这一层做的）",
                 show(&bad)
             )),
             TxnEnd::Rollback,
@@ -617,7 +617,7 @@ fn cmd_finish(txn: &mut Option<Box<dyn KvTxn + '_>>, commit: bool) -> Out {
         Some(t) => {
             let v = t.version();
             if commit {
-                t.commit();
+                if let Err(e) = t.try_commit() { return Out::err(e.to_string()); }
             } else {
                 t.rollback();
             }
@@ -942,6 +942,26 @@ mod tests {
         let o = outs(&*db, &mut txn, "find u: 1");
         assert_eq!(table(&o, 0, 5).rows[0][0], "u:20");
         assert!(!o[0].message.contains("下一页"), "{:?}", o[0].message);
+    }
+
+    #[test]
+    fn checked_terminal_commit_failures_are_errors() {
+        for explicit in [false, true] {
+            let dir = crate::common::ScratchPath::new("terminal_commit", "bitcask", "");
+            let db = crate::open_engine("bitcask", Some(dir.as_ref())).unwrap();
+            let mut txn = None;
+            if explicit {
+                assert!(outs(&*db, &mut txn, "begin")[0].ok);
+                assert!(outs(&*db, &mut txn, "set k v")[0].ok);
+            }
+            crate::common::wal::fail_next_commit(1);
+            let command = if explicit { "commit" } else { "set k v" };
+            let result = outs(&*db, &mut txn, command);
+            assert!(!result[0].ok && result[0].message.contains("indeterminate"), "{result:?}");
+            assert!(txn.is_none());
+            let read = db.begin();
+            assert_eq!(read.get(b"k"), None);
+        }
     }
 
     #[test]

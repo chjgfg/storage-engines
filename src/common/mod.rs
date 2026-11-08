@@ -10,6 +10,8 @@ pub mod kv_snapshot;
 pub(crate) mod order;
 pub mod store;
 pub mod txn;
+pub mod transaction_error;
+pub use transaction_error::{CommitError, WriteError};
 pub mod types;
 pub mod version;
 pub mod wal;

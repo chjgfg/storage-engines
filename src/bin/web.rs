@@ -235,12 +235,17 @@ fn run_batch(
     }
     if let Some(t) = pending.take() {
         let v = t.version();
-        t.commit();
-        results.push(json!({
-            "ok": true,
-            "type": "TXN",
-            "message": format!("（请求结束还有未提交事务，已自动提交，version {v}）"),
-        }));
+        match t.try_commit() {
+            Ok(()) => results.push(json!({
+                "ok": true,
+                "type": "TXN",
+                "message": format!("（请求结束还有未提交事务，已自动提交，version {v}）"),
+            })),
+            Err(e) => {
+                *all_ok = false;
+                results.push(json!({ "ok": false, "type": "ERROR", "message": e.to_string() }));
+            }
+        }
     }
     (BatchFlow::Done, lines.len())
 }

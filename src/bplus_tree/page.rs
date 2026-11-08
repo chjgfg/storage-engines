@@ -922,24 +922,22 @@ impl PageManager {
 
     /// 刷全部脏页 + meta + freelist。
     pub fn flush_all(&mut self) {
+        if let Err(e) = self.try_flush_all() { eprintln!("flush_all 失败: {e}"); }
+    }
+
+    pub fn try_flush_all(&mut self) -> std::io::Result<()> {
         let dirty: Vec<PageId> = self
             .cache
             .iter()
             .filter(|(_, e)| e.state == PageState::Dirty)
             .map(|(id, _)| *id)
             .collect();
-        if let Err(e) = self.flush_pages_batch(&dirty, true) {
-            eprintln!("flush_all 失败: {e}");
-        }
+        self.flush_pages_batch(&dirty, true)?;
         // 即使没有脏页，meta/freelist 也可能脏
         if self.meta_dirty {
-            if let Err(e) = self.persist_meta_via_dblwr() {
-                eprintln!("persist meta 失败: {e}");
-            }
+            self.persist_meta_via_dblwr()?;
         }
-        if let Err(e) = self.persist_freelist() {
-            eprintln!("persist freelist 失败: {e}");
-        }
+        self.persist_freelist()
     }
 
     /// 释放页：归还 freelist（文件不收缩，槽位可复用）

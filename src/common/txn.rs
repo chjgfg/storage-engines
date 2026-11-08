@@ -18,11 +18,10 @@
 //! 4. row_fits(enc, stored)?    —— bplus 的"这行装不进一页"必须在这里就拒（默认：装得下）
 //! 5. wal_write(xid, enc, ...)  —— 落 WAL 在先，改库在后（默认：成功）；同时把"进过 WAL"记账
 //! 6. put_versioned(enc, ...)   —— 真正改库（**可失败**：bitcask 写数据文件会 Err）
-//! 7. 写集登记                   —— 只登记真落进库的那一行
+//! 7. 写集登记                   —— WAL 成功后的行即使存储报告失败也登记，供回滚清理
 //! ```
 //!
-//! 3~5 都在 6 之前是**刻意的**：任何一步失败都不能留下"写集里有、库里没有"的悬账，否则随后的
-//! `rollback` 会去删一批根本不存在的行、`commit` 的回收账还会多算。
+//! 编码、WAL 或存储写失败会阻止提交。存储可能部分修改，回滚必须尝试清理其版本行。
 //! 4 必须在 5 之前：bplus 原先把容量判定放在 WAL 之后 ⇒ 一条被拒收的超大行在盘上留下
 //! 一条永远写不进去的记录。内核把判定提到它前面，于是拒收的那次**一个字都不落**。
 //!
@@ -50,6 +49,8 @@
 #[cfg(test)]
 use std::thread_local;
 use std::collections::{HashMap, HashSet};
+use std::cell::Cell;
+use crate::common::{CommitError, WriteError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -130,9 +131,7 @@ pub trait WriteSide {
 
     /// 落一行版本：`value = None` 是墓碑。`enc` 已由内核编好（`encode_key(key, version)`）。
     ///
-    /// 返回 `false` = 这一行**没落进去**（bitcask 的 `insert` 会因写数据文件失败而 Err ——
-    /// 那条通道原先只在引擎里 `eprintln!` 一下就被丢掉，于是写集里留着一条库里不存在的行）。
-    /// 内核据此**不登记写集**，所以"写集里有、库里没有"这种悬账不可能再出现。
+    /// 返回 false 表示存储报告失败（可能已部分修改）。内核阻止提交并登记键供回滚清理。
     fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool;
 
     /// 物理撤掉本事务写下的一行（回滚用 —— **不是**写墓碑，那会让这行永远留在库里）。
@@ -165,6 +164,10 @@ pub trait WriteSide {
 ///
 /// 默认实现 = "什么都不做"，因此没有 WAL 的引擎传 `&mut ()` 就行。
 pub trait WalTail {
+    /// Checked durability boundary. Third-party implementations must opt in.
+    fn try_wal_commit(&mut self, _xid: u64) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "checked WAL commit is not implemented"))
+    }
     /// 提交尾：`Commit` 记录 + fsync。只在事务真进过 WAL 时才被调用。
     fn wal_commit(&mut self, _xid: u64) {}
 
@@ -173,7 +176,12 @@ pub trait WalTail {
 }
 
 /// 没有 WAL 的引擎（`memory`）用它当收尾占位；顺带也是"这一家不实现写侧"时的空守卫。
-impl WalTail for () {}
+impl WalTail for () {
+    fn try_wal_commit(&mut self, _xid: u64) -> std::io::Result<()> { Ok(()) }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxnState { Active, Committed, RolledBack, Indeterminate }
 
 /// 事务内核：版本、可见性快照、写集、WAL 开窗状态、回收记账。
 pub struct TxnCore {
@@ -185,6 +193,8 @@ pub struct TxnCore {
     vac: Arc<VacuumScheduler>,
     /// 本事务是否已经进过 WAL（第一次写时才补 `Begin`）—— 见 [`crate::common::WalPolicy`]
     wal_policy: WalPolicy,
+    state: Cell<TxnState>,
+    write_error: Cell<Option<WriteError>>,
 }
 
 impl TxnCore {
@@ -200,12 +210,12 @@ impl TxnCore {
         next_version: &AtomicU64,
         vac: Arc<VacuumScheduler>,
     ) -> Self {
-        let version = next_version.fetch_add(1, Ordering::SeqCst);
-        let active_xid = {
+        let (version, active_xid) = {
             let mut guard = active_txn.lock().unwrap();
+            let version = next_version.fetch_add(1, Ordering::SeqCst);
             let snapshot: HashSet<u64> = guard.keys().cloned().collect();
             guard.insert(version, HashSet::new());
-            snapshot
+            (version, snapshot)
         };
         Self {
             version,
@@ -213,6 +223,8 @@ impl TxnCore {
             active_txn,
             vac,
             wal_policy: WalPolicy::default(),
+            state: Cell::new(TxnState::Active),
+            write_error: Cell::new(None),
         }
     }
 
@@ -225,7 +237,7 @@ impl TxnCore {
     ///
     /// 只查不删：删除必须留给 [`Self::rollback`]，它要按表里那份 key 列表把本事务写过的行清掉。
     pub fn unfinished(&self) -> bool {
-        is_unfinished(&self.active_txn, self.version)
+        self.state.get() == TxnState::Active && is_unfinished(&self.active_txn, self.version)
     }
 
     /// 本事务是否进过 WAL ⇒ `commit` 要不要写 `Commit`、`rollback` 要不要写 `Abort`。
@@ -238,13 +250,7 @@ impl TxnCore {
         self.active_txn.lock().unwrap()
     }
 
-    /// 一次写：按模块头那 8 步走。返回 `false` 有**三种**原因，只有第一种是冲突：
-    ///
-    /// 1. 写冲突（别的事务在我之后改了同一把 key）—— 三家共同的语义，调用方该 `rollback` 重试
-    /// 2. 这一行装不下（bplus：超过一页载荷）
-    /// 3. WAL 写失败
-    ///
-    /// 三者此刻库里都一个字没动，所以可以共用一个返回值（要区分原因得再开一个口子，未承诺）。
+    /// 兼容 bool 写入口；详细错误使用 try_write。任何失败均返回 false。
     pub fn write<S: WriteSide>(
         &self,
         reg: &mut Registry,
@@ -252,9 +258,16 @@ impl TxnCore {
         key: &[u8],
         value: Option<Vec<u8>>,
     ) -> bool {
+        self.try_write(reg, side, key, value).is_ok()
+    }
+
+    pub fn try_write<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
+        key: &[u8], value: Option<Vec<u8>>) -> Result<(), WriteError> {
+        if self.state.get() != TxnState::Active { return Err(WriteError::TransactionClosed); }
+        if let Some(error) = self.write_error.get() { return Err(error); }
         if let Some(latest) = side.latest_version(key) {
             if !self.is_visible(latest) {
-                return false;
+                return Err(WriteError::Conflict);
             }
         }
 
@@ -264,16 +277,16 @@ impl TxnCore {
             Some(v) => match side.encode_value(v) {
                 Some(s) => Some(s),
                 // blob 旁路写失败：不能留下"库里指着个不存在的 blob"的行
-                None => return false,
+                None => return self.fail_write(WriteError::ValueEncodingFailed),
             },
         };
 
         // 只有定长页的引擎会在这里说"装不下"；必须在 WAL 之前，否则盘上留下一条永远写不进的记录
         if !side.row_fits(&enc, stored.as_deref()) {
-            return false;
+            return Err(WriteError::RowTooLarge);
         }
         if !side.wal_write(self.version, &enc, stored.as_deref()) {
-            return false;
+            return self.fail_write(WriteError::WalWriteFailed);
         }
         // M25：第一次写只**记账**，不再落 `Begin`（恢复不读它，守卫
         // `plan_is_identical_with_or_without_begin`）。标记打在 `wal_write` **成功之后**：
@@ -284,31 +297,54 @@ impl TxnCore {
         let writes = reg.entry(self.version).or_default();
         if side.put_versioned(&enc, stored) {
             register_write(writes, key);
-            return true;
+            return Ok(());
         }
-        // 落行失败：写集里一行都不许留（上面 `entry` 建的那个空条目不算账，
-        // `commit` 数的是 `keys.len()`，空条目 = 0 行）
-        false
+        // WAL already contains this row. Include it in rollback even when the
+        // storage side reports a failure after partial mutation.
+        register_write(writes, key);
+        self.fail_write(WriteError::StorageWriteFailed)
     }
 
-    /// 提交：从活跃表销账 + 给自动回收记一笔账 + WAL 收尾（进过 WAL 才收尾）。
-    ///
-    /// 行数是**近似**（按逻辑 key 数算）：要精确就得再走一遍写集，而这一笔账只决定回收的节奏，
-    /// 宁可少算也不为它多付一次遍历。
-    ///
-    /// ⚠️ WAL 之后的 fsync、`flush_mem`、超阈值 checkpoint 这些"提交之后各家想做的事"不在这里 ——
-    /// 它们要么只有磁盘引擎有，要么参数是各家的旋钮。调用方在拿到本方法返回之后接着做。
+    fn fail_write(&self, error: WriteError) -> Result<(), WriteError> {
+        self.write_error.set(Some(error));
+        Err(error)
+    }
+
+    /// 兼容提交入口，失败 panic；调用方应使用 try_commit 处理不确定结果。
+    /// WAL Commit 与 fsync 成功后才销账；可选 flush/checkpoint 留给引擎处理。
     pub fn commit<W: WalTail>(&self, reg: &mut Registry, wal: &mut W) {
+        self.try_commit(reg, wal).expect("transaction commit failed");
+    }
+
+    pub fn try_commit<W: WalTail>(&self, reg: &mut Registry, wal: &mut W) -> Result<(), CommitError> {
+        match self.state.get() {
+            TxnState::Committed => return Ok(()),
+            TxnState::RolledBack => return Err(CommitError::TransactionClosed),
+            TxnState::Indeterminate => return Err(CommitError::Indeterminate {
+                version: self.version, source: std::io::Error::other("previous commit attempt failed"),
+            }),
+            TxnState::Active => {}
+        }
+        if let Some(error) = self.write_error.get() { return Err(CommitError::WriteFailed(error)); }
+        if self.wal_policy.opened() {
+            if let Err(source) = wal.try_wal_commit(self.version) {
+                self.state.set(TxnState::Indeterminate);
+                return Err(CommitError::Indeterminate { version: self.version, source });
+            }
+        }
+        // Publish only after the durability boundary succeeded. On uncertainty
+        // retain the registry entry so readers and vacuum cannot expose it.
         let rows_written = reg.remove(&self.version).map(|k| k.len()).unwrap_or(0);
         self.vac.on_commit(rows_written as u64);
-        if self.wal_policy.opened() {
-            wal.wal_commit(self.version);
-        }
+        self.state.set(TxnState::Committed);
+        Ok(())
     }
 
     /// 回滚：按写集把本事务落下的版本行**物理删掉**，并给 WAL 留一条 `Abort`。
     pub fn rollback<S: WriteSide + WalTail>(&self, reg: &mut Registry, side: &mut S) {
+        if self.state.get() != TxnState::Active { return; }
         let keys = reg.remove(&self.version).unwrap_or_default();
+        self.state.set(TxnState::RolledBack);
         if self.wal_policy.opened() {
             side.wal_abort(self.version);
         }
@@ -411,5 +447,41 @@ impl BulkCore {
             let enc = encode_key(key, self.version);
             side.put_versioned(&enc, Some(value.clone()));
         }
+    }
+}
+
+
+#[cfg(test)]
+mod checked_tests {
+    use super::*;
+    use std::{assert, assert_eq, matches, vec};
+
+    #[test]
+    fn checked_partial_storage_write_cannot_commit_and_is_rolled_back() {
+        #[derive(Default)]
+        struct PartialStore { rows: HashMap<Vec<u8>, Option<Vec<u8>>> }
+        impl WriteSide for PartialStore {
+            fn latest_version(&mut self, _: &[u8]) -> Option<u64> { None }
+            fn put_versioned(&mut self, key: &[u8], value: Option<Vec<u8>>) -> bool {
+                self.rows.insert(key.to_vec(), value);
+                false // A storage operation can fail after partial mutation.
+            }
+            fn remove_versioned(&mut self, key: &[u8]) { self.rows.remove(key); }
+        }
+        impl WalTail for PartialStore {
+            fn try_wal_commit(&mut self, _: u64) -> std::io::Result<()> { Ok(()) }
+        }
+        let reg = Arc::new(Mutex::new(Registry::new()));
+        let tx = TxnCore::begin(reg, &AtomicU64::new(1), Arc::new(VacuumScheduler::default()));
+        let mut guard = tx.lock_registry();
+        let mut store = PartialStore::default();
+        assert_eq!(tx.try_write(&mut guard, &mut store, b"k", Some(vec![1])),
+            Err(WriteError::StorageWriteFailed));
+        assert_eq!(store.rows.len(), 1, "must actually mutate before reporting failure");
+        assert!(matches!(tx.try_commit(&mut guard, &mut store),
+            Err(CommitError::WriteFailed(WriteError::StorageWriteFailed))));
+        tx.rollback(&mut guard, &mut store);
+        assert!(store.rows.is_empty(), "rollback must clean a partially written row");
+        assert!(guard.is_empty());
     }
 }

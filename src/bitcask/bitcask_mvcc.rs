@@ -192,15 +192,17 @@ fn run_checkpoint(
     blob: &Mutex<BlobStore>,
     wal: &Mutex<Wal>,
     next_version: &AtomicU64,
-) {
+) -> std::io::Result<()> {
+    wal.lock().unwrap().ensure_healthy()?;
     let mut kv = kv.lock().unwrap();
     let mut blob = blob.lock().unwrap();
     let mut wal = wal.lock().unwrap();
-    let _ = kv.flush();
-    let _ = blob.sync();
-    let _ = kv.dump_hint();
+    kv.flush()?;
+    blob.sync()?;
+    kv.dump_hint()?;
     let next_ver = next_version.load(Ordering::SeqCst);
-    let _ = seal_wal_checkpoint(&mut wal, next_ver);
+    seal_wal_checkpoint(&mut wal, next_ver)?;
+    Ok(())
 }
 
 impl MVCC {
@@ -443,7 +445,15 @@ impl MVCC {
     pub const WAL_CHECKPOINT_BYTES_DEFAULT: u64 = 16 << 20;
 
     pub fn checkpoint(&self) {
-        run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version);
+        if let Err(e) = self.try_checkpoint() { log::error!("checkpoint failed: {e}"); }
+    }
+
+    pub fn try_checkpoint(&self) -> std::io::Result<()> {
+        let active = self.active_txn.lock().unwrap();
+        if !active.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "active transactions prevent checkpoint"));
+        }
+        run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version)
     }
 
     /// WAL 字节阈值可配置项：增长到这么多字节就在**下一次提交后**自动 checkpoint。
@@ -470,10 +480,14 @@ impl MVCC {
     }
 
     pub fn flush(&self) {
+        if let Err(e) = self.try_flush() { log::error!("flush failed: {e}"); }
+    }
+
+    pub fn try_flush(&self) -> std::io::Result<()> {
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
-        let _ = kv.flush();
-        let _ = blob.sync();
+        kv.flush()?;
+        blob.sync()
     }
 
     /// 压缩数据文件 + 写出 hint
@@ -927,8 +941,7 @@ impl Drop for BulkLoader {
 /// 1. `xmin = min(活跃事务 id)` 被一个已经死掉的 id 压住 ⇒ **版本回收从此永久停摆**；
 /// 2. 之后每次 `begin` 的可见性快照 `keys().cloned().collect()` 随漏网数线性变大。
 ///
-/// 判据用「活跃表里是否还有自己」而不是额外标志位：`commit`/`rollback` 都以 `remove` 收尾，
-/// 所以成员关系本身就是「未终结」的充要条件。
+/// 仅 Active 状态自动回滚；Indeterminate 保留活跃表记录，必须重开恢复。
 impl Drop for Transaction {
     fn drop(&mut self) {
         // 判据与"只查不删"的理由见 [`crate::common::is_unfinished`]：
@@ -996,13 +1009,29 @@ impl Transaction {
         self.write(key, None)
     }
 
+    pub fn try_set(&self, key: &[u8], value: Vec<u8>) -> Result<(), crate::WriteError> {
+        self.try_write(key, Some(value))
+    }
+
+    pub fn try_set_raw(&self, key: &[u8], value: Vec<u8>) -> Result<(), crate::WriteError> {
+        self.try_set(key, crate::common::pack_plain(&value))
+    }
+
+    pub fn try_delete(&self, key: &[u8]) -> Result<(), crate::WriteError> {
+        self.try_write(key, None)
+    }
+
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> bool {
+        self.try_write(key, value).is_ok()
+    }
+
+    fn try_write(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<(), crate::WriteError> {
         // 锁序：活跃表 → wal → blob → kv；那八步序列在 [`TxnCore::write`]（四引擎共用的一份）
         let mut reg = self.core.lock_registry();
         let mut wal = self.wal.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
-        self.core.write(
+        self.core.try_write(
             &mut reg,
             &mut TxnSide {
                 wal: &mut wal,
@@ -1129,33 +1158,45 @@ impl Transaction {
     }
 
     pub fn commit(&self) {
-        self.commit_with_options(false);
+        self.try_commit().expect("transaction commit failed");
+    }
+
+    pub fn try_commit(&self) -> Result<(), crate::CommitError> {
+        self.try_commit_with_options(false)
     }
 
     pub fn commit_with_options(&self, flush_data: bool) {
-        // 销账 + 回收记账 + WAL 收尾（`Commit` + fsync）在 [`TxnCore::commit`] 一份。
+        self.try_commit_with_options(flush_data).expect("transaction commit failed");
+    }
+
+    pub fn try_commit_with_options(&self, flush_data: bool) -> Result<(), crate::CommitError> {
+        // WAL 收尾成功后才销账与回收记账，统一走 [`TxnCore::try_commit`]。
         // 收尾只交 wal 守卫：fsync 期间不许握着 kv/blob 把读者挡在门外。
         {
             let mut reg = self.core.lock_registry();
             let mut wal = self.wal.lock().unwrap();
-            self.core.commit(&mut reg, &mut WalOnly { wal: &mut wal });
+            self.core.try_commit(&mut reg, &mut WalOnly { wal: &mut wal })?;
         }
         if flush_data {
             let mut kv = self.kv.lock().unwrap();
             let mut blob = self.blob.lock().unwrap();
-            let _ = kv.flush();
-            let _ = blob.sync();
+            kv.flush().map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
+            blob.sync().map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
         }
 
         // WAL 超阈值就顺带 checkpoint。放在提交之后是因为此刻本事务已持久、
         // 活跃表也已摘除，checkpoint 记到的 next_version 是干净的。
         let limit = self.wal_limit.load(Ordering::SeqCst);
         if limit > 0 {
-            let size = self.wal.lock().unwrap().size_bytes().unwrap_or(0);
+            let size = self.wal.lock().unwrap().size_bytes().map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
             if size >= limit {
-                run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version);
+                let active = self.core.lock_registry();
+                if active.is_empty() {
+                    run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version).map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
+                }
             }
         }
+        Ok(())
     }
 
     pub fn rollback(&self) {
@@ -1237,7 +1278,7 @@ impl Transaction {
 
 /// 写侧：bitcask 的"字节住在哪"= 追加式数据日志（`insert` 会更新 keydir，且**会失败** ——
 /// 那条 io::Result 通道原先只 `eprintln!` 一下就被丢掉，于是写集里留着一条库里没有的行；
-/// 现在它经 [`WriteSide::put_versioned`] 的返回值交给内核，内核据此不登记写集）。
+/// 现在错误交给内核，阻止提交；已写 WAL 的键保留在写集中供回滚清理）。
 ///
 /// 用到 `encode_value` 槽：大 value 走 blob 旁路，而旁路在落 WAL **之前**就可能失败 ——
 /// 失败必须在那里判掉，否则 WAL 里留下一条指向不存在 blob 的记录。
@@ -1283,14 +1324,15 @@ impl WriteSide for TxnSide<'_, '_, '_> {
     }
 }
 
-/// 收尾两条：`Commit` + fsync、`Abort` + fsync。fsync 失败只喊出来（与改前一致）——
-/// 事务此刻已从活跃表摘除、行也已落库，没有能回退的通道。
+/// Commit 追加与 fsync 的错误返回内核；成功后才能从活跃表销账。
+/// Abort 保留原兼容接口；失败会封锁 WAL，后续提交和截断均被拒绝。
 impl WalTail for TxnSide<'_, '_, '_> {
+    fn try_wal_commit(&mut self, xid: u64) -> std::io::Result<()> {
+        self.wal.commit_transaction(xid)
+    }
+
     fn wal_commit(&mut self, xid: u64) {
-        let _ = self.wal.append(WalRecord::Commit { xid });
-        if let Err(e) = self.wal.sync() {
-            eprintln!("WAL fsync 失败: {e}");
-        }
+        self.try_wal_commit(xid).expect("WAL commit failed");
     }
 
     fn wal_abort(&mut self, xid: u64) {
@@ -1300,11 +1342,12 @@ impl WalTail for TxnSide<'_, '_, '_> {
 }
 
 impl WalTail for WalOnly<'_> {
+    fn try_wal_commit(&mut self, xid: u64) -> std::io::Result<()> {
+        self.wal.commit_transaction(xid)
+    }
+
     fn wal_commit(&mut self, xid: u64) {
-        let _ = self.wal.append(WalRecord::Commit { xid });
-        if let Err(e) = self.wal.sync() {
-            eprintln!("WAL fsync 失败: {e}");
-        }
+        self.try_wal_commit(xid).expect("WAL commit failed");
     }
 }
 

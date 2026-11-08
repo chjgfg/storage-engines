@@ -457,13 +457,13 @@ pub fn sync(from: &dyn KvEngine, to: &dyn KvEngine) -> Result<SyncStats, String>
             };
             if !ok {
                 return Err(format!(
-                    "同步写入冲突（键 {:?}）⇒ 这一批不提交，整趟同步以错误收场",
+                    "同步写入失败（冲突、容量限制或存储错误）（键 {:?}）⇒ 这一批不提交，整趟同步以错误收场",
                     String::from_utf8_lossy(&key)
                 ));
             }
             stats.inserted += 1;
         }
-        tx.commit();
+        tx.try_commit().map_err(|e| e.to_string())?;
         Ok(())
     };
     let scanned = src.export_latest_visible_for_each(false, &mut |rec| {
@@ -669,13 +669,13 @@ pub fn import_skip_existing_from_dir(
             };
             if !ok {
                 return Err(format!(
-                    "补齐导入冲突（键 {:?}）⇒ 这一批不提交",
+                    "补齐导入写入失败（冲突、容量限制或存储错误）（键 {:?}）⇒ 这一批不提交",
                     String::from_utf8_lossy(&key)
                 ));
             }
             stats.inserted += 1;
         }
-        tx.commit();
+        tx.try_commit().map_err(|e| e.to_string())?;
         Ok(())
     };
     let on = &mut |rec: KvRecord| -> bool {

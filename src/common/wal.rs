@@ -60,7 +60,17 @@ pub struct Wal {
     next_lsn: u64,
     /// 是否在本次打开后写过记录（决定 open 后要不要走恢复）
     dirty: bool,
+    poisoned: bool,
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_COMMIT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// 1 = before Commit append; 2 = after Commit append, before fsync.
+#[cfg(test)]
+pub(crate) fn fail_next_commit(stage: u8) { FAIL_COMMIT.with(|f| f.set(stage)); }
 
 impl Wal {
     /// 打开或创建 WAL
@@ -85,6 +95,7 @@ impl Wal {
             file,
             next_lsn,
             dirty: false,
+            poisoned: false,
         })
     }
 
@@ -110,6 +121,13 @@ impl Wal {
 
     /// 追加一条记录（**不** fsync；调用方在 commit 时统一 sync）
     pub fn append(&mut self, record: WalRecord) -> std::io::Result<u64> {
+        self.ensure_healthy()?;
+        let result = self.append_inner(record);
+        if result.is_err() { self.poisoned = true; }
+        result
+    }
+
+    fn append_inner(&mut self, record: WalRecord) -> std::io::Result<u64> {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
         let entry = WalEntry { lsn, record };
@@ -128,6 +146,13 @@ impl Wal {
 
     /// fsync WAL（commit 的持久化点）
     pub fn sync(&mut self) -> std::io::Result<()> {
+        self.ensure_healthy()?;
+        let result = self.sync_inner();
+        if result.is_err() { self.poisoned = true; }
+        result
+    }
+
+    fn sync_inner(&mut self) -> std::io::Result<()> {
         // 更新 header 中的 next_lsn 提示
         let mut hdr = vec![0u8; WAL_HEADER_SIZE];
         hdr[0..8].copy_from_slice(WAL_MAGIC);
@@ -189,8 +214,13 @@ impl Wal {
     /// ⇒ 起点不会被算低，不会复用版本号。**反过来说：没有"数据已落盘"这条前提就不许用这个口子。**
     /// 需要"只截断、不写任何新记录"又要求持久的调用方，自己补一次 `sync()`。
     pub fn truncate(&mut self) -> std::io::Result<()> {
-        self.file.set_len(WAL_HEADER_SIZE as u64)?;
-        Self::write_header_bytes(&mut self.file, self.next_lsn)?;
+        self.ensure_healthy()?;
+        let result = self.file.set_len(WAL_HEADER_SIZE as u64)
+            .and_then(|()| Self::write_header_bytes(&mut self.file, self.next_lsn));
+        if let Err(e) = result {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.dirty = false;
         Ok(())
     }
@@ -207,6 +237,31 @@ impl Wal {
 
     pub fn path(&self) -> &Path {
         self.file.path()
+    }
+
+    pub fn ensure_healthy(&self) -> std::io::Result<()> {
+        if self.poisoned {
+            Err(std::io::Error::other("WAL is quarantined after an I/O failure; reopen required"))
+        } else { Ok(()) }
+    }
+
+    /// Both operations are required before the transaction becomes visible.
+    pub fn commit_transaction(&mut self, xid: u64) -> std::io::Result<()> {
+        self.ensure_healthy()?;
+        #[cfg(test)]
+        let fail = FAIL_COMMIT.with(|f| f.replace(0));
+        #[cfg(test)]
+        if fail == 1 {
+            self.poisoned = true;
+            return Err(std::io::Error::other("injected Commit append failure"));
+        }
+        self.append(WalRecord::Commit { xid })?;
+        #[cfg(test)]
+        if fail == 2 {
+            self.poisoned = true;
+            return Err(std::io::Error::other("injected Commit fsync failure"));
+        }
+        self.sync()
     }
 }
 

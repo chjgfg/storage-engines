@@ -222,7 +222,7 @@ impl Default for EngineConfig {
 /// 一个只读/读写事务（快照隔离）。
 ///
 /// 方法语义与各引擎的 `Transaction` 完全一致：`set` / `delete` 返回 `false`
-/// 表示写冲突，此时应当 [`KvTxn::rollback`]。
+/// 表示写入失败，此时应当 [`KvTxn::rollback`]；原因使用 checked API 区分。
 /// 一个只读/读写事务（快照隔离）。
 ///
 /// `Send` 是**必须**的：句柄要能跟着任务跨线程走（交易进程里典型是"主线程开库、
@@ -237,12 +237,26 @@ impl Default for EngineConfig {
 /// search 的精确 total 需要走完整个匹配范围；offset 深翻需走过被跳过的行，连续翻页用游标。
 /// 所有接口均为同步调用；快照事务长期持有会阻挡版本回收，流式不等于短事务。
 pub trait KvTxn: Send {
+    /// Checked APIs refuse to claim a contract a third-party implementation
+    /// has not implemented. The four built-in engines override these methods.
+    fn try_set(&self, _key: &[u8], _value: Vec<u8>) -> std::result::Result<(), crate::WriteError> {
+        Err(crate::WriteError::Unsupported)
+    }
+    fn try_set_raw(&self, _key: &[u8], _value: Vec<u8>) -> std::result::Result<(), crate::WriteError> {
+        Err(crate::WriteError::Unsupported)
+    }
+    fn try_delete(&self, _key: &[u8]) -> std::result::Result<(), crate::WriteError> {
+        Err(crate::WriteError::Unsupported)
+    }
+    fn try_commit(&self) -> std::result::Result<(), crate::CommitError> {
+        Err(crate::CommitError::Unsupported)
+    }
     // ---- 基本读写 ----
 
     /// 本事务的版本号 / xid
     fn version(&self) -> u64;
 
-    /// 写入；`false` = 写冲突
+    /// 写入；`false` = 写入失败（冲突、容量或 I/O 等）；详细原因使用 checked API
     ///
     /// ⚠️ `value` 是**已打过信封**的逻辑值（历史约定，现有调用点按它写）。直接拿这个口子
     /// 存裸字节会踩坑：`0x00` 打头读回来少 1 字节，`0x01` 打头会被当成 TTL 信封少 9 字节、
@@ -250,7 +264,7 @@ pub trait KvTxn: Send {
     fn set(&self, key: &[u8], value: Vec<u8>) -> bool;
 
     /// 原样存这串字节：信封由引擎打，[`KvTxn::get`] 一字不差地还回来（空值、`0x00`/`0x01`
-    /// 打头、走 blob 旁路的长值都一样）。`false` 同 `set` = 写冲突。
+    /// 打头、走 blob 旁路的长值都一样）。`false` 同 `set` 表示写入失败。
     ///
     /// 为什么只加写的一侧：`get` 本来就已经把信封剥掉，它就是 `set_raw` 的读侧对应物；
     /// 再造一个 `get_raw` 只是给同一个行为起第二个名字，换来的是"该用哪个"的困惑。
@@ -258,10 +272,10 @@ pub trait KvTxn: Send {
     /// （`latest_visible_raw`），没有对外承诺。
     fn set_raw(&self, key: &[u8], value: Vec<u8>) -> bool;
 
-    /// 带 TTL 写入；`false` = 写冲突
+    /// 带 TTL 写入；`false` = 写入失败（冲突、容量或 I/O 等）；详细原因使用 checked API
     fn set_with_ttl(&self, key: &[u8], value: Vec<u8>, ttl: Duration) -> bool;
 
-    /// 逻辑删除（写 tombstone）；`false` = 写冲突
+    /// 逻辑删除（写 tombstone）；`false` = 写入失败（冲突、容量或 I/O 等）；详细原因使用 checked API
     fn delete(&self, key: &[u8]) -> bool;
 
     /// 读取用户 value（已剥 TTL 信封；过期/删除/不存在均为 `None`）
@@ -273,7 +287,7 @@ pub trait KvTxn: Send {
 
     // ---- 批量 ----
 
-    /// 批量写；`Err(key)` 表示在该 key 上写冲突（已写入的部分不回滚，
+    /// 批量写；`Err(key)` 表示在该 key 上写入失败（已写入的部分不回滚，
     /// 调用方通常应 [`KvTxn::rollback`] 整个事务）
     fn batch_set(&self, items: &[(Vec<u8>, Vec<u8>)]) -> std::result::Result<(), Vec<u8>>;
 
@@ -1123,6 +1137,19 @@ macro_rules! impl_engine {
                 self.inner.commit()
             }
 
+            fn try_commit(&self) -> std::result::Result<(), crate::CommitError> {
+                self.inner.try_commit()
+            }
+            fn try_set(&self, key: &[u8], value: Vec<u8>) -> std::result::Result<(), crate::WriteError> {
+                self.inner.try_set(key, value)
+            }
+            fn try_set_raw(&self, key: &[u8], value: Vec<u8>) -> std::result::Result<(), crate::WriteError> {
+                self.inner.try_set_raw(key, value)
+            }
+            fn try_delete(&self, key: &[u8]) -> std::result::Result<(), crate::WriteError> {
+                self.inner.try_delete(key)
+            }
+
             fn rollback(&self) {
                 self.inner.rollback()
             }
@@ -1209,12 +1236,12 @@ macro_rules! impl_engine {
     // ---- flush / checkpoint 分支 ----
     (@durable yes) => {
         fn flush(&self) -> Result<()> {
-            self.inner.flush();
+            self.inner.try_flush()?;
             Ok(())
         }
 
         fn checkpoint(&self) -> Result<()> {
-            self.inner.checkpoint();
+            self.inner.try_checkpoint()?;
             Ok(())
         }
     };
@@ -1489,6 +1516,93 @@ mod tests {
     fn binary_key_lsm() { binary_key_regression("lsm_tree"); }
     #[test]
     fn binary_key_memory() { binary_key_regression("memory"); }
+
+    #[test]
+    fn checked_commit_quarantines_failures_and_recovers() {
+        for name in ["bitcask", "bplus_tree", "lsm_tree"] {
+            for stage in [0, 1, 2] {
+                let dir = tmp_dir(name);
+                let db = open_engine(name, Some(dir.as_ref())).unwrap();
+                db.set_vacuum_auto_slice(0);
+                let tx = db.begin();
+                tx.try_set_raw(b"k", b"value".to_vec()).unwrap();
+                crate::common::wal::fail_next_commit(stage);
+                let result = tx.try_commit();
+                if stage == 0 {
+                    result.unwrap();
+                    assert_eq!(tx.try_set_raw(b"late", vec![]), Err(crate::WriteError::TransactionClosed));
+                } else {
+                    assert!(matches!(result, Err(crate::CommitError::Indeterminate { .. })), "{name}: {result:?}");
+                    assert!(matches!(tx.try_commit(), Err(crate::CommitError::Indeterminate { .. })));
+                    tx.rollback(); // Must not contradict an uncertain Commit with Abort.
+                }
+                drop(tx);
+                let read = db.begin();
+                assert_eq!(read.get(b"k"), (stage == 0).then(|| b"value".to_vec()), "{name} stage {stage}");
+                read.try_commit().unwrap();
+                drop(read);
+                if stage != 0 {
+                    assert!(db.vacuum().unwrap().skipped_active_txn);
+                    let next = db.begin();
+                    assert_eq!(next.try_set_raw(b"next", vec![]), Err(crate::WriteError::WalWriteFailed));
+                    assert!(matches!(next.try_commit(), Err(crate::CommitError::WriteFailed(_))));
+                    next.rollback();
+                }
+                // Even an explicit checkpoint must preserve uncertain WAL records.
+                if stage == 0 { db.checkpoint().unwrap(); }
+                else { assert!(db.checkpoint().is_err()); }
+                drop(db);
+                let reopened = open_engine(name, Some(dir.as_ref())).unwrap();
+                let read = reopened.begin();
+                // Stage 2 writes a complete Commit before the injected sync failure;
+                // normal process reopen may recover it. It is NOT evidence of power-loss durability.
+                assert_eq!(read.get(b"k"), (stage != 1).then(|| b"value".to_vec()), "{name} recovered stage {stage}");
+                read.try_commit().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn checked_checkpoint_preserves_active_transaction_log() {
+        for name in ["bitcask", "bplus_tree", "lsm_tree"] {
+            let dir = tmp_dir(name);
+            let db = open_engine(name, Some(dir.as_ref())).unwrap();
+            let tx = db.begin();
+            tx.try_set_raw(b"pending", vec![1]).unwrap();
+            assert!(db.checkpoint().is_err(), "{name}: must retain active WAL");
+            let other = db.begin();
+            other.try_set_raw(b"committed", vec![2]).unwrap();
+            other.try_commit().unwrap();
+            tx.rollback();
+            drop(tx);
+            drop(other);
+            db.checkpoint().unwrap();
+            drop(db);
+            let reopened = open_engine(name, Some(dir.as_ref())).unwrap();
+            let read = reopened.begin();
+            assert_eq!(read.get(b"pending"), None, "{name}");
+            assert_eq!(read.get(b"committed"), Some(vec![2]), "{name}");
+        }
+    }
+
+    #[test]
+    fn checked_writes_distinguish_conflict_capacity_and_closed() {
+        for entry in open_all() {
+            let (name, db) = (entry.0, &*entry.1);
+            let old = db.begin();
+            let writer = db.begin();
+            writer.try_set_raw(b"k", vec![1]).unwrap();
+            writer.try_commit().unwrap();
+            assert_eq!(old.try_set_raw(b"k", vec![2]), Err(crate::WriteError::Conflict));
+            old.rollback();
+            assert_eq!(old.try_delete(b"k"), Err(crate::WriteError::TransactionClosed));
+            if name == "bplus_tree" {
+                let tx = db.begin();
+                assert_eq!(tx.try_set_raw(&vec![b'x'; 8192], vec![]), Err(crate::WriteError::RowTooLarge));
+                tx.try_commit().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn binary_key_views_match_a_logical_map() {

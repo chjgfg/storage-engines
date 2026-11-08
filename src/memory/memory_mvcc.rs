@@ -752,12 +752,28 @@ impl Transaction {
         self.write(key, None)
     }
 
+    pub fn try_set(&self, key: &[u8], value: Vec<u8>) -> Result<(), crate::WriteError> {
+        self.try_write(key, Some(value))
+    }
+
+    pub fn try_set_raw(&self, key: &[u8], value: Vec<u8>) -> Result<(), crate::WriteError> {
+        self.try_set(key, crate::common::pack_plain(&value))
+    }
+
+    pub fn try_delete(&self, key: &[u8]) -> Result<(), crate::WriteError> {
+        self.try_write(key, None)
+    }
+
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> bool {
+        self.try_write(key, value).is_ok()
+    }
+
+    fn try_write(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<(), crate::WriteError> {
         // 锁序：先活跃表，再存储侧（理由见 [`crate::common::TxnCore`] 的模块头）。
         // 那 8 步序列（冲突判定 → 编码 → WAL → 落行 → 写集登记）在 [`TxnCore::write`] 里，四引擎一份。
         let mut reg = self.core.lock_registry();
         let mut side = self.store.lock().unwrap();
-        self.core.write(&mut reg, &mut *side, key, value)
+        self.core.try_write(&mut reg, &mut *side, key, value)
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -860,9 +876,12 @@ impl Transaction {
     }
 
     pub fn commit(&self) {
-        // 销账 + 给自动回收记一笔账，都在 [`TxnCore::commit`]；内存引擎没有 WAL，收尾交个空占位
+        self.try_commit().expect("transaction commit failed");
+    }
+
+    pub fn try_commit(&self) -> Result<(), crate::CommitError> {
         let mut reg = self.core.lock_registry();
-        self.core.commit(&mut reg, &mut ());
+        self.core.try_commit(&mut reg, &mut ())
     }
 
     pub fn rollback(&self) {
