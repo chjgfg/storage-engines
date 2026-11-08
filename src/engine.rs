@@ -2455,6 +2455,46 @@ mod tests {
     ///    所以下面那条 `memory_engine_has_no_path_and_no_merge` 守卫并不会红 —— 方案预计的
     ///    "path() 必红"只在"给了目录"那一支成立）。
     #[test]
+    fn memory_snapshot_binary_values_survive_repeated_reopens() {
+        let dir = tmp_dir("memory_snapshot_binary");
+        let values = vec![
+            vec![], vec![0], vec![0, 0, 65],
+            vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 65],
+            vec![1, 255, 255, 255, 255, 255, 255, 255, 255, 65],
+            (0..=255).collect::<Vec<u8>>(),
+        ];
+        let expires = crate::common::codec::now_unix_secs() + 3600;
+        {
+            let db = open_engine("memory", Some(&dir)).unwrap();
+            let tx = db.begin();
+            for i in 0usize..1007 {
+                assert!(tx.set_raw(&i.to_be_bytes(), values[i % values.len()].clone()));
+            }
+            assert!(tx.set(b"ttl", crate::common::codec::pack_ttl(&values[3], expires)));
+            assert!(tx.set(b"expired", crate::common::codec::pack_ttl(b"gone", 1)));
+            assert!(tx.set_raw(b"deleted", vec![0, 65]));
+            assert!(tx.delete(b"deleted"));
+            tx.try_commit().unwrap();
+        }
+        for reopen in 1..=3 {
+            let db = open_engine("memory", Some(&dir)).unwrap();
+            let tx = db.begin();
+            for i in 0usize..1007 {
+                assert_eq!(tx.get(&i.to_be_bytes()), Some(values[i % values.len()].clone()),
+                    "reopen {reopen}, key {i}");
+            }
+            assert_eq!(tx.get(b"ttl"), Some(values[3].clone()));
+            assert_eq!(tx.get(b"expired"), None);
+            assert_eq!(tx.get(b"deleted"), None);
+            let records = db.export_latest_visible(true);
+            assert!(records.iter().any(|r| r.key == b"deleted" && r.value.is_none()));
+            assert_eq!(records.iter().find(|r| r.key == b"ttl").unwrap().expire_unix_secs,
+                Some(expires));
+            tx.try_commit().unwrap();
+        }
+    }
+
+    #[test]
     fn memory_snapshot_round_trips_only_at_open_and_stop() {
         let dir = tmp_dir("memory_snapshot");
         let snap = dir.join("snapshot.bxp");

@@ -167,7 +167,7 @@ impl MVCC {
             }
             batch.push((rec.key, value, rec.expire_unix_secs));
             if batch.len() >= PAGE {
-                if let Some(e) = MVCC::replay_page(self, &mut batch, now) {
+                if let Some(e) = MVCC::replay_page(self, &mut batch) {
                     err = Some(e);
                     return false;
                 }
@@ -177,7 +177,7 @@ impl MVCC {
         if let Some(e) = err {
             return Err(e);
         }
-        if let Some(e) = MVCC::replay_page(self, &mut batch, now) {
+        if let Some(e) = MVCC::replay_page(self, &mut batch) {
             return Err(e);
         }
         log::info!(
@@ -205,7 +205,6 @@ impl MVCC {
     fn replay_page(
         mvcc: &MVCC,
         batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
-        now: u64,
     ) -> Option<std::io::Error> {
         if batch.is_empty() {
             return None;
@@ -215,9 +214,9 @@ impl MVCC {
         for (k, v, expire) in batch.drain(..) {
             let ok = match (v, expire) {
                 (None, _) => tx.delete(&k),
-                // 绝对时刻减 now：文件里躺过多久都不影响这一行还剩多少命（与 migrate 同式）
-                (Some(v), Some(e)) => tx.set_with_ttl(&k, v, std::time::Duration::from_secs(e - now)),
-                (Some(v), None) => tx.set(&k, v),
+                // 文件值已剥封装；恢复绝对到期时刻，不能把重放耗时加回 TTL。
+                (Some(v), Some(e)) => tx.set(&k, crate::common::pack_ttl(&v, e)),
+                (Some(v), None) => tx.set_raw(&k, v),
             };
             if !ok && bad.is_none() {
                 bad = Some(k);
