@@ -1,5 +1,30 @@
 # 更新日志
 
+## 未发布（2026-11-10）
+
+### M94：Bitcask 自动 checkpoint 摊销 hint 刷新
+
+- WAL 默认 16 MiB 的触发节奏与数据/blob 同步后收口顺序不变；自动 checkpoint 仅在累计
+  变更记录数达到当前 KeyDir 条数的一半时刷新 hint。插入、覆盖、软/硬删除、rollback/vacuum
+  共用变更账；每次自动发布遍历条数不超过本轮变更量的两倍。重开后的第一次发布另付已有索引成本。
+- 手动 checkpoint、bulk 收尾、merge、Drop 仍发布完整 hint。延迟发布的代价是异常退出后
+  多读未入 hint 的数据日志；读取旧 active 的尾部、后续密封段和当前 active，按追加顺序施加删除。
+  缺段/损坏仍回退全量扫描；没有后台线程，不改变磁盘格式。
+- 先跑旧实现对照：64 次小提交重写 2080 条 hint；跨两次 rotate 的旧 hint 会复活已硬删键。
+  两条守卫修复后通过，Bitcask 定向测试 64 passed / 0 failed。跨段守卫还断言确实走增量恢复。
+  修正旧增量测试被 Drop 自动更新 hint 掩盖的问题；rotate 的 fsync 失败现在向上传递。
+- `cargo test --offline --release --lib hint_ -- --test-threads=1`：10 passed / 1 ignored。
+  `cargo test --offline --release --lib checkpoint_cost_5m -- --ignored --nocapture --test-threads=1`：
+  1 passed，126.72 s，重开后逐键逐值核验 5,000,000 行。
+
+| 阶段 | 总耗时 s | checkpoint 次数 / s | hint s | hint 行数 / 字节数 | commit p95 / p99 / max ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 灌 5M | 90.520070 | 43 / 2.831140 | 2.460214 | 6589000 / 461230200 | 4.472 / 9.227 / 1338.392 |
+| 更新 500k | 6.728455 | 3 / 0.020804 | 0.000000 | 0 / 0 | 2.974 / 3.724 / 10.881 |
+
+与 M92 同形状的 43 次 checkpoint 相比，灌库 hint 字节量下降约 94%；这是工作量证据。
+两次测量不在同一运行环境窗口，墙钟不宣称为严格 A/B 加速比；本轮未并行编译/运行其他压测。
+
 ## 未发布（2026-11-09）
 
 ### M89：memory 快照恢复保留原始字节与绝对 TTL

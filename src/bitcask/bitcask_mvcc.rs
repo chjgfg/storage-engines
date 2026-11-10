@@ -180,12 +180,13 @@ fn seal_wal_checkpoint(wal: &mut Wal, next_version: u64) -> std::io::Result<()> 
 ///
 /// 顺序不能换：`Commit` 记录落盘 = 事务持久，数据页可以之后慢慢刷；但 WAL 一旦被截断，
 /// 未落盘的数据就再无重放来源 —— 所以先 flush 数据与 blob，最后才收口 WAL。
-/// 顺手 `dump_hint` 是为了下次 open 不必全量扫日志。
+/// WAL 收口保持原节奏；自动调用摊销 hint 刷新，手动调用强制刷新。
 fn run_checkpoint(
     kv: &Mutex<Bitcask>,
     blob: &Mutex<BlobStore>,
     wal: &Mutex<Wal>,
     next_version: &AtomicU64,
+    hint_policy: super::bitcask::HintPolicy,
 ) -> std::io::Result<()> {
     #[cfg(test)]
     let _checkpoint = super::checkpoint_probe::Timer::start(super::checkpoint_probe::Stage::Checkpoint);
@@ -202,7 +203,12 @@ fn run_checkpoint(
     {
         #[cfg(test)]
         let _hint = super::checkpoint_probe::Timer::start(super::checkpoint_probe::Stage::Hint);
-        kv.dump_hint()?;
+        match kv.checkpoint_hint(hint_policy)? {
+            super::bitcask::HintRefresh::Written => {},
+            super::bitcask::HintRefresh::Deferred { unhinted_records } => {
+                log::debug!("checkpoint deferred hint: {unhinted_records} changed records; recovery replays data-log tail");
+            }
+        }
     }
     let next_ver = next_version.load(Ordering::SeqCst);
     #[cfg(test)]
@@ -459,7 +465,7 @@ impl MVCC {
         if !active.is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "active transactions prevent checkpoint"));
         }
-        run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version)
+        run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version, super::bitcask::HintPolicy::Force)
     }
 
     /// WAL 字节阈值可配置项：增长到这么多字节就在**下一次提交后**自动 checkpoint。
@@ -1200,7 +1206,7 @@ impl Transaction {
             if size >= limit {
                 let active = self.core.lock_registry();
                 if active.is_empty() {
-                    run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version).map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
+                    run_checkpoint(&self.kv, &self.blob, &self.wal, &self.next_version, super::bitcask::HintPolicy::Amortized).map_err(|source| crate::CommitError::CommittedMaintenance { version: self.core.version, source })?;
                 }
             }
         }
@@ -1348,6 +1354,30 @@ impl WalTail for WalOnly<'_> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn automatic_checkpoint_amortizes_hint_work() {
+        use crate::bitcask::checkpoint_probe::Scope;
+        let dir = tmp_db("hint_amortized");
+        let db = MVCC::try_open(&dir).unwrap();
+        db.set_wal_checkpoint_limit(1);
+        let scope = Scope::start();
+        for i in 0u64..64 {
+            let tx = db.begin_transaction();
+            tx.try_set_raw(&i.to_be_bytes(), vec![i as u8]).unwrap();
+            tx.try_commit().unwrap();
+        }
+        let stats = scope.stats();
+        assert_eq!(stats.checkpoints, 64, "WAL maintenance must still run");
+        assert!(stats.hint_rows <= 3 * 64, "hint amplification: {} rows", stats.hint_rows);
+        db.try_checkpoint().unwrap();
+        assert_eq!(scope.stats().hint_rows - stats.hint_rows, 64, "explicit checkpoint refreshes hint");
+        drop(scope);
+        drop(db);
+        let db = MVCC::try_open(&dir).unwrap();
+        let tx = db.begin_transaction();
+        for i in 0u64..64 { assert_eq!(tx.get(&i.to_be_bytes()), Some(vec![i as u8])); }
+    }
+
+    #[test]
     fn checkpoint_probe_counts_real_hint_work_and_obeys_gate() {
         use crate::bitcask::checkpoint_probe::{Scope, Timer, Stage};
         assert!(Timer::start(Stage::Commit).is_none());
@@ -1410,7 +1440,10 @@ mod tests {
                 stats.flush_ns as f64 / 1e9, stats.hint_ns as f64 / 1e9, stats.wal_ns as f64 / 1e9,
                 stats.hint_rows, stats.hint_bytes, quantile(95), quantile(99), quantile(100));
             assert!(stats.checkpoints > 0);
-            assert!(stats.hint_rows > rows as u64);
+            if phase == "insert" {
+                assert!(stats.hint_rows > 0);
+                assert!(stats.hint_rows <= 3 * rows as u64, "hint work must grow linearly");
+            }
         }
         db.try_checkpoint().unwrap();
         drop(db);

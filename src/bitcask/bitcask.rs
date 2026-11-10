@@ -1346,6 +1346,21 @@ impl<'a> DoubleEndedIterator for ScanIterator<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum HintPolicy { Force, Amortized }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HintRefresh {
+    Written,
+    Deferred { unhinted_records: u64 },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HintReplay {
+    ActiveTail,
+    Rotated { active_id: u32, sealed_segments: usize },
+}
+
 pub struct Bitcask {
     /// Active 路径（始终是 `data.log` 等 stem 路径）
     base_path: PathBuf,
@@ -1369,6 +1384,8 @@ pub struct Bitcask {
     /// 只能看到"空索引"，那会让它们什么也不做（不删、不写），但会把"库是空的"当成真话 ——
     /// 这就是 B1 的代价，写在 README M43 那一节。
     index_rebuilding: bool,
+    /// Includes inserts, overwrites, both tombstone kinds and rollback/vacuum.
+    unhinted_records: u64,
 }
 
 impl Drop for Bitcask {
@@ -1415,27 +1432,15 @@ impl Bitcask {
         let (key_dir, active_id, active) = if let Some((mut kd, active_id, active_size)) = from_hint
         {
             let mut active = Log::new(base_path.clone())?;
-            let file_len = active.file.metadata()?.len();
-            if active_size > file_len {
-                log::warn!(
-                    "hint active_size={} > data.log len={}，回退全量扫",
-                    active_size,
-                    file_len
-                );
-                drop(active);
-                Self::full_rebuild(&base_path, &sealed_ids)?
-            } else if let Err(e) = active.load_index_from(&mut kd, active_id, active_size) {
-                log::warn!("hint 增量扫失败: {e}，回退全量扫");
-                drop(active);
-                Self::full_rebuild(&base_path, &sealed_ids)?
-            } else if !hint_files_exist(&kd, active_id, &sealed_ids) {
-                // hint 指的是向已经不在的分片 ⇒ 增量扫只补 active 里新增的行，那些行**永远不在**
-                // 这次扫描里，于是键悄悄变少 —— 比启动慢严重得多，所以退回全量扫重建。
-                log::warn!("hint 引用了已不存在的分片，回退全量扫（崩在 merge 中间会留这种 hint）");
-                drop(active);
-                Self::full_rebuild(&base_path, &sealed_ids)?
-            } else {
-                (kd, active_id, active)
+            match Self::replay_hint(&base_path, &sealed_ids, &mut kd, active_id, active_size, &mut active) {
+                Ok(HintReplay::ActiveTail) => (kd, active_id, active),
+                Ok(HintReplay::Rotated { active_id, .. }) => (kd, active_id, active),
+                Err(e) => {
+                    // Invalid/missing hint history costs a full scan, never partial recovery.
+                    log::warn!("hint 增量扫失败: {e}，回退全量扫");
+                    drop(active);
+                    Self::full_rebuild(&base_path, &sealed_ids)?
+                }
             }
         } else {
             Self::full_rebuild(&base_path, &sealed_ids)?
@@ -1447,11 +1452,41 @@ impl Bitcask {
             base_path,
             active,
             active_id,
+            unhinted_records: key_dir.len() as u64,
             key_dir,
             max_file_bytes,
             sealed: std::collections::HashMap::new(),
             index_rebuilding: false,
         })
+    }
+
+    fn replay_hint(base: &Path, sealed: &[u32], kd: &mut KeyDir, hint_id: u32,
+        offset: u64, active: &mut Log) -> Result<HintReplay> {
+        let current = match sealed.last() {
+            Some(id) => id.checked_add(1).ok_or_else(|| std::io::Error::other("segment id exhausted"))?,
+            None => 0,
+        };
+        if hint_id > current || !hint_files_exist(kd, current, sealed) {
+            return Err(std::io::Error::other("hint references missing segment history"));
+        }
+        if hint_id == current {
+            active.load_index_from(kd, current, offset)?;
+            return Ok(HintReplay::ActiveTail);
+        }
+        // The old active is now sealed. Replay its tail, then every later segment
+        // in append order, including hard deletes; never apply its offset to today's active.
+        let mut expected = hint_id;
+        let mut segments = 0;
+        for &id in sealed.iter().filter(|&&id| id >= hint_id) {
+            if id != expected { return Err(std::io::Error::other("gap in hint replay history")); }
+            let mut log = Log::new(segment_path(base, id))?;
+            log.load_index_from(kd, id, if id == hint_id { offset } else { 0 })?;
+            expected = id + 1;
+            segments += 1;
+        }
+        if expected != current { return Err(std::io::Error::other("incomplete hint replay history")); }
+        active.load_index_from(kd, current, 0)?;
+        Ok(HintReplay::Rotated { active_id: current, sealed_segments: segments })
     }
 
     /// 认回 / 清理崩在中间的 merge 产物，让 `merge()` 里那几步删除变得可恢复。
@@ -1586,7 +1621,21 @@ impl Bitcask {
         self.active.flush_buf()?;
         let log_size = self.active.end_pos;
         let path = self.hint_path();
-        write_hint_file(&path, &self.key_dir, self.active_id, log_size)
+        write_hint_file(&path, &self.key_dir, self.active_id, log_size)?;
+        self.unhinted_records = 0;
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint_hint(&mut self, policy: HintPolicy) -> Result<HintRefresh> {
+        self.usable()?;
+        // A publication visits at most twice the accumulated changed records.
+        // Explicit checkpoint, bulk finish, merge and Drop still publish immediately.
+        if matches!(policy, HintPolicy::Amortized)
+            && self.unhinted_records < (self.key_dir.len() as u64).div_ceil(2).max(1) {
+            return Ok(HintRefresh::Deferred { unhinted_records: self.unhinted_records });
+        }
+        self.dump_hint()?;
+        Ok(HintRefresh::Written)
     }
 
     /// 从指定分片读 value
@@ -1608,6 +1657,7 @@ impl Bitcask {
 
     /// active 写满后密封：`data.log` → `data.{active_id}.log`，再开新 active
     fn maybe_rotate(&mut self) -> Result<()> {
+        self.unhinted_records = self.unhinted_records.saturating_add(1);
         if self.active.end_pos < self.max_file_bytes {
             return Ok(());
         }
@@ -1619,9 +1669,8 @@ impl Bitcask {
 // M53 记账
         #[cfg(test)]
         crate::common::disk::note_fsync(crate::common::disk::SITE_BITCASK_LOG_FLUSH);
-        if self.active.file.sync_all().is_ok() {
-            self.active.dirty = false;
-        }
+        self.active.file.sync_all()?;
+        self.active.dirty = false;
 
         let sealed_path = segment_path(&self.base_path, self.active_id);
         // Windows：必须先 drop 句柄再 rename
@@ -2334,6 +2383,41 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_hint_crosses_rotations_without_losing_deletes() {
+        let path = tmp_log("hint_rotations");
+        let stale;
+        {
+            let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
+            eng.set(b"a", vec![1; 32]).unwrap();
+            eng.set(b"b", vec![2; 32]).unwrap();
+            eng.flush().unwrap();
+            eng.dump_hint().unwrap();
+            stale = std::fs::read(eng.hint_path()).unwrap();
+            eng.set(b"a", vec![3; 32]).unwrap();
+            eng.rotate().unwrap();
+            eng.delete(b"b").unwrap();
+            eng.insert(b"tomb".to_vec(), None).unwrap();
+            eng.rotate().unwrap();
+            eng.set(b"c", vec![4; 256]).unwrap();
+            eng.flush().unwrap();
+        }
+        // Restore the exact pre-rotation hint: normal Drop would hide this case.
+        std::fs::write(hint_path_for(&path), stale).unwrap();
+        {
+            let (mut kd, id, offset) = read_hint_file(&hint_path_for(&path)).unwrap();
+            let mut active = Log::new(path.to_path_buf()).unwrap();
+            assert_eq!(Bitcask::replay_hint(&path, &discover_sealed_ids(&path), &mut kd, id, offset, &mut active).unwrap(),
+                HintReplay::Rotated { active_id: 2, sealed_segments: 2 });
+        }
+        let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
+        assert_eq!(eng.get(b"a").unwrap(), Some(vec![3; 32]));
+        assert_eq!(eng.get(b"b").unwrap(), None);
+        assert_eq!(eng.get(b"c").unwrap(), Some(vec![4; 256]));
+        assert!(eng.key_dir.contains_key(b"tomb".as_slice()));
+        assert_eq!(eng.len(), 3);
+    }
+
+    #[test]
     fn test_hint_incremental_tail_scan() {
         let path = tmp_log("incr");
         {
@@ -2343,6 +2427,7 @@ mod tests {
             eng.flush().unwrap();
             eng.dump_hint().unwrap();
         }
+        let stale = std::fs::read(hint_path_for(&path)).unwrap();
         // 写更多数据但不更新 hint → open 应 hint + 扫尾部
         {
             let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
@@ -2352,6 +2437,8 @@ mod tests {
             // 故意不 dump_hint
             drop(eng);
         }
+        // Drop publishes a fresh hint; restore the old bytes to exercise replay.
+        std::fs::write(hint_path_for(&path), stale).unwrap();
         {
             let mut eng = Bitcask::new(path.to_path_buf()).unwrap();
             assert_eq!(eng.get(b"k1").unwrap(), Some(b"v1b".to_vec()));
