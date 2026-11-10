@@ -142,6 +142,8 @@ impl MVCC {
     /// ② 按页一事务（照 `migrate` 的写侧），不把两千万行攒进一个写集；
     /// ③ TTL 保留文件内绝对到期时刻；不把重放耗时加回剩余寿命。
     fn load_snapshot_from(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        let _timer = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::Total);
         if !path.exists() {
             return Ok(());
         }
@@ -207,6 +209,8 @@ impl MVCC {
         batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
     ) -> Option<std::io::Error> {
         #[cfg(test)]
+        let _timer = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::Replay);
+        #[cfg(test)]
         if replay_reference::enabled() { return Self::replay_page_reference(mvcc, batch); }
         if batch.is_empty() { return None; }
         let tx = mvcc.begin_transaction();
@@ -221,14 +225,14 @@ impl MVCC {
                     Some(e) => crate::common::pack_ttl(&v, e),
                     None => crate::common::pack_plain(&v),
                 });
-                if tx.core.try_write(&mut reg, &mut *side, &key, logical).is_err() && bad.is_none() {
-                    bad = Some(key);
+                if let Err(error) = tx.core.try_write_owned(&mut reg, &mut *side, key, logical) {
+                    if bad.is_none() { bad = Some(error); }
                 }
             }
         }
         tx.commit();
-        bad.map(|key| std::io::Error::new(std::io::ErrorKind::InvalidData,
-            format!("快照重放被引擎拒收: {key:?}")))
+        bad.map(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("快照重放被引擎拒收: {error:?}")))
     }
 
     #[cfg(test)]
@@ -680,6 +684,11 @@ impl WriteSide for MemStore {
         true
     }
 
+    fn put_versioned_owned(&mut self, enc: Vec<u8>, value: Option<Vec<u8>>) -> bool {
+        self.insert(enc, value);
+        true
+    }
+
     fn remove_versioned(&mut self, enc: &[u8]) {
         self.delete(enc);
     }
@@ -1016,6 +1025,93 @@ mod tests {
     use std::eprintln;
     use std::vec;
     use std::format;
+
+    #[test]
+    fn memory_owned_write_retains_encoded_key_buffer() {
+        let mut store = MemStore::new();
+        let key = encode_key(b"owned", 1);
+        let ptr = key.as_ptr();
+        assert!(store.put_versioned_owned(key, Some(vec![3])));
+        assert_eq!(store.iter_keys_in(None, None).next().unwrap().as_ptr(), ptr);
+    }
+
+    #[test]
+    fn memory_owned_write_retains_registry_key_buffer() {
+        let db = MVCC::new();
+        let tx = db.begin_transaction();
+        let key = b"owned".to_vec();
+        let ptr = key.as_ptr();
+        {
+            let mut reg = tx.core.lock_registry();
+            let mut store = db.store.lock().unwrap();
+            tx.core.try_write_owned(&mut reg, &mut *store, key, Some(vec![3])).unwrap();
+            assert_eq!(reg[&tx.core.version].get(b"owned".as_slice()).unwrap().as_ptr(), ptr);
+        }
+        tx.rollback();
+        assert_eq!(db.health().total_rows, 0);
+    }
+
+    #[test]
+    fn memory_owned_write_keeps_conflict_and_closed_checks() {
+        let db = MVCC::new();
+        let older = db.begin_transaction();
+        let newer = db.begin_transaction();
+        assert!(newer.set_raw(b"k", vec![7]));
+        newer.commit();
+        {
+            let mut reg = older.core.lock_registry();
+            let mut store = db.store.lock().unwrap();
+            assert_eq!(older.core.try_write_owned(&mut reg, &mut *store, b"k".to_vec(), Some(vec![8])),
+                Err(crate::WriteError::Conflict));
+        }
+        older.rollback();
+        {
+            let mut reg = older.core.lock_registry();
+            let mut store = db.store.lock().unwrap();
+            assert_eq!(older.core.try_write_owned(&mut reg, &mut *store, b"new".to_vec(), None),
+                Err(crate::WriteError::TransactionClosed));
+        }
+        assert_eq!(db.begin_transaction().get(b"k"), Some(vec![7]));
+    }
+
+    #[test]
+    fn snapshot_owned_replay_preserves_duplicates_prefixes_and_ttl() {
+        use crate::common::kv_snapshot::{KvRecord, atomic_write_bin_v4};
+        let path = crate::common::ScratchPath::new("memory", "owned_replay", ".bxp");
+        let expiry = crate::common::now_unix_secs() + 3600;
+        atomic_write_bin_v4(&path, |writer| {
+            for i in 0..1003u64 {
+                writer.write(&KvRecord::new(i.to_be_bytes().to_vec(), Some(i.to_le_bytes().to_vec())))?;
+            }
+            writer.write(&KvRecord::new(0u64.to_be_bytes().to_vec(), Some(vec![99])))?;
+            writer.write(&KvRecord::new(1u64.to_be_bytes().to_vec(), None))?;
+            writer.write(&KvRecord::new(vec![], Some(vec![0, 1])))?;
+            writer.write(&KvRecord::new(vec![0], Some(vec![1, 0])).with_expire(expiry))?;
+            writer.write(&KvRecord::new(b"expired".to_vec(), Some(vec![8])).with_expire(1))?;
+            Ok(())
+        }).unwrap();
+        let mut expected = BTreeMap::new();
+        for i in 0..1003u64 { expected.insert(i.to_be_bytes().to_vec(), (Some(i.to_le_bytes().to_vec()), None)); }
+        expected.insert(0u64.to_be_bytes().to_vec(), (Some(vec![99]), None));
+        expected.insert(1u64.to_be_bytes().to_vec(), (None, None));
+        expected.insert(vec![], (Some(vec![0, 1]), None));
+        expected.insert(vec![0], (Some(vec![1, 0]), Some(expiry)));
+        for reference in [true, false] {
+            let _mode = reference.then(crate::common::txn::owned_reference::Scope::start);
+            let recovery = crate::common::kv_snapshot::recovery_probe::Scope::start();
+            let mut db = MVCC::new();
+            db.load_snapshot_from(&path).unwrap();
+            let stages = recovery.stats();
+            assert!(stages.verify_ns > 0 && stages.decode_ns > 0 && stages.replay_ns > 0);
+            assert!(stages.total_ns >= stages.verify_ns + stages.decode_ns + stages.replay_ns);
+            drop(recovery);
+            assert!(crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::Total).is_none());
+            let actual: BTreeMap<_, _> = db.export_latest_visible(true).into_iter()
+                .map(|r| (r.key, (r.value, r.expire_unix_secs))).collect();
+            assert_eq!(actual, expected);
+            assert!(db.active_txn.lock().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn test_encode_order() {

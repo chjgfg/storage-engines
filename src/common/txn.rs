@@ -49,6 +49,7 @@
 #[cfg(test)]
 use std::thread_local;
 use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
 use std::cell::Cell;
 use crate::common::{CommitError, WriteError};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,10 +94,10 @@ pub fn write_set_scans() -> u64 {
 ///
 /// 查重走哈希 —— **不许**退回 `writes.iter().any(|k| k == key)`，那是单事务内 O(写集²)。
 /// 尺子就在这个唯一入口里，所以退化会当场被 [`write_set_scans`] 看见。
-fn register_write(writes: &mut HashSet<Vec<u8>>, key: &[u8]) -> bool {
+fn register_write(writes: &mut HashSet<Vec<u8>>, key: Cow<'_, [u8]>) -> bool {
     #[cfg(test)]
     note_write_set_scan(1);
-    writes.insert(key.to_vec())
+    writes.insert(key.into_owned())
 }
 
 /// 从写集摘掉一行（批量写撞墙后的部分撤销）。同样是哈希减法，不是遍历。
@@ -133,6 +134,11 @@ pub trait WriteSide {
     ///
     /// 返回 false 表示存储报告失败（可能已部分修改）。内核阻止提交并登记键供回滚清理。
     fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool;
+
+    /// Consume an encoded key when the backend can retain it directly.
+    fn put_versioned_owned(&mut self, enc: Vec<u8>, value: Option<Vec<u8>>) -> bool {
+        self.put_versioned(&enc, value)
+    }
 
     /// 物理撤掉本事务写下的一行（回滚用 —— **不是**写墓碑，那会让这行永远留在库里）。
     fn remove_versioned(&mut self, enc: &[u8]);
@@ -263,15 +269,20 @@ impl TxnCore {
 
     pub fn try_write<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
         key: &[u8], value: Option<Vec<u8>>) -> Result<(), WriteError> {
+        self.try_write_inner(reg, side, Cow::Borrowed(key), value)
+    }
+
+    fn try_write_inner<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
+        key: Cow<'_, [u8]>, value: Option<Vec<u8>>) -> Result<(), WriteError> {
         if self.state.get() != TxnState::Active { return Err(WriteError::TransactionClosed); }
         if let Some(error) = self.write_error.get() { return Err(error); }
-        if let Some(latest) = side.latest_version(key) {
+        if let Some(latest) = side.latest_version(&key) {
             if !self.is_visible(latest) {
                 return Err(WriteError::Conflict);
             }
         }
 
-        let enc = encode_key(key, self.version);
+        let enc = encode_key(&key, self.version);
         let stored = match value {
             None => None,
             Some(v) => match side.encode_value(v) {
@@ -295,7 +306,12 @@ impl TxnCore {
         self.wal_policy.mark_opened();
 
         let writes = reg.entry(self.version).or_default();
-        if side.put_versioned(&enc, stored) {
+        #[cfg(test)]
+        let inserted = if owned_reference::enabled() { side.put_versioned(&enc, stored) }
+            else { side.put_versioned_owned(enc, stored) };
+        #[cfg(not(test))]
+        let inserted = side.put_versioned_owned(enc, stored);
+        if inserted {
             register_write(writes, key);
             return Ok(());
         }
@@ -303,6 +319,13 @@ impl TxnCore {
         // storage side reports a failure after partial mutation.
         register_write(writes, key);
         self.fail_write(WriteError::StorageWriteFailed)
+    }
+
+    pub(crate) fn try_write_owned<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
+        key: Vec<u8>, value: Option<Vec<u8>>) -> Result<(), WriteError> {
+        #[cfg(test)]
+        if owned_reference::enabled() { return self.try_write(reg, side, &key, value); }
+        self.try_write_inner(reg, side, Cow::Owned(key), value)
     }
 
     fn fail_write(&self, error: WriteError) -> Result<(), WriteError> {
@@ -471,17 +494,32 @@ mod checked_tests {
         impl WalTail for PartialStore {
             fn try_wal_commit(&mut self, _: u64) -> std::io::Result<()> { Ok(()) }
         }
-        let reg = Arc::new(Mutex::new(Registry::new()));
-        let tx = TxnCore::begin(reg, &AtomicU64::new(1), Arc::new(VacuumScheduler::default()));
-        let mut guard = tx.lock_registry();
-        let mut store = PartialStore::default();
-        assert_eq!(tx.try_write(&mut guard, &mut store, b"k", Some(vec![1])),
-            Err(WriteError::StorageWriteFailed));
-        assert_eq!(store.rows.len(), 1, "must actually mutate before reporting failure");
-        assert!(matches!(tx.try_commit(&mut guard, &mut store),
-            Err(CommitError::WriteFailed(WriteError::StorageWriteFailed))));
-        tx.rollback(&mut guard, &mut store);
-        assert!(store.rows.is_empty(), "rollback must clean a partially written row");
-        assert!(guard.is_empty());
+        for owned in [false, true] {
+            let reg = Arc::new(Mutex::new(Registry::new()));
+            let tx = TxnCore::begin(reg, &AtomicU64::new(1), Arc::new(VacuumScheduler::default()));
+            let mut guard = tx.lock_registry();
+            let mut store = PartialStore::default();
+            let result = if owned {
+                tx.try_write_owned(&mut guard, &mut store, b"k".to_vec(), Some(vec![1]))
+            } else { tx.try_write(&mut guard, &mut store, b"k", Some(vec![1])) };
+            assert_eq!(result, Err(WriteError::StorageWriteFailed));
+            assert_eq!(store.rows.len(), 1, "must actually mutate before reporting failure");
+            assert!(matches!(tx.try_commit(&mut guard, &mut store),
+                Err(CommitError::WriteFailed(WriteError::StorageWriteFailed))));
+            tx.rollback(&mut guard, &mut store);
+            assert!(store.rows.is_empty(), "rollback must clean a partially written row");
+            assert!(guard.is_empty());
+        }
     }
+}
+
+
+#[cfg(test)]
+pub(crate) mod owned_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
 }

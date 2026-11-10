@@ -5320,6 +5320,54 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "snapshot IO and owned replay comparison; release single thread"]
+    fn memory_snapshot_io_owned_cost() {
+        use crate::common::kv_snapshot::{io_reference, recovery_probe, snapshot_probe};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 1000);
+        let mut recovery_allocations = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("snapshot_io_owned");
+            let db = open_engine(EngineKind::Memory, Some(&dir.0)).unwrap();
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin();
+                for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.commit();
+            }
+            let _io_mode = reference.then(io_reference::Scope::start);
+            let probe = snapshot_probe::Scope::start(false);
+            let start = std::time::Instant::now();
+            drop(db);
+            let elapsed = start.elapsed().as_nanos();
+            let stats = probe.stats();
+            eprintln!("SNAPSHOT_IO_STOP round={round} reference={reference} rows={rows} total_ms={:.3} release_ms={:.3} stages={stats:?}",
+                elapsed as f64 / 1e6, elapsed.saturating_sub(stats.total_ns) as f64 / 1e6);
+            drop(probe);
+            let mode = reference.then(crate::common::txn::owned_reference::Scope::start);
+            let recovery = recovery_probe::Scope::start();
+            let before = crate::mem_probe::allocations();
+            let start = std::time::Instant::now();
+            let db = open_engine(EngineKind::Memory, Some(&dir.0)).unwrap();
+            let elapsed = start.elapsed().as_secs_f64();
+            let allocations = crate::mem_probe::allocations() - before;
+            recovery_allocations.push(allocations);
+            eprintln!("SNAPSHOT_IO_RECOVER round={round} reference={reference} rows={rows} seconds={elapsed:.6} allocations={allocations} stages={:?}", recovery.stats());
+            drop(recovery); drop(mode);
+            let mut seen = 0;
+            db.export_latest_visible_for_each(false, &mut |record| {
+                assert_eq!(record.key, scale_key(seen));
+                assert_eq!(record.value, Some(scale_val(seen)));
+                assert_eq!(record.expire_unix_secs, None);
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+            eprintln!("SNAPSHOT_IO_VERIFIED round={round} rows={seen}");
+        }
+        assert!(recovery_allocations[1] + (rows as u64) < recovery_allocations[0]);
+        assert!(recovery_allocations[2] + (rows as u64) < recovery_allocations[3]);
+    }
+
+    #[test]
     #[ignore = "vacuum planning old/new/new/old; release single thread"]
     fn vacuum_plan_cost() {
         let rows: usize = std::env::var("VACUUM_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);
@@ -5946,9 +5994,13 @@ mod tests {
                     );
                 }
                 if let Some(scope) = snapshot {
-                    eprintln!("SCALE_SNAPSHOT engine={label} stages={:?}", scope.stats());
+                    let stats = scope.stats();
+                    eprintln!("SCALE_SNAPSHOT engine={label} release_ms={:.3} stages={stats:?}",
+                        t_stop.elapsed().as_nanos().saturating_sub(stats.total_ns) as f64 / 1e6);
                 }
+                let recovery = (kind == EngineKind::Memory).then(crate::common::kv_snapshot::recovery_probe::Scope::start);
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+                if let Some(scope) = recovery { eprintln!("SCALE_RECOVERY phase=first stages={:?}", scope.stats()); }
                 line(
                     label,
                     "冷重开(恢复)",
@@ -6257,8 +6309,18 @@ mod tests {
             //   "停止落盘"那行不计时读数只在上面那一处打，免得同一格的两条噪声线混淆。）
             let db = {
                 let st_base = open_stages_begin();
+                let snapshot = (kind == EngineKind::Memory).then(|| crate::common::kv_snapshot::snapshot_probe::Scope::start(false));
+                let stop = std::time::Instant::now();
                 drop(db);
+                if let Some(scope) = snapshot {
+                    let stats = scope.stats();
+                    eprintln!("SCALE_SNAPSHOT phase=bulk total_ms={:.3} release_ms={:.3} stages={stats:?}",
+                        stop.elapsed().as_secs_f64() * 1e3,
+                        stop.elapsed().as_nanos().saturating_sub(stats.total_ns) as f64 / 1e6);
+                }
+                let recovery = (kind == EngineKind::Memory).then(crate::common::kv_snapshot::recovery_probe::Scope::start);
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+                if let Some(scope) = recovery { eprintln!("SCALE_RECOVERY phase=bulk stages={:?}", scope.stats()); }
                 line(
                     label,
                     "再冷重开",

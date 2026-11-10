@@ -261,6 +261,72 @@ pub(crate) mod snapshot_probe {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod io_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+fn snapshot_buffer_size(snapshot: bool) -> usize {
+    #[cfg(test)]
+    if io_reference::enabled() { return 8 * 1024; }
+    if snapshot { 256 * 1024 } else { 8 * 1024 }
+}
+
+#[cfg(test)]
+pub(crate) mod recovery_probe {
+    use std::{assert, cell::RefCell, thread_local, time::Instant};
+    #[derive(Debug, Clone, Default)]
+    pub struct Stats {
+        pub total_ns: u128,
+        pub verify_ns: u128,
+        pub decode_ns: u128,
+        pub replay_ns: u128,
+        pub reads: u64,
+    }
+    thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
+    pub struct Scope;
+    impl Scope {
+        pub fn start() -> Self { ACTIVE.with(|s| { assert!(s.borrow().is_none()); *s.borrow_mut() = Some(Stats::default()); }); Self }
+        pub fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().as_ref().unwrap().clone()) }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
+    pub enum Kind { Total, Verify, Records, Replay }
+    pub struct Timer { kind: Kind, start: Instant, replay_before: u128 }
+    impl Timer {
+        pub fn start(kind: Kind) -> Option<Self> {
+            ACTIVE.with(|s| s.borrow().as_ref().map(|stats| Self { kind, start: Instant::now(), replay_before: stats.replay_ns }))
+        }
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            let ns = self.start.elapsed().as_nanos();
+            ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+                match self.kind {
+                    Kind::Total => stats.total_ns += ns,
+                    Kind::Verify => stats.verify_ns += ns,
+                    Kind::Records => stats.decode_ns += ns.saturating_sub(stats.replay_ns - self.replay_before),
+                    Kind::Replay => stats.replay_ns += ns,
+                }
+            });
+        }
+    }
+    pub struct Input(pub std::fs::File);
+    impl std::io::Read for Input {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.reads += 1; });
+            std::io::Read::read(&mut self.0, bytes)
+        }
+    }
+    impl std::io::Seek for Input {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> { std::io::Seek::seek(&mut self.0, pos) }
+    }
+}
+
 impl BinWriter {
     pub fn create(path: &Path, with_seq: bool) -> std::io::Result<Self> {
         Self::create_shape(path, with_seq, false)
@@ -305,8 +371,7 @@ impl BinWriter {
             #[cfg(test)]
             stats: snapshot_probe::Stats::default(),
         };
-        // Keep the existing 8 KiB buffer: the A/B isolates CRC placement.
-        let mut w = BufWriter::new(sink);
+        let mut w = BufWriter::with_capacity(snapshot_buffer_size(checked), sink);
         w.write_all(magic)?;
         #[cfg(test)]
         if w.get_ref().legacy_fields && checked {
@@ -648,7 +713,9 @@ fn read_bin_policy(path: &Path, on: &mut dyn FnMut(KvRecord) -> bool,
     use std::io::{Read, Seek, SeekFrom};
     let file = File::open(path)?;
     let length = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
+    #[cfg(test)]
+    let file = recovery_probe::Input(file);
+    let mut reader = BufReader::with_capacity(snapshot_buffer_size(strict), file);
     if length < 8 { return Err(snapshot_invalid("文件过短")); }
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
@@ -662,6 +729,8 @@ fn read_bin_policy(path: &Path, on: &mut dyn FnMut(KvRecord) -> bool,
     // prepass prevents an importer from committing a corrupt file's prefix.
     let checked = &magic == BIN_MAGIC_V4;
     let (body_len, expected) = if checked {
+        #[cfg(test)]
+        let _timer = recovery_probe::Timer::start(recovery_probe::Kind::Verify);
         if length < 24 { return Err(snapshot_invalid("missing snapshot footer")); }
         reader.seek(SeekFrom::Start(0))?;
         let mut remaining = length - 16;
@@ -682,6 +751,8 @@ fn read_bin_policy(path: &Path, on: &mut dyn FnMut(KvRecord) -> bool,
         reader.seek(SeekFrom::Start(8))?;
         (length - 24, Some(u64::from_le_bytes(footer[4..12].try_into().unwrap())))
     } else { (length - 8, None) };
+    #[cfg(test)]
+    let _timer = recovery_probe::Timer::start(recovery_probe::Kind::Records);
     read_bin_records(&mut reader, body_len, with_seq, with_expire, strict || checked, expected, on)
 }
 
@@ -895,6 +966,38 @@ fn parse_jsonl_line(line: &str) -> Result<(String, Option<String>), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_io_buffer_bounds_real_writes() {
+        use super::*;
+        let path = crate::common::ScratchPath::new("snapshot", "io_buffer", ".bxp");
+        let mut reference_bytes = None;
+        for reference in [true, false] {
+            let _mode = reference.then(io_reference::Scope::start);
+            let scope = snapshot_probe::Scope::start(false);
+            atomic_write_bin_v4(&path, |w| {
+                for i in 0u64..20_000 {
+                    w.write(&KvRecord::new(i.to_be_bytes().to_vec(), Some(vec![7; 64])))?;
+                }
+                Ok(())
+            }).unwrap();
+            let writes = scope.stats().write_calls;
+            if reference { assert!(writes > 100); } else { assert!(writes <= 8); }
+            let bytes = std::fs::read(&path).unwrap();
+            if reference { reference_bytes = Some(bytes); }
+            else { assert_eq!(Some(bytes), reference_bytes); }
+            let recovery = recovery_probe::Scope::start();
+            let mut seen = 0u64;
+            read_snapshot_with(&path, &mut |row| {
+                assert_eq!(row.key, seen.to_be_bytes());
+                assert_eq!(row.value, Some(vec![7; 64]));
+                seen += 1; true
+            }).unwrap();
+            assert_eq!(seen, 20_000);
+            let reads = recovery.stats().reads;
+            if reference { assert!(reads > 100); } else { assert!(reads < 30); }
+        }
+    }
+
     #[test]
     fn snapshot_buffered_crc_matches_reference_and_batches_calls() {
         use super::*;
