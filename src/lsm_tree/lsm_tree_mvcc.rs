@@ -41,7 +41,7 @@ use std::{
     },
 };
 
-use crate::lsm_tree::lsm_tree::{LSMTree, LSMTreeOptions};
+use crate::lsm_tree::lsm_tree::{BlobGcPlan, LSMTree, LSMTreeOptions};
 use crate::lsm_tree::storage::{lock_path, wal_path, FileLock};
 use crate::lsm_tree::wal::{analyze_recovery, Wal, WalRecord};
 pub use crate::common::{
@@ -323,7 +323,11 @@ impl MVCC {
     /// 不跑维护器就等下一次写或手动 `vacuum()`。
     /// LSM 的一片是「每个源各读 slice 行」的窗口，块读取代价由稀疏索引压住。
     fn tick_auto_vacuum(&self) {
-        if let Err(e) = self.vac.run_pending(|after, rows| self.vacuum_bounded(after, rows)) {
+        if let Err(e) = self.vac.run_pending(|after, rows| {
+            #[cfg(test)]
+            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::AutoVacuum);
+            self.vacuum_bounded(after, rows)
+        }) {
             log::warn!("自动版本回收失败，保留待回收账: {e}");
         }
     }
@@ -652,6 +656,8 @@ impl MVCC {
         // O(全库) 的账一起塌成 O(一块)。块间下界用 `enc ‖ 0x00`（严格后继方向，⚠️ 不是
         // `‖ 0xFF×8` 那种右界写法），与 bitcask 那条同源、同一个理由。
         let full_sweep = budget_rows == u64::MAX;
+        let blob_plan = kv.blob_gc_plan(full_sweep)?;
+        let collect_refs = blob_plan == BlobGcPlan::ScanReferences;
         let mut groups: crate::common::order::KeyWindow<Vec<(u64, Vec<u8>, bool, ())>> = crate::common::order::KeyWindow::new();
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
         let mut keep_enc: Vec<Vec<u8>> = Vec::new();
@@ -663,6 +669,8 @@ impl MVCC {
         let mut budget_cut = false;
         let mut lower: Option<Vec<u8>> = after.map(|k| k.to_vec());
         loop {
+            #[cfg(test)]
+            let scan_timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumScan);
             let mut chunk_rows = 0usize;
             let mut next_lower: Option<Vec<u8>> = None;
             let mut done = false;
@@ -681,7 +689,7 @@ impl MVCC {
                     while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
                         let (d, k) = vacuum_plan_group(&mut group, xmin);
                         to_delete.extend(d);
-                        if full_sweep { keep_enc.extend(k.into_iter().map(|(enc, _)| enc)); }
+                        if collect_refs { keep_enc.extend(k.into_iter().map(|(enc, _)| enc)); }
                         cur_raw = Some(key);
                     }
                     // Stop only after the complete overlapping prefix window is finalized.
@@ -710,17 +718,23 @@ impl MVCC {
                 while let Some((key, mut group)) = groups.pop_first() {
                     let (d, k) = vacuum_plan_group(&mut group, xmin);
                     to_delete.extend(d);
-                    if full_sweep { keep_enc.extend(k.into_iter().map(|(enc, _)| enc)); }
+                    if collect_refs { keep_enc.extend(k.into_iter().map(|(enc, _)| enc)); }
                     cur_raw = Some(key);
                 }
             }
             #[cfg(test)]
             note_vac_pending(to_delete.len() + keep_enc.len());
+            #[cfg(test)]
+            drop(scan_timer);
+            #[cfg(test)]
+            let delete_timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumDelete);
             for enc in to_delete.drain(..) {
                 let _ = kv.remove(&enc);
                 removed += 1;
             }
-            if full_sweep {
+            #[cfg(test)]
+            drop(delete_timer);
+            if collect_refs {
                 kv.collect_blob_refs(&keep_enc, &mut referenced);
                 keep_enc.clear();
             }
@@ -740,8 +754,12 @@ impl MVCC {
         // 新事务仍可能看见 version < xmin；删除屏障必须在跨层压实时保留，直到被遮住的
         // 旧来源一起参与合并。不能仅凭版本小于 xmin 就宣称它不可见。
         let mut blob_rewritten = None;
-        if budget_rows == u64::MAX {
+        if full_sweep {
+            #[cfg(test)]
+            let sync_timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
             kv.flush()?;
+            #[cfg(test)]
+            drop(sync_timer);
             #[cfg(test)]
             {
                 vac_base = crate::mem_probe::stage_mark(1, vac_base);
@@ -755,7 +773,10 @@ impl MVCC {
             // 「还有没有人在引用这个 blob」是个全库问题。引用集合是上面逐块并进来的，
             // 这里只剩"按集合删孤儿文件"那一半（`gc_blobs` 那个收整张清单的入口仍然在，
             // 它就是这两半的壳）。
-            blob_rewritten = Some(kv.gc_blobs_referenced(&referenced)? > 0);
+            blob_rewritten = Some(match blob_plan {
+                BlobGcPlan::ScanReferences => kv.gc_blobs_referenced(&referenced)? > 0,
+                BlobGcPlan::NoFiles | BlobGcPlan::SkipBounded => false,
+            });
             #[cfg(test)]
             {
                 let _ = crate::mem_probe::stage_mark(2, vac_base);
@@ -2746,8 +2767,14 @@ mod tests {
             }
             assert_eq!(blob_count(&mvcc), CHAIN as usize, "每版都该是一个独立的 blob 文件");
 
+            mvcc.try_checkpoint().unwrap();
+            drop(mvcc);
+            let mvcc = MVCC::open(&path);
+            let probe = crate::common::maintenance_probe::Scope::start();
+
             // 有界轮次不动 blob 文件：全库收尾只属于 vacuum()
             let slice = mvcc.vacuum_bounded(None, 4).unwrap();
+            assert_eq!(probe.stats().blob_point_reads, 0, "bounded vacuum must not scan blob references");
             assert!(slice.next_cursor.is_some() || slice.stats.versions_removed > 0);
             assert_eq!(
                 blob_count(&mvcc),
@@ -2756,6 +2783,7 @@ mod tests {
             );
 
             let stats = mvcc.vacuum().unwrap();
+            assert!(probe.stats().blob_point_reads > 0, "existing blob files must keep reference collection");
             // 上一片可能已经裁掉过几版，所以按两轮之和核总账
             assert!(
                 slice.stats.versions_removed + stats.versions_removed >= CHAIN as usize - 1,
@@ -2773,6 +2801,74 @@ mod tests {
             tx.commit();
         }
         cleanup(&path);
+    }
+
+    #[test]
+    fn vacuum_without_blobs_does_not_point_read_survivors() {
+        let path = tmp_db("vac_no_blob");
+        let mvcc = MVCC::open(&path);
+        mvcc.set_vacuum_auto_slice(0);
+        for version in 0..2 {
+            let tx = mvcc.begin_transaction();
+            for i in 0..100 {
+                assert!(tx.set_raw(format!("k{i:04}").as_bytes(), vec![version; 24]));
+            }
+            tx.commit();
+        }
+        mvcc.flush();
+        let probe = crate::common::maintenance_probe::Scope::start();
+        let stats = mvcc.vacuum().unwrap();
+        assert_eq!(stats.versions_removed, 100);
+        assert_eq!(stats.blob_rewritten, Some(false));
+        assert_eq!(probe.stats().blob_point_reads, 0, "no blob files means no references to collect");
+        {
+            let _reference = crate::lsm_tree::lsm_tree::blob_reference::Scope::start();
+            mvcc.vacuum().unwrap();
+        }
+        assert_eq!(probe.stats().blob_point_reads, 100, "old path must still exercise every survivor lookup");
+        std::fs::create_dir(path.join("blobs")).unwrap();
+        mvcc.vacuum().unwrap();
+        let keep: Vec<_> = (0..100).map(|i| encode_key(format!("k{i:04}").as_bytes(), 1)).collect();
+        assert_eq!(mvcc.kv.lock().unwrap().gc_blobs(&keep).unwrap(), 0);
+        assert_eq!(probe.stats().blob_point_reads, 100, "empty directory and public GC must also skip reads");
+        let tx = mvcc.begin_transaction();
+        for i in 0..100 { assert_eq!(tx.get(format!("k{i:04}").as_bytes()), Some(vec![1; 24])); }
+        tx.commit();
+    }
+
+    #[test]
+    fn blob_gc_rechecks_after_writes_and_rejects_directory_errors() {
+        let path = tmp_db("blob_recheck");
+        let mvcc = MVCC::open(&path);
+        mvcc.set_vacuum_auto_slice(0);
+        assert_eq!(mvcc.vacuum().unwrap().blob_rewritten, Some(false));
+        for version in 0..2 {
+            let tx = mvcc.begin_transaction();
+            assert!(tx.set_raw(b"small", vec![version; 24]));
+            tx.commit();
+        }
+        // A file at the directory path is a deterministic read_dir error on
+        // both supported hosts, unlike permission bits when running as admin.
+        std::fs::write(path.join("blobs"), b"not a directory").unwrap();
+        assert!(mvcc.vacuum().is_err());
+        assert_eq!(mvcc.health().total_rows, 2, "probe failure must precede deletion");
+        assert!(mvcc.kv.lock().unwrap().gc_blobs(&[]).is_err());
+        let slice = mvcc.vacuum_bounded(None, 1).unwrap();
+        assert_eq!(slice.stats.blob_rewritten, None);
+        std::fs::remove_file(path.join("blobs")).unwrap();
+
+        let tx = mvcc.begin_transaction();
+        assert!(tx.set_raw(b"big", vec![7; 8192]));
+        tx.commit();
+        std::fs::write(path.join("blobs").join("18446744073709551615.blob"), b"orphan").unwrap();
+        let probe = crate::common::maintenance_probe::Scope::start();
+        assert_eq!(mvcc.vacuum().unwrap().blob_rewritten, Some(true));
+        assert_eq!(probe.stats().blob_point_reads, 2, "previously empty does not mean always empty");
+        assert_eq!(std::fs::read_dir(path.join("blobs")).unwrap().count(), 1);
+        let tx = mvcc.begin_transaction();
+        assert_eq!(tx.get(b"big"), Some(vec![7; 8192]));
+        assert_eq!(tx.get(b"small"), Some(vec![1; 24]));
+        tx.commit();
     }
 
     /// 有界回收：每轮只碰一小段，多轮跑完必须和一次全库 vacuum 得到**同样**的结果。

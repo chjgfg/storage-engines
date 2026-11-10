@@ -45,6 +45,23 @@ impl<I: Iterator> Iterator for Stoppeable<I> {
     }
 }
 
+/// A bounded slice cannot establish global reachability. Only a confirmed
+/// empty/missing directory can skip reference reads in a full sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlobGcPlan { SkipBounded, NoFiles, ScanReferences }
+
+#[cfg(test)]
+pub(crate) mod blob_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
 // ─── Options ─────────────────────────────────────────────────────────────────
 
 /// 引擎可调参数（可在运行时通过 [`LSMTree::set_options`] 热更新部分字段）
@@ -945,9 +962,27 @@ impl LSMTree {
     /// 保守方向是「宁可留着也不删错」：删掉一个仍被引用的 blob 是**丢数据**，
     /// 留着一个没人引用的 blob 只是占空间。
     pub fn gc_blobs(&self, keep: &[Vec<u8>]) -> std::io::Result<usize> {
+        if self.blob_gc_plan(true)? != BlobGcPlan::ScanReferences { return Ok(0); }
         let mut referenced: HashSet<u64> = HashSet::new();
         self.collect_blob_refs(keep, &mut referenced);
         self.gc_blobs_referenced(&referenced)
+    }
+
+    /// Recheck on every full sweep; an earlier empty directory says nothing
+    /// about blobs written since. Caller holds the tree lock through the sweep.
+    pub(crate) fn blob_gc_plan(&self, full_sweep: bool) -> std::io::Result<BlobGcPlan> {
+        if !full_sweep { return Ok(BlobGcPlan::SkipBounded); }
+        let plan = match fs::read_dir(self.dir.join("blobs")) {
+            Ok(mut entries) => match entries.next().transpose()? {
+                None => BlobGcPlan::NoFiles,
+                Some(_) => BlobGcPlan::ScanReferences,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BlobGcPlan::NoFiles,
+            Err(e) => return Err(e),
+        };
+        #[cfg(test)]
+        if blob_reference::enabled() { return Ok(BlobGcPlan::ScanReferences); }
+        Ok(plan)
     }
 
     /// [`Self::gc_blobs`] 的前半段：把这批保留行引用的 blob `seq` 并进 `into`。
@@ -957,7 +992,11 @@ impl LSMTree {
     /// 留下的 `referenced` 只数**真有大 value 的行**（一个 `u64` 一条）。
     /// 判据与 `gc_blobs` 同一个口径（这份就是它原来的那段循环，没第二条实现）。
     pub(crate) fn collect_blob_refs(&self, keep: &[Vec<u8>], into: &mut HashSet<u64>) {
+        #[cfg(test)]
+        let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumBlobRefs);
         for enc in keep {
+            #[cfg(test)]
+            crate::common::maintenance_probe::note_blob_read();
             // 外层 None = 这行已经不在；内层 None = Drop 墓碑（墓碑不引用任何 blob）
             // ⚠️ 这里刻意用**不解析**的 get_raw_key_at：GC 靠指针字节认引用，解析就认不出来了
             let Some(Some(val)) = self.get_raw_key_at(enc, u64::MAX) else {
@@ -972,12 +1011,17 @@ impl LSMTree {
     /// [`Self::gc_blobs`] 的后半段：拿着"还被引用的 seq 集合"去删没人引用的 blob 文件。
     /// 保守方向不变：宁可留着也不删错（删掉被引用的是**丢数据**）。
     pub(crate) fn gc_blobs_referenced(&self, referenced: &HashSet<u64>) -> std::io::Result<usize> {
+        #[cfg(test)]
+        let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumBlobGc);
         let blob_dir = self.dir.join("blobs");
-        let Ok(rd) = fs::read_dir(&blob_dir) else {
-            return Ok(0); // 从没写过大数据 ⇒ 没有旁路目录，正常
+        let rd = match fs::read_dir(&blob_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
         };
         let mut removed = 0usize;
-        for ent in rd.flatten() {
+        for ent in rd {
+            let ent = ent?;
             let name = ent.file_name();
             let name = name.to_string_lossy();
             // 文件名是 `{seq:016}.blob`：十进制零填充

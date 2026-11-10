@@ -5724,6 +5724,9 @@ mod tests {
         let rows: usize = std::env::var("RECHECK_ROWS").map(|s| s.parse().unwrap()).unwrap_or(10_000_000);
         let rounds: usize = std::env::var("RECHECK_ROUNDS").map(|s| s.parse().unwrap()).unwrap_or(2);
         let name = std::env::var("RECHECK_ENGINE").unwrap_or_else(|_| "memory".to_string());
+        let compare_blobs = std::env::var("RECHECK_BLOB_COMPARE").is_ok_and(|v| v == "1");
+        assert!(!compare_blobs || (name == "lsm_tree" && rounds % 4 == 0),
+            "blob comparison requires lsm_tree and complete old/new/new/old rounds");
         let kind = match name.as_str() {
             "memory" => EngineKind::Memory,
             "lsm_tree" => EngineKind::LsmTree,
@@ -5775,12 +5778,18 @@ mod tests {
             let auto_removed = db.reclamation_status().unwrap().versions_removed;
             assert_eq!(auto_removed + health.rows_above_one, updates as u64,
                 "old versions reappeared after automatic reclamation/compaction");
+            let reference = compare_blobs && (round % 4 == 0 || round % 4 == 3);
+            let blob_reference = reference.then(crate::lsm_tree::lsm_tree::blob_reference::Scope::start);
             let stages = crate::common::maintenance_probe::Scope::start();
             let start = std::time::Instant::now();
             let vacuum = db.vacuum().unwrap();
-            eprintln!("RECHECK_VACUUM engine={name} round={round} seconds={:.6} stats={vacuum:?}", start.elapsed().as_secs_f64());
+            eprintln!("RECHECK_VACUUM engine={name} round={round} reference={reference} seconds={:.6} stats={vacuum:?}", start.elapsed().as_secs_f64());
             eprintln!("RECHECK_VACUUM_STAGES engine={name} round={round} doors={:?}", stages.stats());
+            if kind == EngineKind::LsmTree {
+                assert_eq!(stages.stats().blob_point_reads, if reference { rows as u64 } else { 0 });
+            }
             drop(stages);
+            drop(blob_reference);
             assert!(!vacuum.skipped_active_txn);
             assert_eq!(vacuum.versions_removed as u64, health.rows_above_one);
             scale_note_maintenance(&*db, "vacuum", &scope);

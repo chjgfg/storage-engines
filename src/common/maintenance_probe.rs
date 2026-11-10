@@ -2,25 +2,30 @@
 use std::{assert, cell::RefCell, thread_local, time::Instant};
 
 #[derive(Clone, Copy)]
-pub(crate) enum Stage { Checkpoint, Commit, AutoVacuum, VacuumScan, VacuumDelete, VacuumSync }
+pub(crate) enum Stage { Checkpoint, Commit, AutoVacuum, VacuumScan, VacuumDelete, VacuumSync, VacuumBlobRefs, VacuumBlobGc }
 
 #[derive(Clone, Default)]
 pub(crate) struct Stats {
-    pub ns: [u128; 6],
-    pub calls: [u64; 6],
+    pub ns: [u128; 8],
+    pub calls: [u64; 8],
+    pub blob_point_reads: u64,
 }
 
 impl std::fmt::Debug for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = f.debug_struct("MaintenanceMs");
-        for (i, name) in ["checkpoint", "commit", "auto_vacuum", "vacuum_scan", "vacuum_delete", "vacuum_sync"].into_iter().enumerate() {
+        for (i, name) in ["checkpoint", "commit", "auto_vacuum", "vacuum_scan", "vacuum_delete", "vacuum_sync", "vacuum_blob_refs", "vacuum_blob_gc"].into_iter().enumerate() {
             out.field(name, &(self.calls[i], self.ns[i] as f64 / 1e6));
         }
-        out.finish()
+        out.field("blob_point_reads", &self.blob_point_reads).finish()
     }
 }
 
 thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
+
+pub(crate) fn note_blob_read() {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.blob_point_reads += 1; });
+}
 
 pub(crate) struct Scope;
 impl Scope {
