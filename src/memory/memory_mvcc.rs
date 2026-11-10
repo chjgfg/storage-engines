@@ -140,7 +140,7 @@ impl MVCC {
     /// 读入快照并重放。三条硬规矩都是这个仓库一路在收的东西：
     /// ① **已过期的行不许复活**（拿文件里的绝对 expire 与 now 比，不信任"它当时是活的"）；
     /// ② 按页一事务（照 `migrate` 的写侧），不把两千万行攒进一个写集；
-    /// ③ TTL 按"expire − now"起算 —— 与 `migrate` 同式，文件里那个剩余时长早就过期了。
+    /// ③ TTL 保留文件内绝对到期时刻；不把重放耗时加回剩余寿命。
     fn load_snapshot_from(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         if !path.exists() {
             return Ok(());
@@ -203,6 +203,36 @@ impl MVCC {
     /// 借用检查在两件事之间反复；而"攒满一页就冲"与"收尾把剩的冲掉"必须是**同一份**代码，
     /// 否则尾巴那半页会静默不写（本仓库收过这类账）。
     fn replay_page(
+        mvcc: &MVCC,
+        batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
+    ) -> Option<std::io::Error> {
+        #[cfg(test)]
+        if replay_reference::enabled() { return Self::replay_page_reference(mvcc, batch); }
+        if batch.is_empty() { return None; }
+        let tx = mvcc.begin_transaction();
+        let mut bad = None;
+        {
+            // open_with_snapshot has not published this instance. Keep the same
+            // page transaction/conflict checks, taking registry -> store once.
+            let mut reg = tx.core.lock_registry();
+            let mut side = mvcc.store.lock().unwrap();
+            for (key, value, expire) in batch.drain(..) {
+                let logical = value.map(|v| match expire {
+                    Some(e) => crate::common::pack_ttl(&v, e),
+                    None => crate::common::pack_plain(&v),
+                });
+                if tx.core.try_write(&mut reg, &mut *side, &key, logical).is_err() && bad.is_none() {
+                    bad = Some(key);
+                }
+            }
+        }
+        tx.commit();
+        bad.map(|key| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("快照重放被引擎拒收: {key:?}")))
+    }
+
+    #[cfg(test)]
+    fn replay_page_reference(
         mvcc: &MVCC,
         batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
     ) -> Option<std::io::Error> {
@@ -771,6 +801,8 @@ impl Transaction {
     }
 
     fn try_write(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<(), crate::WriteError> {
+        #[cfg(test)]
+        replay_reference::note_row_lock();
         // 锁序：先活跃表，再存储侧（理由见 [`crate::common::TxnCore`] 的模块头）。
         // 那 8 步序列（冲突判定 → 编码 → WAL → 落行 → 写集登记）在 [`TxnCore::write`] 里，四引擎一份。
         let mut reg = self.core.lock_registry();
@@ -812,6 +844,33 @@ impl Transaction {
     /// （版本大端接在 key 后面 ⇒ 组内升序）。在半截组上收手会把旧版本当成最新行。
     /// 返回的 `bool` = 是否已走到界尾（`false` = 是被 `budget` 拦下的，还能续跑）。
     pub(crate) fn scan_candidates(
+        &self, start: Option<&[u8]>, end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
+        #[cfg(test)]
+        if scan_reference::enabled() {
+            return self.scan_candidates_reference(start, end, accept, after, budget);
+        }
+        let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
+        let lo = crate::common::fold_lower_bound(start, after);
+        let store = self.store.lock().unwrap();
+        let mut fold = crate::common::order::CandidateFold::new(
+            start, end, after, accept, self.core.version, budget);
+        for (enc, value) in store.iter_entries_in(lo, hi.as_deref()) {
+            #[cfg(test)]
+            FOLD_KEYS.with(|c| c.set(c.get() + 1));
+            // Retain a reference while selecting winners. Clone only final
+            // winners under the same store lock; no second tree search.
+            if fold.push(enc, |v| self.is_visible(v), || value) { break; }
+        }
+        let (rows, complete) = fold.finish();
+        (rows.into_iter().map(|c| crate::common::WinCandidate {
+            key: c.key, version: c.version, row: c.row.clone(),
+        }).collect(), complete)
+    }
+
+    #[cfg(test)]
+    fn scan_candidates_reference(
         &self, start: Option<&[u8]>, end: Option<&[u8]>,
         accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
     ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
@@ -920,6 +979,35 @@ impl Transaction {
             decode_key(enc).is_some_and(|vk| vk.raw_key.as_slice() == key && accept(vk.version))
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) mod scan_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod replay_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ROW_LOCKS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) fn note_row_lock() { ROW_LOCKS.with(|c| c.set(c.get() + 1)); }
+    pub(crate) fn row_locks() -> u64 { ROW_LOCKS.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
 }
 
 #[cfg(test)]

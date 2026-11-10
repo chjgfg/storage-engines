@@ -22,7 +22,11 @@ use std::ops::Bound;
 #[cfg(test)]
 thread_local! {
     static ROWS_TOUCHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static POINT_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+#[cfg(test)]
+pub(crate) fn point_lookups() -> u64 { POINT_LOOKUPS.with(|c| c.get()) }
 
 /// 当前线程已访问的行数（测试探针用）
 #[cfg(test)]
@@ -76,6 +80,8 @@ impl MemStore {
 
     /// 精确查找
     pub fn get(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
+        #[cfg(test)]
+        POINT_LOOKUPS.with(|c| c.set(c.get() + 1));
         self.data.get(key)
     }
 
@@ -194,6 +200,14 @@ impl MemStore {
         self.data
             .range::<[u8], _>((lo, hi))
             .map(|(k, _v)| k)
+    }
+
+    pub(crate) fn iter_entries_in(&self, from: Option<&[u8]>, to: Option<&[u8]>)
+        -> impl Iterator<Item = (&Vec<u8>, &Option<Vec<u8>>)> + '_ {
+        self.data.range::<[u8], _>((
+            from.map_or(Bound::Unbounded, Bound::Included),
+            to.map_or(Bound::Unbounded, Bound::Excluded),
+        ))
     }
 
     /// 全表有序迭代（克隆 value，教学清晰）

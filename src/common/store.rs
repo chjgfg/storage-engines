@@ -215,7 +215,7 @@ where
                 // 出口必须把 TTL 一起带出去：只交用户字节 = 导入侧无从重打信封 ⇒ 键变永久。
                 // 多解一次信封（1 个标签字节 + 8 字节）换的是"搬一次少一批到期时刻"。
                 // ⚠️ 取账要在 `unseal(bytes)` 把字节交出去**之前** —— 那之后 `bytes` 就没了。
-                let expire = decode_value_meta(&bytes).expire_unix_secs();
+                let expire = crate::common::codec::logical_expiry(&bytes);
                 match unseal(bytes) {
                     Some(user) => Some(ExportRecord { key, value: Some(user), expire_unix_secs: expire }),
                     None => {
@@ -296,7 +296,7 @@ fn record_of<S: VersionedStore>(
         // 逻辑值还要剥一次信封；过期与墓碑同待（只在 include_deleted 时出现）
         RowValue::Value(logical) => {
             // 取账要在 `logical_to_user` 收走字节之前（同上，`bytes`/`logical` 都是移动语义）
-            let expire = decode_value_meta(&logical).expire_unix_secs();
+            let expire = crate::common::codec::logical_expiry(&logical);
             match logical_to_user(logical) {
                 Some(user) => Some(ExportRecord { key, value: Some(user), expire_unix_secs: expire }),
                 None => include_deleted.then_some(ExportRecord::new(key, None)),
@@ -412,7 +412,7 @@ pub fn search_page_walk<S: VersionedStore>(
             if items.len() < page_size {
                 items.push(ExportRecord {
                     key,
-                    expire_unix_secs: logical.as_ref().and_then(|l| decode_value_meta(l).expire_unix_secs()),
+                    expire_unix_secs: logical.as_ref().and_then(|l| crate::common::codec::logical_expiry(l)),
                     value: logical.and_then(logical_to_user),
                 });
                 return true;

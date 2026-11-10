@@ -5240,6 +5240,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn memory_export_does_not_reseek_each_winner() {
+        let db = open_engine(EngineKind::Memory, None).unwrap();
+        let tx = db.begin();
+        for i in 0..2001 { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+        tx.commit();
+        let before = crate::memory::mem_store::point_lookups();
+        let mut seen = 0;
+        db.export_latest_visible_for_each(false, &mut |record| {
+            assert_eq!(record.key, scale_key(seen));
+            assert_eq!(record.value, Some(scale_val(seen)));
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, 2001);
+        assert_eq!(crate::memory::mem_store::point_lookups() - before, 0);
+        let _reference = crate::memory::memory_mvcc::scan_reference::Scope::start();
+        let before = crate::memory::mem_store::point_lookups();
+        assert_eq!(db.export_latest_visible_for_each(false, &mut |_| true), 2001);
+        assert_eq!(crate::memory::mem_store::point_lookups() - before, 2001,
+            "reference must still exercise one lookup per winner");
+    }
+
+    #[test]
+    #[ignore = "snapshot scan old/new/new/old; release single thread"]
+    fn memory_snapshot_scan_cost() {
+        use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        let mut allocations = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("snapshot_scan");
+            let db = open_engine(EngineKind::Memory, Some(&dir.0)).unwrap();
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin();
+                for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.commit();
+            }
+            let mode = reference.then(crate::memory::memory_mvcc::scan_reference::Scope::start);
+            let probe = snapshot_probe::Scope::start(false);
+            let before = crate::mem_probe::allocations();
+            let lookups = crate::memory::mem_store::point_lookups();
+            let start = std::time::Instant::now();
+            drop(db);
+            let seconds = start.elapsed().as_secs_f64();
+            let allocs = crate::mem_probe::allocations() - before;
+            let lookups = crate::memory::mem_store::point_lookups() - lookups;
+            allocations.push(allocs);
+            eprintln!("SNAPSHOT_SCAN round={round} reference={reference} rows={rows} seconds={seconds:.6} allocations={allocs} lookups={lookups} stages={:?}", probe.stats());
+            assert_eq!(lookups, if reference { rows as u64 } else { 0 });
+            drop(probe); drop(mode);
+            let mut seen = 0;
+            read_snapshot_with(&dir.0.join("snapshot.bxp"), &mut |record| {
+                assert_eq!(record.key, scale_key(seen));
+                assert_eq!(record.value, Some(scale_val(seen)));
+                assert_eq!(record.expire_unix_secs, None);
+                seen += 1; true
+            }).unwrap();
+            assert_eq!(seen, rows);
+            let replay_mode = reference.then(crate::memory::memory_mvcc::replay_reference::Scope::start);
+            let locks = crate::memory::memory_mvcc::replay_reference::row_locks();
+            let start = std::time::Instant::now();
+            let db = open_engine(EngineKind::Memory, Some(&dir.0)).unwrap();
+            let seconds = start.elapsed().as_secs_f64();
+            let locks = crate::memory::memory_mvcc::replay_reference::row_locks() - locks;
+            eprintln!("SNAPSHOT_REPLAY round={round} reference={reference} rows={rows} seconds={seconds:.6} row_lock_pairs={locks}");
+            assert_eq!(locks, if reference { rows as u64 } else { 0 });
+            drop(replay_mode);
+            let mut seen = 0;
+            db.export_latest_visible_for_each(false, &mut |record| {
+                assert_eq!(record.key, scale_key(seen));
+                assert_eq!(record.value, Some(scale_val(seen)));
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+        }
+        assert!(allocations[1] + rows as u64 / 2 < allocations[0]);
+        assert!(allocations[2] + rows as u64 / 2 < allocations[3]);
+    }
+
     /// TTL 两格仍量真实 set/get；紧接着在计时外去掉期限，而非把期限调得更长。
     /// 必须先验值再 persist（不是 set_raw 重播种），缺失/过期/损坏不能被修补后蒙混过关。
     fn scale_persist_auxiliary(db: &dyn KvEngine, rows: usize) {

@@ -3203,6 +3203,16 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
 
+        check_oversized_hint(false);
+    }
+
+    #[test]
+    #[ignore = "process allocator delta; run alone with --test-threads=1"]
+    fn hint_rejected_file_heap_growth() {
+        check_oversized_hint(true);
+    }
+
+    fn check_oversized_hint(measure_heap: bool) {
         // ⑥ 端到端：把头部那个声明值改成 `u64::MAX` 的坏 hint —— 读它必须**报错**，
         //    而不是按声明值先做一次巨大分配（这条就是那条界在真实路径上的样子）
         let path = tmp_log("hint_bound_lie");
@@ -3220,11 +3230,10 @@ mod tests {
         let before = crate::mem_probe::live() as i64;
         hint_reserve_reset();
         let bad = read_hint_file(&hint).err().expect("条目数被吹大的 hint 要报错");
-        let grew = crate::mem_probe::live() as i64 - before;
-        assert!(
-            grew < 1 << 16,
-            "坏 hint 读失败前多占了 {grew} B ⇒ 预留没被文件字节数夹住"
-        );
+        if measure_heap {
+            let grew = crate::mem_probe::live() as i64 - before;
+            assert!(grew < 1 << 16, "坏 hint 读失败前多占了 {grew} B ⇒ 预留没被文件字节数夹住");
+        }
         // 端到端那一半：门自己承认它预留了几条 —— 声明是 `u64::MAX`，界只能是"这文件装得下的 3 条"
         assert!(
             hint_reserve_noted() <= rows.len(),

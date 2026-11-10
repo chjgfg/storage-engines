@@ -47,36 +47,37 @@ pub fn pack_ttl(user: &[u8], expire_unix_secs: u64) -> Vec<u8> {
 
 /// 解码逻辑 value 字节
 pub fn decode_value_meta(logical: &[u8]) -> ValueMeta {
-    if logical.is_empty() {
-        return ValueMeta::Plain { user: Vec::new() };
-    }
-    match logical[0] {
-        VAL_META_PLAIN => ValueMeta::Plain {
-            user: logical[1..].to_vec(),
-        },
-        VAL_META_TTL if logical.len() >= 9 => {
-            let expire = u64::from_le_bytes(logical[1..9].try_into().unwrap());
-            ValueMeta::Ttl {
-                expire_unix_secs: expire,
-                user: logical[9..].to_vec(),
-            }
-        }
-        // 旧数据 / 无 tag：整段当用户 value
-        _ => ValueMeta::Plain {
-            user: logical.to_vec(),
-        },
+    let (offset, expire) = envelope(logical);
+    let user = logical[offset..].to_vec();
+    match expire {
+        Some(expire_unix_secs) => ValueMeta::Ttl { expire_unix_secs, user },
+        None => ValueMeta::Plain { user },
     }
 }
 
+// One parser for owned decoding, borrowed metadata and in-place unsealing.
+fn envelope(logical: &[u8]) -> (usize, Option<u64>) {
+    match logical.first() {
+        Some(&VAL_META_PLAIN) => (1, None),
+        Some(&VAL_META_TTL) if logical.len() >= 9 =>
+            (9, Some(u64::from_le_bytes(logical[1..9].try_into().unwrap()))),
+        _ => (0, None),
+    }
+}
+
+pub(crate) fn logical_expiry(logical: &[u8]) -> Option<u64> { envelope(logical).1 }
+
 /// 逻辑 value → 用户可见 value；过期返回 None
-pub fn logical_to_user(logical: Vec<u8>) -> Option<Vec<u8>> {
-    let meta = decode_value_meta(&logical);
-    if meta.is_expired_at(now_unix_secs()) {
+pub fn logical_to_user(mut logical: Vec<u8>) -> Option<Vec<u8>> {
+    let (offset, expire) = envelope(&logical);
+    if expire.is_some_and(|e| now_unix_secs() >= e) {
         None
     } else {
         #[cfg(test)]
         note_user_value_copied();
-        Some(meta.user().to_vec())
+        logical.copy_within(offset.., 0);
+        logical.truncate(logical.len() - offset);
+        Some(logical)
     }
 }
 
@@ -86,16 +87,7 @@ pub fn logical_to_user(logical: Vec<u8>) -> Option<Vec<u8>> {
 /// 要付的应当只有这一判。判据与它**逐条对齐**（空 → 永久；`0x00` → 永久；`0x01` 且长度够
 /// → 看 8 字节小端 `expire`，`now >= expire` 算过期；其余按旧数据的裸 value = 永久）。
 pub fn logical_is_live(logical: &[u8]) -> bool {
-    if logical.len() < 1 {
-        return true;
-    }
-    match logical[0] {
-        VAL_META_TTL if logical.len() >= 9 => {
-            let expire = u64::from_le_bytes(logical[1..9].try_into().unwrap());
-            now_unix_secs() < expire
-        }
-        _ => true,
-    }
+    logical_expiry(logical).is_none_or(|expire| now_unix_secs() < expire)
 }
 
 // 测试专用（M35 的尺子）：**用户字节被拷出来过几次**。
@@ -120,6 +112,36 @@ pub(crate) fn note_user_value_copied() {
 #[cfg(test)]
 pub(crate) fn user_value_copies() -> u64 {
     USER_VALUE_COPIES.with(|c| c.get())
+}
+
+#[cfg(test)]
+#[test]
+fn owned_unseal_reuses_allocation() {
+    use std::assert_eq;
+    for mut bytes in [pack_plain(b"payload"), pack_ttl(b"payload", u64::MAX), b"payload".to_vec()] {
+        bytes.reserve(64);
+        let pointer = bytes.as_ptr();
+        let user = logical_to_user(bytes).unwrap();
+        assert_eq!(user, b"payload");
+        assert_eq!(user.as_ptr(), pointer, "unsealing an owned buffer must reuse its allocation");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unseal_keeps_legacy_tags_and_exact_expiry() {
+    use std::{assert_eq, vec};
+    for (logical, expected) in [
+        (vec![], vec![]), (vec![0], vec![]), (vec![0, 0, 1], vec![0, 1]),
+        (vec![1, 2], vec![1, 2]), (vec![2, 0, 1], vec![2, 0, 1]),
+        (vec![1, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1], vec![0, 1]),
+    ] {
+        assert_eq!(decode_value_meta(&logical).user(), expected.as_slice());
+        assert_eq!(logical_to_user(logical), Some(expected));
+    }
+    let expired = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 42];
+    assert_eq!(logical_expiry(&expired), Some(0));
+    assert_eq!(logical_to_user(expired), None);
 }
 
 /// 解析用户 value 为 `i64`（计数器用）

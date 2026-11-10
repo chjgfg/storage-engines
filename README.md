@@ -3,11 +3,11 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M99 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M100 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
-- M97 库测试 **426 passed / 0 failed / 41 ignored**；集成测试 5 项、CLI 测试 8 项、文档测试 6 项通过，合计 445 项。
+- M100 库测试 **431 passed / 0 failed / 43 ignored**；M97 集成测试 5 项、CLI 测试 8 项、文档测试 6 项通过。
   Windows / Linux 全目标 all-features 编译检查通过；Linux 未运行测试。
   默认忽略的台架中，本轮单独运行了快照读取内存探针和 Bitcask 5M checkpoint 探针，详见更新日志。
 - 许可证：MIT 或 Apache-2.0 任选。
@@ -27,6 +27,7 @@ M97 补齐 bulk 重开全量种子验收与维护计量，并修复 LSM 压实�
 删除/TTL/过滤结果在外部旧来源仍可能存在时保留屏障；异常档复测入口见压测手册。
 M98 更正压测末页页码，并对返回页逐键逐值验收；历史深翻读数的解释修订见更新日志。
 M99 增加 B+ / memory 更新与回收分段计量；串行复测未复现 test5 慢档，暂不归因于单一代码路径。
+M100 导出借用 TTL 元数据、复用值缓冲；memory 扫描免逐键回查，快照恢复按页加锁，对照见更新日志。
 
 ## 引入方式
 
