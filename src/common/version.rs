@@ -109,7 +109,61 @@ pub(crate) fn reset_vacuum_group_counters() {
 ///
 /// 组是**取走**的（`std::mem::take`）⇒ 调用方那句之后手上的 `Vec` 已经空着可以接下一把键，
 /// 不需要自己再 `clear()`（四家各写一遍"判完记得清空"就是四个漏清空的機會）。
-pub fn vacuum_plan_group<V, R>(
+pub fn vacuum_plan_group<V: Clone, R: Clone>(
+    group: &mut Vec<(u64, V, bool, R)>, xmin: u64,
+) -> (Vec<V>, Vec<(V, R)>) {
+    let mut delete = Vec::new();
+    let mut keep = Vec::new();
+    vacuum_drain_group(group, xmin, |row| delete.push(row), |row, extra| keep.push((row, extra)));
+    (delete, keep)
+}
+
+/// Move each owned row directly to its destination. Callers that need no kept
+/// rows can discard them without allocating an intermediate keep Vec.
+pub(crate) fn vacuum_drain_group<V: Clone, R: Clone>(
+    group: &mut Vec<(u64, V, bool, R)>, xmin: u64,
+    mut delete: impl FnMut(V), mut keep: impl FnMut(V, R),
+) {
+    #[cfg(test)]
+    if vacuum_reference::enabled() {
+        let (d, k) = vacuum_plan_group_reference(group, xmin);
+        for row in d { delete(row); }
+        for (row, extra) in k { keep(row, extra); }
+        return;
+    }
+    let mut versions = std::mem::take(group);
+    #[cfg(test)]
+    if !versions.is_empty() {
+        VACUUM_GROUP_CALLS.with(|c| c.set(c.get() + 1));
+        VACUUM_GROUP_MAX_ROWS.with(|m| m.set(m.get().max(versions.len() as u64)));
+    }
+    // Stable sorting preserves the old rule for duplicate version numbers.
+    versions.sort_by_key(|(v, _, _, _)| *v);
+    let last_old = versions.iter().rposition(|(v, _, _, _)| *v < xmin);
+    let reap_last = last_old.is_some_and(|i| versions[i].2 && i + 1 == versions.len());
+    for (i, (_, row, _, extra)) in versions.into_iter().enumerate() {
+        if last_old.is_some_and(|last| i < last || (i == last && reap_last)) {
+            delete(row);
+        } else {
+            keep(row, extra);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod vacuum_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
+fn vacuum_plan_group_reference<V, R>(
     group: &mut Vec<(u64, V, bool, R)>,
     xmin: u64,
 ) -> (Vec<V>, Vec<(V, R)>)
@@ -202,6 +256,46 @@ mod tests {
     use std::assert;
     use std::assert_eq;
     use std::vec;
+
+    #[test]
+    fn vacuum_plan_moves_rows_without_cloning() {
+        use std::{cell::Cell, rc::Rc};
+        struct Row(u8, Rc<Cell<usize>>);
+        impl Clone for Row {
+            fn clone(&self) -> Self {
+                self.1.set(self.1.get() + 1);
+                Self(self.0, self.1.clone())
+            }
+        }
+        let clones = Rc::new(Cell::new(0));
+        let mut group = vec![(1, Row(1, clones.clone()), false, ()), (2, Row(2, clones.clone()), false, ())];
+        let (delete, keep) = vacuum_plan_group(&mut group, 3);
+        assert_eq!(delete[0].0, 1);
+        assert_eq!(keep[0].0.0, 2);
+        assert!(group.is_empty());
+        assert_eq!(clones.get(), 0, "owned rows must be moved into their destination");
+        let _reference = vacuum_reference::Scope::start();
+        let mut group = vec![(1, Row(1, clones.clone()), false, ()), (2, Row(2, clones.clone()), false, ())];
+        let _ = vacuum_plan_group(&mut group, 3);
+        assert_eq!(clones.get(), 2, "reference arm must exercise the original copies");
+    }
+
+    #[test]
+    fn vacuum_plan_matches_reference_for_unsorted_duplicate_versions_and_tombstones() {
+        for len in 0..=5 {
+            for mut code in 0..6usize.pow(len) {
+                let mut group = Vec::new();
+                for row in 0..len {
+                    group.push(((code % 3) as u64, row, code % 6 >= 3, row % 2 == 0));
+                    code /= 6;
+                }
+                for xmin in 0..=4 {
+                    let expected = vacuum_plan_group_reference(&mut group.clone(), xmin);
+                    assert_eq!(vacuum_plan_group(&mut group.clone(), xmin), expected);
+                }
+            }
+        }
+    }
 
     /// 大端编码 ⇒ 版本递增即字节序递增，链尾就是最新版
     #[test]

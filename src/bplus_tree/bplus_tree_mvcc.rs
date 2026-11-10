@@ -33,7 +33,7 @@ pub use crate::common::{
 };
 use crate::common::VacuumScheduler;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
-use crate::common::vacuum_plan_group;
+use crate::common::version::vacuum_drain_group;
 
 /// MVCC 存储引擎
 /// M37：一次 `vacuum_bounded` 走查的**块大小**（物理行）—— 与 bitcask / lsm / memory 同值，
@@ -642,9 +642,7 @@ impl MVCC {
                     return false;
                 }
                 while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
-                    let (d, k) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    has_blob_ref |= k.iter().any(|(_, refs_blob)| *refs_blob);
+                    vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |_, refs_blob| has_blob_ref |= refs_blob);
                     cur_raw = Some(key);
                 }
                 // Stop only after the complete overlapping prefix window is finalized.
@@ -670,9 +668,7 @@ impl MVCC {
             });
             if done || next_lower.is_none() {
                 while let Some((key, mut group)) = groups.pop_first() {
-                    let (d, k) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    has_blob_ref |= k.iter().any(|(_, refs_blob)| *refs_blob);
+                    vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |_, refs_blob| has_blob_ref |= refs_blob);
                     cur_raw = Some(key);
                 }
             }

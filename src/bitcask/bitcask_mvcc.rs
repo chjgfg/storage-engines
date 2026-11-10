@@ -40,7 +40,7 @@ pub use crate::common::{
 };
 use crate::common::VacuumScheduler;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
-use crate::common::vacuum_plan_group;
+use crate::common::version::vacuum_drain_group;
 
 /// MVCC 存储引擎（Bitcask 后端）
 pub struct MVCC {
@@ -666,9 +666,7 @@ impl MVCC {
                     continue;
                 }
                 while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
-                    let (d, k) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    if full_sweep { kept.extend(k.into_iter().map(|(enc, _)| enc)); }
+                    vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |row, _| { if full_sweep { kept.push(row); } });
                     cur_raw = Some(key);
                 }
                 // Stop only after the complete overlapping prefix window is finalized.
@@ -690,9 +688,7 @@ impl MVCC {
             // ⚠️ 走到这里 `for` 里那个按引用迭代 KeyDir 的迭代器已经 drop ⇒ 才拿得到 `&mut kv`
             if done || next_lower.is_none() {
                 while let Some((key, mut group)) = groups.pop_first() {
-                    let (d, k) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    if full_sweep { kept.extend(k.into_iter().map(|(enc, _)| enc)); }
+                    vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |row, _| { if full_sweep { kept.push(row); } });
                     cur_raw = Some(key);
                 }
             }

@@ -5319,6 +5319,46 @@ mod tests {
         assert!(allocations[2] + rows as u64 / 2 < allocations[3]);
     }
 
+    #[test]
+    #[ignore = "vacuum planning old/new/new/old; release single thread"]
+    fn vacuum_plan_cost() {
+        let rows: usize = std::env::var("VACUUM_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 10);
+        let mut allocations = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let db = crate::memory::memory_mvcc::MVCC::new();
+            db.set_vacuum_auto_slice(0);
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.commit();
+            }
+            let tx = db.begin_transaction();
+            for i in 0..rows / 10 { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+            tx.commit();
+            let mode = reference.then(crate::common::version::vacuum_reference::Scope::start);
+            let probe = crate::common::maintenance_probe::Scope::start();
+            let before = crate::mem_probe::allocations();
+            let start = std::time::Instant::now();
+            let stats = db.vacuum();
+            let seconds = start.elapsed().as_secs_f64();
+            let allocs = crate::mem_probe::allocations() - before;
+            allocations.push(allocs);
+            eprintln!("VACUUM_PLAN round={round} reference={reference} rows={rows} seconds={seconds:.6} allocations={allocs} stages={:?}", probe.stats());
+            assert_eq!(stats.versions_removed, rows / 10);
+            drop(probe); drop(mode);
+            let mut seen = 0;
+            db.export_latest_visible_for_each(false, |record| {
+                assert_eq!(record.key, scale_key(seen));
+                assert_eq!(record.value, Some(scale_val(if seen < rows / 10 { seen + rows } else { seen })));
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+        }
+        assert!(allocations[0] >= allocations[1] + 2 * rows as u64);
+        assert!(allocations[3] >= allocations[2] + 2 * rows as u64);
+    }
+
     /// TTL 两格仍量真实 set/get；紧接着在计时外去掉期限，而非把期限调得更长。
     /// 必须先验值再 persist（不是 set_raw 重播种），缺失/过期/损坏不能被修补后蒙混过关。
     fn scale_persist_auxiliary(db: &dyn KvEngine, rows: usize) {

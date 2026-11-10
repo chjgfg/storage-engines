@@ -22,7 +22,7 @@ pub use crate::common::{
     DurabilityProfile, EngineTuning, ExportRecord, MvccHealth, VacuumRound, VacuumStats,
 };
 use crate::common::VacuumScheduler;
-use crate::common::vacuum_plan_group;
+use crate::common::version::vacuum_drain_group;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WriteSide};
 use crate::memory::mem_store::MemStore;
 
@@ -519,9 +519,7 @@ impl MVCC {
                         return false;
                     }
                     while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
-                        let (d, k) = vacuum_plan_group(&mut group, xmin);
-                        to_delete.extend(d);
-                        let _ = k;
+                        vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |_, _| {});
                         cur_raw = Some(key);
                     }
                     // Stop only after the complete overlapping prefix window is finalized.
@@ -544,9 +542,7 @@ impl MVCC {
             }
             if done || next_lower.is_none() {
                 while let Some((key, mut group)) = groups.pop_first() {
-                    let (d, k) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    let _ = k;
+                    vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |_, _| {});
                     cur_raw = Some(key);
                 }
             }

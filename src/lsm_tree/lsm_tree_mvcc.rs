@@ -49,7 +49,7 @@ pub use crate::common::{
 };
 use crate::common::VacuumScheduler;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WalTail, WriteSide};
-use crate::common::vacuum_plan_group;
+use crate::common::version::vacuum_drain_group;
 
 /// M37：一次 `vacuum_bounded` 走查的**块大小**（物理行）—— 与 bitcask 那条同源同值，
 /// 两家共用"块界"这件事由各自的守卫各自钉住（`test_vacuum_deletes_in_bounded_chunks`）。
@@ -687,9 +687,7 @@ impl MVCC {
                         continue;
                     }
                     while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
-                        let (d, k) = vacuum_plan_group(&mut group, xmin);
-                        to_delete.extend(d);
-                        if collect_refs { keep_enc.extend(k.into_iter().map(|(enc, _)| enc)); }
+                        vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |row, _| { if collect_refs { keep_enc.push(row); } });
                         cur_raw = Some(key);
                     }
                     // Stop only after the complete overlapping prefix window is finalized.
@@ -716,9 +714,7 @@ impl MVCC {
             }
             if done || next_lower.is_none() {
                 while let Some((key, mut group)) = groups.pop_first() {
-                    let (d, k) = vacuum_plan_group(&mut group, xmin);
-                    to_delete.extend(d);
-                    if collect_refs { keep_enc.extend(k.into_iter().map(|(enc, _)| enc)); }
+                    vacuum_drain_group(&mut group, xmin, |row| to_delete.push(row), |row, _| { if collect_refs { keep_enc.push(row); } });
                     cur_raw = Some(key);
                 }
             }
