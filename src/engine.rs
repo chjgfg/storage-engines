@@ -5069,7 +5069,7 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(600_000);
         let page_size = 100usize;
-        let last_page = rows / page_size;
+        let last_page = scale_last_page_index(rows, page_size);
 
         fn key(i: usize) -> Vec<u8> {
             format!("{i:08}#/worldquant/datafields/x.json").into_bytes()
@@ -5201,6 +5201,43 @@ mod tests {
 
     fn scale_val(i: usize) -> Vec<u8> {
         format!("{{\"i\":{i},\"h\":\"{:0<28}\",\"v\":1}}", i * 7).into_bytes()
+    }
+
+    fn scale_last_page_index(rows: usize, page_size: usize) -> usize {
+        rows.saturating_sub(1) / page_size
+    }
+
+    fn scale_check_last_page(page: &SearchPage, rows: usize, page_size: usize) {
+        let pages = rows.div_ceil(page_size);
+        let count = if rows == 0 { 0 } else { (rows - 1) % page_size + 1 };
+        assert_eq!(page.total, Some(rows));
+        assert_eq!(page.total_pages, Some(pages));
+        assert_eq!(page.page, pages.saturating_sub(1));
+        assert_eq!(page.page_size, page_size);
+        assert!(!page.has_next());
+        assert_eq!(page.items.len(), count, "last page must contain its seeded rows");
+        for (record, i) in page.items.iter().zip(rows - count..rows) {
+            assert_eq!(record.key, scale_key(i));
+            assert_eq!(record.value, Some(scale_val(i)));
+            assert_eq!(record.expire_unix_secs, None);
+        }
+    }
+
+    #[test]
+    fn scale_last_page_matches_seed_across_page_boundaries() {
+        for kind in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree, EngineKind::Memory] {
+            for rows in [0, 1, 99, 100, 101, 200, 201] {
+                let dir = ScaleScratch::new("last_page");
+                let path = if kind == EngineKind::BPlusTree { dir.0.join("bplus.db") } else { dir.0.clone() };
+                let db = open_engine(kind, Some(&path)).unwrap();
+                let tx = db.begin();
+                for i in 0..rows { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.commit();
+                let tx = db.begin();
+                let page = tx.search_keys(&SearchQuery::contains(b"", scale_last_page_index(rows, 100), 100));
+                scale_check_last_page(&page, rows, 100);
+            }
+        }
     }
 
     /// TTL 两格仍量真实 set/get；紧接着在计时外去掉期限，而非把期限调得更长。
@@ -5830,7 +5867,7 @@ mod tests {
 
             // ---- 管理面：分页搜索（首页 vs 深页 —— 深翻是最常见的"一次调用打满 CPU"） ----
             let page_size = 100usize;
-            let last_page = rows / page_size;
+            let last_page = scale_last_page_index(rows, page_size);
             let (d, live, peak, one) = timed(|| {
                 let tx = db.begin();
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, page_size))
@@ -5849,11 +5886,13 @@ mod tests {
                 let tx = db.begin();
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", last_page, page_size))
             });
-            line(label, "search 末页(深翻)", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", deep.total.unwrap_or_default()));
+            scale_check_last_page(&deep, rows, page_size);
+            line(label, "search 末页(深翻)", d.as_secs_f64() * 1e6, "µs/次", live, peak,
+                 &format!("命中 {}，末页 {} 条（已逐值验收）", deep.total.unwrap_or_default(), deep.items.len()));
             // M81 第 4 项：末页的**免 total** 那一支，代价 = 页宽 × O(一次点读)，四家都不随库涨。
             // ⚠️ 不许与上面那格直接对拍：`search 末页(深翻)` 要精确 total（数全库那一遍是主导，
-            // 20M 档 80.7 s），这一格恒取 `page_size` 行、不数；两格行数也不同（深翻那格是
-            // `total % page_size`，尾巴不齐时更少）⇒ 只比 µs/次，别折成 µs/行。
+            // 20M 档 80.7 s），这一格最多取 `page_size` 行、不数；真正末页可能不足页宽。
+            // M98 修订：旧台架 total 整除页宽时误请求越界空页；现在末页逐键逐值验收。
             // 覆盖情况（11-04 起）：`lsm_tree` 走反向逐步退（SST 块读）；其余三家走
             // `common::store::back_n_with`（bplus/memory 先右路下降取库尾）。**11-04 之前的构建里
             // 三家停在 trait 默认**（`reverse_scan` 截尾 = O(库)：20M 档 88~106 / 55~71 / 64~69 s、
