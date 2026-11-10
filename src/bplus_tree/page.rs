@@ -601,6 +601,8 @@ impl PageManager {
         if !self.freelist_dirty {
             return Ok(());
         }
+        #[cfg(test)]
+        let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::Freelist);
         let ids: Vec<u64> = self.free_page_ids.iter().map(|p| p.0).collect();
         write_freelist(&freelist_path(&self.path), &ids)?;
         self.freelist_dirty = false;
@@ -662,6 +664,8 @@ impl PageManager {
             return Ok(());
         }
 
+        #[cfg(test)]
+        let pack_timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::PagePack);
         let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(page_ids.len() + 1);
         for &pid in page_ids {
             if let Some(entry) = self.cache.get(&pid) {
@@ -674,6 +678,8 @@ impl PageManager {
             let payload = self.build_meta_payload();
             batch.push((META_PAGE_ID, pack_page(META_PAGE_ID, &payload)));
         }
+        #[cfg(test)]
+        drop(pack_timer);
         if batch.is_empty() {
             // 可能只有 freelist 变更
             self.persist_freelist()?;
@@ -690,12 +696,15 @@ impl PageManager {
             }
         } else {
             for chunk in batch.chunks(crate::bplus_tree::storage::DBLWR_MAX_PAGES) {
-                let owned: Vec<(u64, Vec<u8>)> = chunk.to_vec();
-                self.dblwr.write_batch(&owned)?;
-                for (pid, raw) in &owned {
-                    self.file.write_page(*pid, raw)?;
+                self.dblwr.write_batch(chunk)?;
+                {
+                    #[cfg(test)]
+                    let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::PageWrite);
+                    for (pid, raw) in chunk { self.file.write_page(*pid, raw)?; }
                 }
                 if do_sync {
+                    #[cfg(test)]
+                    let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::PageSync);
                     self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
                 }
                 self.dblwr.clear()?;

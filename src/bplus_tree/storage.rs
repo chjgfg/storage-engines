@@ -101,21 +101,54 @@ const DBLWR_HEADER_SIZE: usize = 16;
 /// 最多缓存的脏页数（一次 flush 批量上限）
 pub const DBLWR_MAX_PAGES: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DblwrState { Unknown, DurableEmpty, Published }
+
 pub struct DoubleWriteBuffer {
     file: DiskFile,
+    state: DblwrState,
+}
+
+#[cfg(test)]
+pub(crate) mod dblwr_probe {
+    use std::{assert, assert_eq, cell::Cell, thread_local};
+    thread_local! {
+        static REFERENCE: Cell<bool> = const { Cell::new(false) };
+        static PAYLOAD_WRITES: Cell<u64> = const { Cell::new(0) };
+        static FAULT: Cell<u8> = const { Cell::new(0) };
+    }
+    pub fn reference() -> bool { REFERENCE.with(|c| c.get()) }
+    pub fn writes() -> u64 { PAYLOAD_WRITES.with(|c| c.get()) }
+    pub fn note_write() { PAYLOAD_WRITES.with(|c| c.set(c.get() + 1)); }
+    pub fn fail_at(at: u8) -> std::io::Result<()> {
+        if FAULT.with(|c| c.get() == at && c.replace(0) == at) {
+            return Err(std::io::Error::other("injected double-write interruption"));
+        }
+        Ok(())
+    }
+    pub struct Scope;
+    impl Scope {
+        pub fn start() -> Self { REFERENCE.with(|c| assert!(!c.replace(true))); Self }
+        pub fn fault(at: u8) -> Self { FAULT.with(|c| assert_eq!(c.replace(at), 0)); Self }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) { REFERENCE.with(|c| c.set(false)); FAULT.with(|c| c.set(0)); }
+    }
 }
 
 impl DoubleWriteBuffer {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut file = DiskFile::open(path)?;
+        let mut state = DblwrState::Unknown;
         if file.len()? == 0 {
             // 初始化空 header
             let mut hdr = vec![0u8; DBLWR_HEADER_SIZE];
             hdr[0..8].copy_from_slice(DBLWR_MAGIC);
             file.write_all_at(0, &hdr)?;
             file.sync_at(SITE_BPLUS_DBLWR)?;
+            state = DblwrState::DurableEmpty;
         }
-        Ok(Self { file })
+        Ok(Self { file, state })
     }
 
     /// 把一批**已 pack** 的完整页写入双写区并 fsync
@@ -129,26 +162,62 @@ impl DoubleWriteBuffer {
         hdr[0..8].copy_from_slice(DBLWR_MAGIC);
         hdr[8..12].copy_from_slice(&(pages.len() as u32).to_le_bytes());
 
-        // 先把 count 写成 0，避免半写入状态被当成有效 batch
-        let mut zero_hdr = hdr.clone();
-        zero_hdr[8..12].copy_from_slice(&0u32.to_le_bytes());
-        self.file.write_all_at(0, &zero_hdr)?;
-        self.file.sync_at(SITE_BPLUS_DBLWR)?;
-
-        // 写各页：每槽 = page_id(8) + page(PAGE_SIZE)
-        let slot_size = 8 + PAGE_SIZE;
-        for (i, (page_id, page)) in pages.iter().enumerate() {
-            let offset = (DBLWR_HEADER_SIZE + i * slot_size) as u64;
-            let mut slot = vec![0u8; slot_size];
-            slot[0..8].copy_from_slice(&page_id.to_le_bytes());
-            slot[8..].copy_from_slice(page);
-            self.file.write_all_at(offset, &slot)?;
+        #[cfg(test)]
+        let reference = dblwr_probe::reference();
+        #[cfg(not(test))]
+        let reference = false;
+        // Only an acknowledged clear/initialization proves the header durably
+        // empty. Reopen and every partial write use the conservative reset.
+        let reset = self.state != DblwrState::DurableEmpty || reference;
+        self.state = DblwrState::Unknown;
+        if reset {
+            #[cfg(test)]
+            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrReset);
+            let mut zero_hdr = hdr.clone();
+            zero_hdr[8..12].copy_from_slice(&0u32.to_le_bytes());
+            self.file.write_all_at(0, &zero_hdr)?;
+            self.file.sync_at(SITE_BPLUS_DBLWR)?;
         }
-        self.file.sync_at(SITE_BPLUS_DBLWR)?;
-
-        // 最后写真实 count 并 fsync → 标志着 batch 完整
-        self.file.write_all_at(0, &hdr)?;
-        self.file.sync_at(SITE_BPLUS_DBLWR)?;
+        {
+            #[cfg(test)]
+            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrData);
+            // One bounded contiguous write; the existing on-disk slots and
+            // publication barriers remain identical (at most 64 pages).
+            let slot_size = 8 + PAGE_SIZE;
+            if reference {
+                for (i, (page_id, page)) in pages.iter().enumerate() {
+                    let mut slot = Vec::with_capacity(slot_size);
+                    slot.extend_from_slice(&page_id.to_le_bytes());
+                    slot.extend_from_slice(page);
+                    #[cfg(test)]
+                    dblwr_probe::note_write();
+                    self.file.write_all_at((DBLWR_HEADER_SIZE + i * slot_size) as u64, &slot)?;
+                }
+            } else {
+                let mut payload = Vec::with_capacity(pages.len() * slot_size);
+                for (page_id, page) in pages {
+                    payload.extend_from_slice(&page_id.to_le_bytes());
+                    payload.extend_from_slice(page);
+                }
+                if !payload.is_empty() {
+                    #[cfg(test)]
+                    dblwr_probe::note_write();
+                    self.file.write_all_at(DBLWR_HEADER_SIZE as u64, &payload)?;
+                }
+            }
+            self.file.sync_at(SITE_BPLUS_DBLWR)?;
+        }
+        #[cfg(test)]
+        dblwr_probe::fail_at(1)?;
+        {
+            #[cfg(test)]
+            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrPublish);
+            self.file.write_all_at(0, &hdr)?;
+            #[cfg(test)]
+            dblwr_probe::fail_at(2)?;
+            self.file.sync_at(SITE_BPLUS_DBLWR)?;
+        }
+        self.state = DblwrState::Published;
         Ok(())
     }
 
@@ -189,11 +258,17 @@ impl DoubleWriteBuffer {
 
     /// 清空 batch（flush 主文件成功后调用）
     pub fn clear(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrClear);
+        self.state = DblwrState::Unknown;
         let mut hdr = vec![0u8; DBLWR_HEADER_SIZE];
         hdr[0..8].copy_from_slice(DBLWR_MAGIC);
         // count = 0
         self.file.write_all_at(0, &hdr)?;
+        #[cfg(test)]
+        dblwr_probe::fail_at(3)?;
         self.file.sync_at(SITE_BPLUS_DBLWR)?;
+        self.state = DblwrState::DurableEmpty;
         Ok(())
     }
 }
@@ -624,6 +699,80 @@ mod tests {
             assert!(dw.read_batch().unwrap().is_empty());
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dblwr_durable_empty_does_not_repeat_invalidation_sync() {
+        use crate::common::disk::fsync_counts;
+        let path = crate::common::ScratchPath::new("bplus", "dblwr_empty", ".bin");
+        let mut dw = DoubleWriteBuffer::open(&path).unwrap();
+        let pages = vec![(7, pack_page(7, b"new page"))];
+        let before = fsync_counts()[SITE_BPLUS_DBLWR];
+        dw.write_batch(&pages).unwrap();
+        assert_eq!(dw.read_batch().unwrap(), pages);
+        dw.clear().unwrap();
+        assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3,
+            "durably empty header needs payload/publish/clear sync only");
+    }
+
+    #[test]
+    fn dblwr_reopen_and_interrupted_writes_require_reset() {
+        use crate::common::disk::fsync_counts;
+        let path = crate::common::ScratchPath::new("bplus", "dblwr_states", ".bin");
+        let pages = vec![(7, pack_page(7, b"live page"))];
+        {
+            let mut dw = DoubleWriteBuffer::open(&path).unwrap();
+            dw.write_batch(&pages).unwrap();
+        }
+        let mut dw = DoubleWriteBuffer::open(&path).unwrap();
+        assert_eq!(dw.state, DblwrState::Unknown);
+        assert_eq!(dw.read_batch().unwrap(), pages, "reopen must retain recoverable pages");
+        let before = fsync_counts()[SITE_BPLUS_DBLWR];
+        dw.write_batch(&pages).unwrap();
+        assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3);
+        // A published batch without an acknowledged clear also needs reset.
+        let before = fsync_counts()[SITE_BPLUS_DBLWR];
+        dw.write_batch(&pages).unwrap();
+        assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3);
+        for fault in 1..=3 {
+            dw.clear().unwrap();
+            {
+                let _fault = dblwr_probe::Scope::fault(fault);
+                if fault == 3 {
+                    dw.write_batch(&pages).unwrap();
+                    assert!(dw.clear().is_err());
+                } else {
+                    assert!(dw.write_batch(&pages).is_err());
+                }
+            }
+            assert_eq!(dw.state, DblwrState::Unknown);
+            if fault == 1 { assert!(dw.read_batch().unwrap().is_empty()); }
+            if fault == 2 { assert_eq!(dw.read_batch().unwrap(), pages); }
+            let before = fsync_counts()[SITE_BPLUS_DBLWR];
+            dw.write_batch(&pages).unwrap();
+            assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3);
+            assert_eq!(dw.read_batch().unwrap(), pages);
+        }
+    }
+
+    #[test]
+    fn dblwr_batches_payload_and_preserves_slots() {
+        use crate::common::disk::fsync_counts;
+        let path = crate::common::ScratchPath::new("bplus", "dblwr_slots", ".bin");
+        let mut dw = DoubleWriteBuffer::open(&path).unwrap();
+        for reference in [true, false] {
+            let _mode = reference.then(dblwr_probe::Scope::start);
+            for len in [0, 1, DBLWR_MAX_PAGES] {
+                dw.clear().unwrap();
+                let pages: Vec<_> = (0..len).map(|i| ((i * 3) as u64, pack_page((i * 3) as u64, &[i as u8; 97]))).collect();
+                let writes = dblwr_probe::writes();
+                let syncs = fsync_counts()[SITE_BPLUS_DBLWR];
+                dw.write_batch(&pages).unwrap();
+                assert_eq!(dw.read_batch().unwrap(), pages);
+                assert_eq!(dblwr_probe::writes() - writes, if reference { len as u64 } else { u64::from(len > 0) });
+                assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - syncs, if reference { 3 } else { 2 });
+            }
+        }
     }
 
     #[test]

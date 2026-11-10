@@ -2,19 +2,19 @@
 use std::{assert, cell::RefCell, thread_local, time::Instant};
 
 #[derive(Clone, Copy)]
-pub(crate) enum Stage { Checkpoint, Commit, AutoVacuum, VacuumScan, VacuumDelete, VacuumSync, VacuumBlobRefs, VacuumBlobGc }
+pub(crate) enum Stage { Checkpoint, Commit, AutoVacuum, VacuumScan, VacuumDelete, VacuumSync, VacuumBlobRefs, VacuumBlobGc, DblwrReset, DblwrData, DblwrPublish, DblwrClear, PagePack, PageWrite, PageSync, Freelist }
 
 #[derive(Clone, Default)]
 pub(crate) struct Stats {
-    pub ns: [u128; 8],
-    pub calls: [u64; 8],
+    pub ns: [u128; 16],
+    pub calls: [u64; 16],
     pub blob_point_reads: u64,
 }
 
 impl std::fmt::Debug for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = f.debug_struct("MaintenanceMs");
-        for (i, name) in ["checkpoint", "commit", "auto_vacuum", "vacuum_scan", "vacuum_delete", "vacuum_sync", "vacuum_blob_refs", "vacuum_blob_gc"].into_iter().enumerate() {
+        for (i, name) in ["checkpoint", "commit", "auto_vacuum", "vacuum_scan", "vacuum_delete", "vacuum_sync", "vacuum_blob_refs", "vacuum_blob_gc", "dblwr_reset", "dblwr_data", "dblwr_publish", "dblwr_clear", "page_pack", "page_write", "page_sync", "freelist"].into_iter().enumerate() {
             out.field(name, &(self.calls[i], self.ns[i] as f64 / 1e6));
         }
         out.field("blob_point_reads", &self.blob_point_reads).finish()
