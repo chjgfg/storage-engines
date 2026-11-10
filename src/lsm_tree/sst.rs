@@ -2014,18 +2014,38 @@ pub fn merge_latest(
 pub fn merge_to_ssts<F>(
     sources: Vec<MergeInput<'_, StoredEntry>>,
     mut keep: F,
-    mut new_builder: impl FnMut() -> SstBuilder,
+    new_builder: impl FnMut() -> SstBuilder,
     target_bytes: usize,
 ) -> std::io::Result<Vec<SstFile>>
 where
     F: FnMut(&[u8], &StoredEntry) -> bool,
 {
+    merge_to_ssts_with_action(sources, |key, entry| {
+        if keep(key, entry) { CompactionAction::Keep } else { CompactionAction::Discard }
+    }, new_builder, target_bytes)
+}
+
+/// Dropping a winner is safe only when no unmerged source can reveal an older
+/// value. Otherwise keep its sequence number as a deletion barrier.
+pub(crate) enum CompactionAction { Keep, Discard, RetainDeletion }
+
+pub(crate) fn merge_to_ssts_with_action(
+    sources: Vec<MergeInput<'_, StoredEntry>>,
+    mut action: impl FnMut(&[u8], &StoredEntry) -> CompactionAction,
+    mut new_builder: impl FnMut() -> SstBuilder,
+    target_bytes: usize,
+) -> std::io::Result<Vec<SstFile>> {
     let mut out = Vec::new();
     let mut builder: Option<SstBuilder> = None;
     let mut err: Option<std::io::Error> = None;
-    merge_streaming(sources, &mut keep, |k, se| {
+    merge_streaming(sources, |_, _| true, |k, mut se| {
         if err.is_some() {
             return;
+        }
+        match action(&k, &se) {
+            CompactionAction::Keep => {},
+            CompactionAction::Discard => return,
+            CompactionAction::RetainDeletion => se.value = EntryValue::Drop,
         }
         if builder.is_none() {
             builder = Some(new_builder());

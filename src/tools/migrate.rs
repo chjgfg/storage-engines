@@ -1290,13 +1290,20 @@ mod tests {
                 let tx = db.begin();
                 for (k, e) in &rows {
                     match e {
-                        Some(v) => assert!(tx.set_with_ttl(k, b"v".to_vec(), Duration::from_secs(v - now))),
+                        // Seed the exact deadline under test. Computing a duration
+                        // before open and adding a later clock can shift it by 1 s.
+                        Some(v) => assert!(tx.set(k, pack_ttl(b"v", *v))),
                         None => assert!(tx.set_raw(k, b"v".to_vec())),
                     }
                 }
                 tx.commit();
                 db.flush().unwrap();
                 db.checkpoint().unwrap();
+                let check = db.begin();
+                for (k, expiry) in &rows {
+                    assert_eq!(check.get_meta(k).unwrap().expire_unix_secs, *expiry,
+                        "source fixture must have the intended absolute deadline");
+                }
             }
             let snap = r.join(match fmt {
                 SnapshotFormat::Bin => "s.bin",

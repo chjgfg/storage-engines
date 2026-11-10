@@ -262,7 +262,7 @@ try {
             $expected = @('bitcask','bplus_tree','lsm_tree','memory')
             # M81 第 2 项：`flush+merge` 拆成两格 ⇒ 122 → 126。第 4 项又加 `search 末页(免 total)`
             # 一格 ⇒ 126 → 130（34 类）。第 6 项把 memory 冷重开的两处特判拆掉（它有启停快照了）
-            # ⇒ 130 → 132（35 类）。放在一个变量里，就是为了下一项只动这一处。
+            # ⇒ 130 → 132（每引擎 33 格）。M97 的逐值验收与维护诊断不增加性能格。
             $expectedMetrics = 132
             if ($exit -ne 0 -or -not $state.done -or $state.metrics.Count -ne $expectedMetrics -or
                 @($expected | Where-Object { -not $state.engines.ContainsKey($_) }).Count -ne 0) {

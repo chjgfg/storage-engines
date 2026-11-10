@@ -5230,10 +5230,26 @@ mod tests {
         rows: usize,
         stats: MigrateStats,
     ) -> std::result::Result<(), String> {
+        scale_check_contents(target, rows, ScaleExpected::Migration(stats))
+    }
+
+    enum ScaleExpected {
+        Migration(MigrateStats),
+        BulkReopen { bulk_rows: usize },
+    }
+
+    fn scale_check_contents(target: &dyn KvEngine, rows: usize, phase: ScaleExpected)
+        -> std::result::Result<(), String> {
         let ttl_rows = 1000.min(rows);
-        let want = (rows + ttl_rows + 1) as u64;
-        if stats.rows != want || stats.with_ttl != 0 {
-            return Err(format!("迁移统计应为 {want} 行、0 TTL，实际 {stats:?}"));
+        let bulk_rows = match &phase {
+            ScaleExpected::Migration(_) => 0,
+            ScaleExpected::BulkReopen { bulk_rows } => *bulk_rows,
+        };
+        let want = (rows + ttl_rows + 1 + bulk_rows) as u64;
+        if let ScaleExpected::Migration(stats) = &phase {
+            if stats.rows != want || stats.with_ttl != 0 {
+                return Err(format!("迁移统计应为 {want} 行、0 TTL，实际 {stats:?}"));
+            }
         }
         let mut seen = 0u64;
         let mut bytes = 0u64;
@@ -5250,6 +5266,8 @@ mod tests {
                     .and_then(|i| {
                         if i < rows {
                             Some(scale_val(if i < (rows / 10).max(1) { i + rows } else { i }))
+                        } else if i - rows < bulk_rows {
+                            Some(scale_val(i - rows))
                         } else if i >= rows * 4 && i - rows * 4 < ttl_rows {
                             Some(scale_val(i - rows * 4))
                         } else {
@@ -5261,6 +5279,8 @@ mod tests {
                 Some("键重复或逆序")
             } else if expected.is_none() {
                 Some("出现种子之外的键")
+            } else if rec.expire_unix_secs.is_some() {
+                Some("永久化后的行仍有 TTL")
             } else if rec.value != expected {
                 Some("用户值不符（含更新/计数器）")
             } else {
@@ -5281,8 +5301,10 @@ mod tests {
         if seen != want || handed as u64 != seen {
             return Err(format!("目标应有 {want} 个唯一合法键，实际 {seen}（导出报告 {handed}）"));
         }
-        if stats.bytes != bytes {
-            return Err(format!("用户字节应为 {bytes}，迁移报告 {}", stats.bytes));
+        if let ScaleExpected::Migration(stats) = &phase {
+            if stats.bytes != bytes {
+                return Err(format!("用户字节应为 {bytes}，迁移报告 {}", stats.bytes));
+            }
         }
         Ok(())
     }
@@ -5457,6 +5479,51 @@ mod tests {
         assert_eq!(db.begin().get(&missing), None);
     }
 
+    fn scale_seed_bulk(db: &dyn KvEngine, rows: usize, bulk_rows: usize) {
+        scale_seed_test_fixture(db, rows);
+        scale_persist_auxiliary(db, rows);
+        let mut bulk = db.begin_bulk();
+        bulk.put_batch_owned((0..bulk_rows).map(|i| (scale_key(rows + i), scale_val(i))).collect());
+        bulk.finish();
+    }
+
+    #[test]
+    fn scale_bulk_reopen_verifies_all_engines() {
+        for kind in [EngineKind::Bitcask, EngineKind::BPlusTree, EngineKind::LsmTree, EngineKind::Memory] {
+            let scratch = ScaleScratch::new("bulk_manifest");
+            let path = if kind == EngineKind::BPlusTree { scratch.0.join("bplus.db") } else { scratch.0.clone() };
+            let db = open_engine(kind, Some(&path)).unwrap();
+            scale_seed_bulk(&*db, 40, 4);
+            drop(db);
+            let db = open_engine(kind, Some(&path)).unwrap();
+            scale_check_contents(&*db, 40, ScaleExpected::BulkReopen { bulk_rows: 4 }).unwrap();
+        }
+    }
+
+    #[test]
+    fn scale_bulk_manifest_rejects_nonfirst_damage() {
+        for defect in ["missing", "value", "extra-key", "old-row", "ttl"] {
+            let db = open_engine(EngineKind::Memory, None).unwrap();
+            scale_seed_bulk(&*db, 40, 4);
+            scale_check_contents(&*db, 40, ScaleExpected::BulkReopen { bulk_rows: 4 }).unwrap();
+            let tx = db.begin();
+            match defect {
+                "missing" => assert!(tx.delete(&scale_key(42))),
+                "value" => assert!(tx.set_raw(&scale_key(42), b"wrong".to_vec())),
+                "extra-key" => {
+                    assert!(tx.delete(&scale_key(42)));
+                    assert!(tx.set_raw(b"unexpected", scale_val(2)));
+                }
+                "old-row" => assert!(tx.set_raw(&scale_key(2), b"old-corrupt".to_vec())),
+                "ttl" => assert!(tx.set(&scale_key(42), crate::common::pack_ttl(&scale_val(2), u64::MAX))),
+                _ => unreachable!(),
+            }
+            tx.commit();
+            assert!(db.begin().get(&scale_key(40)).is_some(), "old first-key guard still passes");
+            assert!(scale_check_contents(&*db, 40, ScaleExpected::BulkReopen { bulk_rows: 4 }).is_err(), "missed {defect}");
+        }
+    }
+
     #[test]
     fn scale_scratch_cleans_owned_directory_on_unwind() {
         let scratch = ScaleScratch::new("scale_cleanup_test");
@@ -5482,6 +5549,95 @@ mod tests {
         run_scale_baseline(rows);
     }
 
+    fn scale_note_maintenance(db: &dyn KvEngine, phase: &str,
+        scope: &crate::lsm_tree::lsm_tree::maintenance_probe::Scope) {
+        let s = scope.stats();
+        eprintln!("SCALE_MAINT engine={} phase={phase} auto={:?} lsm_flushes={} lsm_flush_ms={:.3} lsm_compactions={} lsm_compact_ms={:.3} lsm_input_files={} lsm_input_bytes={}",
+            db.name(), db.reclamation_status(), s.flushes, s.flush_ns as f64 / 1e6,
+            s.compactions, s.compact_ns as f64 / 1e6, s.input_files, s.input_bytes);
+    }
+
+    #[test]
+    fn scale_maintenance_probe_observes_real_flush_and_obeys_gate() {
+        use crate::lsm_tree::lsm_tree::maintenance_probe::{Scope, Timer, Kind};
+        assert!(Timer::start(Kind::Flush).is_none());
+        let dir = ScaleScratch::new("maintenance_probe");
+        let db = open_engine(EngineKind::LsmTree, Some(&dir.0)).unwrap();
+        let tx = db.begin();
+        assert!(tx.set_raw(b"key", b"value".to_vec()));
+        tx.commit(); drop(tx);
+        let scope = Scope::start();
+        db.flush().unwrap();
+        assert_eq!(scope.stats().flushes, 1);
+        db.flush().unwrap();
+        assert_eq!(scope.stats().flushes, 1, "empty flush does not create another SST");
+        assert_eq!(db.begin().get(b"key"), Some(b"value".to_vec()));
+        drop(scope);
+        assert!(Timer::start(Kind::Compact).is_none());
+    }
+
+    #[test]
+    #[ignore = "focused 10M write/update/vacuum recheck; release single thread"]
+    fn scale_maintenance_recheck() {
+        let rows: usize = std::env::var("RECHECK_ROWS").map(|s| s.parse().unwrap()).unwrap_or(10_000_000);
+        let rounds: usize = std::env::var("RECHECK_ROUNDS").map(|s| s.parse().unwrap()).unwrap_or(2);
+        let name = std::env::var("RECHECK_ENGINE").unwrap_or_else(|_| "memory".to_string());
+        let kind = match name.as_str() {
+            "memory" => EngineKind::Memory,
+            "lsm_tree" => EngineKind::LsmTree,
+            _ => panic!("RECHECK_ENGINE must be memory or lsm_tree"),
+        };
+        assert!(rows > 0 && rounds > 0);
+        for round in 0..rounds {
+            let dir = ScaleScratch::new("maintenance_recheck");
+            let scope = crate::lsm_tree::lsm_tree::maintenance_probe::Scope::start();
+            let db = open_engine(kind, Some(&dir.0)).unwrap();
+            let start = std::time::Instant::now();
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin();
+                for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.commit();
+                if (base + 1000) % 1_000_000 == 0 { eprintln!("RECHECK_PROGRESS engine={name} round={round} rows={} elapsed_s={:.3}", base + 1000, start.elapsed().as_secs_f64()); }
+            }
+            eprintln!("RECHECK_INSERT engine={name} round={round} rows={rows} seconds={:.6}", start.elapsed().as_secs_f64());
+            scale_note_maintenance(&*db, "insert", &scope);
+            db.flush().unwrap(); db.checkpoint().unwrap();
+            eprintln!("RECHECK_REOPEN engine={name} round={round}");
+            drop(db);
+            let db = open_engine(kind, Some(&dir.0)).unwrap();
+            let updates = (rows / 10).max(1);
+            let start = std::time::Instant::now();
+            for base in (0..updates).step_by(500) {
+                let tx = db.begin();
+                for i in base..(base + 500).min(updates) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+                tx.commit();
+            }
+            eprintln!("RECHECK_UPDATE engine={name} round={round} rows={updates} seconds={:.6}", start.elapsed().as_secs_f64());
+            scale_note_maintenance(&*db, "update", &scope);
+            let start = std::time::Instant::now();
+            let health = db.health();
+            eprintln!("RECHECK_HEALTH engine={name} round={round} seconds={:.6} stats={health:?}", start.elapsed().as_secs_f64());
+            let auto_removed = db.reclamation_status().unwrap().versions_removed;
+            assert_eq!(auto_removed + health.rows_above_one, updates as u64,
+                "old versions reappeared after automatic reclamation/compaction");
+            let start = std::time::Instant::now();
+            let vacuum = db.vacuum().unwrap();
+            eprintln!("RECHECK_VACUUM engine={name} round={round} seconds={:.6} stats={vacuum:?}", start.elapsed().as_secs_f64());
+            assert!(!vacuum.skipped_active_txn);
+            assert_eq!(vacuum.versions_removed as u64, health.rows_above_one);
+            scale_note_maintenance(&*db, "vacuum", &scope);
+            let mut seen = 0;
+            db.export_latest_visible_for_each(false, &mut |rec| {
+                assert_eq!(rec.key, scale_key(seen));
+                assert_eq!(rec.value, Some(scale_val(if seen < updates { seen + rows } else { seen })));
+                seen += 1;
+                true
+            });
+            assert_eq!(seen, rows);
+            eprintln!("RECHECK_VERIFIED engine={name} round={round} rows={seen}");
+        }
+    }
+
     fn run_scale_baseline(rows: usize) {
         assert!(rows > 0 && rows.checked_mul(16).is_some(), "SCALE_ROWS 必须为非零且不溢出的行数");
         // 键 ≈ 35 字节、值 ≈ 60 字节：照下游真实形状（也都远小于任何 blob 阈值）
@@ -5490,7 +5646,7 @@ mod tests {
         eprintln!("SCALE_BEGIN rows={rows} package={} os={} arch={} optimized={}",
             env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, !cfg!(debug_assertions));
         eprintln!("=== 大库基线 rows={rows}（µs/次 + 常驻/峰值 MB）===");
-        eprintln!("验收政策：TTL 两格后计时外 persist 同一批辅助键；后续固定 rows+min(rows,1000)+1，迁移目标逐键逐值验收不计入32类性能格。");
+        eprintln!("验收政策：TTL 两格后计时外 persist 同一批辅助键；迁移期望 rows+min(rows,1000)+1，bulk 重开再加 bulk_rows；逐键逐值验收不计入每引擎33格性能记录。");
         for kind in [
             EngineKind::Bitcask,
             EngineKind::BPlusTree,
@@ -5498,6 +5654,7 @@ mod tests {
             EngineKind::Memory,
         ] {
             let label = kind.as_str();
+            let maintenance = crate::lsm_tree::lsm_tree::maintenance_probe::Scope::start();
             let scratch = ScaleScratch::new(&format!("scale_{label}"));
             let dir = scratch.0.clone();
             eprintln!("{label}: scratch={}", dir.display());
@@ -5528,6 +5685,7 @@ mod tests {
                 }
             });
             line(label, &format!("灌 {rows} 行(事务)"), d.as_secs_f64() * 1e6 / rows as f64, "µs/行", live, peak, "");
+            scale_note_maintenance(&*db, "insert", &maintenance);
 
             let (d, live, peak, ()) = timed(|| {
                 db.flush().unwrap();
@@ -5543,6 +5701,7 @@ mod tests {
             // 所以补一行"不计时"的读数（与 `验收准备(不计时)` 同一套写法，不进性能格）。
             let db = {
                 let st_base = open_stages_begin();
+                let snapshot = (kind == EngineKind::Memory).then(|| crate::common::kv_snapshot::snapshot_probe::Scope::start(false));
                 let t_stop = std::time::Instant::now();
                 drop(db);
                 if kind == EngineKind::Memory {
@@ -5551,6 +5710,9 @@ mod tests {
                         "停止落盘",
                         format!("{:.1} ms", t_stop.elapsed().as_secs_f64() * 1e3)
                     );
+                }
+                if let Some(scope) = snapshot {
+                    eprintln!("SCALE_SNAPSHOT engine={label} stages={:?}", scope.stats());
                 }
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
                 line(
@@ -5760,6 +5922,7 @@ mod tests {
                 }
             });
             line(label, &format!("更新 {updates} 键"), d.as_secs_f64() * 1e6 / updates as f64, "µs/次", live, peak, "");
+            scale_note_maintenance(&*db, "update", &maintenance);
 
             // ---- 观测与回收 ----
             let (d, live, peak, h) = timed(|| db.health());
@@ -5767,6 +5930,8 @@ mod tests {
 
             let (d, live, peak, v) = timed(|| db.vacuum().unwrap());
             line(label, "vacuum() 全库", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("裁掉 {} 行", v.versions_removed));
+            eprintln!("SCALE_VACUUM engine={label} rows_scanned={} versions_removed={} skipped={}", v.rows_scanned, v.versions_removed, v.skipped_active_txn);
+            scale_note_maintenance(&*db, "vacuum", &maintenance);
 
             let (d, live, peak, vr) = timed(|| db.vacuum_bounded(None, 2048).unwrap());
             line(label, "vacuum_bounded 一片", d.as_secs_f64() * 1e6, "µs/次", live, peak,
@@ -5865,10 +6030,11 @@ mod tests {
                 db
             };
 
-            // 收尾：确认 bulk 的数据读得回来
-            let tx = db.begin();
-            assert!(tx.get(&key(rows)).is_some(), "{label}: bulk 写的键读不回来");
-            drop(tx);
+            // Independent full manifest, outside the recovery timing. Validate
+            // both bulk rows and all pre-existing rows, not merely the first key.
+            scale_check_contents(&*db, rows, ScaleExpected::BulkReopen { bulk_rows })
+                .unwrap_or_else(|e| panic!("{label}: bulk 重开验收失败: {e}"));
+            eprintln!("{label}: bulk 重开验收通过(不计时) {} 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符", rows + ttl_rows + 1 + bulk_rows);
             drop(db);
 
             // 明确在成功标记之前清理；错误不能被脚本误判为完整通过。

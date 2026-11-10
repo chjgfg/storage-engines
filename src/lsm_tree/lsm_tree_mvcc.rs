@@ -737,7 +737,8 @@ impl MVCC {
 
         // 有界轮次只把删除留在 memtable 里，交给正常的 memtable flush 阈值收口：
         // 每片都 flush 会在 L0 造出一堆只装墓碑的小 SST，压实代价比省下的那点持久性贵。
-        // 崩在中间也不会读到旧值 —— 复活的行都是 version < xmin 的，新事务快照看不见。
+        // 新事务仍可能看见 version < xmin；删除屏障必须在跨层压实时保留，直到被遮住的
+        // 旧来源一起参与合并。不能仅凭版本小于 xmin 就宣称它不可见。
         let mut blob_rewritten = None;
         if budget_rows == u64::MAX {
             kv.flush()?;

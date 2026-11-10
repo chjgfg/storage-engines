@@ -3,7 +3,7 @@
 //! 读路径（新→旧）：mem → immutables → L0 → L1 → …
 //! 写路径：insert →（可选 mem.wal）→ mem；超阈值 flush → L0；再 leveled compact。
 //!
-//! 版本 GC 由上层 `MVCC::vacuum` 负责；compact 只做空间合并（丢弃 Drop）。
+//! 版本 GC 由上层 `MVCC::vacuum` 负责；compact 仅在没有外部旧来源时丢弃删除屏障。
 
 #[cfg(test)]
 use std::assert;
@@ -21,7 +21,7 @@ use std::{
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
-    merge_latest_streaming, merge_streaming, merge_to_ssts, vec_inputs, BlockCache, EntryValue,
+    merge_latest_streaming, merge_streaming, merge_to_ssts_with_action, CompactionAction, vec_inputs, BlockCache, EntryValue,
     LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry,
 };
 
@@ -333,6 +333,54 @@ pub struct LsmStats {
     pub level_bytes: Vec<u64>,
     pub oldest_snapshot: Option<u64>,
     pub dir: PathBuf,
+}
+
+/// Test-only, opt-in timing at real maintenance doors. No production overhead.
+#[cfg(test)]
+pub(crate) mod maintenance_probe {
+    use std::{assert, cell::RefCell, thread_local, time::Instant};
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct Stats {
+        pub flushes: u64,
+        pub flush_ns: u128,
+        pub compactions: u64,
+        pub compact_ns: u128,
+        pub input_files: u64,
+        pub input_bytes: u64,
+    }
+    thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub fn start() -> Self {
+            ACTIVE.with(|s| { assert!(s.borrow().is_none()); *s.borrow_mut() = Some(Stats::default()); });
+            Self
+        }
+        pub fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().as_ref().unwrap().clone()) }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
+    pub(crate) enum Kind { Flush, Compact }
+    pub(crate) struct Timer { kind: Kind, start: Instant }
+    impl Timer {
+        pub fn start(kind: Kind) -> Option<Self> {
+            ACTIVE.with(|s| s.borrow().is_some().then(|| Self { kind, start: Instant::now() }))
+        }
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            let ns = self.start.elapsed().as_nanos();
+            ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+                match self.kind {
+                    Kind::Flush => { stats.flushes += 1; stats.flush_ns += ns; }
+                    Kind::Compact => { stats.compactions += 1; stats.compact_ns += ns; }
+                }
+            });
+        }
+    }
+    pub(crate) fn inputs(files: u64, bytes: u64) {
+        ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+            stats.input_files += files; stats.input_bytes += bytes;
+        });
+    }
 }
 
 impl LSMTree {
@@ -1821,6 +1869,8 @@ impl LSMTree {
         if imm.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        let _probe = maintenance_probe::Timer::start(maintenance_probe::Kind::Flush);
         let id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let path = self.sst_path(id);
         let mut builder = SstBuilder::with_options(
@@ -1960,8 +2010,30 @@ impl LSMTree {
             (files, paths)
         };
 
-        // Drop / TTL / 用户 filter；merge 每个 key 只 emit 最新一条，
-        // 故多版本回收在 merge 折叠时完成（enable_snapshot_gc 主要影响读路径 pin）。
+        #[cfg(test)]
+        let _probe = if input_files.is_empty() { None } else {
+            maintenance_probe::inputs(input_files.len() as u64, input_files.iter().map(|f| f.size_bytes).sum());
+            maintenance_probe::Timer::start(maintenance_probe::Kind::Compact)
+        };
+
+        // Input sources have already been removed from levels. Snapshot only
+        // outside ranges (O(number of files), not values); conservative overlap
+        // retains a deletion barrier until the possible old source participates.
+        let mut outside: Vec<(Vec<u8>, Vec<u8>)> = self.levels.iter().flatten()
+            .map(|s| (s.min_key.clone(), s.max_key.clone())).collect();
+        for mem in std::iter::once(&self.mem).chain(self.immutables.iter()) {
+            if let (Some((lo, _)), Some((hi, _))) = (mem.first_key_value(), mem.last_key_value()) {
+                outside.push((lo.clone(), hi.clone()));
+            }
+        }
+        outside.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (lo, hi) in outside {
+            if let Some(last) = ranges.last_mut() {
+                if lo <= last.1 { last.1 = std::mem::take(&mut last.1).max(hi); continue; }
+            }
+            ranges.push((lo, hi));
+        }
         let filter = self.compaction_filter.clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1984,6 +2056,13 @@ impl LSMTree {
             }
             true
         };
+        let action = |k: &[u8], se: &StoredEntry| {
+            if keep(k, se) { return CompactionAction::Keep; }
+            let end = ranges.partition_point(|(lo, _)| lo.as_slice() <= k);
+            if end > 0 && k <= ranges[end - 1].1.as_slice() {
+                CompactionAction::RetainDeletion
+            } else { CompactionAction::Discard }
+        };
 
         let block_entries = self.opts.sst_block_entries;
         let enable_bloom = self.opts.enable_bloom;
@@ -1996,12 +2075,12 @@ impl LSMTree {
 
         // 每源一路迭代器，`iter_all()` 一块一块读 ⇒ 压实期间活着的是"每源当前那一块 + 一个
         // builder"，不再是"所有输入文件之和"（M33）。
-        let mut new_files = merge_to_ssts(
+        let mut new_files = merge_to_ssts_with_action(
             input_files
                 .iter()
                 .map(|s| Box::new(s.iter_all()) as MergeInput<'_, StoredEntry>)
                 .collect(),
-            &keep,
+            &action,
             || {
                 let id = next_id.fetch_add(1, Ordering::SeqCst);
                 let path = dir.join("sst").join(format!("{id:08}.sst"));
@@ -2030,7 +2109,7 @@ impl LSMTree {
         // 而这一层的输出又只在被压实到时才重写。
         let mut replaced: Vec<PathBuf> = Vec::new();
         if next >= 1 {
-            self.repair_level_overlaps(&mut all_next, &mut replaced, &keep)?;
+            self.repair_level_overlaps(&mut all_next, &mut replaced, &action)?;
         }
         self.levels[next] = all_next;
         self.refresh_level_ranges(next);
@@ -2072,10 +2151,10 @@ impl LSMTree {
     /// 并且是**传递闭包**（A∩B、B∩C 而 A∩C=∅ 也得整段一起折，否则留下新的重叠）。
     /// 长度 1 的段原样留着 —— 那是常态：正常压实不会产生重叠（L0 全量并入、同层输出按键有序）。
     ///
-    /// 取胜规则直接用 [`merge_to_ssts`](→ `merge_streaming`)：**同键取 seq 最大者**，与跨源点查
+    /// 取胜规则直接用 `merge_to_ssts_with_action` → `merge_streaming`：**同键取 seq 最大者**，与跨源点查
     /// `get_entry_at` 同一个判据 ⇒ 修复前后的读答案逐键相同（这条有守卫对拍，不是说法）。
-    /// 过滤条件沿用**本次 compaction 的 `keep`**（TTL / Drop / 用户 filter）：同一次压实里
-    /// "新写出的文件过滤过、修复出来的没过滤"会更难解释。
+    /// 过滤与保留删除屏障沿用本次 compaction 的 action（TTL / Drop / 用户 filter），
+    /// 与常规合并共享同一份外部来源判定。
     ///
     /// ✅ 内存：M33 起这条与常规压实**走同一条流式源**（`iter_all()` 一块一块读）。
     /// 旧写法在这里也 `iter_entries()` 把段里每个文件整篇读进 `Vec`，与压实共用那条账单 ——
@@ -2090,7 +2169,7 @@ impl LSMTree {
         keep: &F,
     ) -> std::io::Result<()>
     where
-        F: Fn(&[u8], &StoredEntry) -> bool,
+        F: Fn(&[u8], &StoredEntry) -> CompactionAction,
     {
         let taken = std::mem::take(files);
         let mut runs: Vec<Vec<SstFile>> = Vec::new();
@@ -2131,7 +2210,7 @@ impl LSMTree {
             let old_paths: Vec<PathBuf> = run.iter().map(|s| s.path.clone()).collect();
             // M33：修复重叠与常规压实**共用同一条流式源账单**。旧写法在这里也 `iter_entries()`
             // 整篇读进 Vec，而修复恰恰多在崩溃恢复之后跑 —— 那时正是内存最紧的时候。
-            let mut merged = merge_to_ssts(
+            let mut merged = merge_to_ssts_with_action(
                 run.iter()
                     .map(|s| Box::new(s.iter_all()) as MergeInput<'_, StoredEntry>)
                     .collect(),
@@ -4255,6 +4334,32 @@ MANIFEST={text:?}
             "[层内重叠] 折之前 40 把键探文件 {probes_before} 次 → 折之后 {probes_after} 次（每个键 1 次）"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_does_not_resurrect_deleted_keys_from_deeper_levels() {
+        for kind in ["hard-delete", "filter", "ttl", "mvcc-tombstone"] {
+            let dir = tmp_dir("deep_delete");
+            let mut db = LSMTree::open(&dir).unwrap();
+            let key = crate::common::encode_key(b"deleted", 1);
+            db.inject_sst_for_test(2, vec![(key.clone(), StoredEntry::put(1, Some(b"old".to_vec())))]).unwrap();
+            let value = match kind {
+                "hard-delete" => EntryValue::Drop,
+                "mvcc-tombstone" => { db.set_mvcc_xmin_filter(2); EntryValue::Put(None) },
+                "filter" => { db.set_compaction_filter(Some(Arc::new(|_, _| false))); EntryValue::Put(Some(b"filtered".to_vec())) },
+                "ttl" => { db.ttl_meta.insert(key.clone(), 1); EntryValue::Put(Some(b"expired".to_vec())) },
+                _ => unreachable!(),
+            };
+            db.inject_sst_for_test(0, vec![(key.clone(), StoredEntry { seq: 2, value })]).unwrap();
+            db.compact_level(0).unwrap();
+            assert_eq!(db.get_raw(&key), None, "{kind}: discarded barrier exposed deeper old data");
+            assert!(matches!(db.get_entry(&key).unwrap().value, EntryValue::Drop), "must retain a barrier until the old source participates");
+            drop(db);
+            let mut db = LSMTree::open(&dir).unwrap();
+            assert_eq!(db.get_raw(&key), None, "{kind}: reopen resurrected data");
+            db.compact_level(1).unwrap();
+            assert!(db.get_entry(&key).is_none(), "barrier may disappear after merging its last old source");
+        }
     }
 }
 
