@@ -2,6 +2,25 @@
 
 ## 未发布（2026-11-10）
 
+### M96：普通逻辑分组免建树，health 复用键缓冲
+
+- 公共 KeyWindow 显式区分 Empty / Single / Overlap；仅真实重叠才分配 BTreeMap，窗口收缩后
+  回到单组。扫描、快照导出和 vacuum 共享此优化；二进制前缀交错仍按逻辑边界等待完整组。
+- logical_floor 先排除首字节必大于版本上界的后缀，再进行原来的精确比较；不放宽边界。
+  health 直接借用逻辑键、复用出窗键缓冲；不再每条 decode_key 分配一份 Vec。
+- 二进制空键、0/255 字节、多层前缀、不同链长及普通/重叠分组切换与独立计数表对拍。
+  `cargo test --offline --lib --quiet`：422 passed / 0 failed / 40 ignored。
+  `cargo check --offline --all-targets --all-features` 通过。
+- 精确 health 仍为持锁全量扫描；这次减少锁内 CPU/分配成本，没有把它改成廉价或有界查询。
+  放锁分段会改变并发快照语义，未混入本次优化；常规轻量监控可读现有 reclamation_status。
+- `cargo test --offline --release --lib logical_health_cost -- --ignored --nocapture --test-threads=1`：
+  1 passed，600k 行同构建旧/新/新/旧对照：236.622 / 42.434 / 42.861 / 199.664 ms，
+  分配次数分别 600001 / 1 / 1 / 600001。旧臂无法满足新臂 `<100` 次分配界；四次计数结果相同。
+  这里只测公共折叠，不含磁盘 I/O，不能等同于四引擎完整 health 的加速比。
+- 重跑 `memory_snapshot_stop_cost`：1 passed，16.85 s，四轮快照逐值验证通过。
+  旧/新/新/旧的 Drop 为 2723.276 / 1145.935 / 2273.097 / 1263.648 ms；
+  新臂 CRC 42.571 / 43.907 ms。停机仍有显著跨轮波动，不能把单轮低值外推到 20M。
+
 ### M95：memory 快照按写缓冲块累计 CRC
 
 - CRC 移到 BufWriter 下方，按文件实际接受的字节累计；保留原 8 KiB 缓冲、BPEXP004 字节格式、

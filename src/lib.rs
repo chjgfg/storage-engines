@@ -63,6 +63,7 @@ pub(crate) mod mem_probe {
 
     static LIVE: AtomicU64 = AtomicU64::new(0);
     static PEAK: AtomicU64 = AtomicU64::new(0);
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 
     pub struct Tracking;
 
@@ -71,6 +72,7 @@ pub(crate) mod mem_probe {
             // SAFETY: 委托给 System，契约由调用方（Rust 运行时）保证
             let p = unsafe { System.alloc(l) };
             if !p.is_null() {
+                ALLOCATIONS.fetch_add(1, Relaxed);
                 let now = LIVE.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
                 PEAK.fetch_max(now, Relaxed);
             }
@@ -90,6 +92,9 @@ pub(crate) mod mem_probe {
     pub(crate) fn live() -> u64 {
         LIVE.load(Relaxed)
     }
+
+    /// Allocation calls, for isolated resource-shape comparisons (not RSS).
+    pub(crate) fn allocations() -> u64 { ALLOCATIONS.load(Relaxed) }
 
     /// 开机到此刻的高水位
     pub(crate) fn peak() -> u64 {

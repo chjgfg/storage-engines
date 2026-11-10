@@ -6,6 +6,7 @@
 //! overlap window; in the worst case that window can span the database.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::{matches, unreachable};
 
 use super::{VersionedKey, WinCandidate, decode_key, encode_key};
 
@@ -24,6 +25,9 @@ pub(crate) fn take_tail_buffer_peak() -> usize { TAIL_BUFFER_PEAK.with(|c| c.rep
 pub(crate) fn logical_floor(enc: &[u8], max_version: u64) -> &[u8] {
     let ceiling = max_version.to_be_bytes();
     for split in 0..enc.len() {
+        // Most ordinary key bytes exceed the first (usually zero) version byte.
+        // Avoid a slice comparison for each such byte; the exact bound is unchanged.
+        if enc[split] > ceiling[0] { continue; }
         if ceiling.as_slice() >= &enc[split..] {
             return &enc[..split];
         }
@@ -51,32 +55,64 @@ pub(crate) fn range_end(end: &[u8], max_version: u64, inclusive: bool) -> Vec<u8
 }
 
 pub(crate) struct KeyWindow<T> {
-    pending: BTreeMap<Vec<u8>, T>,
+    pending: WindowStorage<T>,
+}
+
+/// Ordinary groups need no tree node. Binary prefix overlap explicitly promotes
+/// to a sorted window, whose worst-case size remains the full database.
+enum WindowStorage<T> {
+    Empty,
+    Single(Vec<u8>, T),
+    Overlap(BTreeMap<Vec<u8>, T>),
 }
 
 impl<T> KeyWindow<T> {
     pub(crate) fn new() -> Self {
         Self {
-            pending: BTreeMap::new(),
+            pending: WindowStorage::Empty,
         }
     }
     pub(crate) fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+        matches!(self.pending, WindowStorage::Empty)
     }
     pub(crate) fn insert(&mut self, key: Vec<u8>, value: T) {
-        self.pending.insert(key, value);
+        match &mut self.pending {
+            WindowStorage::Empty => self.pending = WindowStorage::Single(key, value),
+            WindowStorage::Single(old, v) if *old == key => *v = value,
+            WindowStorage::Single(_, _) => {
+                let old = std::mem::replace(&mut self.pending, WindowStorage::Empty);
+                let WindowStorage::Single(old_key, old_value) = old else { unreachable!() };
+                let mut map = BTreeMap::new();
+                map.insert(old_key, old_value);
+                map.insert(key, value);
+                self.pending = WindowStorage::Overlap(map);
+            }
+            WindowStorage::Overlap(map) => { map.insert(key, value); }
+        }
     }
     pub(crate) fn pop_first(&mut self) -> Option<(Vec<u8>, T)> {
-        self.pending.pop_first()
+        match std::mem::replace(&mut self.pending, WindowStorage::Empty) {
+            WindowStorage::Empty => None,
+            WindowStorage::Single(key, value) => Some((key, value)),
+            WindowStorage::Overlap(mut map) => {
+                let out = map.pop_first();
+                self.pending = if map.len() == 1 {
+                    let (key, value) = map.pop_first().expect("one group");
+                    WindowStorage::Single(key, value)
+                } else if map.is_empty() { WindowStorage::Empty }
+                else { WindowStorage::Overlap(map) };
+                out
+            }
+        }
     }
     pub(crate) fn pop_before(&mut self, enc: &[u8], max_version: u64) -> Option<(Vec<u8>, T)> {
-        let floor = logical_floor(enc, max_version);
-        if self
-            .pending
-            .first_key_value()
-            .is_some_and(|(key, _)| key.as_slice() < floor)
-        {
-            self.pending.pop_first()
+        let first = match &self.pending {
+            WindowStorage::Empty => return None,
+            WindowStorage::Single(key, _) => key,
+            WindowStorage::Overlap(map) => map.first_key_value().expect("overlap nonempty").0,
+        };
+        if first.as_slice() < logical_floor(enc, max_version) {
+            self.pop_first()
         } else {
             None
         }
@@ -85,7 +121,27 @@ impl<T> KeyWindow<T> {
 
 impl<T: Default> KeyWindow<T> {
     pub(crate) fn entry(&mut self, key: Vec<u8>) -> &mut T {
-        self.pending.entry(key).or_default()
+        if let WindowStorage::Single(old, _) = &self.pending {
+            if *old != key {
+                let old = std::mem::replace(&mut self.pending, WindowStorage::Empty);
+                let WindowStorage::Single(k, v) = old else { unreachable!() };
+                let mut map = BTreeMap::new();
+                map.insert(k, v);
+                self.pending = WindowStorage::Overlap(map);
+            }
+        }
+        if self.is_empty() {
+            self.pending = WindowStorage::Single(key, T::default());
+            return match &mut self.pending {
+                WindowStorage::Single(_, value) => value,
+                _ => unreachable!(),
+            };
+        }
+        match &mut self.pending {
+            WindowStorage::Single(_, value) => value,
+            WindowStorage::Overlap(map) => map.entry(key).or_default(),
+            WindowStorage::Empty => unreachable!(),
+        }
     }
 }
 
@@ -241,13 +297,27 @@ impl LogicalHealth {
         self.max_chain = self.max_chain.max(count);
     }
     pub(crate) fn push(&mut self, enc: &[u8]) {
-        while let Some((_, count)) = self.groups.pop_before(enc, self.max_version) {
+        if enc.len() < 8 { return; }
+        let raw = &enc[..enc.len() - 8];
+        self.total_rows += 1;
+        if let WindowStorage::Single(key, count) = &mut self.groups.pending {
+            if key.as_slice() == raw { *count += 1; return; }
+        }
+        let mut reusable = Vec::new();
+        while let Some((key, count)) = self.groups.pop_before(enc, self.max_version) {
             self.count(count);
+            reusable = key;
         }
-        if let Some(vk) = decode_key(enc) {
-            self.total_rows += 1;
-            *self.groups.entry(vk.raw_key) += 1;
+        match &mut self.groups.pending {
+            WindowStorage::Single(key, count) if key.as_slice() == raw => { *count += 1; return; }
+            WindowStorage::Overlap(map) => {
+                if let Some(count) = map.get_mut(raw) { *count += 1; return; }
+            }
+            _ => {},
         }
+        reusable.clear();
+        reusable.extend_from_slice(raw);
+        self.groups.insert(reusable, 1);
     }
     pub(crate) fn finish(mut self, active_txns: u64) -> super::MvccHealth {
         while let Some((_, count)) = self.groups.pop_first() {
@@ -320,6 +390,81 @@ pub(crate) fn reverse_window(
 mod tests {
     use super::*;
     use std::{assert, assert_eq, vec};
+
+    fn reference_health(physical: &[Vec<u8>], ceiling: u64) -> super::super::MvccHealth {
+        let mut pending = BTreeMap::<Vec<u8>, u64>::new();
+        let mut out = super::super::MvccHealth::default();
+        for enc in physical {
+            // Original generic map path, including its original floor comparison.
+            let max = ceiling.to_be_bytes();
+            let split = (0..enc.len()).find(|&i| max.as_slice() >= &enc[i..]).unwrap_or(enc.len());
+            while pending.first_key_value().is_some_and(|(k, _)| k.as_slice() < &enc[..split]) {
+                let (_, count) = pending.pop_first().unwrap();
+                out.live_keys += 1;
+                out.max_chain = out.max_chain.max(count);
+            }
+            if let Some(vk) = decode_key(enc) { *pending.entry(vk.raw_key).or_default() += 1; out.total_rows += 1; }
+        }
+        for count in pending.into_values() { out.live_keys += 1; out.max_chain = out.max_chain.max(count); }
+        out.rows_above_one = out.total_rows - out.live_keys;
+        out
+    }
+
+    #[test]
+    fn logical_health_preserves_binary_overlap_and_group_transitions() {
+        let mut raw_keys = vec![vec![], vec![0], vec![255], b"a".to_vec(), b"b".to_vec()];
+        for a in [0, 1, 97, 255] {
+            for b in [0, 1, 97, 255] {
+                raw_keys.push(vec![a, b]);
+                raw_keys.push(vec![a, b, 0]);
+                raw_keys.push(vec![a, b, 0, 0, 0, 0, 0, 0, 1]);
+            }
+        }
+        raw_keys.sort(); raw_keys.dedup();
+        for ceiling in [65_536, u64::MAX] {
+            let mut physical = Vec::new();
+            let mut expected = BTreeMap::<Vec<u8>, u64>::new();
+            for (i, raw) in raw_keys.iter().enumerate() {
+                for version in [0, 1, 256, 65_536].into_iter().take(1 + i % 4) {
+                    physical.push(encode_key(raw, version));
+                    *expected.entry(raw.clone()).or_default() += 1;
+                }
+            }
+            physical.sort();
+            let mut health = LogicalHealth::new(ceiling);
+            for enc in &physical { health.push(enc); }
+            let got = health.finish(0);
+            assert_eq!(got.total_rows, physical.len() as u64);
+            assert_eq!(got.live_keys, expected.len() as u64);
+            assert_eq!(got.max_chain, *expected.values().max().unwrap());
+            assert_eq!(got, reference_health(&physical, ceiling));
+        }
+    }
+
+    #[test]
+    #[ignore = "same-build logical health allocation/time comparison; release single thread"]
+    fn logical_health_cost() {
+        use std::{eprintln, format, time::Instant};
+        let rows = 600_000;
+        let physical: Vec<_> = (0..rows).map(|i| encode_key(format!("{i:08}#/worldquant/datafields/x.json").as_bytes(), 1)).collect();
+        let mut expected = None;
+        for old in [true, false, false, true] {
+            let alloc = crate::mem_probe::allocations();
+            let start = Instant::now();
+            let result = if old { reference_health(&physical, 1000) } else {
+                let mut fold = LogicalHealth::new(1000);
+                for enc in &physical { fold.push(enc); }
+                fold.finish(0)
+            };
+            let elapsed = start.elapsed();
+            let allocations = crate::mem_probe::allocations() - alloc;
+            if let Some(want) = &expected { assert_eq!(&result, want); }
+            else { expected = Some(result); }
+            if old { assert!(allocations >= rows as u64, "reference must expose per-row allocation"); }
+            else { assert!(allocations < 100, "ordinary health must reuse its key buffer"); }
+            eprintln!("HEALTH_COST old={old} rows={rows} ms={:.3} allocations={allocations}", elapsed.as_secs_f64() * 1e3);
+        }
+    }
 
     #[test]
     fn bounded_tail_handles_interleaved_versions_and_empty_answers() {
