@@ -1743,6 +1743,8 @@ impl SstBuilder {
 
     /// `sync=false`：不 fsync（bulk 导入用，结束时统一落盘）
     pub fn finish_with_sync(mut self, sync: bool) -> std::io::Result<SstFile> {
+        #[cfg(test)]
+        let _timer = crate::lsm_tree::lsm_tree::maintenance_probe::Timer::start(crate::lsm_tree::lsm_tree::maintenance_probe::Kind::SstFinish);
         // 最后那半块
         if !self.pending.is_empty() {
             self.emit_block()?;
@@ -1800,6 +1802,8 @@ impl SstBuilder {
         f.write_all(&footer_len.to_le_bytes())?;
         f.flush()?;
         if sync {
+            #[cfg(test)]
+            let _timer = crate::lsm_tree::lsm_tree::maintenance_probe::Timer::start(crate::lsm_tree::lsm_tree::maintenance_probe::Kind::SstSync);
             f.get_mut().sync_all()?;
         }
         let _ = std::fs::remove_file(&self.path);

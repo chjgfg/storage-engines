@@ -14,7 +14,7 @@ use std::matches;
 use std::write;
 use std::writeln;
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{
+    collections::{BTreeMap, BinaryHeap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, BufWriter, Write}, path::{Path, PathBuf}, sync::{
         Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering},
     }, thread::JoinHandle, time::Duration, vec,
 };
@@ -60,6 +60,47 @@ pub(crate) mod blob_reference {
         pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self }
     }
     impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod manifest_reference {
+    use std::{assert, cell::Cell, io::{Result, Write}, thread_local};
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static WRITES: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub fn writes() -> u64 { WRITES.with(|c| c.get()) }
+    pub struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+    pub struct Sink<W>(pub W);
+    impl<W: Write> Write for Sink<W> {
+        fn write(&mut self, bytes: &[u8]) -> Result<usize> {
+            WRITES.with(|c| c.set(c.get() + 1));
+            self.0.write(bytes)
+        }
+        fn flush(&mut self) -> Result<()> { self.0.flush() }
+    }
+}
+
+#[cfg(test)]
+fn manifest_publishes_reference(text: &str, ids: &[u64]) -> bool {
+    ids.iter().all(|id| text.split_whitespace().any(|word| word == id.to_string()))
+}
+
+#[cfg(test)]
+fn manifest_publishes(text: &str, level: usize, ids: &[u64]) -> bool {
+    let tag = format!("L{level}");
+    let mut lines = text.lines().filter_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next() == Some(tag.as_str())).then_some(words)
+    });
+    let Some(words) = lines.next() else { return false; };
+    // Reject ambiguous/invalid target-level lines; metadata/other levels never qualify.
+    if lines.next().is_some() { return false; }
+    let Some(published) = words.map(|word| word.parse::<u64>().ok()).collect::<Option<HashSet<_>>>() else { return false; };
+    ids.iter().all(|id| published.contains(id))
 }
 
 // ─── Options ─────────────────────────────────────────────────────────────────
@@ -364,6 +405,13 @@ pub(crate) mod maintenance_probe {
         pub compact_ns: u128,
         pub input_files: u64,
         pub input_bytes: u64,
+        pub merge_ns: u128,
+        pub repair_ns: u128,
+        pub manifest_ns: u128,
+        pub guard_ns: u128,
+        pub cleanup_ns: u128,
+        pub sst_finish_ns: u128,
+        pub sst_sync_ns: u128,
     }
     thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
     pub(crate) struct Scope;
@@ -375,7 +423,7 @@ pub(crate) mod maintenance_probe {
         pub fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().as_ref().unwrap().clone()) }
     }
     impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
-    pub(crate) enum Kind { Flush, Compact }
+    pub(crate) enum Kind { Flush, Compact, Merge, Repair, Manifest, Guard, Cleanup, SstFinish, SstSync }
     pub(crate) struct Timer { kind: Kind, start: Instant }
     impl Timer {
         pub fn start(kind: Kind) -> Option<Self> {
@@ -389,6 +437,13 @@ pub(crate) mod maintenance_probe {
                 match self.kind {
                     Kind::Flush => { stats.flushes += 1; stats.flush_ns += ns; }
                     Kind::Compact => { stats.compactions += 1; stats.compact_ns += ns; }
+                    Kind::Merge => stats.merge_ns += ns,
+                    Kind::Repair => stats.repair_ns += ns,
+                    Kind::Manifest => stats.manifest_ns += ns,
+                    Kind::Guard => stats.guard_ns += ns,
+                    Kind::Cleanup => stats.cleanup_ns += ns,
+                    Kind::SstFinish => stats.sst_finish_ns += ns,
+                    Kind::SstSync => stats.sst_sync_ns += ns,
                 }
             });
         }
@@ -2119,6 +2174,8 @@ impl LSMTree {
 
         // 每源一路迭代器，`iter_all()` 一块一块读 ⇒ 压实期间活着的是"每源当前那一块 + 一个
         // builder"，不再是"所有输入文件之和"（M33）。
+        #[cfg(test)]
+        let merge_timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Merge);
         let mut new_files = merge_to_ssts_with_action(
             input_files
                 .iter()
@@ -2136,6 +2193,8 @@ impl LSMTree {
         // 迭代器借的是 `input_files`，而下面要**删这些文件** —— Windows 上句柄还开着删不掉，
         // 所以归并一结束就释放输入文件（旧写法"源是 Vec"顺带做到了这点，不是巧合能省的东西）。
         drop(input_files);
+        #[cfg(test)]
+        drop(merge_timer);
         let ns = Self::dir_cache_ns(&self.dir);
         for sst in &mut new_files {
             sst.set_cache_ns(ns);
@@ -2153,6 +2212,8 @@ impl LSMTree {
         // 而这一层的输出又只在被压实到时才重写。
         let mut replaced: Vec<PathBuf> = Vec::new();
         if next >= 1 {
+            #[cfg(test)]
+            let _timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Repair);
             self.repair_level_overlaps(&mut all_next, &mut replaced, &action)?;
         }
         self.levels[next] = all_next;
@@ -2168,21 +2229,21 @@ impl LSMTree {
         self.write_manifest()?;
         #[cfg(test)]
         {
-            // 顺序守卫读的是**盘上的 MANIFEST 内容**，不是"我有没有在删之前调用过一次写"：
-            // 删任何一个旧文件之前，这一层现在每个文件的 id 都必须已经在 MANIFEST 里。
-            // 把上面那次 `write_manifest` 挪回删除之后（旧写法：删完等调用方去记），这段当场红 ——
-            // 而且**不需要谁"记得把探针一起搬"**，因为探针就长在删除点前面。
-            let text = fs::read_to_string(self.manifest_path()).unwrap_or_default();
-            for sst in &self.levels[next] {
-                assert!(
-                    text.split_whitespace().any(|w| w == sst.id.to_string()),
-                    "删旧 SST 之前 MANIFEST 里还找不到新文件 {}（层 {next}）⇒ 崩在这个窗口就是静默丢数据",
-                    sst.id
-                );
+            let _timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Guard);
+            let text = fs::read_to_string(self.manifest_path())?;
+            let ids: Vec<_> = self.levels[next].iter().map(|sst| sst.id).collect();
+            if manifest_reference::enabled() {
+                assert!(manifest_publishes_reference(&text, &ids));
             }
+            assert!(manifest_publishes(&text, next, &ids),
+                "new SST set absent from target level {next} before deleting old files");
         }
-        for p in paths.iter().chain(replaced.iter()) {
-            let _ = fs::remove_file(p);
+        {
+            #[cfg(test)]
+            let _timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Cleanup);
+            for p in paths.iter().chain(replaced.iter()) {
+                let _ = fs::remove_file(p);
+            }
         }
         // 通知后台
         self.notify_bg();
@@ -2335,57 +2396,71 @@ impl LSMTree {
 
     // ─── MANIFEST ────────────────────────────────────────────────────────────
 
+    fn write_manifest_body(&self, mut f: impl Write) -> std::io::Result<()> {
+        writeln!(f, "LSMAN002")?;
+        writeln!(f, "edit {}", self.manifest_edit_id)?;
+        writeln!(
+            f,
+            "next_id {}",
+            self.next_sst_id.load(Ordering::SeqCst)
+        )?;
+        writeln!(
+            f,
+            "next_seq {}",
+            self.write_seq.load(Ordering::SeqCst)
+        )?;
+        for (i, level) in self.levels.iter().enumerate() {
+            write!(f, "L{i}")?;
+            for sst in level {
+                write!(f, " {}", sst.id)?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+
+    fn write_manifest_output(&self, writer: impl Write) -> std::io::Result<()> {
+        #[cfg(test)]
+        if manifest_reference::enabled() {
+            let mut writer = writer;
+            self.write_manifest_body(&mut writer)?;
+            return writer.flush();
+        }
+        let mut buffered = BufWriter::with_capacity(64 * 1024, writer);
+        self.write_manifest_body(&mut buffered)?;
+        // Flush errors must precede sync/publication. Drop cannot report them.
+        buffered.flush()
+    }
+
     fn write_manifest(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        let _timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Manifest);
         self.manifest_edit_id = self.manifest_edit_id.saturating_add(1);
         let path = self.manifest_path();
         let tmp = self.dir.join("MANIFEST.tmp");
         {
             let mut f = File::create(&tmp)?;
-            writeln!(f, "LSMAN002")?;
-            writeln!(f, "edit {}", self.manifest_edit_id)?;
-            writeln!(
-                f,
-                "next_id {}",
-                self.next_sst_id.load(Ordering::SeqCst)
-            )?;
-            writeln!(
-                f,
-                "next_seq {}",
-                self.write_seq.load(Ordering::SeqCst)
-            )?;
-            for (i, level) in self.levels.iter().enumerate() {
-                write!(f, "L{i}")?;
-                for sst in level {
-                    write!(f, " {}", sst.id)?;
-                }
-                writeln!(f)?;
-            }
+            #[cfg(test)]
+            self.write_manifest_output(manifest_reference::Sink(&mut f))?;
+            #[cfg(not(test))]
+            self.write_manifest_output(&mut f)?;
             if !self.bulk_mode {
-                // M53 记账：一次 open / 一次收口都要付的那一下 fsync
                 #[cfg(test)]
                 crate::common::disk::note_fsync(crate::common::disk::SITE_LSM_MANIFEST);
                 f.sync_all()?;
-            } else {
-                f.flush()?;
             }
         }
         let _ = fs::remove_file(&path);
         fs::rename(&tmp, &path)?;
-        // append-only history (version edit chain)
+        // Best-effort history, as before; build one line before appending.
         let hist = self.dir.join("MANIFEST.LOG");
         if let Ok(mut hf) = File::options().create(true).append(true).open(&hist) {
-            let _ = writeln!(
-                hf,
-                "EDIT {} next_id={} next_seq={} levels={}",
+            let line = format!("EDIT {} next_id={} next_seq={} levels={}\n",
                 self.manifest_edit_id,
                 self.next_sst_id.load(Ordering::SeqCst),
                 self.write_seq.load(Ordering::SeqCst),
-                self.levels
-                    .iter()
-                    .map(|l| l.len().to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+                self.levels.iter().map(|l| l.len().to_string()).collect::<Vec<_>>().join(","));
+            let _ = hf.write_all(line.as_bytes());
         }
         Ok(())
     }
@@ -2741,6 +2816,53 @@ mod tests {
     use std::panic;
     use std::println;
     use std::eprintln;
+
+    #[test]
+    fn manifest_publication_guard_requires_target_level() {
+        let text = "LSMAN002\nedit 17\nnext_id 18\nnext_seq 19\nL0 20\nL1 21\nL2 22\n";
+        assert!(manifest_publishes(text, 1, &[21]));
+        assert!(!manifest_publishes("L1 21\nL1 22\n", 1, &[21]));
+        assert!(!manifest_publishes("L1 21 bad\n", 1, &[21]));
+        assert!(!manifest_publishes(text, 3, &[]));
+        for id in [17, 18, 19, 20, 22] {
+            assert!(manifest_publishes_reference(text, &[id]));
+            assert!(!manifest_publishes(text, 1, &[id]), "unpublished id {id} passed the guard");
+        }
+    }
+
+    #[test]
+    fn manifest_buffer_preserves_bytes_and_bounds_writes() {
+        let dir = tmp_dir("manifest_buffer");
+        let mut db = LSMTree::open(&dir).unwrap();
+        db.manifest_edit_id = 17;
+        db.next_sst_id.store(18, Ordering::SeqCst);
+        db.write_seq.store(19, Ordering::SeqCst);
+        let mut bytes = Vec::new();
+        let before = manifest_reference::writes();
+        db.write_manifest_output(manifest_reference::Sink(&mut bytes)).unwrap();
+        assert_eq!(bytes, b"LSMAN002\nedit 17\nnext_id 18\nnext_seq 19\nL0\nL1\nL2\nL3\n");
+        assert_eq!(manifest_reference::writes() - before, 1);
+        let _reference = manifest_reference::Scope::start();
+        let mut old = Vec::new();
+        let before = manifest_reference::writes();
+        db.write_manifest_output(manifest_reference::Sink(&mut old)).unwrap();
+        assert_eq!(old, bytes);
+        assert!(manifest_reference::writes() - before > 10);
+    }
+
+    #[test]
+    fn manifest_buffer_propagates_flush_write_error() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("manifest write interrupted"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let dir = tmp_dir("manifest_write_error");
+        let db = LSMTree::open(&dir).unwrap();
+        assert!(db.write_manifest_output(Broken).is_err());
+    }
 
     /// 返回 **RAII 句柄**（M82）：声明在引擎之前即可，用例结束（含 panic 展开）自动删目录。
     fn tmp_dir(tag: &str) -> crate::common::ScratchPath {

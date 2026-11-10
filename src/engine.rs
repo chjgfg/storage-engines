@@ -5711,6 +5711,11 @@ mod tests {
         eprintln!("SCALE_MAINT engine={} phase={phase} auto={:?} lsm_flushes={} lsm_flush_ms={:.3} lsm_compactions={} lsm_compact_ms={:.3} lsm_input_files={} lsm_input_bytes={}",
             db.name(), db.reclamation_status(), s.flushes, s.flush_ns as f64 / 1e6,
             s.compactions, s.compact_ns as f64 / 1e6, s.input_files, s.input_bytes);
+        if db.name() == "lsm_tree" {
+            eprintln!("SCALE_LSM_STAGES phase={phase} merge_ms={:.3} repair_ms={:.3} manifest_ms={:.3} guard_ms={:.3} cleanup_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3}",
+                s.merge_ns as f64 / 1e6, s.repair_ns as f64 / 1e6, s.manifest_ns as f64 / 1e6,
+                s.guard_ns as f64 / 1e6, s.cleanup_ns as f64 / 1e6, s.sst_finish_ns as f64 / 1e6, s.sst_sync_ns as f64 / 1e6);
+        }
     }
 
     #[test]
@@ -5766,6 +5771,9 @@ mod tests {
         let name = std::env::var("RECHECK_ENGINE").unwrap_or_else(|_| "memory".to_string());
         let compare_blobs = std::env::var("RECHECK_BLOB_COMPARE").is_ok_and(|v| v == "1");
         let compare_dblwr = std::env::var("RECHECK_DBLWR_COMPARE").is_ok_and(|v| v == "1");
+        let compare_manifest = std::env::var("RECHECK_MANIFEST_COMPARE").is_ok_and(|v| v == "1");
+        assert!(!compare_manifest || (name == "lsm_tree" && rounds % 4 == 0 && !compare_blobs),
+            "manifest comparison requires lsm_tree and isolated old/new/new/old rounds");
         assert!(!compare_dblwr || (name == "bplus_tree" && rounds % 4 == 0),
             "double-write comparison requires bplus_tree and complete old/new/new/old rounds");
         assert!(!compare_blobs || (name == "lsm_tree" && rounds % 4 == 0),
@@ -5778,6 +5786,8 @@ mod tests {
         };
         assert!(rows > 0 && rounds > 0);
         for round in 0..rounds {
+            let manifest_reference = compare_manifest && (round % 4 == 0 || round % 4 == 3);
+            let _manifest_mode = manifest_reference.then(crate::lsm_tree::lsm_tree::manifest_reference::Scope::start);
             let dblwr_reference = compare_dblwr && (round % 4 == 0 || round % 4 == 3);
             let _dblwr_mode = dblwr_reference.then(crate::bplus_tree::storage::dblwr_probe::Scope::start);
             let dir = ScaleScratch::new("maintenance_recheck");
@@ -5799,6 +5809,7 @@ mod tests {
             let db = open_engine(kind, Some(&path)).unwrap();
             let updates = (rows / 10).max(1);
             let dblwr_writes = crate::bplus_tree::storage::dblwr_probe::writes();
+            let manifest_writes = crate::lsm_tree::lsm_tree::manifest_reference::writes();
             let syncs = crate::common::disk::fsync_counts();
             let stages = crate::common::maintenance_probe::Scope::start();
             let (mut begin_ns, mut write_ns, mut commit_ns) = (0u128, 0u128, 0u128);
@@ -5822,6 +5833,10 @@ mod tests {
                 eprintln!("RECHECK_DBLWR round={round} reference={dblwr_reference} payload_writes={} fsync_delta={:?}",
                     crate::bplus_tree::storage::dblwr_probe::writes() - dblwr_writes,
                     std::array::from_fn::<_, 14, _>(|i| crate::common::disk::fsync_counts()[i] - syncs[i]));
+            }
+            if kind == EngineKind::LsmTree {
+                eprintln!("RECHECK_MANIFEST round={round} reference={manifest_reference} writes={}",
+                    crate::lsm_tree::lsm_tree::manifest_reference::writes() - manifest_writes);
             }
             scale_note_maintenance(&*db, "update", &scope);
             let start = std::time::Instant::now();
