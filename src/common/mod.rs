@@ -7,6 +7,8 @@ pub mod codec;
 pub mod disk;
 pub mod kernel;
 pub mod kv_snapshot;
+#[cfg(test)]
+pub(crate) mod maintenance_probe;
 pub(crate) mod order;
 pub mod store;
 pub mod txn;

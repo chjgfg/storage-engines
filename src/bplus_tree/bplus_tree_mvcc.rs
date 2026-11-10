@@ -188,6 +188,8 @@ fn seal_wal_checkpoint(
 /// 顺序不能换：先把 `next_version` 记进 meta（`NVER`）再 flush 页，最后才收口 WAL ——
 /// WAL 一旦被截断，未落盘的页就再无重放来源。
 fn run_checkpoint(kv: &Mutex<BPlusTree>, wal: &Mutex<Wal>, next_version: &AtomicU64) -> std::io::Result<()> {
+    #[cfg(test)]
+    let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::Checkpoint);
     wal.lock().unwrap().ensure_healthy()?;
     let mut kv = kv.lock().unwrap();
     let mut wal = wal.lock().unwrap();
@@ -299,7 +301,11 @@ impl MVCC {
     /// 一片的代价 = 走 `slice` 行叶子条目，锁也就按这么久。
     /// 游标回到库尾之后，下一片自动从头开始第二遍。
     fn tick_auto_vacuum(&self) {
-        if let Err(e) = self.vac.run_pending(|after, rows| self.vacuum_bounded(after, rows)) {
+        if let Err(e) = self.vac.run_pending(|after, rows| {
+            #[cfg(test)]
+            let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::AutoVacuum);
+            self.vacuum_bounded(after, rows)
+        }) {
             log::warn!("自动版本回收失败，保留待回收账: {e}");
         }
     }
@@ -615,6 +621,8 @@ impl MVCC {
             let mut done = false;
             // 本块续跑下界：首块 = 逻辑游标 `after`，其后 = 上一块最后一行的 `enc ‖ 0x00`。
             let resume_bound = lower.clone();
+            #[cfg(test)]
+            let scan_probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumScan);
             kv.scan_entries_break_from(lower.as_deref(), |enc, row| {
                 // ⚠️ `scan_entries_break_from` 只下降到 containing 叶子，随后**从该片第一条**起遍历
                 // （叶粒度定位，过滤交给调用方——见其文档）。上一块已经消费过的行会被再喂一遍；若某个
@@ -669,12 +677,16 @@ impl MVCC {
                 }
             }
             #[cfg(test)]
+            std::mem::drop(scan_probe);
+            #[cfg(test)]
             note_vac_pending(to_delete.len());
             // M61b：`to_delete` 是**升序**的（走查顺序就是编码键顺序：先按 raw_key 升序、组内按版本升序），
             // 而可删行天然成块（M61 实测 k = 16.5~17.9 行/叶子）⇒ 交给批量门，一趟下降带一整片叶子。
             // ⚠️ 对照臂（门控 `BPLUS_BATCH_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）逐行删除，
             //   同一份库、同一批键 ⇒ 比值只归因于"合批 vs 不合批"这一件事。
             if !to_delete.is_empty() {
+                #[cfg(test)]
+                let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumDelete);
                 to_delete.sort();
                 let planned = to_delete.len();
                 #[cfg(test)]
@@ -724,6 +736,8 @@ impl MVCC {
         // 把当前 next_version 一并写入 meta，避免下次 open 因 meta 过旧依赖大 WAL
         let next_ver = self.next_version.load(Ordering::SeqCst);
         kv.set_next_version(next_ver);
+        #[cfg(test)]
+        let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
         kv.flush_all();
         blob.sync()?;
 
@@ -1139,6 +1153,8 @@ impl Transaction {
         // 收尾只交 wal 守卫：fsync 期间不许握着 kv/blob —— `flush_all` 与 checkpoint
         // 是放掉锁之后再做的（它们各自要再拿一次 kv 锁）。
         {
+            #[cfg(test)]
+            let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::Commit);
             let mut reg = self.core.lock_registry();
             let mut wal = self.wal.lock().unwrap();
             self.core.try_commit(&mut reg, &mut WalOnly { wal: &mut wal })?;

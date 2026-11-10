@@ -309,6 +309,8 @@ impl MVCC {
     /// 不跑维护器就等下一次写或手动 `vacuum()`。
     fn tick_auto_vacuum(&self) {
         let _: Result<(), std::convert::Infallible> = self.vac.run_pending(|after, rows| {
+            #[cfg(test)]
+            let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::AutoVacuum);
             Ok(self.vacuum_bounded(after, rows))
         });
     }
@@ -475,6 +477,8 @@ impl MVCC {
             let mut chunk_rows = 0usize;
             let mut next_lower: Option<Vec<u8>> = None;
             let mut done = false;
+            #[cfg(test)]
+            let scan_probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumScan);
             {
                 let store = self.store.lock().unwrap();
                 store.scan_entries_from(lower.as_deref(), |enc, val| {
@@ -517,9 +521,13 @@ impl MVCC {
                 }
             }
             #[cfg(test)]
+            std::mem::drop(scan_probe);
+            #[cfg(test)]
             note_vac_pending(to_delete.len());
             // 读锁已经放掉 ⇒ 这一块单独拿写锁删（以前是"整库攒完再删一次"）
             {
+                #[cfg(test)]
+                let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumDelete);
                 let mut store = self.store.lock().unwrap();
                 for enc in to_delete.drain(..) {
                     let _ = store.delete(&enc);

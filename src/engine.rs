@@ -5614,7 +5614,33 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "focused 10M write/update/vacuum recheck; release single thread"]
+    fn scale_update_probe_observes_bplus_doors_and_obeys_gate() {
+        use crate::common::maintenance_probe::{Scope, Stage, Timer};
+        assert!(Timer::start(Stage::Commit).is_none());
+        let dir = ScaleScratch::new("update_probe");
+        let db = open_engine(EngineKind::BPlusTree, Some(&dir.0.join("bplus.db"))).unwrap();
+        let scope = Scope::start();
+        for value in [b"old", b"new"] {
+            let tx = db.begin();
+            assert!(tx.set_raw(b"key", value.to_vec()));
+            tx.commit();
+        }
+        db.checkpoint().unwrap();
+        assert_eq!(db.vacuum().unwrap().versions_removed, 1);
+        assert_eq!(db.begin().get(b"key"), Some(b"new".to_vec()));
+        let s = scope.stats();
+        assert_eq!(s.calls[Stage::Commit as usize], 2);
+        assert_eq!(s.calls[Stage::Checkpoint as usize], 1);
+        for stage in [Stage::VacuumScan, Stage::VacuumDelete, Stage::VacuumSync] {
+            assert!(s.calls[stage as usize] > 0);
+        }
+        assert_eq!(s.calls[Stage::AutoVacuum as usize], 0);
+        drop(scope);
+        assert!(Timer::start(Stage::VacuumScan).is_none());
+    }
+
+    #[test]
+    #[ignore = "focused write/update/vacuum recheck; release single thread"]
     fn scale_maintenance_recheck() {
         let rows: usize = std::env::var("RECHECK_ROWS").map(|s| s.parse().unwrap()).unwrap_or(10_000_000);
         let rounds: usize = std::env::var("RECHECK_ROUNDS").map(|s| s.parse().unwrap()).unwrap_or(2);
@@ -5622,13 +5648,15 @@ mod tests {
         let kind = match name.as_str() {
             "memory" => EngineKind::Memory,
             "lsm_tree" => EngineKind::LsmTree,
-            _ => panic!("RECHECK_ENGINE must be memory or lsm_tree"),
+            "bplus_tree" => EngineKind::BPlusTree,
+            _ => panic!("RECHECK_ENGINE must be memory, bplus_tree or lsm_tree"),
         };
         assert!(rows > 0 && rounds > 0);
         for round in 0..rounds {
             let dir = ScaleScratch::new("maintenance_recheck");
+            let path = if kind == EngineKind::BPlusTree { dir.0.join("bplus.db") } else { dir.0.clone() };
             let scope = crate::lsm_tree::lsm_tree::maintenance_probe::Scope::start();
-            let db = open_engine(kind, Some(&dir.0)).unwrap();
+            let db = open_engine(kind, Some(&path)).unwrap();
             let start = std::time::Instant::now();
             for base in (0..rows).step_by(1000) {
                 let tx = db.begin();
@@ -5641,15 +5669,26 @@ mod tests {
             db.flush().unwrap(); db.checkpoint().unwrap();
             eprintln!("RECHECK_REOPEN engine={name} round={round}");
             drop(db);
-            let db = open_engine(kind, Some(&dir.0)).unwrap();
+            let db = open_engine(kind, Some(&path)).unwrap();
             let updates = (rows / 10).max(1);
+            let stages = crate::common::maintenance_probe::Scope::start();
+            let (mut begin_ns, mut write_ns, mut commit_ns) = (0u128, 0u128, 0u128);
             let start = std::time::Instant::now();
             for base in (0..updates).step_by(500) {
+                let timer = std::time::Instant::now();
                 let tx = db.begin();
+                begin_ns += timer.elapsed().as_nanos();
+                let timer = std::time::Instant::now();
                 for i in base..(base + 500).min(updates) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+                write_ns += timer.elapsed().as_nanos();
+                let timer = std::time::Instant::now();
                 tx.commit();
+                commit_ns += timer.elapsed().as_nanos();
             }
             eprintln!("RECHECK_UPDATE engine={name} round={round} rows={updates} seconds={:.6}", start.elapsed().as_secs_f64());
+            eprintln!("RECHECK_UPDATE_STAGES engine={name} round={round} begin_ms={:.3} write_ms={:.3} commit_ms={:.3} doors={:?}",
+                begin_ns as f64 / 1e6, write_ns as f64 / 1e6, commit_ns as f64 / 1e6, stages.stats());
+            drop(stages);
             scale_note_maintenance(&*db, "update", &scope);
             let start = std::time::Instant::now();
             let health = db.health();
@@ -5657,9 +5696,12 @@ mod tests {
             let auto_removed = db.reclamation_status().unwrap().versions_removed;
             assert_eq!(auto_removed + health.rows_above_one, updates as u64,
                 "old versions reappeared after automatic reclamation/compaction");
+            let stages = crate::common::maintenance_probe::Scope::start();
             let start = std::time::Instant::now();
             let vacuum = db.vacuum().unwrap();
             eprintln!("RECHECK_VACUUM engine={name} round={round} seconds={:.6} stats={vacuum:?}", start.elapsed().as_secs_f64());
+            eprintln!("RECHECK_VACUUM_STAGES engine={name} round={round} doors={:?}", stages.stats());
+            drop(stages);
             assert!(!vacuum.skipped_active_txn);
             assert_eq!(vacuum.versions_removed as u64, health.rows_above_one);
             scale_note_maintenance(&*db, "vacuum", &scope);
@@ -5948,6 +5990,7 @@ mod tests {
 
             // ---- 更新 10% 的键（制造版本链，看点写是否被链拖住） ----
             let updates: usize = (rows / 10).max(1);
+            let update_stages = crate::common::maintenance_probe::Scope::start();
             let (d, live, peak, ()) = timed(|| {
                 for base in (0..updates).step_by(500) {
                     let end = (base + 500).min(updates);
@@ -5961,14 +6004,19 @@ mod tests {
                 }
             });
             line(label, &format!("更新 {updates} 键"), d.as_secs_f64() * 1e6 / updates as f64, "µs/次", live, peak, "");
+            eprintln!("SCALE_UPDATE_STAGES engine={label} doors={:?}", update_stages.stats());
+            drop(update_stages);
             scale_note_maintenance(&*db, "update", &maintenance);
 
             // ---- 观测与回收 ----
             let (d, live, peak, h) = timed(|| db.health());
             line(label, "health()", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("rows={} max_chain={}", h.total_rows, h.max_chain));
 
+            let vacuum_stages = crate::common::maintenance_probe::Scope::start();
             let (d, live, peak, v) = timed(|| db.vacuum().unwrap());
             line(label, "vacuum() 全库", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("裁掉 {} 行", v.versions_removed));
+            eprintln!("SCALE_VACUUM_STAGES engine={label} doors={:?}", vacuum_stages.stats());
+            drop(vacuum_stages);
             eprintln!("SCALE_VACUUM engine={label} rows_scanned={} versions_removed={} skipped={}", v.rows_scanned, v.versions_removed, v.skipped_active_txn);
             scale_note_maintenance(&*db, "vacuum", &maintenance);
 
