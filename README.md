@@ -3,7 +3,7 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M94 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M95 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
@@ -21,6 +21,7 @@ LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现�
 M89–M93 修复 memory 快照字节往返、完整性与读取内存；三家末页回退仅缓存一页。
 M94 将 Bitcask 自动 checkpoint 的 hint 写出按累计变更量摊销；WAL 默认阈值与持久化顺序不变。
 旧 hint 恢复会补扫跨轮转的数据日志，手动 checkpoint 仍立即发布完整 hint；实测见 CHANGELOG。
+M95 将 memory 快照 CRC 移至写缓冲下方，格式、同步与原子替换保持一致；停机分段对照见更新日志。
 
 ## 引入方式
 

@@ -2497,6 +2497,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[ignore = "memory shutdown CRC A/B and stage timings; release single thread"]
+    fn memory_snapshot_stop_cost() {
+        use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        for (round, legacy) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("snapshot_stop_cost");
+            let db = open_engine(EngineKind::Memory, Some(&dir.0)).unwrap();
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin();
+                for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.commit();
+            }
+            let scope = snapshot_probe::Scope::start(legacy);
+            let start = std::time::Instant::now();
+            drop(db);
+            let drop_ns = start.elapsed().as_nanos();
+            let st = scope.stats();
+            drop(scope);
+            eprintln!("SNAPSHOT_STOP round={round} rows={rows} legacy_fields={legacy} drop_ms={:.3} snapshot_ms={:.3} body_ms={:.3} write_ms={:.3} crc_ms={:.3} sync_ms={:.3} publish_ms={:.3} release_ms={:.3} crc_calls={} writes={}",
+                drop_ns as f64 / 1e6, st.total_ns as f64 / 1e6, st.body_ns as f64 / 1e6,
+                st.write_ns as f64 / 1e6, st.crc_ns as f64 / 1e6, st.sync_ns as f64 / 1e6,
+                st.publish_ns as f64 / 1e6, drop_ns.saturating_sub(st.total_ns) as f64 / 1e6, st.crc_calls, st.write_calls);
+            // Independent seed verification, outside the stop timing.
+            let mut seen = 0;
+            read_snapshot_with(&dir.0.join("snapshot.bxp"), &mut |r| {
+                assert_eq!(r.key, scale_key(seen));
+                assert_eq!(r.value, Some(scale_val(seen)));
+                seen += 1;
+                true
+            }).unwrap();
+            assert_eq!(seen, rows);
+        }
+    }
+
     /// M81 第 6 项：memory 的启停快照 —— **只在启停各碰一次文件**。四条判据各钉一件事，
     /// 单看任何一条都像是"过了"，合起来才是这个合同：
     /// ① 运行期不碰文件：写满 1000 行之后快照**还不存在**；

@@ -2,6 +2,30 @@
 
 ## 未发布（2026-11-10）
 
+### M95：memory 快照按写缓冲块累计 CRC
+
+- CRC 移到 BufWriter 下方，按文件实际接受的字节累计；保留原 8 KiB 缓冲、BPEXP004 字节格式、
+  结束标记/条数/CRC、sync_all、原子替换与旧文件保护。正文先 flush，尾部绕过 CRC 层写出。
+- 同构建保留测试专用逐字段对照臂；2001 条记录含大于缓冲区的值与墓碑，两个文件逐字节一致，
+  再按独立种子读回。旧臂 CRC 调用大于 10000，新臂小于 100；强制旧臂无法满足新臂成本界。
+- `cargo test --offline --lib snapshot -- --test-threads=1`：29 passed / 0 failed / 2 ignored。
+  普通库 `cargo check --offline --lib` 通过；探针与对照分支只存在于测试构建。
+- `memory_snapshot_stop_cost` 按旧/新/新/旧交替测同一负载；body 含遍历、编码及缓冲写入，
+  write/CRC 是其中的子项，不能与 body 简单相加。旧臂 crc_ms=0 表示未单独计时，
+  避免逐字段读钟污染对照；release_ms 为 Drop 减快照发布的余项，主要是内存释放，也含析构外围开销。
+- `cargo test --offline --release --lib memory_snapshot_stop_cost -- --ignored --nocapture --test-threads=1`：
+  1 passed，22.92 s；每轮 600k 行，四轮均按独立种子验值。逐字段 CRC 3,000,001 次，按块 7,833 次。
+
+| 臂 / 轮次 | Drop ms | body ms | write ms | CRC ms | sync ms | 析构余项 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 旧 / 0 | 1850.458 | 1610.905 | 186.481 | 未单计 | 140.822 | 97.306 |
+| 新 / 1 | 3006.709 | 2755.027 | 223.330 | 53.369 | 146.129 | 104.257 |
+| 新 / 2 | 1855.225 | 1584.978 | 181.125 | 52.452 | 170.035 | 99.114 |
+| 旧 / 3 | 2517.458 | 1914.187 | 175.197 | 未单计 | 531.818 | 70.457 |
+
+本次没有稳定的总停机提速证据；CRC 调用数下降已证实，但新臂 CRC 仅约 53 ms，
+剩余主要在遍历/编码阶段，并存在同步和运行环境波动。不能据此声称 test4 的 20M / 87.9 s 已消除。
+
 ### M94：Bitcask 自动 checkpoint 摊销 hint 刷新
 
 - WAL 默认 16 MiB 的触发节奏与数据/blob 同步后收口顺序不变；自动 checkpoint 仅在累计

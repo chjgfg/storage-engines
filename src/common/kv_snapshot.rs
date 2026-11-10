@@ -185,11 +185,80 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
 /// 每条 8 B 序号也是在这里决定的 —— 逐行写的人没法先看完全部记录再回头改头部。
 /// 收集壳 `write_bin` 自己扫一遍切片来定，所以它的行为一字没变。
 pub struct BinWriter {
-    w: BufWriter<File>,
+    w: BufWriter<SnapshotFile>,
     stats: IoStats,
     with_seq: bool,
     with_expire: bool,
+}
+
+/// CRC follows the bytes accepted by the file, below buffering. Short record
+/// fields share one CRC update; footer bytes bypass this layer deliberately.
+struct SnapshotFile {
+    file: File,
     checksum: Option<u32>,
+    #[cfg(test)]
+    legacy_fields: bool,
+    #[cfg(test)]
+    measured: bool,
+    #[cfg(test)]
+    stats: snapshot_probe::Stats,
+}
+
+impl Write for SnapshotFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        let start = self.measured.then(std::time::Instant::now);
+        let n = self.file.write(bytes)?;
+        #[cfg(test)]
+        if let Some(start) = start {
+            self.stats.write_ns += start.elapsed().as_nanos();
+            self.stats.write_calls += 1;
+        }
+        #[cfg(test)]
+        if self.legacy_fields { return Ok(n); }
+        if let Some(crc) = &mut self.checksum {
+            #[cfg(test)]
+            let start = self.measured.then(std::time::Instant::now);
+            *crc = crate::common::disk::crc32_extend(*crc, &bytes[..n]);
+            #[cfg(test)]
+            if let Some(start) = start {
+                self.stats.crc_ns += start.elapsed().as_nanos();
+                self.stats.crc_calls += 1;
+            }
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.file.flush() }
+}
+
+#[cfg(test)]
+pub(crate) mod snapshot_probe {
+    use std::{assert, cell::RefCell, thread_local};
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Stats {
+        pub body_ns: u128,
+        pub write_ns: u128,
+        pub crc_ns: u128,
+        pub sync_ns: u128,
+        pub publish_ns: u128,
+        pub total_ns: u128,
+        pub crc_calls: u64,
+        pub write_calls: u64,
+    }
+    thread_local! { static ACTIVE: RefCell<Option<(bool, Stats)>> = const { RefCell::new(None) }; }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub fn start(legacy_fields: bool) -> Self {
+            ACTIVE.with(|s| { assert!(s.borrow().is_none()); *s.borrow_mut() = Some((legacy_fields, Stats::default())); });
+            Self
+        }
+        pub fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().as_ref().unwrap().1.clone()) }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
+    pub(super) fn options() -> Option<bool> { ACTIVE.with(|s| s.borrow().as_ref().map(|s| s.0)) }
+    pub(super) fn note(f: impl FnOnce(&mut Stats)) {
+        ACTIVE.with(|s| { if let Some((_, stats)) = s.borrow_mut().as_mut() { f(stats); } });
+    }
 }
 
 impl BinWriter {
@@ -224,21 +293,43 @@ impl BinWriter {
 
     fn from_file(f: File, magic: &[u8; 8], with_seq: bool, with_expire: bool,
         checked: bool) -> std::io::Result<Self> {
-        let mut w = BufWriter::new(f);
+        #[cfg(test)]
+        let options = snapshot_probe::options();
+        let sink = SnapshotFile {
+            file: f,
+            checksum: checked.then_some(0),
+            #[cfg(test)]
+            legacy_fields: options == Some(true),
+            #[cfg(test)]
+            measured: options.is_some(),
+            #[cfg(test)]
+            stats: snapshot_probe::Stats::default(),
+        };
+        // Keep the existing 8 KiB buffer: the A/B isolates CRC placement.
+        let mut w = BufWriter::new(sink);
         w.write_all(magic)?;
+        #[cfg(test)]
+        if w.get_ref().legacy_fields && checked {
+            w.get_mut().checksum = Some(crate::common::disk::crc32(magic));
+            w.get_mut().stats.crc_calls += 1;
+        }
         Ok(Self {
             w,
             stats: IoStats::default(),
             with_seq,
             with_expire,
-            checksum: checked.then(|| crate::common::disk::crc32(magic)),
         })
     }
 
     fn bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.w.write_all(bytes)?;
-        if let Some(crc) = &mut self.checksum {
-            *crc = crate::common::disk::crc32_extend(*crc, bytes);
+        #[cfg(test)]
+        if self.w.get_ref().legacy_fields {
+            let sink = self.w.get_mut();
+            if let Some(crc) = &mut sink.checksum {
+                *crc = crate::common::disk::crc32_extend(*crc, bytes);
+                sink.stats.crc_calls += 1;
+            }
         }
         Ok(())
     }
@@ -267,15 +358,22 @@ impl BinWriter {
     }
 
     pub fn finish(mut self) -> std::io::Result<IoStats> {
-        if let Some(crc) = self.checksum {
-            self.w.write_all(&u32::MAX.to_le_bytes())?;
-            self.w.write_all(&(self.stats.records as u64).to_le_bytes())?;
-            self.w.write_all(&crc.to_le_bytes())?;
-        }
+        // Flush the entire body before reading its checksum. The footer itself
+        // is not covered by CRC, exactly as in BPEXP004 before this optimization.
         self.w.flush()?;
-        if self.checksum.is_some() {
-            self.w.get_ref().sync_all()?;
+        let sink = self.w.get_mut();
+        if let Some(crc) = sink.checksum {
+            sink.file.write_all(&u32::MAX.to_le_bytes())?;
+            sink.file.write_all(&(self.stats.records as u64).to_le_bytes())?;
+            sink.file.write_all(&crc.to_le_bytes())?;
+            #[cfg(test)]
+            let start = sink.measured.then(std::time::Instant::now);
+            sink.file.sync_all()?;
+            #[cfg(test)]
+            if let Some(start) = start { sink.stats.sync_ns += start.elapsed().as_nanos(); }
         }
+        #[cfg(test)]
+        snapshot_probe::note(|s| *s = sink.stats.clone());
         Ok(self.stats)
     }
 }
@@ -284,6 +382,10 @@ impl BinWriter {
 /// rename leaves the previous snapshot intact. Unix also syncs the parent directory.
 pub(crate) fn atomic_write_bin_v4(path: &Path,
     write: impl FnOnce(&mut BinWriter) -> std::io::Result<()>) -> std::io::Result<IoStats> {
+    #[cfg(test)]
+    let measured = snapshot_probe::options().is_some();
+    #[cfg(test)]
+    let total = measured.then(std::time::Instant::now);
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     struct Staging(std::path::PathBuf);
@@ -301,12 +403,26 @@ pub(crate) fn atomic_write_bin_v4(path: &Path,
         }
     };
     let mut writer = BinWriter::from_file(file, BIN_MAGIC_V4, false, true, true)?;
+    #[cfg(test)]
+    let body = measured.then(std::time::Instant::now);
     write(&mut writer)?;
+    #[cfg(test)]
+    let body_ns = body.map(|s| s.elapsed().as_nanos()).unwrap_or(0);
     let stats = writer.finish()?;
+    #[cfg(test)]
+    let publish = measured.then(std::time::Instant::now);
     // Never remove the destination first: rename performs replacement.
     std::fs::rename(&staging.0, path)?;
     #[cfg(unix)]
     File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?.sync_all()?;
+    #[cfg(test)]
+    if let (Some(total), Some(publish)) = (total, publish) {
+        snapshot_probe::note(|s| {
+            s.body_ns = body_ns;
+            s.publish_ns = publish.elapsed().as_nanos();
+            s.total_ns = total.elapsed().as_nanos();
+        });
+    }
     Ok(stats)
 }
 
@@ -779,6 +895,48 @@ fn parse_jsonl_line(line: &str) -> Result<(String, Option<String>), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_buffered_crc_matches_reference_and_batches_calls() {
+        use super::*;
+        let path = crate::common::ScratchPath::new("snapshot", "crc_blocks", ".bxp");
+        let mut reference = None;
+        for legacy in [true, false] {
+            let scope = snapshot_probe::Scope::start(legacy);
+            atomic_write_bin_v4(&path, |w| {
+                for i in 0u64..2000 {
+                    let len = if i == 123 { 100_003 } else { 61 };
+                    w.write(&KvRecord::new(i.to_be_bytes().to_vec(), Some(vec![i as u8; len])))?;
+                }
+                w.write(&KvRecord::new(b"tombstone".to_vec(), None))?;
+                Ok(())
+            }).unwrap();
+            let stats = scope.stats();
+            drop(scope);
+            let bytes = std::fs::read(&path).unwrap();
+            let footer = bytes.len() - 16;
+            assert_eq!(u32::from_le_bytes(bytes[footer+12..].try_into().unwrap()),
+                crate::common::disk::crc32(&bytes[..footer]));
+            if legacy {
+                assert!(stats.crc_calls > 10_000, "old per-field shape must exceed the new bound");
+                reference = Some(bytes);
+            } else {
+                assert_eq!(Some(bytes), reference, "BPEXP004 bytes must not change");
+                assert!(stats.crc_calls < 100, "CRC was not moved below buffering");
+                assert!(stats.sync_ns > 0, "checked snapshot must still sync");
+            }
+            let mut seen = 0u64;
+            read_snapshot_with(&path, &mut |r| {
+                if seen < 2000 {
+                    assert_eq!(r.key, seen.to_be_bytes());
+                    assert_eq!(r.value, Some(vec![seen as u8; if seen == 123 { 100_003 } else { 61 }]));
+                } else { assert_eq!(r.value, None); }
+                seen += 1;
+                true
+            }).unwrap();
+            assert_eq!(seen, 2001);
+        }
+    }
+
     #[test]
     #[ignore = "allocator peak probe; run alone with --test-threads=1"]
     fn snapshot_streaming_memory_probe() {
