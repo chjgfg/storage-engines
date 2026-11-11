@@ -5925,6 +5925,7 @@ mod tests {
         // 键 ≈ 35 字节、值 ≈ 60 字节：照下游真实形状（也都远小于任何 blob 阈值）
         use self::{scale_key as key, scale_val as val};
 
+        crate::scale_probe::fingerprint();
         eprintln!("SCALE_BEGIN rows={rows} package={} os={} arch={} optimized={}",
             env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, !cfg!(debug_assertions));
         eprintln!("=== 大库基线 rows={rows}（µs/次 + 常驻/峰值 MB）===");
@@ -5981,6 +5982,7 @@ mod tests {
             // 原来那两处"内存引擎不落盘：重开 = 空库"的特判因此拆掉（格数 130 → 132）。
             // 停止那一次写发生在 `Drop` 里、按方案的口径落在计时格外 —— 但它是实打实的价，
             // 所以补一行"不计时"的读数（与 `验收准备(不计时)` 同一套写法，不进性能格）。
+            crate::scale_probe::memory(label, "first_before_stop");
             let db = {
                 let st_base = open_stages_begin();
                 let snapshot = (kind == EngineKind::Memory).then(|| crate::common::kv_snapshot::snapshot_probe::Scope::start(false));
@@ -5998,9 +6000,11 @@ mod tests {
                     eprintln!("SCALE_SNAPSHOT engine={label} release_ms={:.3} stages={stats:?}",
                         t_stop.elapsed().as_nanos().saturating_sub(stats.total_ns) as f64 / 1e6);
                 }
+                crate::scale_probe::memory(label, "first_before_reopen");
                 let recovery = (kind == EngineKind::Memory).then(crate::common::kv_snapshot::recovery_probe::Scope::start);
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
                 if let Some(scope) = recovery { eprintln!("SCALE_RECOVERY phase=first stages={:?}", scope.stats()); }
+                crate::scale_probe::memory(label, "first_after_reopen");
                 line(
                     label,
                     "冷重开(恢复)",
@@ -6294,6 +6298,13 @@ mod tests {
             scale_check_migration(&*target, rows, ms)
                 .unwrap_or_else(|e| panic!("{label}: migrate 验收失败: {e}"));
             eprintln!("{label}: migrate 验收通过(不计时) {want} 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0");
+            crate::scale_probe::memory(label, "migration_before_release");
+            let heap_before_release = crate::mem_probe::live();
+            drop(target);
+            let heap_after_release = crate::mem_probe::live();
+            eprintln!("SCALE_MIGRATION_RELEASE engine={label} released_heap_bytes={}",
+                heap_before_release.saturating_sub(heap_after_release));
+            crate::scale_probe::memory(label, "migration_after_release");
             let bulk_rows = (rows / 10).max(1);
             let (d, live, peak, ()) = timed(|| {
                 let mut bulk = db.begin_bulk();
@@ -6307,6 +6318,7 @@ mod tests {
             // ---- 再冷重开一次：bulk 之后的恢复代价 ----
             // （M81 第 6 项：memory 走同一条路了 —— 这一次 drop 会把它连 bulk 一起写进快照。
             //   "停止落盘"那行不计时读数只在上面那一处打，免得同一格的两条噪声线混淆。）
+            crate::scale_probe::memory(label, "bulk_before_stop");
             let db = {
                 let st_base = open_stages_begin();
                 let snapshot = (kind == EngineKind::Memory).then(|| crate::common::kv_snapshot::snapshot_probe::Scope::start(false));
@@ -6318,9 +6330,11 @@ mod tests {
                         stop.elapsed().as_secs_f64() * 1e3,
                         stop.elapsed().as_nanos().saturating_sub(stats.total_ns) as f64 / 1e6);
                 }
+                crate::scale_probe::memory(label, "bulk_before_reopen");
                 let recovery = (kind == EngineKind::Memory).then(crate::common::kv_snapshot::recovery_probe::Scope::start);
                 let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
                 if let Some(scope) = recovery { eprintln!("SCALE_RECOVERY phase=bulk stages={:?}", scope.stats()); }
+                crate::scale_probe::memory(label, "bulk_after_reopen");
                 line(
                     label,
                     "再冷重开",

@@ -2,6 +2,19 @@
 
 ## 未发布（2026-11-11）
 
+### M107：迁移目标验收后立即释放，台架记录构建与进程内存
+
+- 迁移目标在完整种子验收后、bulk 之前显式 drop；四引擎共用该路径。输出释放前后全进程堆字节与释放量，
+  释放发生在所有性能计时之外。test7 中约 3.89 GB 的 20M 迁移目标不再与后续 bulk / 恢复同时存活。
+- 每档记录 SCALE_BUILD harness=2、运行二进制 SHA256、运行时 Git HEAD 和 tracked_dirty；Git 字段不是
+  编译时提交凭据，二进制 hash 才用于判断构建是否相同。指纹获取失败显式输出 unavailable，不伪造身份。
+- 首次及 bulk 停机/重开边界记录全进程 heap、RSS、private 和累计 page_faults。Windows private 为 PrivateUsage，
+  Linux 为 RssAnon；page_faults 包含软缺页，不能单凭它断言换页。系统指标不可用时保留堆读数及失败原因。
+- 计量只编入测试；固定缓冲读取指纹、进程采样均在计时外。harness=2 与 test7 的 bulk 测量环境不同，比较时需标明边界。
+- 3,000 行标准台架四引擎全部完成，迁移/末页/bulk 重开完整验收通过，1 passed（19.42 s）；
+  memory 迁移目标释放 760995 B，释放前/后总堆 1873310 / 1112315 B。此为 debug 正确性验收，不作性能结论。
+  二进制 SHA256 与 Win32 进程指标守卫 1 passed（4.27 s）；旧 PowerShell 缺少 Get-FileHash 已改为 .NET 流式计算。
+
 ### M106：B+ 换出失败保留脏页，封锁提交与 WAL 截断
 
 - test7 代码复核发现换出忽略 flush 错误后仍移除缓存。页管理器新增 Healthy / Failed 状态，

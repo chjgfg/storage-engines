@@ -213,3 +213,6 @@ pub(crate) mod mem_probe {
         out
     }
 }
+
+#[cfg(test)]
+mod scale_probe;
