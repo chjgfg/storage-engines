@@ -5559,6 +5559,49 @@ mod tests {
         assert!(costs[3] >= costs[2] + rows as u64);
     }
 
+    #[test]
+    #[ignore = "B+ vacuum scan and delete old/new/new/old; release single thread"]
+    fn bplus_vacuum_buffer_cost() {
+        use crate::common::maintenance_probe::{Scope, Stage};
+        let rows: usize = std::env::var("BPLUS_VAC_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        let mut costs = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("bplus_vacuum_buffers");
+            let path = dir.0.join("bplus.db");
+            let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+            db.set_vacuum_auto_slice(0);
+            let mut bulk = db.begin_bulk();
+            for i in 0..rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
+            bulk.try_finish().unwrap();
+            for base in (0..rows / 10).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows / 10) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+                tx.try_commit().unwrap();
+            }
+            let mode = reference.then(crate::bplus_tree::bplus_tree_mvcc::vacuum_scan_reference::Scope::start);
+            let scope = Scope::start();
+            let start = std::time::Instant::now();
+            let result = db.vacuum().unwrap();
+            let seconds = start.elapsed().as_secs_f64();
+            let stats = scope.stats();
+            costs.push(stats.allocations[Stage::VacuumScan as usize]);
+            assert_eq!(result.versions_removed, rows / 10);
+            assert_eq!(result.rows_scanned, (rows + rows / 10) as u64);
+            eprintln!("BPLUS_VACUUM_BUFFER round={round} reference={reference} rows={rows} seconds={seconds:.6} stages={stats:?}");
+            drop(scope); drop(mode); drop(db);
+            let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+            let mut seen = 0;
+            db.export_latest_visible_for_each(false, |r| {
+                assert_eq!(r.key, scale_key(seen));
+                assert_eq!(r.value, Some(scale_val(if seen < rows / 10 { seen + rows } else { seen })));
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+        }
+        assert!(costs[0] >= costs[1] + 2 * rows as u64);
+        assert!(costs[3] >= costs[2] + 2 * rows as u64);
+    }
+
     /// TTL 两格仍量真实 set/get；紧接着在计时外去掉期限，而非把期限调得更长。
     /// 必须先验值再 persist（不是 set_raw 重播种），缺失/过期/损坏不能被修补后蒙混过关。
     fn scale_persist_auxiliary(db: &dyn KvEngine, rows: usize) {

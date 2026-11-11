@@ -1037,19 +1037,36 @@ impl PageManager {
         }
         // 目标：腾出至少 1/4 缓存或 EVICT_BATCH_TARGET 页
         let target_free = (self.max_cache_pages / 4).max(1).min(EVICT_BATCH_TARGET);
+        let unique_victims = true;
+        #[cfg(test)]
+        let unique_victims = unique_victims && !eviction_reference::enabled();
+        let reserve_meta = !self.bulk_mode && self.meta_dirty;
+        #[cfg(test)]
+        let reserve_meta = reserve_meta && !eviction_reference::enabled();
+        let dirty_limit = crate::bplus_tree::storage::DBLWR_MAX_PAGES - usize::from(reserve_meta);
         let mut victims: Vec<PageId> = Vec::with_capacity(target_free);
         let mut dirty_victims: Vec<PageId> = Vec::new();
+        let mut selected = HashSet::with_capacity(target_free);
 
         while victims.len() < target_free {
             let Some(pid) = self.pop_lru_valid() else {
                 break;
             };
+            // The approximate LRU queue can contain multiple touches of a page.
+            // Count and flush a victim once while it remains in cache until publication.
+            if unique_victims && !selected.insert(pid) { continue; }
             if self
                 .cache
                 .get(&pid)
                 .map(|e| e.state == PageState::Dirty)
                 .unwrap_or(false)
             {
+                // Metadata shares the double-write capacity. A 65th page would
+                // force a second data sync; keep it queued for the next batch.
+                if dirty_victims.len() == dirty_limit {
+                    self.lru_queue.push_front(pid);
+                    break;
+                }
                 dirty_victims.push(pid);
             }
             victims.push(pid);
@@ -1131,10 +1148,53 @@ impl Drop for PageManager {
 }
 
 #[cfg(test)]
+pub(crate) mod eviction_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::assert;
     use std::assert_eq;
+
+    #[test]
+    fn eviction_reserves_metadata_and_preserves_every_page() {
+        use crate::common::maintenance_probe::{Scope, Stage};
+        for reference in [true, false] {
+            let path = crate::common::ScratchPath::new("page", "metadata_batch", ".db");
+            {
+                let mut pm = PageManager::open(&path, 512).unwrap();
+                for i in 1..=256_u64 {
+                    let pid = pm.allocate_page();
+                    assert_eq!(pid, PageId(i));
+                    assert!(pm.write_page(pid, &i.to_le_bytes()));
+                }
+                pm.set_root_page_id(PageId(1));
+                pm.max_cache_pages = 256;
+                let reference_mode = reference.then(eviction_reference::Scope::start);
+                let scope = Scope::start();
+                pm.evict_batch_until_room();
+                let stats = scope.stats();
+                assert_eq!(stats.calls[Stage::DblwrData as usize], if reference { 2 } else { 1 });
+                assert_eq!(stats.calls[Stage::PageSync as usize], if reference { 2 } else { 1 });
+                assert_eq!(pm.cache.len(), if reference { 224 } else { 193 });
+                assert!(!pm.meta_dirty);
+                drop(scope); drop(reference_mode);
+                pm.try_flush_all().unwrap();
+            }
+            let mut pm = PageManager::open(&path, 512).unwrap();
+            assert_eq!(pm.root_page_id(), Some(PageId(1)));
+            for i in 1..=256_u64 { assert_eq!(&pm.read_page(PageId(i)).unwrap()[..8], &i.to_le_bytes()); }
+            drop(pm);
+            cleanup(&path);
+        }
+    }
 
     fn temp_db(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

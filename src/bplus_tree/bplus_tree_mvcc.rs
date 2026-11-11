@@ -578,6 +578,195 @@ impl MVCC {
         after: Option<&[u8]>,
         budget_rows: u64,
     ) -> std::io::Result<VacuumRound> {
+        #[cfg(test)]
+        if vacuum_scan_reference::enabled() { return self.vacuum_bounded_reference(after, budget_rows); }
+        let _active_guard = self.active_txn.lock().unwrap();
+        if !_active_guard.is_empty() {
+            return Ok(VacuumRound {
+                stats: VacuumStats {
+                    xmin: 0,
+                    versions_removed: 0,
+                    blob_rewritten: Some(false),
+                    skipped_active_txn: true,
+                    rows_scanned: 0,
+                },
+                // 游标原样退回：跳过不丢进度，下一轮从同一处接着扫
+                next_cursor: after.map(|k| k.to_vec()),
+            });
+        }
+        let xmin = self.next_version.load(Ordering::SeqCst);
+
+        let mut kv = self.kv.lock().unwrap();
+        let mut blob = self.blob.lock().unwrap();
+        kv.ensure_healthy()?;
+
+        // ① 一趟按引用的遍历。判「留哪一版」只需要三样：版本号、这行是不是墓碑、
+        //    这行是不是 blob 指针 —— 全都在叶子条目手里就能读到，不必把 value 克隆出来。
+        //    旧实现在这里有两趟 `kv.iter()`（每行克隆一次 value），第二趟纯粹为查 blob 引用。
+        //    M36：**只攒当前这一把键的那一组**（以前是全库归组 ⇒ vacuum 自己的瞬时内存
+        //    = O(全库物理行)，600k 档 +89.4 MB 那个形状），版本键按 `raw ‖ version_be`
+        //    升序到达 ⇒ 判完一组就地并进 `to_delete`。
+        let budget_rows = budget_rows.max(1);
+        let mut groups: crate::common::order::KeyWindow<Vec<(u64, u64, bool, bool)>> = crate::common::order::KeyWindow::new();
+        let mut spare = Vec::new();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut removed = 0usize;
+        let mut has_blob_ref = false;
+        let mut scanned = 0u64;
+        let mut cur_raw: Option<Vec<u8>> = None;
+        let mut truncated = false;
+        // M37：按块走查（与 bitcask / lsm / memory 同一形状）—— 走查期间 `kv` 被
+        // `scan_entries_break_from` 借住，删除只能在块与块之间做 ⇒ `to_delete` 每块清一次，
+        // 不再 O(全库)。块间下界 `enc ‖ 0x00`：enc 域的严格后继方向。
+        let mut lower: Option<Vec<u8>> = after.map(|k| k.to_vec());
+        loop {
+            let mut chunk_rows = 0usize;
+            let mut next_lower: Option<Vec<u8>> = None;
+            let mut done = false;
+            // 本块续跑下界：首块 = 逻辑游标 `after`，其后 = 上一块最后一行的 `enc ‖ 0x00`。
+            let resume_bound = lower.clone();
+            #[cfg(test)]
+            let scan_probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumScan);
+            kv.scan_entries_break_from(lower.as_deref(), |enc, row| {
+                // ⚠️ `scan_entries_break_from` 只下降到 containing 叶子，随后**从该片第一条**起遍历
+                // （叶粒度定位，过滤交给调用方——见其文档）。上一块已经消费过的行会被再喂一遍；若某个
+                // 版本组正好骑在块边界上（它最新那版恰是续跑叶子的首条），那一版会**第二次**进 `group`，
+                // 让 `vacuum_plan_group` 排序后把"同一 enc 的较早副本"划进 `last_old` 之前、连同活版本的
+                // enc 一起塞进 `to_delete`（判保留的最新版本被物理删掉 ⇒ 静默丢活键）。
+                // ⇒ 按本块续跑下界显式跳过已消费的行（`resume_bound` 是上一块尾行的严格后继方向）。
+                if resume_bound.as_ref().is_some_and(|b| enc < b.as_slice()) {
+                    return false;
+                }
+                let Some((raw_key, version)) = crate::common::version::decode_key_ref(enc) else {
+                    return false;
+                };
+                // 下界落在键的字节域，`raw_key ≤ after` 的那些行（含 `after` 自己那一整组）
+                // 还在范围内 —— 显式跳过，游标才是逻辑 key 域的。
+                if after.is_some_and(|a| raw_key <= a) {
+                    return false;
+                }
+                while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
+                    vacuum_drain_group(&mut group, xmin, |version| to_delete.push(encode_key(&key, version)), |_, refs_blob| has_blob_ref |= refs_blob);
+                    if group.capacity() > spare.capacity() { spare = group; }
+                    cur_raw = Some(key);
+                }
+                // Stop only after the complete overlapping prefix window is finalized.
+                if groups.is_empty() && scanned >= budget_rows {
+                    truncated = true;
+                    done = true;
+                    return true;
+                }
+                scanned += 1;
+                let is_tomb = row.is_none();
+                let refs_blob = row
+                    .as_ref()
+                    .is_some_and(|s| s.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB));
+                groups.entry_with(raw_key, || {
+                    let mut key = cur_raw.take().unwrap_or_default();
+                    key.clear(); key.extend_from_slice(raw_key);
+                    (key, std::mem::take(&mut spare))
+                }).push((version, version, is_tomb, refs_blob));
+                chunk_rows += 1;
+                if chunk_rows >= vac_chunk_limit() {
+                    let mut bound = enc.to_vec();
+                    bound.push(0u8);
+                    next_lower = Some(bound);
+                    return true;
+                }
+                false
+            });
+            if done || next_lower.is_none() {
+                while let Some((key, mut group)) = groups.pop_first() {
+                    vacuum_drain_group(&mut group, xmin, |version| to_delete.push(encode_key(&key, version)), |_, refs_blob| has_blob_ref |= refs_blob);
+                    if group.capacity() > spare.capacity() { spare = group; }
+                    cur_raw = Some(key);
+                }
+            }
+            #[cfg(test)]
+            std::mem::drop(scan_probe);
+            #[cfg(test)]
+            note_vac_pending(to_delete.len());
+            // M61b：`to_delete` 是**升序**的（走查顺序就是编码键顺序：先按 raw_key 升序、组内按版本升序），
+            // 而可删行天然成块（M61 实测 k = 16.5~17.9 行/叶子）⇒ 交给批量门，一趟下降带一整片叶子。
+            // ⚠️ 对照臂（门控 `BPLUS_BATCH_OLD_SHAPE`，`#[cfg(test)]` ⇒ 不随 crate 发布）逐行删除，
+            //   同一份库、同一批键 ⇒ 比值只归因于"合批 vs 不合批"这一件事。
+            if !to_delete.is_empty() {
+                #[cfg(test)]
+                let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumDelete);
+                to_delete.sort();
+                let planned = to_delete.len();
+                #[cfg(test)]
+                let per_row = std::env::var("BPLUS_BATCH_OLD_SHAPE").is_ok();
+                #[cfg(not(test))]
+                let per_row = false;
+                if per_row {
+                    for enc in to_delete.drain(..) {
+                        let _ = kv.delete(enc);
+                    }
+                } else {
+                    let _ = kv.delete_batch(&to_delete);
+                    to_delete.clear();
+                }
+                kv.ensure_healthy()?;
+                // 口径与改前一字不差：按"计划删除的行数"计（不是按门返回的实删数）
+                removed += planned;
+            }
+            match next_lower {
+                Some(l) if !done => lower = Some(l),
+                _ => break,
+            }
+        }
+        let next_cursor = if truncated { cur_raw } else { None };
+
+        // Blob GC（教学简化）：
+        // - 若已无任何大 value 引用 → clear 文件
+        // - 若仍有引用 → 暂不重写（append-only 空间可能残留；完整 compact 后续可做）
+        //   这样避免 Windows 上打开句柄重写导致读路径异常。
+        //
+        // 「有没有人引用 blob」是个全库问题，所以只在这次调用本来就是全库扫描时才处理
+        // （判据用 budget 而不是游标：一把 key 的小库任何一片都正好读到库尾，
+        //   用游标判断会让自动回收每一片都去动 blob 文件）。
+        let blob_rewritten = if budget_rows != u64::MAX {
+            false
+        } else if !has_blob_ref {
+            let old_len = blob.path().metadata().map(|m| m.len()).unwrap_or(0);
+            if old_len > 8 {
+                blob.clear_in_place()?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // 把当前 next_version 一并写入 meta，避免下次 open 因 meta 过旧依赖大 WAL
+        let next_ver = self.next_version.load(Ordering::SeqCst);
+        kv.set_next_version(next_ver);
+        #[cfg(test)]
+        let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
+        kv.try_flush_all()?;
+        blob.sync()?;
+
+        Ok(VacuumRound {
+            stats: VacuumStats {
+                xmin,
+                versions_removed: removed,
+                blob_rewritten: Some(blob_rewritten),
+                skipped_active_txn: false,
+                rows_scanned: scanned,
+            },
+            next_cursor,
+        })
+    }
+
+    // M112 reference: allocation path from ee74ca7, same deletion and I/O gates.
+    #[cfg(test)]
+    fn vacuum_bounded_reference(
+        &self,
+        after: Option<&[u8]>,
+        budget_rows: u64,
+    ) -> std::io::Result<VacuumRound> {
         let _active_guard = self.active_txn.lock().unwrap();
         if !_active_guard.is_empty() {
             return Ok(VacuumRound {
@@ -750,6 +939,16 @@ impl MVCC {
             next_cursor,
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) mod vacuum_scan_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
 }
 
 impl Drop for MVCC {
