@@ -59,12 +59,21 @@ fn count_rows(n: usize) {
 pub struct MemStore {
     /// enc_key → logical value（None = tombstone）
     data: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    // One scratch buffer for range bounds, bounded by the largest queried key.
+    query_bounds: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeyLookup<T> {
+    PastEnd,
+    Searched(Option<T>),
 }
 
 impl MemStore {
     pub fn new() -> Self {
         Self {
             data: BTreeMap::new(),
+            query_bounds: Vec::new(),
         }
     }
 
@@ -121,12 +130,48 @@ impl MemStore {
 
     /// Borrow the reverse key range; clone only the first accepted key.
     pub(crate) fn find_key_back(&self, low: &[u8], high: &[u8], mut accept: impl FnMut(&[u8]) -> bool) -> Option<Vec<u8>> {
+        #[cfg(test)]
+        key_lookup_probe::note(|s| s.searches += 1);
         self.data.range::<[u8], _>((Bound::Included(low), Bound::Included(high)))
             .rev().find_map(|(key, _)| {
                 #[cfg(test)]
                 count_rows(1);
                 accept(key).then(|| key.clone())
             })
+    }
+
+    /// Search [prefix || low_suffix, prefix || high_suffix], projecting a
+    /// borrowed key. Only a lower bound beyond the table's last key skips seek.
+    pub(crate) fn find_prefixed_key_back<T>(&mut self, prefix: &[u8], low_suffix: &[u8],
+        high_suffix: &[u8], mut accept: impl FnMut(&[u8]) -> Option<T>) -> KeyLookup<T> {
+        if self.data.last_key_value().is_none_or(|(last, _)| {
+            prefix.iter().chain(low_suffix).cmp(last.iter()).is_gt()
+        }) {
+            #[cfg(test)]
+            key_lookup_probe::note(|s| s.end_misses += 1);
+            return KeyLookup::PastEnd;
+        }
+        let low_len = prefix.len() + low_suffix.len();
+        let need = low_len + prefix.len() + high_suffix.len();
+        self.query_bounds.clear();
+        #[cfg(test)]
+        key_lookup_probe::note(|s| {
+            s.searches += 1;
+            if self.query_bounds.capacity() < need { s.bound_grows += 1; }
+        });
+        self.query_bounds.reserve_exact(need);
+        self.query_bounds.extend_from_slice(prefix);
+        self.query_bounds.extend_from_slice(low_suffix);
+        self.query_bounds.extend_from_slice(prefix);
+        self.query_bounds.extend_from_slice(high_suffix);
+        let (low, high) = self.query_bounds.split_at(low_len);
+        let found = self.data.range::<[u8], _>((Bound::Included(low), Bound::Included(high)))
+            .rev().find_map(|(key, _)| {
+                #[cfg(test)]
+                count_rows(1);
+                accept(key)
+            });
+        KeyLookup::Searched(found)
     }
 
     /// 全表有序遍历，按**引用**把 `(键, value)` 交给回调 —— 一个 value 都不克隆。
@@ -234,6 +279,26 @@ impl MemStore {
     /// 清空
     pub fn clear(&mut self) {
         self.data.clear();
+        self.query_bounds = Vec::new();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod key_lookup_probe {
+    use std::{assert, cell::RefCell, thread_local};
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct Stats { pub end_misses: u64, pub searches: u64, pub bound_grows: u64 }
+    thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub(crate) fn start() -> Self {
+            ACTIVE.with(|s| assert!(s.borrow_mut().replace(Stats::default()).is_none())); Self
+        }
+        pub(crate) fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().unwrap()) }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
+    pub(super) fn note(f: impl FnOnce(&mut Stats)) {
+        ACTIVE.with(|s| { if let Some(stats) = s.borrow_mut().as_mut() { f(stats); } });
     }
 }
 
@@ -242,6 +307,48 @@ mod tests {
     use super::*;
     use std::assert;
     use std::assert_eq;
+
+    #[test]
+    fn prefixed_lookup_reuses_bounds_without_confusing_binary_prefixes() {
+        use crate::common::version::{decode_key_ref, encode_key};
+        use std::{matches, vec};
+        let mut store = MemStore::new();
+        let keys = [vec![], vec![0], vec![0, 0], vec![0, 255], vec![1], vec![255; 1025]];
+        for key in &keys {
+            for version in [1, 7, u64::MAX] { store.insert(encode_key(key, version), None); }
+        }
+        let lookup = |store: &mut MemStore, key: &[u8]| {
+            store.find_prefixed_key_back(key, &[0; 8], &[255; 8], |enc| {
+                decode_key_ref(enc).and_then(|(raw, version)| (raw == key).then_some(version))
+            })
+        };
+        assert!(matches!(lookup(&mut store, keys.last().unwrap()), KeyLookup::Searched(Some(u64::MAX))));
+        // A longer raw prefix can still fall BELOW the last encoded key.
+        let missing = [vec![0, 1], vec![2], vec![255; 1026], vec![255; 1034]];
+        assert!(matches!(lookup(&mut store, &missing[2]), KeyLookup::Searched(None)));
+        assert!(matches!(lookup(&mut store, &missing[3]), KeyLookup::PastEnd));
+        let capacity = store.query_bounds.capacity();
+        let pointer = store.query_bounds.as_ptr();
+        let scope = key_lookup_probe::Scope::start();
+        for _ in 0..3 {
+            for key in keys.iter().chain(missing.iter()) {
+                let expected = store.find_key_back(&encode_key(key, 0), &encode_key(key, u64::MAX),
+                    |enc| decode_key_ref(enc).is_some_and(|(raw, _)| raw == key))
+                    .and_then(|enc| decode_key_ref(&enc).map(|(_, version)| version));
+                let actual = match lookup(&mut store, key) {
+                    KeyLookup::PastEnd => None, KeyLookup::Searched(version) => version,
+                };
+                assert_eq!(actual, expected, "raw key={key:?}");
+            }
+        }
+        assert_eq!(scope.stats().bound_grows, 0);
+        assert!(scope.stats().end_misses > 0);
+        assert_eq!(store.query_bounds.capacity(), capacity);
+        assert_eq!(store.query_bounds.as_ptr(), pointer);
+        store.clear();
+        assert_eq!(store.query_bounds.capacity(), 0);
+        assert!(matches!(lookup(&mut store, b"empty"), KeyLookup::PastEnd));
+    }
 
     #[test]
     fn test_insert_get_delete() {

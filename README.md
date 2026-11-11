@@ -3,13 +3,14 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M108 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M109 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
-- M101 库测试 **433 passed / 0 failed / 43 ignored**；集成测试 5 项、CLI 测试 8 项、文档测试 6 项通过，合计 452 项。
+- M109 release 库测试 **459 passed / 0 failed / 47 ignored**（116.58 s）。
+  CLI 8 项、集成 5 项、文档 6 项通过，合计 **478 passed / 0 failed**（文档另 1 ignored）。
   Windows / Linux 全目标 all-features 编译检查通过；Linux 未运行测试。
-  默认忽略的台架中，本轮单独运行了快照对照、hint 内存、Bitcask 5M checkpoint 和三引擎定向复测，详见更新日志。
+  单独运行的性能对照与迁层/快照守卫结果见更新日志；本轮未重跑 20M。
 - 许可证：MIT 或 Apache-2.0 任选。
 
 入口：[快速开始](#快速开始) · [下游接入](#下游接入使用说明) · [项目结构](#项目结构) ·
@@ -36,6 +37,7 @@ M105 memory 快照回放减少两次键复制，启停快照使用 256 KiB 有�
 M106 B+ 页 I/O 失败保留脏页和恢复 WAL，阻止提交、回滚误销账和 checkpoint 静默成功。
 M107 台架在迁移验收后释放目标库，记录二进制 SHA256、运行时 Git 与启停边界的总堆/RSS/缺页计数。
 M108 LSM 为安全的单 SST 压实直接迁层，保留 TTL/过滤/删除屏障回退；实际迁层次数和字节单独计量。
+M109 memory 复用回放值和版本查找缓冲，仅对已证明超出表尾的新键省掉区间查询；恢复页失败整页回滚。
 
 ## 引入方式
 

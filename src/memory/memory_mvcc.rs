@@ -157,7 +157,10 @@ impl MVCC {
         let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)> = Vec::with_capacity(PAGE);
         let mut expired = 0usize;
         let mut err: Option<std::io::Error> = None;
-        let stats = crate::common::kv_snapshot::read_snapshot_with(&path, &mut |rec| {
+        let values = crate::common::kv_snapshot::ValueBuffer::PlainEnvelope;
+        #[cfg(test)]
+        let values = if replay_cost_reference::enabled() { crate::common::kv_snapshot::ValueBuffer::Exact } else { values };
+        let stats = crate::common::kv_snapshot::read_snapshot_with(&path, values, &mut |rec| {
             // `value = None` = 墓碑行，照样进重放队列（重放成 `delete`）——
             // 丢掉它就是"重启即失忆"：判据①的地基没了，后续同步能复活已删键。
             let value = rec.value;
@@ -169,7 +172,7 @@ impl MVCC {
             }
             batch.push((rec.key, value, rec.expire_unix_secs));
             if batch.len() >= PAGE {
-                if let Some(e) = MVCC::replay_page(self, &mut batch) {
+                if let Err(e) = MVCC::replay_page(self, &mut batch) {
                     err = Some(e);
                     return false;
                 }
@@ -179,9 +182,7 @@ impl MVCC {
         if let Some(e) = err {
             return Err(e);
         }
-        if let Some(e) = MVCC::replay_page(self, &mut batch) {
-            return Err(e);
-        }
+        MVCC::replay_page(self, &mut batch)?;
         log::info!(
             "memory: 快照读入 {} 行（跳过已过期 {} 行）{}",
             stats.records - expired,
@@ -198,8 +199,8 @@ impl MVCC {
         Ok(())
     }
 
-    /// 把攒好的一页交进库里，一事务一页。**返回 `Err` 而不是 `Result` 是有意的**：调用方在
-    /// `read_snapshot_with` 的回调里，那里没有 `?` 可用，只能把错递出去。
+    /// 一页一事务；任何写入/提交失败都返回错误，未提交的页由事务 Drop 回滚。
+    /// 读取回调把错误带出，尾页直接使用同一个 Result 入口。
     ///
     /// 为什么单独抽出来：回调里要同时用 `&MVCC`（开事务）与 `&mut batch`，写成内联块会让
     /// 借用检查在两件事之间反复；而"攒满一页就冲"与"收尾把剩的冲掉"必须是**同一份**代码，
@@ -207,62 +208,52 @@ impl MVCC {
     fn replay_page(
         mvcc: &MVCC,
         batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
-    ) -> Option<std::io::Error> {
+    ) -> std::io::Result<()> {
         #[cfg(test)]
         let _timer = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::Replay);
         #[cfg(test)]
         if replay_reference::enabled() { return Self::replay_page_reference(mvcc, batch); }
-        if batch.is_empty() { return None; }
+        if batch.is_empty() { return Ok(()); }
         let tx = mvcc.begin_transaction();
-        let mut bad = None;
         {
-            // open_with_snapshot has not published this instance. Keep the same
-            // page transaction/conflict checks, taking registry -> store once.
+            // The unopened instance keeps normal conflict checks, registry ->
+            // store lock ordering and bounded page transactions.
             let mut reg = tx.core.lock_registry();
             let mut side = mvcc.store.lock().unwrap();
             for (key, value, expire) in batch.drain(..) {
-                let logical = value.map(|v| match expire {
-                    Some(e) => crate::common::pack_ttl(&v, e),
-                    None => crate::common::pack_plain(&v),
+                let logical = value.map(|v| {
+                    #[cfg(test)]
+                    if replay_cost_reference::enabled() {
+                        return match expire { Some(e) => crate::common::pack_ttl(&v, e), None => crate::common::pack_plain(&v) };
+                    }
+                    crate::common::codec::pack_owned(v, expire).into_bytes()
                 });
-                if let Err(error) = tx.core.try_write_owned(&mut reg, &mut *side, key, logical) {
-                    if bad.is_none() { bad = Some(error); }
-                }
+                tx.core.try_write_owned(&mut reg, &mut *side, key, logical)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
+                        format!("快照重放被引擎拒收: {error:?}")))?;
             }
         }
-        tx.commit();
-        bad.map(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
-            format!("快照重放被引擎拒收: {error:?}")))
+        tx.try_commit().map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("快照重放提交失败: {error:?}")))
     }
 
     #[cfg(test)]
     fn replay_page_reference(
         mvcc: &MVCC,
         batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
-    ) -> Option<std::io::Error> {
-        if batch.is_empty() {
-            return None;
-        }
+    ) -> std::io::Result<()> {
+        if batch.is_empty() { return Ok(()); }
         let tx = mvcc.begin_transaction();
-        let mut bad: Option<Vec<u8>> = None;
-        for (k, v, expire) in batch.drain(..) {
-            let ok = match (v, expire) {
-                (None, _) => tx.delete(&k),
-                // 文件值已剥封装；恢复绝对到期时刻，不能把重放耗时加回 TTL。
-                (Some(v), Some(e)) => tx.set(&k, crate::common::pack_ttl(&v, e)),
-                (Some(v), None) => tx.set_raw(&k, v),
-            };
-            if !ok && bad.is_none() {
-                bad = Some(k);
-            }
+        for (key, value, expire) in batch.drain(..) {
+            match (value, expire) {
+                (None, _) => tx.try_delete(&key),
+                (Some(value), Some(expiry)) => tx.try_set(&key, crate::common::pack_ttl(&value, expiry)),
+                (Some(value), None) => tx.try_set_raw(&key, value),
+            }.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
+                format!("快照重放被引擎拒收: {error:?}")))?;
         }
-        tx.commit();
-        bad.map(|k| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("快照重放被引擎拒收: {k:?}"),
-            )
-        })
+        tx.try_commit().map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("快照重放提交失败: {error:?}")))
     }
 
     /// 写一次带完整性校验的整库快照（`BPEXP004`），同步后原子替换旧文件。
@@ -670,12 +661,23 @@ impl Drop for BulkLoader {
 
 /// 写侧：内存引擎的"这一行的字节住在哪"= 同一张 `BTreeMap`，所以三个方法都是薄壳。
 ///
-/// ⚠️ [`WriteSide::latest_version`] 走的是链尾反向早停（[`Transaction::find_version_back`]），
-/// 不是整链扫 —— 与点读同一条路径，所以"点写陪跑整条版本链"这个洞只会在一处出现。
+/// [`WriteSide::latest_version`] 借用链尾键并复用查询边界；仅能证明越过表尾时省掉 seek。
+/// 区间分支仍从链尾早停，借用候选键；可见性与写冲突继续由共享事务内核决定。
 impl WriteSide for MemStore {
     fn latest_version(&mut self, key: &[u8]) -> Option<u64> {
-        Transaction::find_version_back(self, key, |_| true)
-            .and_then(|enc| decode_key(&enc).map(|vk| vk.version))
+        #[cfg(test)]
+        if replay_cost_reference::enabled() {
+            return Transaction::find_version_back(self, key, |_| true)
+                .and_then(|enc| decode_key(&enc).map(|vk| vk.version));
+        }
+        use crate::common::version::decode_key_ref;
+        use crate::memory::mem_store::KeyLookup;
+        match self.find_prefixed_key_back(key, &[0; 8], &[255; 8], |enc| {
+            decode_key_ref(enc).and_then(|(raw, version)| (raw == key).then_some(version))
+        }) {
+            KeyLookup::PastEnd => None,
+            KeyLookup::Searched(version) => version,
+        }
     }
 
     fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool {
@@ -986,6 +988,17 @@ impl Transaction {
     }
 }
 
+/// M109-only cost reference: retain M105 buffered IO and owned transaction keys.
+#[cfg(test)]
+pub(crate) mod replay_cost_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
 #[cfg(test)]
 pub(crate) mod scan_reference {
     use std::{assert, cell::Cell, thread_local};
@@ -1025,6 +1038,48 @@ mod tests {
     use std::eprintln;
     use std::vec;
     use std::format;
+
+    #[test]
+    fn ordered_writes_skip_only_proven_absent_version_searches() {
+        const ROWS: u64 = 1003;
+        for reference in [true, false] {
+            let _mode = reference.then(replay_cost_reference::Scope::start);
+            let db = MVCC::new();
+            let tx = db.begin_transaction();
+            let probe = crate::memory::mem_store::key_lookup_probe::Scope::start();
+            for i in 0..ROWS { assert!(tx.set_raw(&i.to_be_bytes(), vec![1])); }
+            let insert = probe.stats();
+            assert_eq!(insert.searches, if reference { ROWS } else { 0 });
+            assert_eq!(insert.end_misses, if reference { 0 } else { ROWS });
+            for i in (0..ROWS).rev() { assert!(tx.set_raw(&i.to_be_bytes(), vec![2])); }
+            let update = probe.stats();
+            assert_eq!(update.searches - insert.searches, ROWS);
+            assert_eq!(update.bound_grows, if reference { 0 } else { 1 });
+            drop(probe);
+            assert_eq!(tx.get(&0u64.to_be_bytes()), Some(vec![2]));
+            tx.rollback();
+            assert_eq!(db.health().total_rows, 0);
+        }
+    }
+
+    #[test]
+    fn replay_failure_rolls_back_entire_page() {
+        let db = MVCC::new();
+        let held = db.begin_transaction();
+        assert!(held.set_raw(b"locked", vec![7]));
+        let mut batch = vec![
+            (b"fresh".to_vec(), Some(vec![1]), None),
+            (b"locked".to_vec(), Some(vec![2]), None),
+            (b"unread".to_vec(), Some(vec![3]), None),
+        ];
+        let error = MVCC::replay_page(&db, &mut batch);
+        assert!(error.is_err());
+        assert!(batch.is_empty());
+        assert_eq!(db.health().total_rows, 1, "a rejected page must not publish its earlier rows");
+        assert_eq!(held.get(b"locked"), Some(vec![7]));
+        assert_eq!(db.active_txn.lock().unwrap().len(), 1);
+        held.rollback();
+    }
 
     #[test]
     fn memory_owned_write_retains_encoded_key_buffer() {
@@ -1096,8 +1151,9 @@ mod tests {
         expected.insert(1u64.to_be_bytes().to_vec(), (None, None));
         expected.insert(vec![], (Some(vec![0, 1]), None));
         expected.insert(vec![0], (Some(vec![1, 0]), Some(expiry)));
-        for reference in [true, false] {
+        for (reference, cost_reference) in [(true, true), (true, false), (false, true), (false, false)] {
             let _mode = reference.then(crate::common::txn::owned_reference::Scope::start);
+            let _cost_mode = cost_reference.then(replay_cost_reference::Scope::start);
             let recovery = crate::common::kv_snapshot::recovery_probe::Scope::start();
             let mut db = MVCC::new();
             db.load_snapshot_from(&path).unwrap();

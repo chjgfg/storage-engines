@@ -30,16 +30,14 @@ pub fn encode_key(raw_key: &[u8], version: u64) -> Vec<u8> {
 
 /// 解码
 pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
-    if enc.len() < 8 {
-        return None;
-    }
-    let split = enc.len() - 8;
-    let mut ver_bytes = [0u8; 8];
-    ver_bytes.copy_from_slice(&enc[split..]);
-    Some(VersionedKey {
-        raw_key: enc[..split].to_vec(),
-        version: u64::from_be_bytes(ver_bytes),
-    })
+    decode_key_ref(enc).map(|(raw_key, version)| VersionedKey { raw_key: raw_key.to_vec(), version })
+}
+
+/// Borrow the raw key when a caller needs only identity and version.
+pub(crate) fn decode_key_ref(enc: &[u8]) -> Option<(&[u8], u64)> {
+    let split = enc.len().checked_sub(8)?;
+    let (raw, version) = enc.split_at(split);
+    Some((raw, u64::from_be_bytes(version.try_into().unwrap())))
 }
 
 /// 版本键域上的** exclusive 上界哨兵**：给定逻辑上界 `end`，返回一个字节串，

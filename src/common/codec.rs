@@ -45,6 +45,62 @@ pub fn pack_ttl(user: &[u8], expire_unix_secs: u64) -> Vec<u8> {
     out
 }
 
+/// The fallback's allocation/copy remains explicit for callers and guards.
+pub(crate) enum SealedValue { Reused(Vec<u8>), Copied(Vec<u8>) }
+
+impl SealedValue {
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        match self { Self::Reused(bytes) | Self::Copied(bytes) => bytes }
+    }
+}
+
+/// Own the user value while adding its logical envelope.
+pub(crate) fn pack_owned(mut user: Vec<u8>, expire: Option<u64>) -> SealedValue {
+    let prefix = if expire.is_some() { 9 } else { 1 };
+    let len = user.len();
+    if user.capacity() - len < prefix {
+        // TTL decoded with only a plain-tag slot keeps the original single-copy
+        // allocation path; it does not realloc and then shift the payload again.
+        return SealedValue::Copied(match expire {
+            Some(expiry) => pack_ttl(&user, expiry), None => pack_plain(&user),
+        });
+    }
+    user.resize(len + prefix, 0);
+    user.copy_within(..len, prefix);
+    match expire {
+        Some(expiry) => {
+            user[0] = VAL_META_TTL;
+            user[1..9].copy_from_slice(&expiry.to_le_bytes());
+        }
+        None => user[0] = VAL_META_PLAIN,
+    }
+    SealedValue::Reused(user)
+}
+
+#[cfg(test)]
+#[test]
+fn owned_seal_reuses_prepared_buffer_and_preserves_bytes() {
+    use std::{assert, assert_eq, matches, vec};
+    for payload in [vec![], vec![0, 1, 0], vec![1; 1024]] {
+        for expiry in [None, Some(0), Some(u64::MAX)] {
+            let mut value = Vec::with_capacity(payload.len() + 9);
+            value.extend_from_slice(&payload);
+            let pointer = value.as_ptr();
+            let sealed = pack_owned(value, expiry);
+            assert!(matches!(&sealed, SealedValue::Reused(_)));
+            let actual = sealed.into_bytes();
+            let expected = match expiry { Some(e) => pack_ttl(&payload, e), None => pack_plain(&payload) };
+            assert_eq!(actual, expected);
+            assert_eq!(actual.as_ptr(), pointer, "prepared payload must keep its allocation");
+            let mut exact = Vec::with_capacity(payload.len());
+            exact.extend_from_slice(&payload);
+            let sealed = pack_owned(exact, expiry);
+            assert!(matches!(&sealed, SealedValue::Copied(_)));
+            assert_eq!(sealed.into_bytes(), expected);
+        }
+    }
+}
+
 /// 解码逻辑 value 字节
 pub fn decode_value_meta(logical: &[u8]) -> ValueMeta {
     let (offset, expire) = envelope(logical);

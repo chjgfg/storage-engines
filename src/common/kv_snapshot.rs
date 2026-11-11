@@ -700,16 +700,25 @@ pub fn read_bin_with(
     path: &Path,
     on: &mut dyn FnMut(KvRecord) -> bool,
 ) -> std::io::Result<IoStats> {
-    read_bin_policy(path, on, false)
+    read_bin_policy(path, on, false, ValueBuffer::Exact)
 }
 
-pub(crate) fn read_snapshot_with(path: &Path,
+/// Raw decoded values may reserve the one-byte memory envelope without
+/// changing their length or byte contents. TTL pays its extra eight bytes later.
+#[derive(Clone, Copy)]
+pub(crate) enum ValueBuffer { Exact, PlainEnvelope }
+
+impl ValueBuffer {
+    fn spare(self) -> usize { match self { Self::Exact => 0, Self::PlainEnvelope => 1 } }
+}
+
+pub(crate) fn read_snapshot_with(path: &Path, values: ValueBuffer,
     on: &mut dyn FnMut(KvRecord) -> bool) -> std::io::Result<IoStats> {
-    read_bin_policy(path, on, true)
+    read_bin_policy(path, on, true, values)
 }
 
 fn read_bin_policy(path: &Path, on: &mut dyn FnMut(KvRecord) -> bool,
-    strict: bool) -> std::io::Result<IoStats> {
+    strict: bool, values: ValueBuffer) -> std::io::Result<IoStats> {
     use std::io::{Read, Seek, SeekFrom};
     let file = File::open(path)?;
     let length = file.metadata()?.len();
@@ -753,7 +762,7 @@ fn read_bin_policy(path: &Path, on: &mut dyn FnMut(KvRecord) -> bool,
     } else { (length - 8, None) };
     #[cfg(test)]
     let _timer = recovery_probe::Timer::start(recovery_probe::Kind::Records);
-    read_bin_records(&mut reader, body_len, with_seq, with_expire, strict || checked, expected, on)
+    read_bin_records(&mut reader, body_len, with_seq, with_expire, strict || checked, expected, values, on)
 }
 
 enum RecordRead {
@@ -765,6 +774,7 @@ enum RecordRead {
 struct RecordInput<R> {
     reader: R,
     remaining: u64,
+    values: ValueBuffer,
 }
 
 impl<R: std::io::Read> RecordInput<R> {
@@ -776,10 +786,14 @@ impl<R: std::io::Read> RecordInput<R> {
         Ok(Some(bytes))
     }
 
-    fn bytes(&mut self, len: u32) -> std::io::Result<Option<Vec<u8>>> {
+    fn bytes(&mut self, len: u32, spare: usize) -> std::io::Result<Option<Vec<u8>>> {
         if len as u64 > self.remaining { return Ok(None); }
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len as usize).map_err(std::io::Error::other)?;
+        // An empty payload allocates once, when its actual envelope is known.
+        let spare = if len == 0 { 0 } else { spare };
+        let capacity = (len as usize).checked_add(spare)
+            .ok_or_else(|| snapshot_invalid("snapshot value capacity overflow"))?;
+        bytes.try_reserve_exact(capacity).map_err(std::io::Error::other)?;
         bytes.resize(len as usize, 0);
         self.reader.read_exact(&mut bytes)?;
         self.remaining -= len as u64;
@@ -789,12 +803,12 @@ impl<R: std::io::Read> RecordInput<R> {
     fn record(&mut self, with_seq: bool, with_expire: bool) -> std::io::Result<RecordRead> {
         if self.remaining == 0 { return Ok(RecordRead::End); }
         let Some(len) = self.fixed::<4>()? else { return Ok(RecordRead::Truncated); };
-        let Some(key) = self.bytes(u32::from_le_bytes(len))? else { return Ok(RecordRead::Truncated); };
+        let Some(key) = self.bytes(u32::from_le_bytes(len), 0)? else { return Ok(RecordRead::Truncated); };
         let Some(len) = self.fixed::<4>()? else { return Ok(RecordRead::Truncated); };
         let value = match u32::from_le_bytes(len) {
             TOMBSTONE_LEN => None,
             len => {
-                let Some(value) = self.bytes(len)? else { return Ok(RecordRead::Truncated); };
+                let Some(value) = self.bytes(len, self.values.spare())? else { return Ok(RecordRead::Truncated); };
                 Some(value)
             }
         };
@@ -812,9 +826,9 @@ impl<R: std::io::Read> RecordInput<R> {
 }
 
 fn read_bin_records(reader: &mut impl std::io::Read, length: u64, with_seq: bool,
-    with_expire: bool, strict: bool, expected: Option<u64>,
+    with_expire: bool, strict: bool, expected: Option<u64>, values: ValueBuffer,
     on: &mut dyn FnMut(KvRecord) -> bool) -> std::io::Result<IoStats> {
-    let mut input = RecordInput { reader, remaining: length };
+    let mut input = RecordInput { reader, remaining: length, values };
     let mut stats = IoStats::default();
     loop {
         match input.record(with_seq, with_expire)? {
@@ -987,7 +1001,7 @@ mod tests {
             else { assert_eq!(Some(bytes), reference_bytes); }
             let recovery = recovery_probe::Scope::start();
             let mut seen = 0u64;
-            read_snapshot_with(&path, &mut |row| {
+            read_snapshot_with(&path, ValueBuffer::Exact, &mut |row| {
                 assert_eq!(row.key, seen.to_be_bytes());
                 assert_eq!(row.value, Some(vec![7; 64]));
                 seen += 1; true
@@ -1028,7 +1042,7 @@ mod tests {
                 assert!(stats.sync_ns > 0, "checked snapshot must still sync");
             }
             let mut seen = 0u64;
-            read_snapshot_with(&path, &mut |r| {
+            read_snapshot_with(&path, ValueBuffer::Exact, &mut |r| {
                 if seen < 2000 {
                     assert_eq!(r.key, seen.to_be_bytes());
                     assert_eq!(r.value, Some(vec![seen as u8; if seen == 123 { 100_003 } else { 61 }]));
@@ -1057,7 +1071,7 @@ mod tests {
             let baseline = crate::mem_probe::reset_peak();
             let control = whole_file.then(|| std::fs::read(&path).unwrap());
             let mut seen = 0u64;
-            read_snapshot_with(&path, &mut |r| {
+            read_snapshot_with(&path, ValueBuffer::Exact, &mut |r| {
                 assert_eq!(r.key, seen.to_be_bytes());
                 assert_eq!(r.value.as_deref(), Some([0u8; 64].as_slice()));
                 seen += 1;
@@ -1091,9 +1105,9 @@ mod tests {
         body.extend_from_slice(&1u32.to_le_bytes()); body.push(b'v');
         let length = body.len() as u64 + 1000;
         let mut reader = FirstOnly(std::io::Cursor::new(body.clone()));
-        assert_eq!(read_bin_records(&mut reader, length, false, false, false, None, &mut |_| false).unwrap().records, 1);
+        assert_eq!(read_bin_records(&mut reader, length, false, false, false, None, ValueBuffer::Exact, &mut |_| false).unwrap().records, 1);
         let mut reader = FirstOnly(std::io::Cursor::new(body));
-        assert!(read_bin_records(&mut reader, length, false, false, false, None, &mut |_| true).is_err());
+        assert!(read_bin_records(&mut reader, length, false, false, false, None, ValueBuffer::Exact, &mut |_| true).is_err());
     }
 
     #[test]
@@ -1133,12 +1147,12 @@ mod tests {
             writer.write(&record).unwrap();
             writer.finish().unwrap();
             let mut back = Vec::new();
-            read_snapshot_with(&path, &mut |r| { back.push(r); true }).unwrap();
+            read_snapshot_with(&path, ValueBuffer::Exact, &mut |r| { back.push(r); true }).unwrap();
             assert_eq!(back, vec![record]);
             let mut bytes = std::fs::read(&path).unwrap();
             bytes.pop();
             std::fs::write(&path, bytes).unwrap();
-            assert!(read_snapshot_with(&path, &mut |_| true).is_err());
+            assert!(read_snapshot_with(&path, ValueBuffer::Exact, &mut |_| true).is_err());
             assert_eq!(read_bin(&path).unwrap().1.records, 0, "legacy import must tolerate partial tail");
         }
     }

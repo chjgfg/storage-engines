@@ -2522,7 +2522,7 @@ mod tests {
                 st.publish_ns as f64 / 1e6, drop_ns.saturating_sub(st.total_ns) as f64 / 1e6, st.crc_calls, st.write_calls);
             // Independent seed verification, outside the stop timing.
             let mut seen = 0;
-            read_snapshot_with(&dir.0.join("snapshot.bxp"), &mut |r| {
+            read_snapshot_with(&dir.0.join("snapshot.bxp"), crate::common::kv_snapshot::ValueBuffer::Exact, &mut |r| {
                 assert_eq!(r.key, scale_key(seen));
                 assert_eq!(r.value, Some(scale_val(seen)));
                 seen += 1;
@@ -5291,7 +5291,7 @@ mod tests {
             assert_eq!(lookups, if reference { rows as u64 } else { 0 });
             drop(probe); drop(mode);
             let mut seen = 0;
-            read_snapshot_with(&dir.0.join("snapshot.bxp"), &mut |record| {
+            read_snapshot_with(&dir.0.join("snapshot.bxp"), crate::common::kv_snapshot::ValueBuffer::Exact, &mut |record| {
                 assert_eq!(record.key, scale_key(seen));
                 assert_eq!(record.value, Some(scale_val(seen)));
                 assert_eq!(record.expire_unix_secs, None);
@@ -5317,6 +5317,72 @@ mod tests {
         }
         assert!(allocations[1] + rows as u64 / 2 < allocations[0]);
         assert!(allocations[2] + rows as u64 / 2 < allocations[3]);
+    }
+
+    #[test]
+    #[ignore = "M109-only replay allocation and stop comparison; release single thread"]
+    fn memory_replay_allocation_cost() {
+        use crate::common::kv_snapshot::{atomic_write_bin_v4, KvRecord, recovery_probe, snapshot_probe};
+        use crate::memory::{mem_store::key_lookup_probe, memory_mvcc::replay_cost_reference};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 1000);
+        for ttl in [false, true] {
+            let dir = ScaleScratch::new("replay_allocation");
+            let path = dir.0.join("snapshot.bxp");
+            let expiry = ttl.then(|| crate::common::now_unix_secs() + 3600);
+            atomic_write_bin_v4(&path, |writer| {
+                for i in 0..rows {
+                    let mut record = KvRecord::new(scale_key(i), Some(scale_val(i)));
+                    record.expire_unix_secs = expiry;
+                    writer.write(&record)?;
+                }
+                Ok(())
+            }).unwrap();
+            let mut allocations = Vec::new();
+            for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+                crate::scale_probe::memory("memory", "replay_cost_before_open");
+                let mode = reference.then(replay_cost_reference::Scope::start);
+                let lookups = key_lookup_probe::Scope::start();
+                let recovery = recovery_probe::Scope::start();
+                let before = crate::mem_probe::allocations();
+                let start = std::time::Instant::now();
+                let db = open_engine(EngineKind::Memory, Some(&dir.0)).unwrap();
+                let seconds = start.elapsed().as_secs_f64();
+                let count = crate::mem_probe::allocations() - before;
+                allocations.push(count);
+                let lookup_stats = lookups.stats();
+                eprintln!("MEMORY_REPLAY_COST round={round} reference={reference} ttl={ttl} rows={rows} seconds={seconds:.6} allocations={count} lookups={lookup_stats:?} stages={:?}", recovery.stats());
+                assert_eq!(lookup_stats.searches, if reference { rows as u64 } else { 0 });
+                assert_eq!(lookup_stats.end_misses, if reference { 0 } else { rows as u64 });
+                assert_eq!(lookup_stats.bound_grows, 0);
+                drop(recovery); drop(lookups); drop(mode);
+                crate::scale_probe::memory("memory", "replay_cost_after_open");
+                let mut seen = 0;
+                db.export_latest_visible_for_each(false, &mut |record| {
+                    assert_eq!(record.key, scale_key(seen));
+                    assert_eq!(record.value, Some(scale_val(seen)));
+                    assert_eq!(record.expire_unix_secs, expiry);
+                    seen += 1; true
+                });
+                assert_eq!(seen, rows);
+                crate::scale_probe::memory("memory", "replay_cost_before_stop");
+                let stop = snapshot_probe::Scope::start(false);
+                let start = std::time::Instant::now();
+                drop(db);
+                let elapsed = start.elapsed().as_nanos();
+                let stats = stop.stats();
+                eprintln!("MEMORY_REPLAY_STOP round={round} reference={reference} ttl={ttl} rows={rows} total_ms={:.3} release_ms={:.3} stages={stats:?}",
+                    elapsed as f64 / 1e6, elapsed.saturating_sub(stats.total_ns) as f64 / 1e6);
+                drop(stop);
+                crate::scale_probe::memory("memory", "replay_cost_after_stop");
+            }
+            // Both sides retain M105 IO/key ownership. Nonempty plain values
+            // remove two bound allocations plus one seal allocation per row;
+            // TTL keeps its eight-byte growth cost, removing only the bounds.
+            let saved_per_row = if ttl { 2 } else { 3 };
+            assert!(allocations[1] + saved_per_row * rows as u64 <= allocations[0]);
+            assert!(allocations[2] + saved_per_row * rows as u64 <= allocations[3]);
+        }
     }
 
     #[test]
