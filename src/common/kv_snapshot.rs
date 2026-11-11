@@ -86,8 +86,11 @@ pub struct IoStats {
 
 impl IoStats {
     fn push(&mut self, value: &Option<Vec<u8>>) {
+        self.push_live(value.is_some());
+    }
+    fn push_live(&mut self, live: bool) {
         self.records += 1;
-        if value.is_some() {
+        if live {
             self.live += 1;
         } else {
             self.deleted += 1;
@@ -244,6 +247,9 @@ pub(crate) mod snapshot_probe {
         pub total_ns: u128,
         pub crc_calls: u64,
         pub write_calls: u64,
+        pub stop_mode: &'static str,
+        pub visited_rows: u64,
+        pub consumed_rows: u64,
     }
     thread_local! { static ACTIVE: RefCell<Option<(bool, Stats)>> = const { RefCell::new(None) }; }
     pub(crate) struct Scope;
@@ -256,7 +262,7 @@ pub(crate) mod snapshot_probe {
     }
     impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
     pub(super) fn options() -> Option<bool> { ACTIVE.with(|s| s.borrow().as_ref().map(|s| s.0)) }
-    pub(super) fn note(f: impl FnOnce(&mut Stats)) {
+    pub(crate) fn note(f: impl FnOnce(&mut Stats)) {
         ACTIVE.with(|s| { if let Some((_, stats)) = s.borrow_mut().as_mut() { f(stats); } });
     }
 }
@@ -400,12 +406,16 @@ impl BinWriter {
     }
 
     pub fn write(&mut self, rec: &KvRecord) -> std::io::Result<()> {
-        if rec.key.len() >= u32::MAX as usize || rec.value.as_ref().is_some_and(|v| v.len() >= u32::MAX as usize) {
+        self.write_borrowed(&rec.key, rec.value.as_deref(), rec.seq, rec.expire_unix_secs)
+    }
+
+    pub(crate) fn write_borrowed(&mut self, key: &[u8], value: Option<&[u8]>, seq: Option<u64>, expire: Option<u64>) -> std::io::Result<()> {
+        if key.len() >= u32::MAX as usize || value.is_some_and(|v| v.len() >= u32::MAX as usize) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "snapshot record too large"));
         }
-        self.bytes(&(rec.key.len() as u32).to_le_bytes())?;
-        self.bytes(&rec.key)?;
-        match &rec.value {
+        self.bytes(&(key.len() as u32).to_le_bytes())?;
+        self.bytes(key)?;
+        match value {
             Some(v) => {
                 self.bytes(&(v.len() as u32).to_le_bytes())?;
                 self.bytes(v)?;
@@ -413,12 +423,12 @@ impl BinWriter {
             None => self.bytes(&TOMBSTONE_LEN.to_le_bytes())?,
         }
         if self.with_seq {
-            self.bytes(&rec.seq.unwrap_or(0).to_le_bytes())?;
+            self.bytes(&seq.unwrap_or(0).to_le_bytes())?;
         }
         if self.with_expire {
-            self.bytes(&rec.expire_unix_secs.unwrap_or(0).to_le_bytes())?;
+            self.bytes(&expire.unwrap_or(0).to_le_bytes())?;
         }
-        self.stats.push(&rec.value);
+        self.stats.push_live(value.is_some());
         Ok(())
     }
 

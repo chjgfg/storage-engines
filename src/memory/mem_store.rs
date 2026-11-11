@@ -184,6 +184,15 @@ impl MemStore {
         }
     }
 
+    pub(crate) fn borrowed_entries(&self) -> impl Iterator<Item = (&[u8], Option<&[u8]>)> {
+        self.data.iter().map(|(key, value)| (key.as_slice(), value.as_deref()))
+    }
+
+    /// Only used after proving exclusive ownership during MVCC destruction.
+    pub(crate) fn take_entries(&mut self) -> std::collections::btree_map::IntoIter<Vec<u8>, Option<Vec<u8>>> {
+        std::mem::take(&mut self.data).into_iter()
+    }
+
     /// 从 `from`（**含**，落在键的字节域上）起的有序遍历，按引用交给回调；
     /// 回调返回 `true` 表示「够了，停在这里」。
     ///

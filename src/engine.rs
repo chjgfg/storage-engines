@@ -5514,6 +5514,51 @@ mod tests {
         assert!(costs[3] >= costs[2] + 2 * rows as u64);
     }
 
+    #[test]
+    #[ignore = "memory stop owned/borrowed/reference cost; release single thread"]
+    fn memory_stop_ownership_cost() {
+        use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        let mut costs = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("stop_ownership");
+            let db = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+            db.set_vacuum_auto_slice(0);
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.try_commit().unwrap();
+            }
+            let reference_mode = reference.then(crate::memory::memory_mvcc::stop_reference::Scope::start);
+            let scope = snapshot_probe::Scope::start(false);
+            let before = crate::mem_probe::allocations();
+            let start = std::time::Instant::now();
+            drop(db);
+            let seconds = start.elapsed().as_secs_f64();
+            let allocations = crate::mem_probe::allocations() - before;
+            let stats = scope.stats();
+            costs.push(allocations);
+            eprintln!("MEMORY_STOP_OWNERSHIP round={round} reference={reference} rows={rows} seconds={seconds:.6} allocations={allocations} release_remainder_ms={:.3} stages={stats:?}", seconds * 1000.0 - stats.total_ns as f64 / 1e6);
+            if !reference { assert_eq!(stats.consumed_rows, rows as u64); }
+            drop(scope); drop(reference_mode);
+            let mut seen = 0;
+            read_snapshot_with(&dir.0.join("snapshot.bxp"), ValueBuffer::Exact, &mut |r| {
+                assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                seen += 1; true
+            }).unwrap();
+            assert_eq!(seen, rows);
+            let reopened = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+            let mut seen = 0;
+            reopened.export_latest_visible_for_each(false, |r| {
+                assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+        }
+        assert!(costs[0] >= costs[1] + rows as u64);
+        assert!(costs[3] >= costs[2] + rows as u64);
+    }
+
     /// TTL 两格仍量真实 set/get；紧接着在计时外去掉期限，而非把期限调得更长。
     /// 必须先验值再 persist（不是 set_raw 重播种），缺失/过期/损坏不能被修补后蒙混过关。
     fn scale_persist_auxiliary(db: &dyn KvEngine, rows: usize) {

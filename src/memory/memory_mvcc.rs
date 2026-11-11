@@ -25,6 +25,12 @@ use crate::common::VacuumScheduler;
 use crate::common::version::vacuum_drain_group;
 use crate::common::txn::{BulkCore, Registry, TxnCore, WriteSide};
 use crate::memory::mem_store::MemStore;
+use std::borrow::Cow;
+
+enum SnapshotOwnership {
+    Exclusive(std::collections::btree_map::IntoIter<Vec<u8>, Option<Vec<u8>>>),
+    Shared,
+}
 
 // 测试专用：本线程在「每个逻辑 key 的胜出行」那次折叠里**走了多少个版本键**。
 //
@@ -267,7 +273,8 @@ impl MVCC {
     ///   文件里存**绝对**时刻 ⇒ 躺多久都不影响这一行还剩多少命。
     ///
     /// 写盘失败**不吞**：一路 `?` 交给 `Drop`，那里降成 `warn`（析构里不能抛）。
-    fn write_snapshot(&self, path: &std::path::Path) -> std::io::Result<usize> {
+    #[cfg(test)]
+    fn write_snapshot_reference(&self, path: &std::path::Path) -> std::io::Result<usize> {
         use crate::common::kv_snapshot::{KvRecord, atomic_write_bin_v4};
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -309,6 +316,89 @@ impl MVCC {
         })?;
         debug_assert_eq!(stats.records, written);
         Ok(written)
+    }
+
+    /// Keep shared handles readable; consume the tree only on the final owner.
+    fn write_stop_snapshot(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if stop_reference::enabled() || scan_reference::enabled() {
+            let result = self.write_snapshot_reference(path);
+            crate::common::kv_snapshot::snapshot_probe::note(|s| s.stop_mode = "reference");
+            return result;
+        }
+        self.tick_auto_vacuum();
+        let ownership = match Arc::get_mut(&mut self.store) {
+            Some(store) => SnapshotOwnership::Exclusive(store.get_mut().unwrap().take_entries()),
+            None => SnapshotOwnership::Shared,
+        };
+        match ownership {
+            SnapshotOwnership::Exclusive(entries) => {
+                let ceiling = self.next_version.load(Ordering::SeqCst);
+                let rows = entries.map(|(key, value)| (Cow::Owned(key), value.map(Cow::Owned)));
+                Self::write_snapshot_rows(path, rows, ceiling, |v| v < ceiling, "exclusive")
+            }
+            SnapshotOwnership::Shared => {
+                let tx = Transaction::begin(self.store.clone(), self.active_txn.clone(), self.next_version.clone(), self.vac.clone());
+                let store = self.store.lock().unwrap();
+                let rows = store.borrowed_entries().map(|(key, value)| (Cow::Borrowed(key), value.map(Cow::Borrowed)));
+                let result = Self::write_snapshot_rows(path, rows, tx.version(), |v| tx.core.is_visible(v), "shared");
+                drop(store);
+                tx.commit();
+                result
+            }
+        }
+    }
+
+    fn write_snapshot_rows<'a>(path: &std::path::Path,
+        rows: impl Iterator<Item = (Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>,
+        ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
+    ) -> std::io::Result<usize> {
+        use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter}, order::KeyWindow, version::decode_key_ref};
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        let mut visited = 0_u64;
+        let stats = atomic_write_bin_v4(path, |sink| {
+            let mut groups: KeyWindow<(u64, Option<Cow<'a, [u8]>>)> = KeyWindow::new();
+            let mut spare = Vec::new();
+            let emit = |sink: &mut BinWriter, key: &[u8], value: Option<Cow<'a, [u8]>>| {
+                let (user, expire) = match value.as_deref() {
+                    Some(bytes) => crate::common::codec::snapshot_value(bytes),
+                    None => (None, None),
+                };
+                sink.write_borrowed(key, user, None, expire)
+            };
+            for (enc, value) in rows {
+                visited += 1;
+                while let Some((key, (_, value))) = groups.pop_before(&enc, ceiling) {
+                    emit(sink, &key, value)?;
+                    spare = key;
+                }
+                let Some((raw, version)) = decode_key_ref(&enc) else { continue; };
+                if !visible(version) { continue; }
+                let len = raw.len();
+                let winner = match enc {
+                    Cow::Owned(mut key) => {
+                        key.truncate(len);
+                        groups.entry(key)
+                    }
+                    Cow::Borrowed(enc) => groups.entry_with(&enc[..len], || {
+                        let mut key = std::mem::take(&mut spare);
+                        key.clear(); key.extend_from_slice(&enc[..len]);
+                        (key, (0, None))
+                    }),
+                };
+                if version >= winner.0 { *winner = (version, value); }
+            }
+            while let Some((key, (_, value))) = groups.pop_first() { emit(sink, &key, value)?; }
+            Ok(())
+        })?;
+        #[cfg(test)]
+        crate::common::kv_snapshot::snapshot_probe::note(|s| {
+            s.stop_mode = mode; s.visited_rows = visited;
+            s.consumed_rows = if mode == "exclusive" { visited } else { 0 };
+        });
+        #[cfg(not(test))]
+        let _ = (mode, visited);
+        Ok(stats.records)
     }
 
     pub fn begin_transaction(&self) -> Transaction {
@@ -766,7 +856,7 @@ impl Drop for MVCC {
         let Some(path) = self.snapshot.clone() else {
             return;
         };
-        match self.write_snapshot(&path) {
+        match self.write_stop_snapshot(&path) {
             Ok(n) => log::info!("memory: 停止落盘 {n} 行 → {}", path.display()),
             Err(e) => log::warn!("memory 快照落盘失败（{}）: {e}", path.display()),
         }
@@ -1134,6 +1224,16 @@ pub(crate) mod scan_reference {
 }
 
 #[cfg(test)]
+pub(crate) mod stop_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
 pub(crate) mod replay_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! {
@@ -1160,6 +1260,58 @@ mod tests {
     use std::eprintln;
     use std::vec;
     use std::format;
+
+    #[test]
+    fn snapshot_stop_modes_preserve_bytes_and_shared_transactions() {
+        use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer};
+        let mut golden = None;
+        for mode in ["reference", "exclusive", "shared"] {
+            let path = crate::common::ScratchPath::new("memory", "stop_modes", ".bxp");
+            let mut db = MVCC::new();
+            db.set_vacuum_auto_slice(0);
+            let keys = [vec![], b"a".to_vec(), b"a\0".to_vec(), b"a\0\0".to_vec(), vec![255], vec![255, 0]];
+            let tx = db.begin_transaction();
+            for key in &keys { assert!(tx.set_raw(key, vec![0, 1, 255])); }
+            tx.try_commit().unwrap(); drop(tx);
+            let tx = db.begin_transaction();
+            assert!(tx.delete(&keys[0]));
+            assert!(tx.set(&keys[1], crate::common::pack_ttl(b"future", u64::MAX)));
+            assert!(tx.set(&keys[2], crate::common::pack_ttl(b"expired", 0)));
+            assert!(tx.set_raw(&keys[3], vec![]));
+            tx.try_commit().unwrap(); drop(tx);
+            let held = (mode == "shared").then(|| db.begin_transaction());
+            if let Some(tx) = &held { assert!(tx.set_raw(b"uncommitted", vec![7])); }
+            let reference = (mode == "reference").then(stop_reference::Scope::start);
+            let scope = snapshot_probe::Scope::start(false);
+            let clones = crate::common::codec::user_value_copies();
+            assert_eq!(db.write_stop_snapshot(&path).unwrap(), 6);
+            let stats = scope.stats();
+            assert_eq!(stats.stop_mode, mode);
+            if mode != "reference" { assert_eq!(crate::common::codec::user_value_copies(), clones); }
+            if mode == "exclusive" {
+                assert_eq!(stats.consumed_rows, 10);
+                assert_eq!(db.store.lock().unwrap().iter_keys().count(), 0, "exclusive snapshot must consume its input tree");
+            } else { assert!(db.store.lock().unwrap().iter_keys().count() >= 10); }
+            drop(scope); drop(reference);
+            let bytes = std::fs::read(&path).unwrap();
+            if let Some(expected) = &golden { assert_eq!(&bytes, expected); } else { golden = Some(bytes); }
+            let mut records = Vec::new();
+            read_snapshot_with(&path, ValueBuffer::Exact, &mut |rec| { records.push(rec); true }).unwrap();
+            assert_eq!(records[0].value, None);
+            assert_eq!(records[1].value, Some(b"future".to_vec()));
+            assert_eq!(records[1].expire_unix_secs, Some(u64::MAX));
+            assert_eq!(records[2].value, None);
+            assert_eq!(records[3].value, Some(vec![]));
+            if let Some(tx) = held {
+                assert_eq!(tx.get(b"uncommitted"), Some(vec![7]));
+                assert_eq!(tx.get(&keys[4]), Some(vec![0, 1, 255]));
+                tx.rollback();
+            }
+            let mut reopened = MVCC::new();
+            reopened.load_snapshot_from(&path).unwrap();
+            assert_eq!(reopened.export_latest_visible(true).len(), 6);
+        }
+    }
 
     #[test]
     fn ordered_writes_skip_only_proven_absent_version_searches() {

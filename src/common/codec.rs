@@ -123,6 +123,13 @@ fn envelope(logical: &[u8]) -> (usize, Option<u64>) {
 
 pub(crate) fn logical_expiry(logical: &[u8]) -> Option<u64> { envelope(logical).1 }
 
+/// Borrow the same export value and absolute TTL as the owned decoder.
+pub(crate) fn snapshot_value(logical: &[u8]) -> (Option<&[u8]>, Option<u64>) {
+    let (offset, expire) = envelope(logical);
+    if expire.is_some_and(|e| now_unix_secs() >= e) { (None, None) }
+    else { (Some(&logical[offset..]), expire) }
+}
+
 /// 逻辑 value → 用户可见 value；过期返回 None
 pub fn logical_to_user(mut logical: Vec<u8>) -> Option<Vec<u8>> {
     let (offset, expire) = envelope(&logical);
