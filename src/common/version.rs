@@ -105,8 +105,7 @@ pub(crate) fn reset_vacuum_group_counters() {
 ///
 /// 规则与 [`vacuum_plan`] 完全同一条（这份实现就是它的唯一内核，不存在"两份判据"）。
 ///
-/// 组是**取走**的（`std::mem::take`）⇒ 调用方那句之后手上的 `Vec` 已经空着可以接下一把键，
-/// 不需要自己再 `clear()`（四家各写一遍"判完记得清空"就是四个漏清空的機會）。
+/// 组被 drain 清空但保留容量，调用方可直接复用同一缓冲接下一把键。
 pub fn vacuum_plan_group<V: Clone, R: Clone>(
     group: &mut Vec<(u64, V, bool, R)>, xmin: u64,
 ) -> (Vec<V>, Vec<(V, R)>) {
@@ -129,7 +128,7 @@ pub(crate) fn vacuum_drain_group<V: Clone, R: Clone>(
         for (row, extra) in k { keep(row, extra); }
         return;
     }
-    let mut versions = std::mem::take(group);
+    let versions = group;
     #[cfg(test)]
     if !versions.is_empty() {
         VACUUM_GROUP_CALLS.with(|c| c.set(c.get() + 1));
@@ -139,7 +138,7 @@ pub(crate) fn vacuum_drain_group<V: Clone, R: Clone>(
     versions.sort_by_key(|(v, _, _, _)| *v);
     let last_old = versions.iter().rposition(|(v, _, _, _)| *v < xmin);
     let reap_last = last_old.is_some_and(|i| versions[i].2 && i + 1 == versions.len());
-    for (i, (_, row, _, extra)) in versions.into_iter().enumerate() {
+    for (i, (_, row, _, extra)) in versions.drain(..).enumerate() {
         if last_old.is_some_and(|last| i < last || (i == last && reap_last)) {
             delete(row);
         } else {
@@ -410,4 +409,19 @@ mod tests {
             "合同范围内的最大版本仍须在界内"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn vacuum_drain_retains_the_group_allocation() {
+    use std::{assert_eq, vec};
+    let mut group = vec![(1, 11_u64, false, ()), (2, 22, false, ())];
+    let pointer = group.as_ptr();
+    let capacity = group.capacity();
+    let mut deleted = Vec::new();
+    vacuum_drain_group(&mut group, 3, |v| deleted.push(v), |_, _| {});
+    assert_eq!(deleted, vec![11]);
+    assert_eq!(group.len(), 0);
+    assert_eq!(group.capacity(), capacity);
+    assert_eq!(group.as_ptr(), pointer);
 }

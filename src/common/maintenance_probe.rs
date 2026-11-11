@@ -8,6 +8,10 @@ pub(crate) enum Stage { Checkpoint, Commit, AutoVacuum, VacuumScan, VacuumDelete
 pub(crate) struct Stats {
     pub ns: [u128; 16],
     pub calls: [u64; 16],
+    pub max_ns: [u128; 16],
+    pub allocations: [u64; 16],
+    /// Scan calls in <=1, <=5, <=10, <=50, <=100, >100 ms buckets.
+    pub scan_histogram: [u64; 6],
     pub blob_point_reads: u64,
 }
 
@@ -17,7 +21,10 @@ impl std::fmt::Debug for Stats {
         for (i, name) in ["checkpoint", "commit", "auto_vacuum", "vacuum_scan", "vacuum_delete", "vacuum_sync", "vacuum_blob_refs", "vacuum_blob_gc", "dblwr_reset", "dblwr_data", "dblwr_publish", "dblwr_clear", "page_pack", "page_write", "page_sync", "freelist"].into_iter().enumerate() {
             out.field(name, &(self.calls[i], self.ns[i] as f64 / 1e6));
         }
-        out.field("blob_point_reads", &self.blob_point_reads).finish()
+        out.field("vacuum_scan_max_ms", &(self.max_ns[Stage::VacuumScan as usize] as f64 / 1e6))
+            .field("vacuum_scan_allocations", &self.allocations[Stage::VacuumScan as usize])
+            .field("vacuum_scan_histogram", &self.scan_histogram)
+            .field("blob_point_reads", &self.blob_point_reads).finish()
     }
 }
 
@@ -37,10 +44,10 @@ impl Scope {
 }
 impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
 
-pub(crate) struct Timer { stage: Stage, start: Instant }
+pub(crate) struct Timer { stage: Stage, start: Instant, allocations: u64 }
 impl Timer {
     pub fn start(stage: Stage) -> Option<Self> {
-        ACTIVE.with(|s| s.borrow().is_some().then(|| Self { stage, start: Instant::now() }))
+        ACTIVE.with(|s| s.borrow().is_some().then(|| Self { stage, start: Instant::now(), allocations: crate::mem_probe::allocations() }))
     }
 }
 impl Drop for Timer {
@@ -49,6 +56,13 @@ impl Drop for Timer {
         ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
             stats.ns[self.stage as usize] += ns;
             stats.calls[self.stage as usize] += 1;
+            stats.max_ns[self.stage as usize] = stats.max_ns[self.stage as usize].max(ns);
+            stats.allocations[self.stage as usize] += crate::mem_probe::allocations().saturating_sub(self.allocations);
+            if let Stage::VacuumScan = self.stage {
+                let bucket = [1_000_000, 5_000_000, 10_000_000, 50_000_000, 100_000_000]
+                    .partition_point(|bound| ns > *bound);
+                stats.scan_histogram[bucket] += 1;
+            }
         });
     }
 }

@@ -60,6 +60,56 @@ pub(crate) fn memory(engine: &str, phase: &str) {
     }
 }
 
+#[cfg(windows)]
+fn cpu_ns() -> io::Result<u128> {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct FileTime { low: u32, high: u32 }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessTimes(process: *mut std::ffi::c_void, creation: *mut FileTime,
+            exit: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+    }
+    let mut times = [FileTime::default(); 4];
+    // SAFETY: current-process handle and four distinct initialized FILETIME buffers.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), &mut times[0], &mut times[1],
+        &mut times[2], &mut times[3]) } == 0 { return Err(io::Error::last_os_error()); }
+    let ticks = |t: FileTime| ((t.high as u64) << 32) | t.low as u64;
+    Ok((ticks(times[2]) as u128 + ticks(times[3]) as u128) * 100)
+}
+
+#[cfg(not(windows))]
+fn cpu_ns() -> io::Result<u128> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "process CPU timer unavailable on this target"))
+}
+
+/// Process CPU includes all threads; allocations and wall time are inclusive.
+/// Fault deltas alone do not distinguish disk paging from other page faults.
+pub(crate) struct Phase {
+    wall: std::time::Instant,
+    cpu: io::Result<u128>,
+    allocations: u64,
+    process: io::Result<ProcessMemory>,
+}
+impl Phase {
+    pub(crate) fn start() -> Self {
+        let process = read_memory();
+        let cpu = cpu_ns();
+        Self { wall: std::time::Instant::now(), cpu, process, allocations: crate::mem_probe::allocations() }
+    }
+    pub(crate) fn finish(self, engine: &str, phase: &str) {
+        let wall_ms = self.wall.elapsed().as_secs_f64() * 1e3;
+        let cpu_ms = self.cpu.and_then(|start| cpu_ns().map(|end| end.saturating_sub(start) as f64 / 1e6));
+        let faults = self.process.and_then(|before| read_memory().and_then(|after| match (before, after) {
+            (ProcessMemory::Available { page_faults: a, .. }, ProcessMemory::Available { page_faults: b, .. }) => Ok(b.saturating_sub(a)),
+            _ => Err(io::Error::other("process page fault counters unavailable")),
+        }));
+        eprintln!("SCALE_PHASE engine={engine} phase={phase} wall_ms={wall_ms:.3} cpu_ms={cpu_ms:?} allocations={} page_faults_delta={faults:?}",
+            crate::mem_probe::allocations().saturating_sub(self.allocations));
+    }
+}
+
 fn output(command: &mut Command) -> io::Result<String> {
     #[cfg(windows)] {
         use std::os::windows::process::CommandExt;

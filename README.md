@@ -3,7 +3,7 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M109 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M110 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
@@ -38,6 +38,9 @@ M106 B+ 页 I/O 失败保留脏页和恢复 WAL，阻止提交、回滚误销账
 M107 台架在迁移验收后释放目标库，记录二进制 SHA256、运行时 Git 与启停边界的总堆/RSS/缺页计数。
 M108 LSM 为安全的单 SST 压实直接迁层，保留 TTL/过滤/删除屏障回退；实际迁层次数和字节单独计量。
 M109 memory 复用回放值和版本查找缓冲，仅对已证明超出表尾的新键省掉区间查询；恢复页失败整页回滚。
+M110 memory vacuum 复用逻辑键与版本组，确定删除后才编码；60 万键同构建四轮分配约 192 万→6 万次。
+对照入口 `VACUUM_ROWS=600000 cargo test --release --lib memory_vacuum_buffer_cost -- --ignored --nocapture --test-threads=1`。
+标准台架新增 vacuum 切片延迟、分配、CPU 与缺页差值；大档耗时结论以新压测为准。
 
 ## 引入方式
 

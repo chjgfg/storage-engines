@@ -6,7 +6,7 @@
 //! overlap window; in the worst case that window can span the database.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::{matches, unreachable};
+use std::{debug_assert_eq, matches, unreachable};
 
 use super::{VersionedKey, WinCandidate, decode_key, encode_key};
 
@@ -115,6 +115,42 @@ impl<T> KeyWindow<T> {
             self.pop_first()
         } else {
             None
+        }
+    }
+
+    /// Allocate the logical key and group only on first insertion. The factory
+    /// may reuse a finalized group's buffers; overlapping binary groups remain owned.
+    pub(crate) fn entry_with(&mut self, key: &[u8], make: impl FnOnce() -> (Vec<u8>, T)) -> &mut T {
+        if matches!(&self.pending, WindowStorage::Single(old, _) if old.as_slice() == key) {
+            return match &mut self.pending {
+                WindowStorage::Single(_, value) => value,
+                _ => unreachable!(),
+            };
+        }
+        if self.is_empty() {
+            let (owned, value) = make();
+            debug_assert_eq!(owned.as_slice(), key);
+            self.pending = WindowStorage::Single(owned, value);
+            return match &mut self.pending {
+                WindowStorage::Single(_, value) => value,
+                _ => unreachable!(),
+            };
+        }
+        if matches!(&self.pending, WindowStorage::Single(_, _)) {
+            let old = std::mem::replace(&mut self.pending, WindowStorage::Empty);
+            let WindowStorage::Single(owned, value) = old else { unreachable!() };
+            let mut map = BTreeMap::new();
+            map.insert(owned, value);
+            self.pending = WindowStorage::Overlap(map);
+        }
+        match &mut self.pending {
+            WindowStorage::Overlap(map) => {
+                if map.contains_key(key) { return map.get_mut(key).unwrap(); }
+                let (owned, value) = make();
+                debug_assert_eq!(owned.as_slice(), key);
+                map.entry(owned).or_insert(value)
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -526,4 +562,19 @@ mod tests {
         let enc = encode_key(&[97, 0, 0, 0, 0, 0, 0, 0, 2], 2);
         assert_eq!(logical_floor(&enc, 3), b"a");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn lazy_window_factory_is_called_only_for_new_groups() {
+    use std::{assert_eq, vec};
+    let mut window = KeyWindow::<Vec<u64>>::new();
+    let mut calls = 0;
+    for (key, value) in [(b"a".as_slice(), 1), (b"a".as_slice(), 2), (b"a\0".as_slice(), 3), (b"a".as_slice(), 4)] {
+        window.entry_with(key, || { calls += 1; (key.to_vec(), vec![]) }).push(value);
+    }
+    assert_eq!(calls, 2);
+    assert_eq!(window.pop_first(), Some((b"a".to_vec(), vec![1, 2, 4])));
+    assert_eq!(window.pop_first(), Some((b"a\0".to_vec(), vec![3])));
+    assert_eq!(window.pop_first(), None);
 }
