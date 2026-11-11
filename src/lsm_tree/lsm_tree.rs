@@ -306,6 +306,8 @@ pub struct Snapshot {
     pub seq: u64,
 }
 
+enum MoveOutcome { Moved, Rewrite }
+
 /// LSM 存储引擎
 pub struct LSMTree {
     dir: PathBuf,
@@ -405,6 +407,8 @@ pub(crate) mod maintenance_probe {
         pub compact_ns: u128,
         pub input_files: u64,
         pub input_bytes: u64,
+        pub trivial_moves: u64,
+        pub moved_bytes: u64,
         pub merge_ns: u128,
         pub repair_ns: u128,
         pub manifest_ns: u128,
@@ -447,6 +451,11 @@ pub(crate) mod maintenance_probe {
                 }
             });
         }
+    }
+    pub(crate) fn moved(bytes: u64) {
+        ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+            stats.trivial_moves += 1; stats.moved_bytes += bytes;
+        });
     }
     pub(crate) fn inputs(files: u64, bytes: u64) {
         ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
@@ -2044,10 +2053,72 @@ impl LSMTree {
     }
 
     /// compact `level` → `level+1`
+    /// Move one certified file without decoding or rewriting its contents.
+    /// Any semantic transform or uncertain metadata keeps the ordinary merge path.
+    fn try_trivial_move(&mut self, level: usize, next: usize) -> std::io::Result<MoveOutcome> {
+        #[cfg(test)]
+        if trivial_move_probe::reference() { return Ok(MoveOutcome::Rewrite); }
+        if self.bulk_mode || self.compaction_filter.is_some() || self.levels[level].is_empty()
+            || (level == 0 && self.levels[0].len() != 1) {
+            return Ok(MoveOutcome::Rewrite);
+        }
+        let idx = if level == 0 { 0 } else {
+            self.levels[level].iter().enumerate().max_by_key(|(_, s)| s.size_bytes).unwrap().0
+        };
+        let file = &self.levels[level][idx];
+        if file.move_eligibility() != crate::lsm_tree::sst::MoveEligibility::Ready {
+            return Ok(MoveOutcome::Rewrite);
+        }
+        // Existing target overlaps must still enter repair, even if unrelated to the picked file.
+        if self.levels[level].windows(2).any(|pair| pair[0].max_key >= pair[1].min_key)
+            || self.levels[next].windows(2).any(|pair| pair[0].max_key >= pair[1].min_key)
+            || self.levels[next].iter().any(|s| ranges_overlap(&file.min_key, &file.max_key, &s.min_key, &s.max_key)) {
+            return Ok(MoveOutcome::Rewrite);
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        if self.ttl_meta.range(file.min_key.clone()..=file.max_key.clone()).any(|(_, exp)| now > *exp) {
+            return Ok(MoveOutcome::Rewrite);
+        }
+        let id = file.id;
+        let bytes = file.size_bytes;
+        #[cfg(test)]
+        let _probe = maintenance_probe::Timer::start(maintenance_probe::Kind::Compact);
+        #[cfg(test)]
+        maintenance_probe::inputs(1, bytes);
+        let file = self.levels[level].remove(idx);
+        let position = self.levels[next].partition_point(|s| s.min_key < file.min_key);
+        self.levels[next].insert(position, file);
+        // The same durable file is referenced by either manifest. Never remove it.
+        if let Err(error) = self.write_manifest() {
+            let file = self.levels[next].remove(position);
+            self.levels[level].insert(idx, file);
+            self.refresh_level_ranges(level);
+            self.refresh_level_ranges(next);
+            return Err(error);
+        }
+        self.refresh_level_ranges(level);
+        self.refresh_level_ranges(next);
+        self.stats_dirty = true;
+        #[cfg(test)] {
+            maintenance_probe::moved(bytes);
+            let text = fs::read_to_string(self.manifest_path())?;
+            assert!(manifest_publishes(&text, next, &[id]));
+        }
+        #[cfg(not(test))]
+        let _ = (id, bytes);
+        self.notify_bg();
+        Ok(MoveOutcome::Moved)
+    }
+
     fn compact_level(&mut self, level: usize) -> std::io::Result<()> {
         let next = level + 1;
         if next >= self.levels.len() {
             return Ok(());
+        }
+        match self.try_trivial_move(level, next)? {
+            MoveOutcome::Moved => return Ok(()),
+            MoveOutcome::Rewrite => {}
         }
 
         // `input_files`：**拥有**本次压实的输入文件，顺序 = 源序（新→旧）。
@@ -2828,6 +2899,131 @@ mod tests {
             assert!(manifest_publishes_reference(text, &[id]));
             assert!(!manifest_publishes(text, 1, &[id]), "unpublished id {id} passed the guard");
         }
+    }
+
+    #[test]
+    fn trivial_move_reference_rewrites_and_fallbacks_preserve_semantics() {
+        for mode in 0..8 {
+            let dir = tmp_dir("trivial_fallback");
+            let mut db = LSMTree::open(&dir).unwrap();
+            let entries = if mode == 3 {
+                vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"old".to_vec()))),
+                    (b"a".to_vec(), StoredEntry::put(2, Some(b"new".to_vec())))]
+            } else { vec![(b"a".to_vec(), if mode == 2 { StoredEntry::drop_at(2) }
+                else { StoredEntry::put(2, Some(b"new".to_vec())) })] };
+            db.inject_sst_for_test(1, entries).unwrap();
+            let id = db.levels[1][0].id;
+            if mode == 1 { db.set_compaction_filter(Some(Arc::new(|_, _| false))); }
+            if mode == 2 { db.inject_sst_for_test(3, vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"old".to_vec())))]).unwrap(); }
+            if mode == 4 { db.ttl_meta.insert(b"a".to_vec(), 1); }
+            if mode == 5 { db.inject_sst_for_test(2, vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"old".to_vec())))]).unwrap(); }
+            if mode == 6 {
+                let path = db.levels[1][0].path.clone();
+                db.levels[1][0] = SstFile::open(id, path).unwrap(); // Unknown certificate after reopen.
+            }
+            if mode == 7 { db.inject_sst_for_test(1, vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"old".to_vec())))]).unwrap(); }
+            let reference = (mode == 0).then(trivial_move_probe::Scope::start);
+            let scope = maintenance_probe::Scope::start();
+            db.compact_level(1).unwrap();
+            assert_eq!(scope.stats().trivial_moves, 0, "mode={mode}");
+            assert!(db.levels[2].iter().all(|file| file.id != id));
+            if mode == 1 || mode == 4 { assert!(db.levels[2].is_empty()); }
+            else {
+                let value = &db.levels[2][0].get(b"a").unwrap().value;
+                if mode == 2 { assert!(matches!(value, EntryValue::Drop)); }
+                else if mode == 7 {
+                    // Equal-sized source files select the last one. Its old
+                    // value moves lower; the newer source still wins globally.
+                    assert_eq!(value, &EntryValue::Put(Some(b"old".to_vec())));
+                    assert_eq!(db.get(b"a"), Some(b"new".to_vec()));
+                } else { assert_eq!(value, &EntryValue::Put(Some(b"new".to_vec()))); }
+            }
+            drop(scope); drop(reference);
+        }
+    }
+
+    #[test]
+    #[ignore = "same-build rewrite/move comparison; SCALE_ROWS controls input size"]
+    fn trivial_move_cost_comparison() {
+        let rows: usize = std::env::var("SCALE_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(100_000);
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = tmp_dir("trivial_compare");
+            let mut db = LSMTree::open(&dir).unwrap();
+            db.opts.target_sst_bytes = usize::MAX;
+            let id = db.next_sst_id.fetch_add(1, Ordering::SeqCst);
+            let mut builder = SstBuilder::with_options(id, db.sst_path(id), 128, true);
+            for i in 0..rows {
+                builder.add((i as u64).to_be_bytes().to_vec(), StoredEntry::put(i as u64 + 1, Some(vec![7; 64])));
+            }
+            db.levels[1].push(builder.finish().unwrap());
+            db.write_manifest().unwrap();
+            let reference_scope = reference.then(trivial_move_probe::Scope::start);
+            let scope = maintenance_probe::Scope::start();
+            let start = std::time::Instant::now();
+            db.compact_level(1).unwrap();
+            let seconds = start.elapsed().as_secs_f64();
+            let stats = scope.stats();
+            assert_eq!(stats.trivial_moves, if reference { 0 } else { 1 });
+            if !reference { assert_eq!(stats.merge_ns, 0); assert_eq!(stats.sst_sync_ns, 0); }
+            drop(scope); drop(reference_scope);
+            let mut seen = 0;
+            for file in &db.levels[2] {
+                for (key, value) in file.iter_all() {
+                    assert_eq!(key, (seen as u64).to_be_bytes());
+                    assert_eq!(value, StoredEntry::put(seen as u64 + 1, Some(vec![7; 64])));
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, rows);
+            eprintln!("LSM_MOVE_COMPARE round={round} reference={reference} rows={rows} seconds={seconds:.6} stats={stats:?}");
+        }
+    }
+
+    #[test]
+    fn trivial_move_manifest_failure_preserves_file_and_source_membership() {
+        let dir = tmp_dir("trivial_publish_failure");
+        let mut db = LSMTree::open(&dir).unwrap();
+        db.inject_sst_for_test(1, vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"v".to_vec())))]).unwrap();
+        db.write_manifest().unwrap();
+        let old_manifest = fs::read(db.manifest_path()).unwrap();
+        let id = db.levels[1][0].id;
+        let path = db.levels[1][0].path.clone();
+        // Occupying the temporary manifest path forces a real publication error.
+        fs::create_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+        assert!(db.compact_level(1).is_err());
+        assert_eq!(db.levels[1][0].id, id);
+        assert!(db.levels[2].is_empty());
+        assert!(path.exists());
+        assert_eq!(fs::read(db.manifest_path()).unwrap(), old_manifest);
+        fs::remove_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+        db.compact_level(1).unwrap();
+        assert_eq!(db.levels[2][0].id, id);
+    }
+
+    #[test]
+    fn trivial_move_preserves_file_identity_and_bytes() {
+        let dir = tmp_dir("trivial_move");
+        let mut db = LSMTree::open(&dir).unwrap();
+        db.inject_sst_for_test(1, vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"one".to_vec()))),
+            (b"b".to_vec(), StoredEntry::put(2, None))]).unwrap();
+        let id = db.levels[1][0].id;
+        let path = db.levels[1][0].path.clone();
+        let before = fs::read(&path).unwrap();
+        let scope = maintenance_probe::Scope::start();
+        db.compact_level(1).unwrap();
+        assert_eq!(scope.stats().trivial_moves, 1);
+        assert_eq!(scope.stats().merge_ns, 0);
+        assert_eq!(scope.stats().sst_sync_ns, 0);
+        drop(scope);
+        assert_eq!(db.levels[2][0].id, id, "single safe input must retain its file");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(db.levels[2][0].get(b"a").unwrap(), StoredEntry::put(1, Some(b"one".to_vec())));
+        assert_eq!(db.levels[2][0].get(b"b").unwrap(), StoredEntry::put(2, None));
+        assert!(manifest_publishes(&fs::read_to_string(db.manifest_path()).unwrap(), 2, &[id]));
+        drop(db);
+        let db = LSMTree::open(&dir).unwrap();
+        assert_eq!(db.levels[2][0].id, id);
+        assert_eq!(db.levels[2][0].get(b"a").unwrap(), StoredEntry::put(1, Some(b"one".to_vec())));
     }
 
     #[test]
@@ -4751,4 +4947,14 @@ impl<'a> Iterator for LightMerge<'a> {
         // 走到这里 = 堆空**且**等待队列空 ⇒ 所有源都收干净了，最后一个待定键可以吐
         self.pending.take()
     }
+}
+
+#[cfg(test)]
+mod trivial_move_probe {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static REFERENCE: Cell<bool> = const { Cell::new(false) }; }
+    pub fn reference() -> bool { REFERENCE.with(|c| c.get()) }
+    pub struct Scope;
+    impl Scope { pub fn start() -> Self { REFERENCE.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { REFERENCE.with(|c| c.set(false)); } }
 }

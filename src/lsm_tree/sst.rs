@@ -507,12 +507,17 @@ struct IndexEntry {
 
 // ─── SstFile ─────────────────────────────────────────────────────────────────
 
+/// Only builders that observed every entry can certify a no-rewrite move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoveEligibility { Unknown, RewriteRequired, Ready }
+
 pub struct SstFile {
     pub id: u64,
     pub path: PathBuf,
     pub min_key: Vec<u8>,
     pub max_key: Vec<u8>,
     pub size_bytes: u64,
+    move_eligibility: MoveEligibility,
     entries_cache: Option<Vec<(Vec<u8>, StoredEntry)>>,
     index: Vec<IndexEntry>,
     bloom: Bloom,
@@ -548,6 +553,8 @@ impl std::fmt::Debug for SstFile {
 }
 
 impl SstFile {
+    pub(crate) fn move_eligibility(&self) -> MoveEligibility { self.move_eligibility }
+
     pub fn num_entries(&self) -> usize {
         if let Some(e) = &self.entries_cache {
             return e.len();
@@ -1176,6 +1183,7 @@ fn open_v1(
         min_key,
         max_key,
         size_bytes,
+        move_eligibility: MoveEligibility::Unknown,
         entries_cache: Some(entries),
         index: Vec::new(),
         bloom: Bloom::empty(),
@@ -1268,6 +1276,7 @@ fn open_v2_from_footer(id: u64, path: PathBuf, size_bytes: u64) -> std::io::Resu
         min_key,
         max_key,
         size_bytes,
+        move_eligibility: MoveEligibility::Unknown,
         entries_cache: None,
         index,
         bloom,
@@ -1540,6 +1549,7 @@ pub struct SstBuilder {
     /// `add` 里没有地方返回 IO 错误（`pub fn add(&mut self, …)` 四处调用方在用，改签名是破坏性的）
     /// ⇒ 第一个错误存下来，`finish()` 如实抛出。**不吞错，也不改公开签名。**
     io_err: Option<std::io::Error>,
+    move_eligibility: MoveEligibility,
 }
 
 // 测试专用尺子：一次"要不要切文件"的判定**走过了多少个条目**。
@@ -1635,10 +1645,15 @@ impl SstBuilder {
             count: 0,
             est_bytes: 0,
             io_err: None,
+            move_eligibility: MoveEligibility::Ready,
         }
     }
 
     pub fn add(&mut self, key: Vec<u8>, se: StoredEntry) {
+        let previous = self.pending.last().map(|(k, _)| k.as_slice()).or(self.tail_key.as_deref());
+        if matches!(se.value, EntryValue::Drop) || previous.is_some_and(|k| k >= key.as_slice()) {
+            self.move_eligibility = MoveEligibility::RewriteRequired;
+        }
         // 有序断言：上一键可能在还没落盘的那半块里，也可能已经是上一块的尾键
         debug_assert!(
             match self.pending.last() {
@@ -1808,7 +1823,10 @@ impl SstBuilder {
         }
         let _ = std::fs::remove_file(&self.path);
         std::fs::rename(self.path.with_extension("sst.tmp"), &self.path)?;
-        SstFile::open(self.id, &self.path)
+        let mut sst = SstFile::open(self.id, &self.path)?;
+        // Unknown for a disk-opened file; no format change and no hidden full scan.
+        if sync && self.count > 0 { sst.move_eligibility = self.move_eligibility; }
+        Ok(sst)
     }
 }
 

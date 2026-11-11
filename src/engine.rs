@@ -5760,6 +5760,7 @@ mod tests {
             db.name(), db.reclamation_status(), s.flushes, s.flush_ns as f64 / 1e6,
             s.compactions, s.compact_ns as f64 / 1e6, s.input_files, s.input_bytes);
         if db.name() == "lsm_tree" {
+            eprintln!("SCALE_LSM_MOVES phase={phase} files={} bytes={}", s.trivial_moves, s.moved_bytes);
             eprintln!("SCALE_LSM_STAGES phase={phase} merge_ms={:.3} repair_ms={:.3} manifest_ms={:.3} guard_ms={:.3} cleanup_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3}",
                 s.merge_ns as f64 / 1e6, s.repair_ns as f64 / 1e6, s.manifest_ns as f64 / 1e6,
                 s.guard_ns as f64 / 1e6, s.cleanup_ns as f64 / 1e6, s.sst_finish_ns as f64 / 1e6, s.sst_sync_ns as f64 / 1e6);
