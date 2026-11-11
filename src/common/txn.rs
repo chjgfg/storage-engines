@@ -143,6 +143,13 @@ pub trait WriteSide {
     /// 物理撤掉本事务写下的一行（回滚用 —— **不是**写墓碑，那会让这行永远留在库里）。
     fn remove_versioned(&mut self, enc: &[u8]);
 
+    /// Keep unfinished versions registered when a backend cannot finish undo.
+    fn try_remove_versioned(&mut self, enc: &[u8]) -> Result<(), WriteError> {
+        self.remove_versioned(enc);
+        Ok(())
+    }
+
+
     /// 逻辑 value → 存储字节（大值走 blob 旁路就在这里）。`None` = 写旁路失败 ⇒ 整次写作废。
     fn encode_value(&mut self, value: Vec<u8>) -> Option<Vec<u8>> {
         Some(value)
@@ -328,6 +335,13 @@ impl TxnCore {
         self.try_write_inner(reg, side, Cow::Owned(key), value)
     }
 
+    /// Latch an engine failure without changing an already completed outcome.
+    pub(crate) fn mark_storage_failed(&self) {
+        if self.state.get() == TxnState::Active {
+            self.write_error.set(Some(WriteError::StorageWriteFailed));
+        }
+    }
+
     fn fail_write(&self, error: WriteError) -> Result<(), WriteError> {
         self.write_error.set(Some(error));
         Err(error)
@@ -367,17 +381,20 @@ impl TxnCore {
     pub fn rollback<S: WriteSide + WalTail>(&self, reg: &mut Registry, side: &mut S) {
         if self.state.get() != TxnState::Active { return; }
         let keys = reg.remove(&self.version).unwrap_or_default();
-        self.state.set(TxnState::RolledBack);
         if self.wal_policy.opened() {
             side.wal_abort(self.version);
         }
-        if keys.is_empty() {
-            return;
+        for k in &keys {
+            let enc = encode_key(k, self.version);
+            if let Err(error) = side.try_remove_versioned(&enc) {
+                self.write_error.set(Some(error));
+                // Registry is locked throughout: no reader can observe its
+                // temporary removal. Preserve all keys for retry/recovery.
+                reg.insert(self.version, keys);
+                return;
+            }
         }
-        for k in keys {
-            let enc = encode_key(&k, self.version);
-            side.remove_versioned(&enc);
-        }
+        self.state.set(TxnState::RolledBack);
     }
 
     /// **部分**撤销：把 `keys` 这几把已写过的 key 从库里撤掉，并从写集里摘掉。
@@ -395,7 +412,10 @@ impl TxnCore {
         }
         for k in keys {
             let enc = encode_key(k, self.version);
-            side.remove_versioned(&enc);
+            if let Err(error) = side.try_remove_versioned(&enc) {
+                self.write_error.set(Some(error));
+                return;
+            }
         }
         if let Some(writes) = reg.get_mut(&self.version) {
             // 减法也走哈希：`writes.retain(|w| !keys.iter().any(...))` 是 O(写集 × 撤销数)

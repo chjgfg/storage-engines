@@ -8,6 +8,7 @@ use std::eprintln;
 use std::thread_local;
 use std::vec;
 use std::format;
+use std::matches;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
@@ -74,6 +75,13 @@ pub struct CacheEntry {
 /// 换出时攒多少脏页再写盘（并在非 bulk 模式下 fsync 一次）
 const EVICT_BATCH_TARGET: usize = 64;
 
+/// A failed write may have partially published pages. Only reopen/recovery may
+/// clear this state; retrying checkpoint must never discard the recovery WAL.
+enum PageIoState {
+    Healthy,
+    Failed { kind: std::io::ErrorKind, message: String },
+}
+
 /// 页管理器
 pub struct PageManager {
     /// 单写者锁（持有即占用库；Drop 释放）
@@ -99,6 +107,7 @@ pub struct PageManager {
     freelist_dirty: bool,
     /// bulk 模式：换出/刷盘跳过双写与频繁 fsync，只在 flush_all 末尾 sync 一次
     bulk_mode: bool,
+    io_state: PageIoState,
     /// 每页被写入过几次（`write_page` / `allocate_page` 各算一次）。
     ///
     /// 上层用它验证"解析过的节点还新不新"：数字一变，那份 `BTreeNode` 就是陈旧的，必须重解析。
@@ -413,6 +422,7 @@ impl PageManager {
             meta_dirty: false,
             freelist_dirty: false,
             bulk_mode: false,
+            io_state: PageIoState::Healthy,
             page_writes: HashMap::new(),
             pinned: HashSet::new(),
             pin_budget: DEFAULT_PIN_BUDGET_PAGES,
@@ -660,6 +670,23 @@ impl PageManager {
     /// - `do_sync=true`：写完 fsync（checkpoint / 非 bulk 换出）
     /// - bulk 模式：跳过双写，仅 write；是否 sync 由调用方决定
     fn flush_pages_batch(&mut self, page_ids: &[PageId], do_sync: bool) -> std::io::Result<()> {
+        self.ensure_healthy()?;
+        let result = self.flush_pages_batch_inner(page_ids, do_sync);
+        if let Err(error) = &result {
+            self.io_state = PageIoState::Failed { kind: error.kind(), message: error.to_string() };
+        }
+        result
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> std::io::Result<()> {
+        match &self.io_state {
+            PageIoState::Healthy => Ok(()),
+            PageIoState::Failed { kind, message } => Err(std::io::Error::new(*kind,
+                format!("B+ page I/O failed; close and reopen for recovery: {message}"))),
+        }
+    }
+
+    fn flush_pages_batch_inner(&mut self, page_ids: &[PageId], do_sync: bool) -> std::io::Result<()> {
         if page_ids.is_empty() && !self.meta_dirty && !self.freelist_dirty {
             return Ok(());
         }
@@ -688,10 +715,14 @@ impl PageManager {
 
         if self.bulk_mode {
             // 快速路径：直接写主文件，不做双写；sync 可选
+            #[cfg(test)]
+            crate::bplus_tree::storage::dblwr_probe::fail_at(4)?;
             for (pid, raw) in &batch {
                 self.file.write_page(*pid, raw)?;
             }
             if do_sync {
+                #[cfg(test)]
+                crate::bplus_tree::storage::dblwr_probe::fail_at(5)?;
                 self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
             }
         } else {
@@ -700,17 +731,23 @@ impl PageManager {
                 {
                     #[cfg(test)]
                     let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::PageWrite);
+                    #[cfg(test)]
+                    crate::bplus_tree::storage::dblwr_probe::fail_at(4)?;
                     for (pid, raw) in chunk { self.file.write_page(*pid, raw)?; }
                 }
                 if do_sync {
                     #[cfg(test)]
                     let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::PageSync);
+                    #[cfg(test)]
+                    crate::bplus_tree::storage::dblwr_probe::fail_at(5)?;
                     self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
                 }
                 self.dblwr.clear()?;
             }
         }
 
+        // Mark clean only after the entire publication succeeds.
+        self.persist_freelist()?;
         for &pid in page_ids {
             if let Some(entry) = self.cache.get_mut(&pid) {
                 if entry.state == PageState::Dirty {
@@ -719,8 +756,6 @@ impl PageManager {
             }
         }
         self.meta_dirty = false;
-        // freelist 与 meta 同事务落盘
-        self.persist_freelist()?;
         Ok(())
     }
 
@@ -794,6 +829,8 @@ impl PageManager {
             }
         };
         self.evict_if_needed();
+        // Reads remain usable for inspection, without growing the failed cache.
+        if self.ensure_healthy().is_err() { return Some(payload); }
         self.cache.insert(
             page_id,
             CacheEntry {
@@ -914,12 +951,13 @@ impl PageManager {
 
     /// 刷单个脏页
     pub fn flush_page(&mut self, page_id: PageId) -> bool {
+        if self.ensure_healthy().is_err() { return false; }
         let is_dirty = self
             .cache
             .get(&page_id)
             .map(|e| e.state == PageState::Dirty)
             .unwrap_or(false);
-        if !is_dirty && !self.meta_dirty {
+        if !is_dirty && !self.meta_dirty && !self.freelist_dirty {
             return true;
         }
         if let Err(e) = self.flush_pages_via_dblwr(&[page_id]) {
@@ -941,12 +979,8 @@ impl PageManager {
             .filter(|(_, e)| e.state == PageState::Dirty)
             .map(|(id, _)| *id)
             .collect();
-        self.flush_pages_batch(&dirty, true)?;
-        // 即使没有脏页，meta/freelist 也可能脏
-        if self.meta_dirty {
-            self.persist_meta_via_dblwr()?;
-        }
-        self.persist_freelist()
+        // The batch owns data, meta and freelist publication and error latching.
+        self.flush_pages_batch(&dirty, true)
     }
 
     /// 释放页：归还 freelist（文件不收缩，槽位可复用）
@@ -994,6 +1028,10 @@ impl PageManager {
 
     /// 缓存满时一次换出多页：脏页凑一批再写盘，bulk 下不 fsync
     fn evict_batch_until_room(&mut self) {
+        // An in-flight tree operation must finish its in-memory structural edits.
+        // Keep all its dirty pages, then let the tree/transaction report failure.
+        // Subsequent operations are refused by the tree/transaction entry points.
+        if !matches!(self.io_state, PageIoState::Healthy) { return; }
         if self.cache.len() < self.max_cache_pages {
             return;
         }
@@ -1022,7 +1060,10 @@ impl PageManager {
             let sync = !self.bulk_mode;
             #[cfg(test)]
             BATCH_FLUSHED_PAGES.with(|c| c.set(c.get() + dirty_victims.len() as u64));
-            let _ = self.flush_pages_batch(&dirty_victims, sync);
+            if self.flush_pages_batch(&dirty_victims, sync).is_err() {
+                self.lru_queue.extend(victims);
+                return;
+            }
         }
         #[cfg(test)]
         PAGE_EVICTIONS.with(|c| c.set(c.get() + victims.len() as u64));
@@ -1110,6 +1151,25 @@ mod tests {
         let _ = std::fs::remove_file(freelist_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::lock_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::blob_path(path));
+    }
+
+    #[test]
+    fn eviction_failure_retains_dirty_pages() {
+        let path = crate::common::ScratchPath::new("page", "eviction_failure", ".db");
+        {
+            let mut pm = PageManager::open(&path, 1).unwrap();
+            let pid = pm.allocate_page();
+            assert!(pm.write_page(pid, b"unsynced"));
+            let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(1);
+            pm.evict_batch_until_room();
+            assert_eq!(pm.get_page_state(pid), Some(PageState::Dirty),
+                "failed eviction must retain the dirty page");
+            assert_eq!(&pm.read_page(pid).unwrap()[..8], b"unsynced");
+            assert!(pm.ensure_healthy().is_err());
+            assert!(pm.try_flush_all().is_err(), "a later checkpoint must not hide the failure");
+            assert!(!pm.flush_page(pid));
+        }
+        cleanup(&path);
     }
 
     #[test]

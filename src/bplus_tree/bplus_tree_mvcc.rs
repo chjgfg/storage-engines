@@ -596,6 +596,7 @@ impl MVCC {
 
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
+        kv.ensure_healthy()?;
 
         // ① 一趟按引用的遍历。判「留哪一版」只需要三样：版本号、这行是不是墓碑、
         //    这行是不是 blob 指针 —— 全都在叶子条目手里就能读到，不必把 value 克隆出来。
@@ -697,6 +698,7 @@ impl MVCC {
                     let _ = kv.delete_batch(&to_delete);
                     to_delete.clear();
                 }
+                kv.ensure_healthy()?;
                 // 口径与改前一字不差：按"计划删除的行数"计（不是按门返回的实删数）
                 removed += planned;
             }
@@ -734,7 +736,7 @@ impl MVCC {
         kv.set_next_version(next_ver);
         #[cfg(test)]
         let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
-        kv.flush_all();
+        kv.try_flush_all()?;
         blob.sync()?;
 
         Ok(VacuumRound {
@@ -880,34 +882,40 @@ impl BulkLoader {
     }
 
     pub fn finish(mut self) {
-        self.finish_inner();
+        self.finish_inner().expect("B+ bulk finish failed");
     }
 
-    fn finish_inner(&mut self) {
+    pub fn try_finish(mut self) -> std::io::Result<()> {
+        self.finish_inner()
+    }
+
+    fn finish_inner(&mut self) -> std::io::Result<()> {
         // 幂等守卫在内核里（`finish()` 与 `Drop` 都会调），收尾动作本身是 bplus 自己的事
         if !self.core.first_finish() {
-            return;
+            return Ok(());
         }
         let mut kv = self.kv.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         let mut wal = self.wal.lock().unwrap();
-        let _ = blob.sync();
+        blob.sync()?;
         let next_ver = self.core.next_version().load(Ordering::SeqCst);
         kv.set_next_version(next_ver);
-        kv.flush_all();
+        kv.try_flush_all()?;
         kv.set_bulk_mode(false);
         let root = kv.root_page_id();
         let next_page = kv.next_page_id();
         // M52：这里是 `append(Checkpoint) → sync → truncate()` —— `truncate()` 只留 header，
         // 刚写的那条 Checkpoint 被自己抹掉 ⇒ 下一次 open 拿不到起点（bplus 还有 `NVER` meta
         // 兜着，所以表现为"README 写的第二级永远走不到"）。收口只有一份：`seal_wal_checkpoint`。
-        let _ = seal_wal_checkpoint(&mut wal, next_ver, root.0, next_page);
+        seal_wal_checkpoint(&mut wal, next_ver, root.0, next_page)
     }
 }
 
 impl Drop for BulkLoader {
     fn drop(&mut self) {
-        self.finish_inner();
+        if let Err(error) = self.finish_inner() {
+            log::error!("B+ bulk drop failed; reopen for recovery: {error}");
+        }
     }
 }
 
@@ -1005,6 +1013,7 @@ impl Transaction {
         let mut wal = self.wal.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
+        kv.ensure_healthy().map_err(|_| crate::WriteError::StorageWriteFailed)?;
         self.core.try_write(
             &mut reg,
             &mut TxnSide {
@@ -1153,6 +1162,9 @@ impl Transaction {
             let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::Commit);
             let mut reg = self.core.lock_registry();
             let mut wal = self.wal.lock().unwrap();
+            if self.kv.lock().unwrap().ensure_healthy().is_err() {
+                self.core.mark_storage_failed();
+            }
             self.core.try_commit(&mut reg, &mut WalOnly { wal: &mut wal })?;
         }
         if flush_pages {
@@ -1180,6 +1192,8 @@ impl Transaction {
         let mut wal = self.wal.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
+        // Keep the active version hidden and its WAL intact until recovery.
+        if kv.ensure_healthy().is_err() { return; }
         self.core.rollback(
             &mut reg,
             &mut TxnSide {
@@ -1196,6 +1210,7 @@ impl Transaction {
         let mut wal = self.wal.lock().unwrap();
         let mut blob = self.blob.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
+        if kv.ensure_healthy().is_err() { return; }
         self.core.undo(
             &mut reg,
             &mut TxnSide {
@@ -1255,6 +1270,13 @@ impl WriteSide for TxnSide<'_, '_, '_> {
     fn remove_versioned(&mut self, enc: &[u8]) {
         let _ = self.kv.delete(enc.to_vec());
     }
+
+    fn try_remove_versioned(&mut self, enc: &[u8]) -> Result<(), crate::WriteError> {
+        self.kv.ensure_healthy().map_err(|_| crate::WriteError::StorageWriteFailed)?;
+        self.kv.delete(enc.to_vec());
+        self.kv.ensure_healthy().map_err(|_| crate::WriteError::StorageWriteFailed)
+    }
+
 
     fn encode_value(&mut self, value: Vec<u8>) -> Option<Vec<u8>> {
         // 逻辑 value → 叶子存储编码（大 value 写 blob；事务路径每条都 fsync）
@@ -1346,6 +1368,112 @@ mod tests {
         let _ = std::fs::remove_file(crate::bplus_tree::storage::freelist_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::lock_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::blob_path(path));
+    }
+
+    #[test]
+    fn eviction_failure_blocks_commit_and_checkpoint_preserves_recovery() {
+        for fault in 1..=5 {
+            let path = tmp_db("eviction_failure");
+            {
+                let db = MVCC::open(&path, 4, 2);
+                db.set_vacuum_auto_slice(0);
+                let seed = db.begin_transaction();
+                assert!(seed.set_raw(b"committed", b"keep".to_vec()));
+                seed.try_commit().unwrap();
+                drop(seed);
+                let tx = db.begin_transaction();
+                let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(fault);
+                let mut failed = false;
+                for i in 0u32..100 {
+                    if tx.try_set_raw(&i.to_be_bytes(), vec![7; 512]).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                assert!(failed, "small cache must reach the injected write failure");
+                assert!(matches!(tx.try_commit(), Err(crate::CommitError::WriteFailed(
+                    crate::WriteError::StorageWriteFailed))));
+                assert!(db.try_checkpoint().is_err());
+                let wal_before = std::fs::read(wal_path(&path)).unwrap();
+                assert!(tx.try_set_raw(b"after", b"no".to_vec()).is_err());
+                tx.rollback();
+                assert!(db.active_txn.lock().unwrap().contains_key(&tx.version()));
+                drop(tx);
+                drop(db);
+                assert_eq!(std::fs::read(wal_path(&path)).unwrap(), wal_before,
+                    "failed close must preserve recovery WAL");
+            }
+            let db = MVCC::open(&path, 4, 2);
+            let tx = db.begin_transaction();
+            assert_eq!(tx.get(b"committed"), Some(b"keep".to_vec()));
+            for i in 0u32..100 { assert_eq!(tx.get(&i.to_be_bytes()), None); }
+            assert_eq!(tx.get(b"after"), None);
+            tx.try_commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn rollback_page_failure_keeps_remaining_versions_invisible() {
+        let path = tmp_db("rollback_page_failure");
+        let db = MVCC::open(&path, 4, 2);
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        // Build the rollback workload without measuring setup fsyncs.
+        db.kv.lock().unwrap().set_bulk_mode(true);
+        for i in 0u32..20 { tx.try_set_raw(&i.to_be_bytes(), vec![7; 512]).unwrap(); }
+        db.kv.lock().unwrap().set_bulk_mode(false);
+        let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(4);
+        tx.rollback();
+        assert!(db.kv.lock().unwrap().ensure_healthy().is_err(), "rollback must reach the fault");
+        assert!(db.active_txn.lock().unwrap().contains_key(&tx.version()),
+            "failed rollback must keep its remaining versions invisible");
+        assert!(tx.try_commit().is_err());
+    }
+
+    #[test]
+    fn bulk_finish_propagates_page_sync_failure_without_sealing_wal() {
+        let path = tmp_db("bulk_sync_failure");
+        let db = MVCC::open(&path, 4, 16);
+        let tx = db.begin_transaction();
+        assert!(tx.set_raw(b"committed", b"keep".to_vec()));
+        tx.try_commit().unwrap();
+        drop(tx);
+        let mut bulk = db.begin_bulk();
+        bulk.put(b"bulk", crate::common::pack_plain(b"pending"));
+        let before = std::fs::read(wal_path(&path)).unwrap();
+        let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(5);
+        assert!(bulk.try_finish().is_err());
+        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before);
+        assert!(db.try_checkpoint().is_err());
+        assert!(db.vacuum().is_err());
+        drop(db);
+        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before);
+        let db = MVCC::open(&path, 4, 16);
+        let tx = db.begin_transaction();
+        assert_eq!(tx.get(b"committed"), Some(b"keep".to_vec()));
+        tx.try_commit().unwrap();
+    }
+
+    #[test]
+    fn page_failure_without_active_transaction_keeps_checkpoint_wal() {
+        let path = tmp_db("checkpoint_page_failure");
+        let db = MVCC::open(&path, 4, 16);
+        let tx = db.begin_transaction();
+        assert!(tx.set_raw(b"committed", b"keep".to_vec()));
+        tx.try_commit().unwrap();
+        let before = std::fs::read(wal_path(&path)).unwrap();
+        let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(4);
+        assert!(db.try_flush().is_err());
+        tx.try_commit().unwrap(); // A previously committed result remains committed.
+        drop(tx);
+        assert!(db.try_checkpoint().is_err());
+        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before);
+        drop(db);
+        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before);
+        let db = MVCC::open(&path, 4, 16);
+        let tx = db.begin_transaction();
+        assert_eq!(tx.get(b"committed"), Some(b"keep".to_vec()));
+        tx.try_commit().unwrap();
     }
 
     /// 把 `vacuum_bounded` 的块大小临时压小的 RAII 守卫：离开作用域（含 panic 展开）一律复位，

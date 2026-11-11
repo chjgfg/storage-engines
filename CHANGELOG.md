@@ -2,6 +2,21 @@
 
 ## 未发布（2026-11-11）
 
+### M106：B+ 换出失败保留脏页，封锁提交与 WAL 截断
+
+- test7 代码复核发现换出忽略 flush 错误后仍移除缓存。页管理器新增 Healthy / Failed 状态，
+  首次失败保留原因、脏页与 LRU，后续 flush/checkpoint 返回错误；正在执行的树操作完成内存结构修改后报告失败，
+  后续树写入被拒绝。meta / freelist 与数据页共用错误锁存入口，全部发布成功后才标为 Clean。
+- 事务提交在 WAL Commit 前检查页错误；已提交事务的幂等结果保持成功。回滚/undo 使用可失败的删除入口，
+  中途失败保留活跃版本与写集，防残留版本变成可见；关闭时保留 WAL 供恢复。vacuum 不再吞掉 flush 错误。
+  B+ BulkLoader 新增 try_finish，兼容 finish 失败时 panic，Drop 仅记录错误且不截断 WAL。
+- 脏页守卫原版先红（Dirty 变成 None）；回滚守卫关闭删除错误传播后先红，恢复保护后通过。
+  双写发布前/发布中/清空、主文件 write/sync 五处注入均验证拒绝提交、保留 WAL，重开保住已提交行并撤销未提交行；
+  另覆盖无活跃事务 checkpoint、bulk 收尾同步失败和已提交结果幂等。
+- 第一次 B+ 定向回归 89 passed / 0 failed / 6 ignored；最终故障用例 5 passed / 0 failed（15.38 s），
+  共享事务相关用例 6 passed / 0 failed / 1 ignored（3.06 s）；Windows 全目标 all-features 检查无警告通过。
+  这里只修错误处理，不把 test7 的 fsync 批次增长宣称为已优化；未重跑 20M。
+
 ### M105：memory 恢复转移键所有权，快照扩大有界 I/O 缓冲
 
 - TxnCore 借用/拥有键共用一份状态、冲突、编码、WAL、落库及写集登记判据；WriteSide 新增有默认实现的

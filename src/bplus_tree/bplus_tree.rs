@@ -322,6 +322,10 @@ impl BPlusTree {
         if let Err(e) = self.try_flush_all() { log::error!("flush_all failed: {e}"); }
     }
 
+    pub(crate) fn ensure_healthy(&self) -> std::io::Result<()> {
+        self.page_manager.ensure_healthy()
+    }
+
     pub fn try_flush_all(&mut self) -> std::io::Result<()> {
         self.page_manager.set_root_page_id(self.root);
         self.page_manager.try_flush_all()?;
@@ -840,13 +844,14 @@ impl BPlusTree {
         Self::leaf_base(None) + Self::entry_bytes_borrowed(key, row) <= MAX_PAYLOAD as i64
     }
 
-    /// 插入一行。返回 `false` = **这一行没进去**，只有一种成因：这一条比一整页还大，
-    /// 分裂也切不出「两半都装得下」的分界。此时磁盘上一个字节都没动 ⇒ 已有的行不受影响。
+    /// 插入一行。超大行在修改前拒绝；页 I/O 失败也返回 false，可能已部分修改。
+    /// I/O 失败后保留脏页并封锁后续写入/checkpoint，调用方必须重开恢复。
     ///
     /// 写法是**下降一趟全在内存里算，到顶才统一落盘**（`InsertStep::writes`）。老写法边算边写，
     /// 于是「孩子已经分裂写完、父亲却放不下」这一格会把刚分出去的那一半变成**没人引用的页** ——
     /// 和 M11f 那个静默丢页是同一个形状：`write_page` 超载只打一行日志，返回的 `false` 被调用链丢掉。
     pub fn insert(&mut self, key: Key, row_id: RowId) -> bool {
+        if self.ensure_healthy().is_err() { return false; }
         let step = self.insert_recursive(self.root, key, row_id);
         if !step.landed {
             // 一个字节都没写 ⇒ 途中占下的页谁也不引用，回收掉别留孤儿
@@ -877,7 +882,7 @@ impl BPlusTree {
             }
             self.set_root(new_root_page_id);
         }
-        true
+        self.ensure_healthy().is_ok()
     }
 
     /// 一趟下降：返回「还没落盘的一串（页号, 内容）」与要不要往上升一层。
@@ -1216,6 +1221,7 @@ impl Del {
 impl BPlusTree {
     /// 删除：移除指定 key，必要时借键/合并并处理根降层
     pub fn delete(&mut self, key: Key) -> bool {
+        if self.ensure_healthy().is_err() { return false; }
         let (res, _) = self.delete_recursive(self.root, std::slice::from_ref(&key), None);
 
         // 根是内部节点且只剩一个子节点时降层 —— **只在本次删除真合并过一页时才问**（M56b）。
@@ -1226,7 +1232,7 @@ impl BPlusTree {
         }
         // M56：一趟删除结束把阶段清空 ⇒ 下一趟的桶不会串到这一趟上
         set_page_phase(PHASE_OTHER);
-        res.removed > 0
+        res.removed > 0 && self.ensure_healthy().is_ok()
     }
 
     /// 批量删除（M61b）：`keys` **必须按升序给出**，同一叶子里的连续多行共用一趟下降。
@@ -1240,6 +1246,7 @@ impl BPlusTree {
     /// ⚠️ 乱序输入不会损坏数据（每片叶子里都按序二分），但会退化成"每行一趟下降"—— 白跑一趟树，
     ///   所以顺序是调用方的义务；这里不 assert（release 里 assert 也要钱），由守卫 `delete_leaf_runs` 的 k 读数盯住。
     pub fn delete_batch(&mut self, keys: &[Key]) -> usize {
+        if self.ensure_healthy().is_err() { return 0; }
         let mut i = 0usize;
         let mut removed = 0usize;
         while i < keys.len() {
@@ -1252,6 +1259,7 @@ impl BPlusTree {
             }
             // 递归承诺 `used ≥ 1`（哪怕整段都不在树里也会推进），所以这里不可能死循环
             i += used.max(1);
+            if self.ensure_healthy().is_err() { break; }
         }
         set_page_phase(PHASE_OTHER);
         removed
