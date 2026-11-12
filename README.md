@@ -3,8 +3,9 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M119 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M120 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - M119 的 LSM 删除专项实际运行 600k / 5M / 20M；20M 每轮点查 4000000→0、重开全量逐值通过。规模、数据形状与剩余压实成本见更新日志。
+- M120 的 B+ 20M 维护补验通过：四轮读取 22M 物理行，分配约 4771 万→2/5 次；完整 vacuum 删除 2M 历史版本并重开逐值核对 20M 唯一键。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
