@@ -13,6 +13,9 @@ pub(crate) struct Stats {
     /// Scan calls in <=1, <=5, <=10, <=50, <=100, >100 ms buckets.
     pub scan_histogram: [u64; 6],
     pub blob_point_reads: u64,
+    pub bitcask_empty_sweeps: u64,
+    pub bitcask_reference_sweeps: u64,
+    pub bitcask_value_reads: u64,
 }
 
 impl std::fmt::Debug for Stats {
@@ -24,7 +27,10 @@ impl std::fmt::Debug for Stats {
         out.field("vacuum_scan_max_ms", &(self.max_ns[Stage::VacuumScan as usize] as f64 / 1e6))
             .field("vacuum_scan_allocations", &self.allocations[Stage::VacuumScan as usize])
             .field("vacuum_scan_histogram", &self.scan_histogram)
-            .field("blob_point_reads", &self.blob_point_reads).finish()
+            .field("blob_point_reads", &self.blob_point_reads)
+            .field("bitcask_empty_sweeps", &self.bitcask_empty_sweeps)
+            .field("bitcask_reference_sweeps", &self.bitcask_reference_sweeps)
+            .field("bitcask_value_reads", &self.bitcask_value_reads).finish()
     }
 }
 
@@ -32,6 +38,15 @@ thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(Non
 
 pub(crate) fn note_blob_read() {
     ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.blob_point_reads += 1; });
+}
+
+pub(crate) fn note_bitcask_scan(inspect: bool) {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+        if inspect { stats.bitcask_reference_sweeps += 1; } else { stats.bitcask_empty_sweeps += 1; }
+    });
+}
+pub(crate) fn note_bitcask_value_read() {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.bitcask_value_reads += 1; });
 }
 
 pub(crate) struct Scope;

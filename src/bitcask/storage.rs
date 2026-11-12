@@ -76,7 +76,43 @@ pub struct BlobStore {
 
 const BLOB_BUF_TARGET: usize = 4 * 1024 * 1024;
 
+/// Empty files need no live-value lookup. Pending writes require inspection too.
+pub(crate) enum ReferenceScan { Empty, Inspect }
+
+#[cfg(test)]
+mod reference_scan_tests {
+    use super::*;
+    use std::{assert, matches};
+
+    #[test]
+    fn blob_reference_mode_accounts_for_buffer_and_rejects_changed_file() {
+        let dir = crate::common::ScratchPath::new("blob_mode", "pending", "");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut blob = BlobStore::open(&dir).unwrap();
+        assert!(matches!(blob.reference_scan().unwrap(), ReferenceScan::Empty));
+        blob.append(&[1; 512]).unwrap();
+        assert!(matches!(blob.reference_scan().unwrap(), ReferenceScan::Inspect), "buffered append must not look empty");
+        blob.sync().unwrap();
+        assert!(matches!(blob.reference_scan().unwrap(), ReferenceScan::Inspect));
+        std::fs::OpenOptions::new().write(true).open(blob.path()).unwrap().set_len(8).unwrap();
+        assert!(blob.reference_scan().is_err(), "truncated file is an error, not empty mode");
+    }
+}
+
 impl BlobStore {
+    pub(crate) fn reference_scan(&mut self) -> std::io::Result<ReferenceScan> {
+        let disk_len = self.path().metadata()?.len();
+        if disk_len != self.end_pos - self.buf.len() as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "blob file length changed"));
+        }
+        let mut magic = [0; 8];
+        self.file.read_exact_at(0, &mut magic)?;
+        if &magic != BLOB_MAGIC {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid blob header"));
+        }
+        Ok(if self.end_pos == BLOB_MAGIC.len() as u64 { ReferenceScan::Empty } else { ReferenceScan::Inspect })
+    }
+
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         let path = blob_path(dir);
         let mut file = DiskFile::open(&path)?;
