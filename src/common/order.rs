@@ -25,6 +25,7 @@ pub(crate) fn take_tail_buffer_peak() -> usize { TAIL_BUFFER_PEAK.with(|c| c.rep
 /// Smallest logical key that an encoded key >= `enc` can represent.
 /// A logical key smaller than `enc` must be one of its prefixes; its largest
 /// possible encoding is that prefix followed by `max_version`.
+#[cfg(test)]
 pub(crate) fn logical_floor(enc: &[u8], max_version: u64) -> &[u8] {
     let ceiling = max_version.to_be_bytes();
     for split in 0..enc.len() {
@@ -36,6 +37,19 @@ pub(crate) fn logical_floor(enc: &[u8], max_version: u64) -> &[u8] {
         }
     }
     enc
+}
+
+/// Test only prefixes that can be <= this pending key. Prefixes beyond its
+/// shared bytes with enc are larger, so cannot prevent this key's completion.
+fn window_before(first: &[u8], enc: &[u8], max_version: u64) -> bool {
+    if first >= enc { return false; }
+    let common = first.iter().zip(enc).take_while(|(a, b)| a == b).count();
+    let ceiling = max_version.to_be_bytes();
+    for split in 0..=common {
+        if enc.get(split).is_some_and(|&b| b > ceiling[0]) { continue; }
+        if ceiling.as_slice() >= &enc[split..] { return false; }
+    }
+    true
 }
 
 /// Exclusive physical bound covering logical keys < end (or <= end).
@@ -114,7 +128,13 @@ impl<T> KeyWindow<T> {
             WindowStorage::Single(key, _) => key,
             WindowStorage::Overlap(map) => map.first_key_value().expect("overlap nonempty").0,
         };
-        if first.as_slice() < logical_floor(enc, max_version) {
+        #[cfg(test)]
+        let before = if super::kv_snapshot::snapshot_emit_reference::enabled() {
+            first.as_slice() < logical_floor(enc, max_version)
+        } else { window_before(first, enc, max_version) };
+        #[cfg(not(test))]
+        let before = window_before(first, enc, max_version);
+        if before {
             self.pop_first()
         } else {
             None
@@ -444,6 +464,29 @@ pub(crate) fn reverse_window(
 mod tests {
     use super::*;
     use std::{assert, assert_eq, vec};
+
+    #[test]
+    fn window_bound_matches_original_floor_exhaustively() {
+        let mut keys = vec![vec![]];
+        let mut level = vec![vec![]];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for key in level {
+                for byte in [0, 1, 255] { let mut key = key.clone(); key.push(byte); next.push(key); }
+            }
+            keys.extend(next.clone()); level = next;
+        }
+        for ceiling in [0, 1, 255, 256, u64::MAX] {
+            for first in &keys {
+                for enc in &keys {
+                    assert_eq!(window_before(first, enc, ceiling), first.as_slice() < logical_floor(enc, ceiling),
+                        "first={first:?} enc={enc:?} ceiling={ceiling}");
+                    let enc = encode_key(enc, ceiling);
+                    assert_eq!(window_before(first, &enc, ceiling), first.as_slice() < logical_floor(&enc, ceiling));
+                }
+            }
+        }
+    }
 
     fn reference_health(physical: &[Vec<u8>], ceiling: u64) -> super::super::MvccHealth {
         let mut pending = BTreeMap::<Vec<u8>, u64>::new();

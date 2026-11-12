@@ -5876,6 +5876,88 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "memory stop record batches, first/bulk shapes ABBA; release single thread"]
+    fn memory_stop_emit_cost() {
+        use crate::common::kv_snapshot::{snapshot_emit_reference, snapshot_probe, read_snapshot_with,
+            ValueBuffer, RECORD_BATCH_BYTES};
+        use std::io::{Read, Seek, SeekFrom};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 1000);
+        for appended in [false, true] {
+            let total_rows = rows + if appended { rows / 10 } else { 0 };
+            let mut golden_footer = None;
+            let mut golden_bytes = None;
+            for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+                let dir = ScaleScratch::new("stop_emit");
+                let mut db = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+                db.set_vacuum_auto_slice(0);
+                for base in (0..rows).step_by(1000) {
+                    let tx = db.begin_transaction();
+                    for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                    tx.try_commit().unwrap();
+                }
+                if appended {
+                    drop(db);
+                    db = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+                    db.set_vacuum_auto_slice(0);
+                    let mut bulk = db.begin_bulk();
+                    for i in rows..total_rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
+                    bulk.finish();
+                }
+                let mode = reference.then(snapshot_emit_reference::Scope::start);
+                let scope = snapshot_probe::Scope::start(false);
+                let before = crate::mem_probe::allocations();
+                let start = std::time::Instant::now();
+                drop(db);
+                let seconds = start.elapsed().as_secs_f64();
+                let allocations = crate::mem_probe::allocations() - before;
+                let stats = scope.stats();
+                assert_eq!(stats.stop_mode, "exclusive");
+                assert_eq!(stats.consumed_rows, total_rows as u64);
+                assert_eq!(stats.input_batches, total_rows.div_ceil(8192) as u64);
+                assert!(stats.pull_ns + stats.fold_emit_ns <= stats.body_ns);
+                if reference {
+                    assert_eq!(stats.record_reference_rows, total_rows as u64);
+                    assert_eq!(stats.record_buffer_bytes, 0);
+                    assert_eq!(stats.record_flushes, 0);
+                } else {
+                    assert_eq!(stats.record_buffer_bytes, RECORD_BATCH_BYTES);
+                    assert_eq!(stats.record_buffered_rows, total_rows as u64);
+                    assert_eq!(stats.record_direct_large_rows, 0);
+                    assert_eq!(stats.record_reference_rows, 0);
+                    assert!(stats.record_flushes > 0 && stats.record_flushes < total_rows as u64);
+                    assert!(stats.record_flush_ns <= stats.fold_emit_ns);
+                }
+                eprintln!("MEMORY_STOP_EMIT round={round} reference={reference} appended={appended} rows={total_rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");
+                drop(scope); drop(mode);
+                let path = dir.0.join("snapshot.bxp");
+                let mut file = std::fs::File::open(&path).unwrap();
+                file.seek(SeekFrom::End(-16)).unwrap();
+                let mut footer = [0_u8; 16]; file.read_exact(&mut footer).unwrap(); drop(file);
+                if let Some(expected) = &golden_footer { assert_eq!(&footer, expected); } else { golden_footer = Some(footer); }
+                if rows <= 5000 {
+                    let bytes = std::fs::read(&path).unwrap();
+                    if let Some(expected) = &golden_bytes { assert_eq!(&bytes, expected); } else { golden_bytes = Some(bytes); }
+                }
+                let mut seen = 0;
+                read_snapshot_with(&path, ValueBuffer::Exact, &mut |r| {
+                    assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                    assert_eq!(r.expire_unix_secs, None); seen += 1; true
+                }).unwrap();
+                assert_eq!(seen, total_rows);
+                let reopened = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+                let mut seen = 0;
+                reopened.export_latest_visible_for_each(false, |r| {
+                    assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                    assert_eq!(r.expire_unix_secs, None); seen += 1; true
+                });
+                assert_eq!(seen, total_rows);
+                eprintln!("MEMORY_STOP_EMIT_VERIFIED round={round} appended={appended} rows={seen}");
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "B+ batched delete and serializer old/new/new/old; release single thread"]
     fn bplus_delete_buffer_cost() {
         use crate::common::maintenance_probe::{Scope, Stage};

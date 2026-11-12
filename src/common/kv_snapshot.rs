@@ -192,6 +192,46 @@ pub struct BinWriter {
     stats: IoStats,
     with_seq: bool,
     with_expire: bool,
+    record_batch: RecordBatch,
+}
+
+pub(crate) const RECORD_BATCH_BYTES: usize = 512 * 1024;
+
+/// Memory stop records are assembled in one bounded buffer. Large records
+/// keep their streaming path; an empty snapshot allocates no record buffer.
+#[derive(Default)]
+struct RecordBatch {
+    bytes: Vec<u8>,
+    pending: IoStats,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RecordEncoding {
+    Buffered,
+    DirectLarge,
+    #[cfg(test)]
+    DirectReference,
+}
+
+fn record_size(key: &[u8], value: Option<&[u8]>, with_seq: bool, with_expire: bool) -> std::io::Result<usize> {
+    if key.len() >= u32::MAX as usize || value.is_some_and(|v| v.len() >= u32::MAX as usize) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "snapshot record too large"));
+    }
+    key.len().checked_add(value.map_or(0, <[u8]>::len))
+        .and_then(|n| n.checked_add(8 + 8 * (with_seq as usize + with_expire as usize)))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "snapshot record size overflow"))
+}
+
+/// One field layout for direct writes and buffered memory records.
+fn encode_record(key: &[u8], value: Option<&[u8]>, seq: Option<u64>, expire: Option<u64>,
+    with_seq: bool, with_expire: bool, mut bytes: impl FnMut(&[u8]) -> std::io::Result<()>) -> std::io::Result<()> {
+    bytes(&(key.len() as u32).to_le_bytes())?;
+    bytes(key)?;
+    bytes(&value.map_or(TOMBSTONE_LEN, |v| v.len() as u32).to_le_bytes())?;
+    if let Some(value) = value { bytes(value)?; }
+    if with_seq { bytes(&seq.unwrap_or(0).to_le_bytes())?; }
+    if with_expire { bytes(&expire.unwrap_or(0).to_le_bytes())?; }
+    Ok(())
 }
 
 /// CRC follows the bytes accepted by the file, below buffering. Short record
@@ -201,6 +241,8 @@ struct SnapshotFile {
     checksum: Option<u32>,
     #[cfg(test)]
     legacy_fields: bool,
+    #[cfg(test)]
+    record_reference: bool,
     #[cfg(test)]
     measured: bool,
     #[cfg(test)]
@@ -256,6 +298,14 @@ pub(crate) mod snapshot_probe {
         pub fold_emit_ns: u128,
         pub input_batches: u64,
         pub input_buffer_bytes: usize,
+        pub record_buffer_bytes: usize,
+        pub record_flushes: u64,
+        pub record_buffered_rows: u64,
+        /// Nested in fold/emit, including file writes and CRC below buffering.
+        pub record_flush_ns: u128,
+        pub record_direct_large_rows: u64,
+        pub record_direct_large_ns: u128,
+        pub record_reference_rows: u64,
     }
     thread_local! { static ACTIVE: RefCell<Option<(bool, Stats)>> = const { RefCell::new(None) }; }
     pub(crate) struct Scope;
@@ -282,6 +332,17 @@ pub(crate) mod io_reference {
     pub struct Scope;
     impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
     impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+/// Freeze M117 record fields and logical-window bounds for stop comparisons.
+#[cfg(test)]
+pub(crate) mod snapshot_emit_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|s| s.set(false)); } }
 }
 
 fn snapshot_buffer_size(snapshot: bool) -> usize {
@@ -405,6 +466,8 @@ impl BinWriter {
             #[cfg(test)]
             legacy_fields: options == Some(true),
             #[cfg(test)]
+            record_reference: options == Some(true) || io_reference::enabled() || snapshot_emit_reference::enabled(),
+            #[cfg(test)]
             measured: options.is_some(),
             #[cfg(test)]
             stats: snapshot_probe::Stats::default(),
@@ -421,6 +484,7 @@ impl BinWriter {
             stats: IoStats::default(),
             with_seq,
             with_expire,
+            record_batch: RecordBatch::default(),
         })
     }
 
@@ -442,29 +506,72 @@ impl BinWriter {
     }
 
     pub(crate) fn write_borrowed(&mut self, key: &[u8], value: Option<&[u8]>, seq: Option<u64>, expire: Option<u64>) -> std::io::Result<()> {
-        if key.len() >= u32::MAX as usize || value.is_some_and(|v| v.len() >= u32::MAX as usize) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "snapshot record too large"));
-        }
-        self.bytes(&(key.len() as u32).to_le_bytes())?;
-        self.bytes(key)?;
-        match value {
-            Some(v) => {
-                self.bytes(&(v.len() as u32).to_le_bytes())?;
-                self.bytes(v)?;
-            }
-            None => self.bytes(&TOMBSTONE_LEN.to_le_bytes())?,
-        }
-        if self.with_seq {
-            self.bytes(&seq.unwrap_or(0).to_le_bytes())?;
-        }
-        if self.with_expire {
-            self.bytes(&expire.unwrap_or(0).to_le_bytes())?;
-        }
+        record_size(key, value, self.with_seq, self.with_expire)?;
+        self.flush_record_batch()?;
+        encode_record(key, value, seq, expire, self.with_seq, self.with_expire, |bytes| self.bytes(bytes))?;
         self.stats.push_live(value.is_some());
         Ok(())
     }
 
+    pub(crate) fn write_snapshot_batched(&mut self, key: &[u8], value: Option<&[u8]>,
+        expire: Option<u64>) -> std::io::Result<RecordEncoding> {
+        if self.w.get_ref().checksum.is_none() || !self.with_expire || self.with_seq {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "record batches require BPEXP004"));
+        }
+        let size = record_size(key, value, false, true)?;
+        #[cfg(test)]
+        if self.w.get_ref().record_reference {
+            self.write_borrowed(key, value, None, expire)?;
+            self.w.get_mut().stats.record_reference_rows += 1;
+            return Ok(RecordEncoding::DirectReference);
+        }
+        if size > RECORD_BATCH_BYTES {
+            self.flush_record_batch()?;
+            #[cfg(test)]
+            let start = self.w.get_ref().measured.then(std::time::Instant::now);
+            self.write_borrowed(key, value, None, expire)?;
+            #[cfg(test)]
+            {
+                let stats = &mut self.w.get_mut().stats;
+                stats.record_direct_large_rows += 1;
+                if let Some(start) = start { stats.record_direct_large_ns += start.elapsed().as_nanos(); }
+            }
+            return Ok(RecordEncoding::DirectLarge);
+        }
+        if self.record_batch.bytes.len() + size > RECORD_BATCH_BYTES { self.flush_record_batch()?; }
+        if self.record_batch.bytes.capacity() == 0 { self.record_batch.bytes = Vec::with_capacity(RECORD_BATCH_BYTES); }
+        encode_record(key, value, None, expire, false, true, |bytes| {
+            self.record_batch.bytes.extend_from_slice(bytes); Ok(())
+        })?;
+        self.record_batch.pending.push_live(value.is_some());
+        Ok(RecordEncoding::Buffered)
+    }
+
+    pub(crate) fn flush_record_batch(&mut self) -> std::io::Result<()> {
+        if self.record_batch.bytes.is_empty() { return Ok(()); }
+        #[cfg(test)]
+        let start = self.w.get_ref().measured.then(std::time::Instant::now);
+        self.w.write_all(&self.record_batch.bytes)?;
+        // Count records only after the complete batch is accepted. Any partial
+        // write returns an error to atomic publication, retaining the old file.
+        let pending = std::mem::take(&mut self.record_batch.pending);
+        self.stats.records += pending.records;
+        self.stats.live += pending.live;
+        self.stats.deleted += pending.deleted;
+        #[cfg(test)]
+        {
+            let stats = &mut self.w.get_mut().stats;
+            stats.record_buffer_bytes = self.record_batch.bytes.capacity();
+            stats.record_flushes += 1;
+            stats.record_buffered_rows += pending.records as u64;
+            if let Some(start) = start { stats.record_flush_ns += start.elapsed().as_nanos(); }
+        }
+        self.record_batch.bytes.clear();
+        Ok(())
+    }
+
     pub fn finish(mut self) -> std::io::Result<IoStats> {
+        self.flush_record_batch()?;
         // Flush the entire body before reading its checksum. The footer itself
         // is not covered by CRC, exactly as in BPEXP004 before this optimization.
         self.w.flush()?;
@@ -1022,6 +1129,93 @@ fn parse_jsonl_line(line: &str) -> Result<(String, Option<String>), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_batches_keep_bytes_counts_large_fallback_and_finish_flush() {
+        use super::*;
+        let path = crate::common::ScratchPath::new("snapshot", "record_batches", ".bxp");
+        let records = vec![
+            KvRecord::new(vec![], Some(vec![])),
+            KvRecord::new(b"exact".to_vec(), Some(vec![1; RECORD_BATCH_BYTES - 16 - 5])),
+            KvRecord::new(b"large".to_vec(), Some(vec![2; RECORD_BATCH_BYTES])).with_expire(u64::MAX),
+            KvRecord::new(b"tomb".to_vec(), None),
+            KvRecord::new(b"tail".to_vec(), Some(vec![0, 1, 255])).with_expire(u64::MAX),
+        ];
+        let mut golden = None;
+        for reference in [true, false] {
+            let mode = reference.then(snapshot_emit_reference::Scope::start);
+            let scope = snapshot_probe::Scope::start(false);
+            let counts = atomic_write_bin_v4(&path, |w| {
+                for (i, record) in records.iter().enumerate() {
+                    if i == 3 { w.write(record)?; continue; }
+                    let outcome = w.write_snapshot_batched(&record.key, record.value.as_deref(), record.expire_unix_secs)?;
+                    assert_eq!(outcome, if reference { RecordEncoding::DirectReference }
+                        else if i == 2 { RecordEncoding::DirectLarge } else { RecordEncoding::Buffered });
+                }
+                // Tail remains buffered. BinWriter.finish must write/count it.
+                if !reference { assert_eq!(w.record_batch.pending.records, 1); assert_eq!(w.stats.records, 4); }
+                Ok(())
+            }).unwrap();
+            assert_eq!((counts.records, counts.live, counts.deleted), (5, 4, 1));
+            let stats = scope.stats();
+            if reference { assert_eq!(stats.record_buffer_bytes, 0); assert_eq!(stats.record_reference_rows, 4); }
+            else {
+                assert_eq!(stats.record_buffer_bytes, RECORD_BATCH_BYTES);
+                assert_eq!(stats.record_buffered_rows, 3);
+                assert_eq!(stats.record_flushes, 3);
+                assert_eq!(stats.record_direct_large_rows, 1);
+                assert!(stats.record_direct_large_ns > 0);
+            }
+            drop(scope); drop(mode);
+            let bytes = std::fs::read(&path).unwrap();
+            if let Some(golden) = &golden { assert_eq!(&bytes, golden); } else { golden = Some(bytes); }
+            assert_eq!(read_bin(&path).unwrap().0, records);
+        }
+        let scope = snapshot_probe::Scope::start(false);
+        atomic_write_bin_v4(&path, |_| Ok(())).unwrap();
+        assert_eq!(scope.stats().record_buffer_bytes, 0);
+        assert_eq!(scope.stats().record_flushes, 0);
+    }
+
+    #[test]
+    fn record_batch_flush_failure_preserves_previous_and_unaccepted_counts() {
+        use super::*;
+        let path = crate::common::ScratchPath::new("snapshot", "record_flush_failure", ".bxp");
+        atomic_write_bin_v4(&path, |w| w.write(&KvRecord::new(b"old".to_vec(), Some(vec![7])))).unwrap();
+        let golden = std::fs::read(&path).unwrap();
+        let result = atomic_write_bin_v4(&path, |w| {
+            let large = vec![1; RECORD_BATCH_BYTES - 16];
+            assert_eq!(w.write_snapshot_batched(b"", Some(&large), None)?, RecordEncoding::Buffered);
+            // A real read-only file handle forces the batch's write to fail.
+            w.w.get_mut().file = File::open(&path)?;
+            let result = w.flush_record_batch();
+            assert!(result.is_err());
+            assert_eq!(w.stats.records, 0);
+            assert_eq!(w.record_batch.pending.records, 1);
+            result
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), golden);
+        assert_eq!(read_bin(&path).unwrap().0[0].key, b"old");
+    }
+
+    #[test]
+    fn record_batch_keeps_legacy_crc_and_io_controls() {
+        use super::*;
+        for legacy in [true, false] {
+            let mode = (!legacy).then(io_reference::Scope::start);
+            let scope = snapshot_probe::Scope::start(legacy);
+            let path = crate::common::ScratchPath::new("snapshot", "record_controls", ".bxp");
+            atomic_write_bin_v4(&path, |w| {
+                assert_eq!(w.write_snapshot_batched(b"k", Some(b"v"), None)?, RecordEncoding::DirectReference);
+                Ok(())
+            }).unwrap();
+            assert_eq!(scope.stats().record_buffer_bytes, 0);
+            assert_eq!(scope.stats().record_reference_rows, 1);
+            assert_eq!(read_bin(&path).unwrap().0, vec![KvRecord::new(b"k".to_vec(), Some(b"v".to_vec()))]);
+            drop(scope); drop(mode);
+        }
+    }
+
     #[test]
     fn snapshot_io_buffer_bounds_real_writes() {
         use super::*;

@@ -384,7 +384,7 @@ impl MVCC {
         rows: impl Iterator<Item = (Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>,
         ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
     ) -> std::io::Result<usize> {
-        use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter}, order::KeyWindow, version::decode_key_ref};
+        use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter, RecordEncoding}, order::KeyWindow, version::decode_key_ref};
         #[cfg(test)]
         if stop_rows_reference::enabled() {
             return Self::write_snapshot_rows_reference(path, rows, ceiling, visible, mode);
@@ -401,12 +401,16 @@ impl MVCC {
             let mut rows = rows;
             const INPUT_BATCH: usize = 8192;
             let mut batch = Vec::with_capacity(rows.size_hint().0.min(INPUT_BATCH));
-            let emit = |sink: &mut BinWriter, key: &[u8], value: Option<Cow<'a, [u8]>>| {
+            let emit = |sink: &mut BinWriter, key: &[u8], value: Option<Cow<'a, [u8]>>| -> std::io::Result<()> {
                 let (user, expire) = match value.as_deref() {
                     Some(bytes) => crate::common::codec::snapshot_value(bytes),
                     None => (None, None),
                 };
-                sink.write_borrowed(key, user, None, expire)
+                match sink.write_snapshot_batched(key, user, expire)? {
+                    RecordEncoding::Buffered | RecordEncoding::DirectLarge => Ok(()),
+                    #[cfg(test)]
+                    RecordEncoding::DirectReference => Ok(()),
+                }
             };
             loop {
                 #[cfg(test)]
@@ -449,6 +453,7 @@ impl MVCC {
             #[cfg(test)]
             let tail = measured.then(std::time::Instant::now);
             while let Some((key, (_, value))) = groups.pop_first() { emit(sink, &key, value)?; }
+            sink.flush_record_batch()?;
             #[cfg(test)]
             if let Some(tail) = tail { detail.fold_emit_ns += tail.elapsed().as_nanos(); }
             Ok(())
@@ -1460,7 +1465,9 @@ mod tests {
     fn snapshot_stop_modes_preserve_bytes_and_shared_transactions() {
         use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer};
         let mut golden = None;
-        for (mode, old_rows) in [("reference", false), ("exclusive", true), ("exclusive", false), ("shared", true), ("shared", false)] {
+        for (mode, old_rows, old_emit) in [("reference", false, true), ("exclusive", true, true),
+            ("exclusive", false, true), ("exclusive", false, false), ("shared", true, true),
+            ("shared", false, true), ("shared", false, false)] {
             let path = crate::common::ScratchPath::new("memory", "stop_modes", ".bxp");
             let mut db = MVCC::new();
             db.set_vacuum_auto_slice(0);
@@ -1478,6 +1485,7 @@ mod tests {
             if let Some(tx) = &held { assert!(tx.set_raw(b"uncommitted", vec![7])); }
             let reference = (mode == "reference").then(stop_reference::Scope::start);
             let rows_reference = old_rows.then(stop_rows_reference::Scope::start);
+            let emit_reference = old_emit.then(crate::common::kv_snapshot::snapshot_emit_reference::Scope::start);
             let scope = snapshot_probe::Scope::start(false);
             let clones = crate::common::codec::user_value_copies();
             assert_eq!(db.write_stop_snapshot(&path).unwrap(), 6);
@@ -1494,7 +1502,12 @@ mod tests {
                 assert!(stats.pull_ns > 0 && stats.fold_emit_ns > 0);
                 assert!(stats.pull_ns + stats.fold_emit_ns <= stats.body_ns);
             } else { assert_eq!(stats.input_batches, 0); }
-            drop(scope); drop(reference); drop(rows_reference);
+            if mode != "reference" && !old_rows && !old_emit {
+                assert_eq!(stats.record_buffered_rows, 6);
+                assert_eq!(stats.record_reference_rows, 0);
+                assert_eq!(stats.record_flushes, 1);
+            } else { assert_eq!(stats.record_buffered_rows, 0); }
+            drop(scope); drop(reference); drop(rows_reference); drop(emit_reference);
             let bytes = std::fs::read(&path).unwrap();
             if let Some(expected) = &golden { assert_eq!(&bytes, expected); } else { golden = Some(bytes); }
             let mut records = Vec::new();
