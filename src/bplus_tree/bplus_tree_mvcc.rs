@@ -627,7 +627,7 @@ impl MVCC {
             let resume_bound = lower.clone();
             #[cfg(test)]
             let scan_probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumScan);
-            kv.scan_entries_break_from(lower.as_deref(), |enc, row| {
+            let end = kv.scan_maintenance_from(lower.as_deref(), |enc, row| {
                 // ⚠️ `scan_entries_break_from` 只下降到 containing 叶子，随后**从该片第一条**起遍历
                 // （叶粒度定位，过滤交给调用方——见其文档）。上一块已经消费过的行会被再喂一遍；若某个
                 // 版本组正好骑在块边界上（它最新那版恰是续跑叶子的首条），那一版会**第二次**进 `group`，
@@ -659,7 +659,6 @@ impl MVCC {
                 scanned += 1;
                 let is_tomb = row.is_none();
                 let refs_blob = row
-                    .as_ref()
                     .is_some_and(|s| s.first() == Some(&crate::bplus_tree::storage::VAL_TAG_BLOB));
                 groups.entry_with(raw_key, || {
                     let mut key = cur_raw.take().unwrap_or_default();
@@ -674,7 +673,9 @@ impl MVCC {
                     return true;
                 }
                 false
-            });
+            })?;
+            debug_assert_eq!(end == crate::bplus_tree::bplus_tree::MaintenanceEnd::Complete,
+                !done && next_lower.is_none());
             if done || next_lower.is_none() {
                 while let Some((key, mut group)) = groups.pop_first() {
                     vacuum_drain_group(&mut group, xmin, |version| to_delete.push(encode_key(&key, version)), |_, refs_blob| has_blob_ref |= refs_blob);
@@ -1567,6 +1568,76 @@ mod tests {
         let _ = std::fs::remove_file(crate::bplus_tree::storage::freelist_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::lock_path(path));
         let _ = std::fs::remove_file(crate::bplus_tree::storage::blob_path(path));
+    }
+
+    #[test]
+    fn vacuum_rejects_truncated_tree_before_blob_clear() {
+        for reference in [true, false] {
+        let path = tmp_db("vacuum_truncated_tree");
+        {
+            let db = MVCC::open(&path, 4, 2);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin_transaction();
+            for i in 0..32 { assert!(tx.set_raw(format!("k{i:04}").as_bytes(), vec![b'x'; 32])); }
+            assert!(tx.set_raw(b"z-blob", vec![b'b'; 1024]));
+            tx.try_commit().unwrap();
+            db.try_flush().unwrap();
+        }
+        let db = MVCC::open(&path, 4, 2);
+        db.set_vacuum_auto_slice(0);
+        let blob_path = crate::bplus_tree::storage::blob_path(&path);
+        let before = std::fs::read(&blob_path).unwrap();
+        assert!(before.len() > 1024);
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_len(crate::bplus_tree::storage::PAGE_SIZE as u64).unwrap();
+        let mode = reference.then(crate::bplus_tree::bplus_tree::maintenance_reference::Scope::start);
+        let result = db.vacuum();
+        let after = std::fs::read(&blob_path).unwrap();
+        eprintln!("BPLUS_BAD_TREE reference={reference} result={result:?} blob_before={} blob_after={}", before.len(), after.len());
+        if reference {
+            assert!(result.is_ok(), "the frozen old reader must expose the unsafe success");
+            assert_eq!(after.len(), 8, "the old incomplete walk really authorizes blob clear");
+        } else {
+            assert!(result.is_err(), "an unreadable tree must not authorize full-sweep GC");
+            assert_eq!(before, after, "partial maintenance must preserve blob bytes");
+            assert!(db.try_checkpoint().is_err(), "an unreadable maintenance source must not truncate recovery WAL");
+        }
+        drop(mode);
+        }
+    }
+
+    #[test]
+    fn vacuum_bad_crc_or_valid_crc_bad_node_preserves_blob_and_wal() {
+        for malformed in [false, true] {
+            let path = tmp_db("vacuum_bad_node");
+            {
+                let db = MVCC::open(&path, 4, 2);
+                db.set_vacuum_auto_slice(0);
+                let tx = db.begin_transaction();
+                for i in 0..32 { assert!(tx.set_raw(format!("k{i:04}").as_bytes(), vec![b'x'; 32])); }
+                assert!(tx.set_raw(b"z-blob", vec![b'b'; 1024]));
+                tx.try_commit().unwrap(); db.try_flush().unwrap();
+            }
+            let db = MVCC::open(&path, 4, 2);
+            db.set_vacuum_auto_slice(0);
+            let root = db.kv.lock().unwrap().root_page_id().0 as usize;
+            let mut bytes = std::fs::read(&path).unwrap();
+            let offset = root * crate::bplus_tree::storage::PAGE_SIZE;
+            bytes[offset + crate::bplus_tree::storage::PAGE_HEADER_SIZE] = 255;
+            if malformed {
+                let crc = crate::common::disk::crc32(&bytes[offset + 16..offset + 4096]);
+                bytes[offset + 8..offset + 12].copy_from_slice(&crc.to_le_bytes());
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            let blob_path = crate::bplus_tree::storage::blob_path(&path);
+            let before_blob = std::fs::read(&blob_path).unwrap();
+            let before_wal = std::fs::read(wal_path(&path)).unwrap();
+            assert!(db.vacuum().is_err());
+            assert!(db.try_checkpoint().is_err());
+            assert_eq!(std::fs::read(&blob_path).unwrap(), before_blob);
+            drop(db);
+            assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before_wal);
+        }
     }
 
     #[test]

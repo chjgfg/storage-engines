@@ -21,6 +21,8 @@ pub(crate) struct Stats {
     pub lsm_vacuum_blocks: u64,
     pub bplus_pack_buffers: u64,
     pub bplus_backtrack_reuses: u64,
+    pub bplus_maintenance_pages: u64,
+    pub bplus_maintenance_rows: u64,
 }
 
 impl std::fmt::Debug for Stats {
@@ -40,7 +42,9 @@ impl std::fmt::Debug for Stats {
             .field("lsm_vacuum_legacy_key_copies", &self.lsm_vacuum_legacy_key_copies)
             .field("lsm_vacuum_blocks", &self.lsm_vacuum_blocks)
             .field("bplus_pack_buffers", &self.bplus_pack_buffers)
-            .field("bplus_backtrack_reuses", &self.bplus_backtrack_reuses).finish()
+            .field("bplus_backtrack_reuses", &self.bplus_backtrack_reuses)
+            .field("bplus_maintenance_pages", &self.bplus_maintenance_pages)
+            .field("bplus_maintenance_rows", &self.bplus_maintenance_rows).finish()
     }
 }
 
@@ -73,6 +77,12 @@ pub(crate) fn note_bplus_pack_buffer() {
 }
 pub(crate) fn note_bplus_backtrack_reuse() {
     ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.bplus_backtrack_reuses += 1; });
+}
+
+pub(crate) fn note_bplus_maintenance_page(rows: usize) {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+        stats.bplus_maintenance_pages += 1; stats.bplus_maintenance_rows += rows as u64;
+    });
 }
 
 pub(crate) struct Scope;

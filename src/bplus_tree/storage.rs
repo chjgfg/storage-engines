@@ -84,6 +84,20 @@ pub fn unpack_page(raw: &[u8]) -> Result<(u64, Vec<u8>), String> {
 }
 
 /// 只校验 CRC，不拆 payload
+pub(crate) fn maintenance_payload(raw: &[u8], wanted: u64) -> std::io::Result<&[u8]> {
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    if raw.len() != PAGE_SIZE || raw[..4] != PAGE_MAGIC.to_le_bytes() {
+        return Err(invalid("maintenance page is missing or has an invalid magic"));
+    }
+    let found = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as u64;
+    if found != wanted { return Err(invalid("maintenance page identity mismatch")); }
+    let payload = &raw[PAGE_HEADER_SIZE..];
+    let expected = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    if crc32(payload) != expected { return Err(invalid("maintenance page CRC mismatch")); }
+    Ok(payload)
+}
+
+/// 只校验 CRC，不拆 payload
 pub fn verify_page(raw: &[u8]) -> bool {
     unpack_page(raw).is_ok()
 }

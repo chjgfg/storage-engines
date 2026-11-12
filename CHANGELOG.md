@@ -2,6 +2,22 @@
 
 ## 未发布（2026-11-12）
 
+### M118：B+ 维护页借用解码与严格错误出口
+
+- vacuum 使用维护专用读取：一个 4 KiB 栈页缓冲，直接借用既有 bincode 1 固定宽度小端字段；先验证完整节点，再交付键/墓碑/blob 标志。
+  冷读校验页号/CRC、不回填点读缓存，命中的脏页仍为权威内容；已有公开扫描入口保持。
+  页缺失、解码失败、节点乱序、非叶链和循环显式返回错误并锁存，后续 checkpoint 不能销掉恢复 WAL；有效双写页可修复主页，修复写失败传播。
+- 先在旧实现执行真实截断负对照：vacuum 返回成功、扫描 0 行，并把 blob 1041 B 清成 8 B，守卫红。
+  固定旧读入口后两臂同测：旧路仍清成 8 B；新路返回 InvalidData、blob 保持 1041 B，checkpoint 拒绝。
+  CRC 错误与 CRC 正确但节点编码错误的守卫均拒绝维护并保留 blob/WAL；借用字段与原 bincode 字节、脏页/二进制键/早停/重开守卫通过。
+  初版在普通测试中用进程级分配计数要求 5 次，实测混入测试框架分配为 7 次；改为指针/字节守卫，分配结论仅由串行 ignored 对照验收，未放宽阈值。
+- 永久入口 `cargo test --offline --release --lib bplus_maintenance_scan_cost -- --ignored --nocapture --test-threads=1`（BPLUS_SCAN_ROWS 默认 600000）。
+  C 盘默认测试目录，旧/新/新/旧四轮通过（78.99 s）；每轮扫描 660000 行、删除 60000 版本，重开全量逐键逐值通过。
+  扫描分配旧 1501376 / 1501372 次，新均 60255 次；新每轮处理 35426 叶页 / 661485 条借用行，包含 containing 叶首重读，不能与最终扫描数混用。
+  扫描旧 768.728 / 1588.426 ms，新 829.071 / 537.324 ms；总 vacuum 旧 2.180297 / 3.536654 s，新 2.925265 / 1.978006 s。
+  分配配对下降守卫通过，时间存在漂移、未宣称每轮提速或外推 20M；同步/写回仍嵌套在删除中。
+- 最新 B+ release 回归 99 passed / 0 failed / 6 ignored（62.52 s），公共 DiskFile 9 passed / 0 failed；Windows all-targets/all-features 编译检查通过。
+
 ### M117：公共扫描原地解封和片尾游标，memory 启停分段计量
 
 - 公共扫描/分页的已拥有逻辑值由 VisibleOwnedValue 原地解封，保留绝对 TTL；取消 decode_value_meta 后再 user.to_vec 的两次额外分配。

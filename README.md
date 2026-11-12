@@ -3,7 +3,7 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M117 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M118 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
@@ -61,6 +61,9 @@ M117 公共扫描原地解封并保留 TTL，逻辑键只在首次可见组分�
 memory 恢复新增每页 setup/encode/apply/commit 计量；停止以最多 8192 行、384 KiB 输入缓冲拆出 pull 与 fold/emit。
 入口 `cargo test --offline --release --lib memory_stop_batch_cost -- --ignored --nocapture --test-threads=1`。
 停止 body 已包含树节点与值释放，fold/emit 内含 write/CRC；子阶段不能重复相加，大档吞吐与时长波动以新压测为准。
+M118 B+ vacuum 借用维护页字段并传播坏页/坏节点错误，失败保留 blob 与恢复 WAL。
+600k 同构建对照扫描分配约 150 万→60255 次，重开逐值通过；时长漂移与边界见更新日志。
+入口 `cargo test --offline --release --lib bplus_maintenance_scan_cost -- --ignored --nocapture --test-threads=1`。
 
 ## 引入方式
 

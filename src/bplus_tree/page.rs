@@ -686,6 +686,10 @@ impl PageManager {
         }
     }
 
+    pub(crate) fn mark_maintenance_failed(&mut self, error: &std::io::Error) {
+        self.io_state = PageIoState::Failed { kind: error.kind(), message: error.to_string() };
+    }
+
     fn flush_pages_batch_inner(&mut self, page_ids: &[PageId], do_sync: bool) -> std::io::Result<()> {
         if page_ids.is_empty() && !self.meta_dirty && !self.freelist_dirty {
             return Ok(());
@@ -895,6 +899,43 @@ impl PageManager {
             self.lru_queue.push_back(page_id);
         }
         Some(payload)
+    }
+
+    /// Maintenance must distinguish an unreadable page from the end of a walk.
+    /// Coherent dirty cache entries remain authoritative; cold reads never fill
+    /// either cache, and reuse one caller-owned page for the whole walk.
+    pub(crate) fn read_maintenance_page<'a>(&mut self, page_id: PageId,
+        raw: &'a mut [u8; PAGE_SIZE]) -> std::io::Result<&'a [u8]> {
+        self.ensure_healthy()?;
+        #[cfg(test)]
+        { PAGE_READS.with(|c| c.set(c.get() + 1)); note_phase_read(); }
+        if !self.page_is_live(page_id) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "maintenance reached a non-live page"));
+        }
+        self.clock += 1;
+        if self.cache.contains_key(&page_id) {
+            #[cfg(test)]
+            CACHE_HITS.with(|c| c.set(c.get() + 1));
+            self.update_lru(page_id);
+            let entry = self.cache.get_mut(&page_id).unwrap();
+            entry.last_access = self.clock;
+            raw[..MAX_PAYLOAD].copy_from_slice(&entry.data);
+            return Ok(&raw[..MAX_PAYLOAD]);
+        }
+        #[cfg(test)]
+        CACHE_MISSES.with(|c| c.set(c.get() + 1));
+        self.file.read_page_into(page_id.0, raw)?;
+        if crate::bplus_tree::storage::maintenance_payload(raw, page_id.0).is_err() {
+            // A valid published double-write page may repair a torn main page.
+            // The recovery write must succeed before maintenance can proceed.
+            let replacement = self.dblwr.read_batch()?.into_iter().find(|(id, bytes)|
+                *id == page_id.0 && crate::bplus_tree::storage::maintenance_payload(bytes, *id).is_ok());
+            if let Some((_, bytes)) = replacement {
+                self.file.write_page(page_id.0, &bytes)?;
+                raw.copy_from_slice(&bytes);
+            }
+        }
+        crate::bplus_tree::storage::maintenance_payload(raw, page_id.0)
     }
 
     /// 写页 payload（标记 Dirty，真正落盘在 flush / 换出时）

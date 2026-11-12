@@ -392,11 +392,22 @@ impl DiskFile {
     /// 语义一字未动，少的是一次系统调用；这条由 `test_read_page_does_not_ask_file_length`
     /// 与 `test_read_page_tail_shapes_match_the_old_length_guarded_form` 两头守着。
     pub fn read_page(&mut self, page_index: u64) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.page_size()?];
+        self.read_page_into(page_index, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Same zero-filled tail protocol, using a caller-owned bounded buffer.
+    pub(crate) fn read_page_into(&mut self, page_index: u64, buf: &mut [u8]) -> std::io::Result<()> {
         #[cfg(test)]
         DISK_PAGE_READS.with(|c| c.set(c.get() + 1));
         let size = self.page_size()?;
-        let offset = page_index * size as u64;
-        let mut buf = vec![0u8; size];
+        if buf.len() != size {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "page buffer has the wrong size"));
+        }
+        let offset = page_index.checked_mul(size as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "page offset overflow"))?;
+        buf.fill(0);
         self.file.seek(SeekFrom::Start(offset))?;
         let mut filled = 0usize;
         while filled < size {
@@ -408,7 +419,7 @@ impl DiskFile {
                 Err(e) => return Err(e),
             }
         }
-        Ok(buf)
+        Ok(())
     }
 
     /// 写一整块（必须正好一块）

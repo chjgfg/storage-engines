@@ -117,6 +117,80 @@ enum BTreeNode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaintenanceEnd { Complete, Stopped }
+
+/// Borrow the existing bincode 1 fixed-width, little-endian node format. A
+/// complete node is validated before any row can authorize reclamation.
+struct NodeBytes<'a>(&'a [u8]);
+impl<'a> NodeBytes<'a> {
+    fn take(&mut self, n: usize) -> std::io::Result<&'a [u8]> {
+        if n > self.0.len() { return Err(Self::invalid()); }
+        let (head, rest) = self.0.split_at(n); self.0 = rest; Ok(head)
+    }
+    fn invalid() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid maintenance node encoding")
+    }
+    fn u64(&mut self) -> std::io::Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap())) }
+    fn len(&mut self) -> std::io::Result<usize> { usize::try_from(self.u64()?).map_err(|_| Self::invalid()) }
+    fn bytes(&mut self) -> std::io::Result<&'a [u8]> { let n = self.len()?; self.take(n) }
+    fn option(&mut self) -> std::io::Result<bool> {
+        match self.take(1)?[0] { 0 => Ok(false), 1 => Ok(true), _ => Err(Self::invalid()) }
+    }
+    fn row(&mut self) -> std::io::Result<(&'a [u8], Option<&'a [u8]>)> {
+        let key = self.bytes()?;
+        let value = if self.option()? { Some(self.bytes()?) } else { None };
+        Ok((key, value))
+    }
+}
+enum MaintenanceNode<'a> {
+    Leaf { rows: &'a [u8], count: usize, next: Option<PageId> },
+    Internal { keys: &'a [u8], count: usize, children: &'a [u8] },
+}
+impl<'a> MaintenanceNode<'a> {
+    fn decode(payload: &'a [u8]) -> std::io::Result<Self> {
+        let mut bytes = NodeBytes(payload);
+        let tag = u32::from_le_bytes(bytes.take(4)?.try_into().unwrap());
+        let count = bytes.len()?;
+        let begin = bytes.0;
+        let mut previous: Option<&[u8]> = None;
+        if count > bytes.0.len() / 8 { return Err(NodeBytes::invalid()); }
+        let node = match tag {
+            0 => {
+                for _ in 0..count {
+                    let (key, _) = bytes.row()?;
+                    if previous.is_some_and(|old| old >= key) { return Err(NodeBytes::invalid()); }
+                    previous = Some(key);
+                }
+                let rows = &begin[..begin.len() - bytes.0.len()];
+                let next = if bytes.option()? { Some(PageId(bytes.u64()?)) } else { None };
+                Self::Leaf { rows, count, next }
+            }
+            1 => {
+                for _ in 0..count {
+                    let key = bytes.bytes()?;
+                    if previous.is_some_and(|old| old >= key) { return Err(NodeBytes::invalid()); }
+                    previous = Some(key);
+                }
+                let keys = &begin[..begin.len() - bytes.0.len()];
+                let child_count = bytes.len()?;
+                if count.checked_add(1) != Some(child_count) { return Err(NodeBytes::invalid()); }
+                let children = bytes.take(child_count.checked_mul(8).ok_or_else(NodeBytes::invalid)?)?;
+                Self::Internal { keys, count, children }
+            }
+            _ => return Err(NodeBytes::invalid()),
+        };
+        if bytes.0.iter().any(|b| *b != 0) { return Err(NodeBytes::invalid()); }
+        Ok(node)
+    }
+    fn child(keys: &[u8], count: usize, children: &[u8], lower: &[u8]) -> std::io::Result<PageId> {
+        let mut keys = NodeBytes(keys);
+        let mut index = 0;
+        for _ in 0..count { if keys.bytes()? <= lower { index += 1; } else { break; } }
+        Ok(PageId(u64::from_le_bytes(children[index * 8..index * 8 + 8].try_into().unwrap())))
+    }
+}
+
 /// 相邻一对节点重排的三种结局（`handle_underflow` 据此决定是否继续向上传下溢）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairReorg {
@@ -2355,6 +2429,64 @@ pub struct BPlusTreeIterator<'a> {
 }
 
 impl BPlusTree {
+    pub(crate) fn scan_maintenance_from(&mut self, from: Option<&[u8]>,
+        mut on: impl FnMut(&[u8], Option<&[u8]>) -> bool) -> std::io::Result<MaintenanceEnd> {
+        #[cfg(test)]
+        if maintenance_reference::enabled() {
+            let mut stopped = false;
+            self.scan_entries_break_from(from, |key, value| {
+                stopped = on(key, value.as_deref()); stopped
+            });
+            return Ok(if stopped { MaintenanceEnd::Stopped } else { MaintenanceEnd::Complete });
+        }
+        let result = self.scan_maintenance_inner(from, &mut on);
+        if let Err(error) = &result { self.page_manager.mark_maintenance_failed(error); }
+        result
+    }
+
+    fn scan_maintenance_inner(&mut self, from: Option<&[u8]>,
+        on: &mut impl FnMut(&[u8], Option<&[u8]>) -> bool) -> std::io::Result<MaintenanceEnd> {
+        let mut raw = [0; crate::bplus_tree::storage::PAGE_SIZE];
+        let mut page = self.root;
+        let mut visits = 0_u64;
+        let mut last_key = Vec::new();
+        let mut has_last = false;
+        loop {
+            visits += 1;
+            if visits > self.page_manager.next_page_id() { return Err(NodeBytes::invalid()); }
+            let payload = self.page_manager.read_maintenance_page(page, &mut raw)?;
+            match MaintenanceNode::decode(payload)? {
+                MaintenanceNode::Internal { keys, count, children } => {
+                    page = MaintenanceNode::child(keys, count, children, from.unwrap_or(&[]))?;
+                }
+                MaintenanceNode::Leaf { .. } => break,
+            }
+        }
+        loop {
+            let payload = self.page_manager.read_maintenance_page(page, &mut raw)?;
+            let MaintenanceNode::Leaf { rows, count, next } = MaintenanceNode::decode(payload)? else {
+                return Err(NodeBytes::invalid());
+            };
+            #[cfg(test)]
+            crate::common::maintenance_probe::note_bplus_maintenance_page(count);
+            let mut rows = NodeBytes(rows);
+            let mut tail = None;
+            for _ in 0..count {
+                let (key, value) = rows.row()?;
+                if has_last && key <= last_key.as_slice() { return Err(NodeBytes::invalid()); }
+                tail = Some(key);
+                // Preserve containing-leaf semantics; the MVCC resume filter
+                // remains responsible for excluding already consumed rows.
+                if on(key, value) { return Ok(MaintenanceEnd::Stopped); }
+            }
+            if let Some(key) = tail { last_key.clear(); last_key.extend_from_slice(key); has_last = true; }
+            let Some(next) = next else { return Ok(MaintenanceEnd::Complete); };
+            page = next;
+            visits += 1;
+            if visits > self.page_manager.next_page_id() { return Err(NodeBytes::invalid()); }
+        }
+    }
+
     /// 全表流式遍历，按**引用**把 `(键, value)` 交给回调 —— 不克隆任何 value。
     ///
     /// B+ 树的 value 就住在叶子条目里，没有 Bitcask `KeyDir` 那种独立键索引，所以
@@ -2567,6 +2699,83 @@ impl fmt::Display for BPlusTree {
 // ===================== 测试代码 =====================
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn maintenance_borrowed_nodes_match_bincode_without_row_allocations() {
+        let keys = vec![vec![], vec![0], vec![0, 0], vec![0, 255], vec![1], vec![255]];
+        let nodes = [
+            BTreeNode::Leaf { entries: keys.iter().enumerate().map(|(i, k)|
+                (k.clone(), RowId(if i % 3 == 0 { None } else { Some(vec![i as u8; i * 7]) }))).collect(), next_leaf: Some(PageId(42)) },
+            BTreeNode::Internal { keys: keys.clone(), children: (1..=7).map(PageId).collect() },
+        ];
+        for expected in nodes {
+            let mut bytes = bincode::serialize(&expected).unwrap();
+            bytes.resize(MAX_PAYLOAD, 0);
+            let actual = MaintenanceNode::decode(&bytes).unwrap();
+            match (&expected, actual) {
+                (BTreeNode::Leaf { entries, next_leaf }, MaintenanceNode::Leaf { rows, count, next }) => {
+                    assert_eq!(count, entries.len()); assert_eq!(next, *next_leaf);
+                    let mut view = NodeBytes(rows);
+                    for (key, row) in entries {
+                        let (borrowed_key, borrowed_value) = view.row().unwrap();
+                        assert_eq!((borrowed_key, borrowed_value), (key.as_slice(), row.0.as_deref()));
+                        assert!((bytes.as_ptr() as usize..bytes.as_ptr() as usize + bytes.len()).contains(&(borrowed_key.as_ptr() as usize)));
+                    }
+                    assert!(view.0.is_empty());
+                }
+                (BTreeNode::Internal { keys, children }, MaintenanceNode::Internal { keys: raw, count, children: child_bytes }) => {
+                    for bound in [b"".as_slice(), &[0], &[0, 1], &[255], &[255, 255]] {
+                        let index = BPlusTree::child_index(keys, &bound.to_vec());
+                        assert_eq!(MaintenanceNode::child(raw, count, child_bytes, bound).unwrap(), children[index]);
+                    }
+                }
+                _ => panic!("borrowed node kind changed"),
+            }
+            // Allocation counts belong to the isolated ignored old/new cost
+            // test: mem_probe counts the whole process, including the harness.
+            let old: BTreeNode = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(bincode::serialize(&old).unwrap(), bincode::serialize(&expected).unwrap());
+        }
+        for bad in [vec![], vec![0; 8], vec![255; 20]] { assert!(MaintenanceNode::decode(&bad).is_err()); }
+        let mut bad_option = bincode::serialize(&BTreeNode::Leaf { entries: vec![], next_leaf: None }).unwrap();
+        bad_option[12] = 2;
+        assert!(MaintenanceNode::decode(&bad_option).is_err());
+        let bad_order = BTreeNode::Internal { keys: vec![vec![2], vec![1]], children: vec![PageId(1), PageId(2), PageId(3)] };
+        assert!(MaintenanceNode::decode(&bincode::serialize(&bad_order).unwrap()).is_err());
+        let bad_children = BTreeNode::Internal { keys: vec![vec![1]], children: vec![PageId(1)] };
+        assert!(MaintenanceNode::decode(&bincode::serialize(&bad_children).unwrap()).is_err());
+    }
+
+    #[test]
+    fn maintenance_walk_matches_old_dirty_binary_rows_and_stop() {
+        let (_scratch, mut tree) = anon(8, 8);
+        for i in 0..200 { assert!(tree.insert(format!("k{i:04}").into_bytes(), RowId(Some(vec![i as u8; 15])))); }
+        for key in [vec![], vec![0], vec![0, 0], vec![0, 255], vec![255]] { assert!(tree.insert(key, RowId(None))); }
+        for bound in [None, Some(b"k0010".as_slice()), Some(b"z")] {
+            for limit in [7, usize::MAX] {
+                let mut expected = Vec::new();
+                let scope = maintenance_reference::Scope::start();
+                let old_end = tree.scan_maintenance_from(bound, |key, value| {
+                    if bound.is_none_or(|b| key >= b) { expected.push((key.to_vec(), value.map(<[u8]>::to_vec))); }
+                    expected.len() >= limit
+                }).unwrap();
+                drop(scope);
+                let mut actual = Vec::new();
+                let end = tree.scan_maintenance_from(bound, |key, value| {
+                    if bound.is_none_or(|b| key >= b) { actual.push((key.to_vec(), value.map(<[u8]>::to_vec))); }
+                    actual.len() >= limit
+                }).unwrap();
+                assert_eq!(actual, expected); assert_eq!(end, old_end);
+            }
+        }
+        tree.try_flush_all().unwrap();
+        let path = tree.page_manager.path().to_path_buf();
+        drop(tree);
+        let mut tree = BPlusTree::open(&path, 8, 8);
+        let mut rows = 0;
+        assert_eq!(tree.scan_maintenance_from(None, |_, _| { rows += 1; false }).unwrap(), MaintenanceEnd::Complete);
+        assert_eq!(rows, 205);
+    }
+
     #[test]
     fn delete_buffers_preserve_serialized_bytes_and_reject_oversized_node() {
         let (_scratch, mut tree) = anon(64, 64);
@@ -3504,6 +3713,16 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod delete_cost_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod maintenance_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
