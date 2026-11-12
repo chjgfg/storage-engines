@@ -249,8 +249,19 @@ impl MVCC {
             let _apply = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::ReplayApply);
             let mut reg = tx.core.lock_registry();
             let mut side = mvcc.store.lock().unwrap();
-            for (key, logical, _) in batch.drain(..) {
-                tx.core.try_write_owned(&mut reg, &mut *side, key, logical)
+            #[cfg(test)]
+            let reference = page_apply_reference::enabled();
+            #[cfg(not(test))]
+            let reference = false;
+            if reference {
+                for (key, logical, _) in batch.drain(..) {
+                    tx.core.try_write_owned(&mut reg, &mut *side, key, logical)
+                        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
+                            format!("快照重放被引擎拒收: {error:?}")))?;
+                }
+            } else {
+                tx.core.try_write_owned_page(&mut reg, &mut *side,
+                    batch.drain(..).map(|(key, logical, _)| (key, logical)))
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
                         format!("快照重放被引擎拒收: {error:?}")))?;
             }
@@ -1300,8 +1311,19 @@ impl Transaction {
     }
 }
 
-/// M109-only cost reference: retain M105 buffered IO and owned transaction keys.
+/// Freeze the M117 page apply and last-key lookup for the M121 comparison.
 #[cfg(test)]
+pub(crate) mod page_apply_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+/// M109-only cost reference: retain M105 buffered IO and owned transaction keys.
 pub(crate) mod replay_cost_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
@@ -1517,7 +1539,36 @@ mod tests {
     }
 
     #[test]
+    fn replay_owned_page_uses_one_registry_lookup_and_preserves_duplicate_keys() {
+        for reference in [true, false] {
+            let mode = reference.then(page_apply_reference::Scope::start);
+            let db = MVCC::new();
+            let mut page = vec![
+                (b"a".to_vec(), Some(vec![1]), None),
+                (b"a\0".to_vec(), Some(vec![2]), Some(u64::MAX)),
+                (b"a".to_vec(), Some(vec![3]), None),
+                (b"tomb".to_vec(), None, None),
+            ];
+            let before = crate::common::txn::write_registry_lookups();
+            MVCC::replay_page(&db, &mut page).unwrap();
+            assert_eq!(crate::common::txn::write_registry_lookups() - before, if reference { 4 } else { 1 });
+            assert!(page.is_empty());
+            assert_eq!(db.health().total_rows, 3);
+            let tx = db.begin_transaction();
+            assert_eq!(tx.get(b"a"), Some(vec![3]));
+            assert_eq!(tx.get(b"a\0"), Some(vec![2]));
+            assert_eq!(tx.get(b"tomb"), None);
+            assert_eq!(db.export_latest_visible(true).into_iter().find(|r| r.key == b"a\0").unwrap().expire_unix_secs, Some(u64::MAX));
+            tx.try_commit().unwrap();
+            assert!(db.active_txn.lock().unwrap().is_empty());
+            drop(mode);
+        }
+    }
+
+    #[test]
     fn replay_failure_rolls_back_entire_page() {
+        for reference in [true, false] {
+        let _mode = reference.then(page_apply_reference::Scope::start);
         let db = MVCC::new();
         let held = db.begin_transaction();
         assert!(held.set_raw(b"locked", vec![7]));
@@ -1539,6 +1590,7 @@ mod tests {
         assert_eq!(held.get(b"locked"), Some(vec![7]));
         assert_eq!(db.active_txn.lock().unwrap().len(), 1);
         held.rollback();
+        }
     }
 
     #[test]
@@ -1552,6 +1604,7 @@ mod tests {
 
     #[test]
     fn memory_owned_write_retains_registry_key_buffer() {
+        for page in [false, true] {
         let db = MVCC::new();
         let tx = db.begin_transaction();
         let key = b"owned".to_vec();
@@ -1559,11 +1612,16 @@ mod tests {
         {
             let mut reg = tx.core.lock_registry();
             let mut store = db.store.lock().unwrap();
-            tx.core.try_write_owned(&mut reg, &mut *store, key, Some(vec![3])).unwrap();
+            if page {
+                tx.core.try_write_owned_page(&mut reg, &mut *store, vec![(key, Some(vec![3]))].into_iter()).unwrap();
+            } else {
+                tx.core.try_write_owned(&mut reg, &mut *store, key, Some(vec![3])).unwrap();
+            }
             assert_eq!(reg[&tx.core.version].get(b"owned".as_slice()).unwrap().as_ptr(), ptr);
         }
         tx.rollback();
         assert_eq!(db.health().total_rows, 0);
+        }
     }
 
     #[test]
@@ -1578,12 +1636,16 @@ mod tests {
             let mut store = db.store.lock().unwrap();
             assert_eq!(older.core.try_write_owned(&mut reg, &mut *store, b"k".to_vec(), Some(vec![8])),
                 Err(crate::WriteError::Conflict));
+            assert_eq!(older.core.try_write_owned_page(&mut reg, &mut *store,
+                vec![(b"k".to_vec(), Some(vec![8]))].into_iter()), Err(crate::WriteError::Conflict));
         }
         older.rollback();
         {
             let mut reg = older.core.lock_registry();
             let mut store = db.store.lock().unwrap();
             assert_eq!(older.core.try_write_owned(&mut reg, &mut *store, b"new".to_vec(), None),
+                Err(crate::WriteError::TransactionClosed));
+            assert_eq!(older.core.try_write_owned_page(&mut reg, &mut *store, std::iter::empty()),
                 Err(crate::WriteError::TransactionClosed));
         }
         assert_eq!(db.begin_transaction().get(b"k"), Some(vec![7]));

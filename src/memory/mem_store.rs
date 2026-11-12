@@ -13,6 +13,9 @@
 #[cfg(test)]
 use std::thread_local;
 use std::collections::BTreeMap;
+use std::matches;
+#[cfg(test)]
+use std::unreachable;
 use std::ops::Bound;
 
 // 测试专用：本线程被访问的**行数**（`range_scan` / `range_back` 返回的行数累加）。
@@ -61,7 +64,13 @@ pub struct MemStore {
     data: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     // One scratch buffer for range bounds, bounded by the largest queried key.
     query_bounds: Vec<u8>,
+    // A certified last key, maintained at the only mutation gates. Unknown is
+    // used by the frozen test writer and rebuilt once when that scope ends.
+    end_bound: EndBound,
 }
+
+#[derive(Debug, Default, Clone)]
+enum EndBound { #[default] Empty, Known(Vec<u8>), #[cfg(test)] Unknown }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeyLookup<T> {
@@ -74,17 +83,40 @@ impl MemStore {
         Self {
             data: BTreeMap::new(),
             query_bounds: Vec::new(),
+            end_bound: EndBound::Empty,
         }
     }
 
     /// 插入 / 覆盖一行（含 tombstone）
     pub fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
+        #[cfg(test)]
+        if crate::memory::memory_mvcc::page_apply_reference::enabled() {
+            self.end_bound = EndBound::Unknown;
+            self.data.insert(key, value);
+            return;
+        }
+        match &mut self.end_bound {
+            EndBound::Empty => self.end_bound = EndBound::Known(key.clone()),
+            EndBound::Known(last) if key > *last => {
+                last.clear(); last.extend_from_slice(&key);
+            }
+            _ => {}
+        }
         self.data.insert(key, value);
     }
 
     /// 删除精确 key（编码后的版本键），返回是否存在
     pub fn delete(&mut self, key: &[u8]) -> bool {
-        self.data.remove(key).is_some()
+        let removed = self.data.remove(key).is_some();
+        if removed && matches!(&self.end_bound, EndBound::Known(last) if last.as_slice() == key) {
+            match self.data.last_key_value() {
+                Some((key, _)) => if let EndBound::Known(last) = &mut self.end_bound {
+                    last.clear(); last.extend_from_slice(key);
+                },
+                None => self.end_bound = EndBound::Empty,
+            }
+        }
+        removed
     }
 
     /// 精确查找
@@ -144,9 +176,29 @@ impl MemStore {
     /// borrowed key. Only a lower bound beyond the table's last key skips seek.
     pub(crate) fn find_prefixed_key_back<T>(&mut self, prefix: &[u8], low_suffix: &[u8],
         high_suffix: &[u8], mut accept: impl FnMut(&[u8]) -> Option<T>) -> KeyLookup<T> {
-        if self.data.last_key_value().is_none_or(|(last, _)| {
-            prefix.iter().chain(low_suffix).cmp(last.iter()).is_gt()
-        }) {
+        #[cfg(test)]
+        let old = crate::memory::memory_mvcc::page_apply_reference::enabled();
+        #[cfg(not(test))]
+        let old = false;
+        let past_end = if old {
+            #[cfg(test)]
+            key_lookup_probe::tail_read();
+            self.data.last_key_value().is_none_or(|(last, _)| prefix.iter().chain(low_suffix).cmp(last.iter()).is_gt())
+        } else {
+            #[cfg(test)]
+            if matches!(self.end_bound, EndBound::Unknown) {
+                #[cfg(test)]
+                key_lookup_probe::tail_read();
+                self.end_bound = self.data.last_key_value().map_or(EndBound::Empty, |(key, _)| EndBound::Known(key.clone()));
+            }
+            match &self.end_bound {
+                EndBound::Empty => true,
+                EndBound::Known(last) => prefix.iter().chain(low_suffix).cmp(last.iter()).is_gt(),
+                #[cfg(test)]
+                EndBound::Unknown => unreachable!(),
+            }
+        };
+        if past_end {
             #[cfg(test)]
             key_lookup_probe::note(|s| s.end_misses += 1);
             return KeyLookup::PastEnd;
@@ -190,6 +242,7 @@ impl MemStore {
 
     /// Only used after proving exclusive ownership during MVCC destruction.
     pub(crate) fn take_entries(&mut self) -> std::collections::btree_map::IntoIter<Vec<u8>, Option<Vec<u8>>> {
+        self.end_bound = EndBound::Empty;
         std::mem::take(&mut self.data).into_iter()
     }
 
@@ -289,15 +342,22 @@ impl MemStore {
     pub fn clear(&mut self) {
         self.data.clear();
         self.query_bounds = Vec::new();
+        self.end_bound = EndBound::Empty;
     }
 }
 
 #[cfg(test)]
 pub(crate) mod key_lookup_probe {
-    use std::{assert, cell::RefCell, thread_local};
+    use std::{assert, cell::{Cell, RefCell}, thread_local};
     #[derive(Clone, Copy, Debug, Default)]
-    pub(crate) struct Stats { pub end_misses: u64, pub searches: u64, pub bound_grows: u64 }
+    pub(crate) struct Stats { pub end_misses: u64, pub searches: u64, pub bound_grows: u64, pub tail_reads: u64 }
     thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
+    thread_local! { static TAIL_READS: Cell<u64> = const { Cell::new(0) }; }
+    pub(crate) fn tail_reads() -> u64 { TAIL_READS.with(Cell::get) }
+    pub(super) fn tail_read() {
+        TAIL_READS.with(|s| s.set(s.get() + 1));
+        note(|s| s.tail_reads += 1);
+    }
     pub(crate) struct Scope;
     impl Scope {
         pub(crate) fn start() -> Self {
@@ -316,6 +376,34 @@ mod tests {
     use super::*;
     use std::assert;
     use std::assert_eq;
+
+    #[test]
+    fn certified_tail_survives_all_mutation_gates_and_reference_scope() {
+        use crate::common::version::encode_key;
+        use std::{matches, vec};
+        let mut db = MemStore::new();
+        let keys = [vec![], vec![0], vec![0, 0], vec![1], vec![255; 1025]];
+        let check = |db: &MemStore| {
+            match (&db.end_bound, db.data.last_key_value()) {
+                (EndBound::Empty, None) => {},
+                (EndBound::Known(cached), Some((actual, _))) => assert_eq!(cached, actual),
+                _ => panic!("tail certificate differs from the actual table"),
+            }
+        };
+        for key in &keys { db.insert(encode_key(key, 1), Some(vec![7])); check(&db); }
+        for key in keys.iter().rev() { assert!(db.delete(&encode_key(key, 1))); check(&db); }
+        let mode = crate::memory::memory_mvcc::page_apply_reference::Scope::start();
+        db.insert(encode_key(b"a", 7), None);
+        drop(mode);
+        assert!(matches!(db.end_bound, EndBound::Unknown));
+        assert!(matches!(db.find_prefixed_key_back(b"b", &[0; 8], &[255; 8], |_| Some(1)), KeyLookup::PastEnd));
+        check(&db);
+        assert!(matches!(db.find_prefixed_key_back(b"a", &[0; 8], &[255; 8], |_| Some(7)), KeyLookup::Searched(Some(7))));
+        db.clear(); check(&db);
+        db.insert(encode_key(b"a", 1), None);
+        let rows: Vec<_> = db.take_entries().collect();
+        assert_eq!(rows.len(), 1); check(&db);
+    }
 
     #[test]
     fn prefixed_lookup_reuses_bounds_without_confusing_binary_prefixes() {

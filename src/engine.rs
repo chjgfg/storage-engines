@@ -5320,6 +5320,60 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "memory page apply old/new/new/old; release single thread"]
+    fn memory_replay_page_cost() {
+        use crate::common::kv_snapshot::{atomic_write_bin_v4, KvRecord, recovery_probe};
+        use crate::memory::{mem_store::key_lookup_probe, memory_mvcc::page_apply_reference};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 1000);
+        for ttl in [false, true] {
+            let dir = ScaleScratch::new("replay_page_cost");
+            let path = dir.0.join("snapshot.bxp");
+            let expiry = ttl.then_some(u64::MAX);
+            atomic_write_bin_v4(&path, |writer| {
+                for i in 0..rows {
+                    let mut record = KvRecord::new(scale_key(i), Some(scale_val(i)));
+                    record.expire_unix_secs = expiry;
+                    writer.write(&record)?;
+                }
+                Ok(())
+            }).unwrap();
+            let mut costs = Vec::new();
+            for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+                let mode = reference.then(page_apply_reference::Scope::start);
+                let lookups = key_lookup_probe::Scope::start();
+                let recovery = recovery_probe::Scope::start();
+                let before = crate::mem_probe::allocations();
+                let start = std::time::Instant::now();
+                let db = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+                let seconds = start.elapsed().as_secs_f64();
+                let allocations = crate::mem_probe::allocations() - before;
+                let stats = recovery.stats();
+                assert_eq!(stats.replay_pages, rows.div_ceil(1000) as u64);
+                assert_eq!(stats.replay_input_rows, rows as u64);
+                assert_eq!(stats.replay_registry_lookups, if reference { rows as u64 } else { stats.replay_pages });
+                assert_eq!(stats.replay_tail_reads, if reference { rows as u64 } else { 0 });
+                assert_eq!(lookups.stats().searches, 0);
+                assert_eq!(lookups.stats().end_misses, rows as u64);
+                eprintln!("MEMORY_REPLAY_PAGE round={round} reference={reference} ttl={ttl} rows={rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");
+                costs.push(allocations);
+                drop(recovery); drop(lookups); drop(mode);
+                let mut seen = 0;
+                db.export_latest_visible_for_each(false, |record| {
+                    assert_eq!(record.key, scale_key(seen));
+                    assert_eq!(record.value, Some(scale_val(seen)));
+                    assert_eq!(record.expire_unix_secs, expiry);
+                    seen += 1; true
+                });
+                assert_eq!(seen, rows);
+                eprintln!("MEMORY_REPLAY_PAGE_VERIFIED round={round} ttl={ttl} rows={seen}");
+            }
+            assert!(costs[0] > costs[1] + rows.div_ceil(1000) as u64);
+            assert!(costs[3] > costs[2] + rows.div_ceil(1000) as u64);
+        }
+    }
+
+    #[test]
     #[ignore = "M109-only replay allocation and stop comparison; release single thread"]
     fn memory_replay_allocation_cost() {
         use crate::common::kv_snapshot::{atomic_write_bin_v4, KvRecord, recovery_probe, snapshot_probe};

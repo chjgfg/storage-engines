@@ -77,6 +77,7 @@ pub type Registry = HashMap<u64, HashSet<Vec<u8>>>;
 #[cfg(test)]
 thread_local! {
     static WRITE_SET_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WRITE_REG_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -89,6 +90,9 @@ pub(crate) fn note_write_set_scan(n: u64) {
 pub fn write_set_scans() -> u64 {
     WRITE_SET_SCANS.with(|c| c.get())
 }
+
+#[cfg(test)]
+pub(crate) fn write_registry_lookups() -> u64 { WRITE_REG_LOOKUPS.with(Cell::get) }
 
 /// 登记一行进写集：`true` = 这行是新登记的那把键（同一把键在一个事务里只记一次账）。
 ///
@@ -281,6 +285,15 @@ impl TxnCore {
 
     fn try_write_inner<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
         key: Cow<'_, [u8]>, value: Option<Vec<u8>>) -> Result<(), WriteError> {
+        self.try_write_row(side, key, value, || {
+            #[cfg(test)]
+            WRITE_REG_LOOKUPS.with(|s| s.set(s.get() + 1));
+            reg.entry(self.version).or_default()
+        })
+    }
+
+    fn try_write_row<'a, S: WriteSide>(&self, side: &mut S, key: Cow<'_, [u8]>,
+        value: Option<Vec<u8>>, writes: impl FnOnce() -> &'a mut HashSet<Vec<u8>>) -> Result<(), WriteError> {
         if self.state.get() != TxnState::Active { return Err(WriteError::TransactionClosed); }
         if let Some(error) = self.write_error.get() { return Err(error); }
         if let Some(latest) = side.latest_version(&key) {
@@ -312,7 +325,7 @@ impl TxnCore {
         // 而一次 WAL 都没落成的事务也不会去付那次无意义的 fsync。
         self.wal_policy.mark_opened();
 
-        let writes = reg.entry(self.version).or_default();
+        let writes = writes();
         #[cfg(test)]
         let inserted = if owned_reference::enabled() { side.put_versioned(&enc, stored) }
             else { side.put_versioned_owned(enc, stored) };
@@ -333,6 +346,27 @@ impl TxnCore {
         #[cfg(test)]
         if owned_reference::enabled() { return self.try_write(reg, side, &key, value); }
         self.try_write_inner(reg, side, Cow::Owned(key), value)
+    }
+
+    /// A bounded owned page uses the same row checks/WAL/registration gate,
+    /// reserving its write set and finding its registry entry once per page.
+    pub(crate) fn try_write_owned_page<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
+        rows: impl ExactSizeIterator<Item = (Vec<u8>, Option<Vec<u8>>)>) -> Result<(), WriteError> {
+        if self.state.get() != TxnState::Active { return Err(WriteError::TransactionClosed); }
+        if let Some(error) = self.write_error.get() { return Err(error); }
+        #[cfg(test)]
+        if owned_reference::enabled() {
+            for (key, value) in rows { self.try_write(reg, side, &key, value)?; }
+            return Ok(());
+        }
+        #[cfg(test)]
+        WRITE_REG_LOOKUPS.with(|s| s.set(s.get() + 1));
+        let writes = reg.entry(self.version).or_default();
+        writes.reserve(rows.len());
+        for (key, value) in rows {
+            self.try_write_row(side, Cow::Owned(key), value, || &mut *writes)?;
+        }
+        Ok(())
     }
 
     /// Latch an engine failure without changing an already completed outcome.
@@ -514,12 +548,14 @@ mod checked_tests {
         impl WalTail for PartialStore {
             fn try_wal_commit(&mut self, _: u64) -> std::io::Result<()> { Ok(()) }
         }
-        for owned in [false, true] {
+        for mode in 0..3 {
             let reg = Arc::new(Mutex::new(Registry::new()));
             let tx = TxnCore::begin(reg, &AtomicU64::new(1), Arc::new(VacuumScheduler::default()));
             let mut guard = tx.lock_registry();
             let mut store = PartialStore::default();
-            let result = if owned {
+            let result = if mode == 2 {
+                tx.try_write_owned_page(&mut guard, &mut store, vec![(b"k".to_vec(), Some(vec![1]))].into_iter())
+            } else if mode == 1 {
                 tx.try_write_owned(&mut guard, &mut store, b"k".to_vec(), Some(vec![1]))
             } else { tx.try_write(&mut guard, &mut store, b"k", Some(vec![1])) };
             assert_eq!(result, Err(WriteError::StorageWriteFailed));
