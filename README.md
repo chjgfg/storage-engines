@@ -3,14 +3,15 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M112 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M113 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
-- M109 release 库测试 **459 passed / 0 failed / 47 ignored**（116.58 s）。
-  CLI 8 项、集成 5 项、文档 6 项通过，合计 **478 passed / 0 failed**（文档另 1 ignored）。
+- M113 release 库测试 **468 passed / 0 failed / 51 ignored**（D 盘测试目录，5371.22 s）。
+  CLI 8 项、集成 5 项、文档 6 项通过，合计 **487 passed / 0 failed**（文档另 1 ignored）。
   Windows / Linux 全目标 all-features 编译检查通过；Linux 未运行测试。
-  单独运行的性能对照与迁层/快照守卫结果见更新日志；本轮未重跑 20M。
+  单独运行的性能对照与迁层/快照守卫结果见更新日志；本轮未重跑四引擎 20M 整套台架。
+  最终 release 50k 四引擎台架通过（46.39 s），132 格齐全，迁移/bulk 重开全量逐值验收通过。
 - 许可证：MIT 或 Apache-2.0 任选。
 
 入口：[快速开始](#快速开始) · [下游接入](#下游接入使用说明) · [项目结构](#项目结构) ·
@@ -47,6 +48,9 @@ M111 memory 独占停止时边写快照边消费原树，共享句柄走借用�
 M112 B+ vacuum 复用分组缓冲，换出批次按页号去重并给脏元数据预留一个双写槽。
 256 脏页守卫旧一次释放 32 页/同步 2 次，新释放 63 页/同步 1 次；回收和页失败恢复守卫通过。
 入口 `BPLUS_VAC_ROWS=600000 cargo test --release --lib bplus_vacuum_buffer_cost -- --ignored --nocapture --test-threads=1`。
+M113 LSM 压实按所有权消费解码块与归并堆，坏块或发布失败恢复原输入，点读缓存不接收压实读入的块。
+600k 两源重叠四轮 EntryValue 克隆 240 万→0 次、分配约 1149 万→608 万次；LegacyShared 回退单列成本。
+入口 `COMPACTION_ROWS=600000 cargo test --release --lib lsm_owned_compaction_cost -- --ignored --nocapture --test-threads=1`。
 
 ## 引入方式
 

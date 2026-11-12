@@ -5602,6 +5602,47 @@ mod tests {
         assert!(costs[3] >= costs[2] + 2 * rows as u64);
     }
 
+    #[test]
+    #[ignore = "LSM overlapping compaction allocation old/new/new/old; release single thread"]
+    fn lsm_owned_compaction_cost() {
+        use crate::lsm_tree::{LSMTree, LSMTreeOptions};
+        use crate::lsm_tree::{sst::{compaction_reference, StoredEntry, entry_value_clones}, lsm_tree::maintenance_probe};
+        let rows: usize = std::env::var("COMPACTION_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        let mut costs = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("owned_compaction");
+            let opts = LSMTreeOptions { sst_block_entries: 128, target_sst_bytes: 4 * 1024 * 1024, ..LSMTreeOptions::default() };
+            let mut db = LSMTree::open_with_config(&dir.0, opts.clone()).unwrap();
+            for generation in 1..=2_u64 {
+                db.inject_sst_stream_for_test(0, (0..rows).map(|i| (scale_key(i), StoredEntry::put(generation, Some(scale_val(i + generation as usize)))))).unwrap();
+            }
+            let mode = reference.then(compaction_reference::Scope::start);
+            let scope = maintenance_probe::Scope::start();
+            let clones = entry_value_clones();
+            let before = crate::mem_probe::allocations();
+            let start = std::time::Instant::now();
+            assert_eq!(db.compact_l0_until(0, 8).unwrap(), 1);
+            let seconds = start.elapsed().as_secs_f64();
+            let allocations = crate::mem_probe::allocations() - before;
+            let clones = entry_value_clones() - clones;
+            let stats = scope.stats();
+            costs.push(allocations);
+            if !reference { assert_eq!(clones, 0); assert_eq!(stats.owned_input_rows, 2 * rows as u64); }
+            else { assert_eq!(clones, 4 * rows as u64); }
+            eprintln!("LSM_OWNED_COMPACTION round={round} reference={reference} rows={rows} seconds={seconds:.6} allocations={allocations} value_clones={clones} stages={stats:?}");
+            drop(scope); drop(mode); drop(db);
+            let db = LSMTree::open_with_config(&dir.0, opts).unwrap();
+            let mut seen = 0;
+            db.export_records_with_seq_for_each(false, &mut |key, value, seq| {
+                assert_eq!(key, scale_key(seen)); assert_eq!(value, Some(scale_val(seen + 2))); assert_eq!(seq, 2);
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+        }
+        assert!(costs[0] >= costs[1] + 4 * rows as u64);
+        assert!(costs[3] >= costs[2] + 4 * rows as u64);
+    }
+
     /// TTL 两格仍量真实 set/get；紧接着在计时外去掉期限，而非把期限调得更长。
     /// 必须先验值再 persist（不是 set_raw 重播种），缺失/过期/损坏不能被修补后蒙混过关。
     fn scale_persist_auxiliary(db: &dyn KvEngine, rows: usize) {
@@ -5951,9 +5992,10 @@ mod tests {
     fn scale_note_maintenance(db: &dyn KvEngine, phase: &str,
         scope: &crate::lsm_tree::lsm_tree::maintenance_probe::Scope) {
         let s = scope.stats();
-        eprintln!("SCALE_MAINT engine={} phase={phase} auto={:?} lsm_flushes={} lsm_flush_ms={:.3} lsm_compactions={} lsm_compact_ms={:.3} lsm_input_files={} lsm_input_bytes={}",
+        eprintln!("SCALE_MAINT engine={} phase={phase} auto={:?} lsm_flushes={} lsm_flush_ms={:.3} lsm_compactions={} lsm_compact_ms={:.3} lsm_input_files={} lsm_input_bytes={} owned_input_rows={} legacy_input_clones={} reference_input_clones={} compaction_blocks={}",
             db.name(), db.reclamation_status(), s.flushes, s.flush_ns as f64 / 1e6,
-            s.compactions, s.compact_ns as f64 / 1e6, s.input_files, s.input_bytes);
+            s.compactions, s.compact_ns as f64 / 1e6, s.input_files, s.input_bytes,
+            s.owned_input_rows, s.legacy_input_clones, s.reference_input_clones, s.compaction_blocks);
         if db.name() == "lsm_tree" {
             eprintln!("SCALE_LSM_MOVES phase={phase} files={} bytes={}", s.trivial_moves, s.moved_bytes);
             eprintln!("SCALE_LSM_STAGES phase={phase} merge_ms={:.3} repair_ms={:.3} manifest_ms={:.3} guard_ms={:.3} cleanup_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3}",

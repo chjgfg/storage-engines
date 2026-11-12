@@ -14,14 +14,14 @@ use std::matches;
 use std::write;
 use std::writeln;
 use std::{
-    collections::{BTreeMap, BinaryHeap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, BufWriter, Write}, path::{Path, PathBuf}, sync::{
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet}, fs::{self, File}, io::{BufRead, BufReader, BufWriter, Write}, path::{Path, PathBuf}, sync::{
         Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering},
     }, thread::JoinHandle, time::Duration, vec,
 };
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
-    merge_latest_streaming, merge_streaming, merge_to_ssts_with_action, CompactionAction, vec_inputs, BlockCache, EntryValue,
+    merge_latest_streaming, merge_streaming, merge_to_ssts_with_action, CompactionAction, TryMergeInput, UnpublishedSsts, vec_inputs, BlockCache, EntryValue,
     LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry,
 };
 
@@ -409,6 +409,10 @@ pub(crate) mod maintenance_probe {
         pub input_bytes: u64,
         pub trivial_moves: u64,
         pub moved_bytes: u64,
+        pub owned_input_rows: u64,
+        pub legacy_input_clones: u64,
+        pub reference_input_clones: u64,
+        pub compaction_blocks: u64,
         pub merge_ns: u128,
         pub repair_ns: u128,
         pub manifest_ns: u128,
@@ -427,6 +431,15 @@ pub(crate) mod maintenance_probe {
         pub fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().as_ref().unwrap().clone()) }
     }
     impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
+    pub(crate) fn input_row(kind: u8) {
+        ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+            match kind { 0 => stats.owned_input_rows += 1, 1 => stats.legacy_input_clones += 1,
+                _ => stats.reference_input_clones += 1 }
+        });
+    }
+    pub(crate) fn input_block() {
+        ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.compaction_blocks += 1; });
+    }
     pub(crate) enum Kind { Flush, Compact, Merge, Repair, Manifest, Guard, Cleanup, SstFinish, SstSync }
     pub(crate) struct Timer { kind: Kind, start: Instant }
     impl Timer {
@@ -1492,9 +1505,16 @@ impl LSMTree {
     /// 手工造那个状态比工程化一次真崩溃便宜，而且造的正是恢复后内存里会出现的那份形状。
     #[cfg(test)]
     pub(crate) fn inject_sst_for_test(
+        &mut self, level: usize, entries: Vec<(Vec<u8>, StoredEntry)>,
+    ) -> std::io::Result<()> {
+        self.inject_sst_stream_for_test(level, entries)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_sst_stream_for_test(
         &mut self,
         level: usize,
-        entries: Vec<(Vec<u8>, StoredEntry)>,
+        entries: impl IntoIterator<Item = (Vec<u8>, StoredEntry)>,
     ) -> std::io::Result<()> {
         let id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let path = self.sst_path(id);
@@ -2121,6 +2141,9 @@ impl LSMTree {
             MoveOutcome::Rewrite => {}
         }
 
+        let original: HashMap<u64, (usize, usize)> = self.levels.iter().enumerate()
+            .flat_map(|(level, files)| files.iter().enumerate().map(move |(position, file)| (file.id, (level, position)))).collect();
+
         // `input_files`：**拥有**本次压实的输入文件，顺序 = 源序（新→旧）。
         // M33 起归并收的是迭代器，所以这些文件必须活到 `merge_to_ssts` 返回为止 ——
         // 旧写法在这里就 `iter_entries()` 把它们整篇读进 `Vec` 再丢掉文件，于是瞬时内存
@@ -2243,14 +2266,13 @@ impl LSMTree {
         let use_mmap = self.opts.use_mmap;
         let target = self.opts.target_sst_bytes;
 
-        // 每源一路迭代器，`iter_all()` 一块一块读 ⇒ 压实期间活着的是"每源当前那一块 + 一个
-        // builder"，不再是"所有输入文件之和"（M33）。
+        // Each compaction input owns its decoded block and propagates read errors.
         #[cfg(test)]
         let merge_timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Merge);
-        let mut new_files = merge_to_ssts_with_action(
+        let merged = merge_to_ssts_with_action(
             input_files
                 .iter()
-                .map(|s| Box::new(s.iter_all()) as MergeInput<'_, StoredEntry>)
+                .map(|s| Box::new(s.compaction_input()) as TryMergeInput<'_, StoredEntry, std::io::Error>)
                 .collect(),
             &action,
             || {
@@ -2260,10 +2282,14 @@ impl LSMTree {
                     .with_bloom_bits(bloom_bits)
             },
             target,
-        )?;
-        // 迭代器借的是 `input_files`，而下面要**删这些文件** —— Windows 上句柄还开着删不掉，
-        // 所以归并一结束就释放输入文件（旧写法"源是 Vec"顺带做到了这点，不是巧合能省的东西）。
-        drop(input_files);
+        );
+        let mut new_files = match merged {
+            Ok(files) => files,
+            Err(error) => {
+                self.rollback_compaction_inputs(&original, input_files, Vec::new());
+                return Err(error);
+            }
+        };
         #[cfg(test)]
         drop(merge_timer);
         let ns = Self::dir_cache_ns(&self.dir);
@@ -2281,11 +2307,15 @@ impl LSMTree {
         // L1+：层内重叠**真的折掉**（M26）。旧实现只 `eprintln!` 告警、把文件原样交回去 ⇒
         // 重叠一旦出现就永远没人修：常规压实只会拉"与所选文件重叠的**下一层**"，从不碰同层兄弟，
         // 而这一层的输出又只在被压实到时才重写。
-        let mut replaced: Vec<PathBuf> = Vec::new();
+        let mut replaced: Vec<SstFile> = Vec::new();
         if next >= 1 {
             #[cfg(test)]
             let _timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Repair);
-            self.repair_level_overlaps(&mut all_next, &mut replaced, &action)?;
+            if let Err(error) = self.repair_level_overlaps(&mut all_next, &mut replaced, &action) {
+                self.levels[next] = all_next;
+                self.rollback_compaction_inputs(&original, input_files, replaced);
+                return Err(error);
+            }
         }
         self.levels[next] = all_next;
         self.refresh_level_ranges(next);
@@ -2297,7 +2327,10 @@ impl LSMTree {
         // 于是重开之后那批数据**既不在 manifest 里也不在盘上**，一句话不报。
         // 反过来留的窗口是"新+旧同时在 manifest 里"（重叠），那正是上面 `repair_level_overlaps`
         // 负责收拾的形状，读答案两边同键同 seq ⇒ 折叠与点查都不受影响。
-        self.write_manifest()?;
+        if let Err(error) = self.write_manifest() {
+            self.rollback_compaction_inputs(&original, input_files, replaced);
+            return Err(error);
+        }
         #[cfg(test)]
         {
             let _timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Guard);
@@ -2312,13 +2345,33 @@ impl LSMTree {
         {
             #[cfg(test)]
             let _timer = maintenance_probe::Timer::start(maintenance_probe::Kind::Cleanup);
-            for p in paths.iter().chain(replaced.iter()) {
+            let replaced_paths: Vec<_> = replaced.iter().map(|file| file.path.clone()).collect();
+            // Windows handles/mappings must close before deleting published inputs.
+            drop(input_files); drop(replaced);
+            for p in paths.iter().chain(replaced_paths.iter()) {
                 let _ = fs::remove_file(p);
             }
         }
         // 通知后台
         self.notify_bg();
         Ok(())
+    }
+
+    fn rollback_compaction_inputs(&mut self, original: &HashMap<u64, (usize, usize)>,
+        mut inputs: Vec<SstFile>, replaced: Vec<SstFile>) {
+        inputs.extend(replaced);
+        for files in &mut self.levels { inputs.append(files); }
+        for file in inputs {
+            if let Some(&(level, _)) = original.get(&file.id) { self.levels[level].push(file); }
+            else {
+                let path = file.path.clone(); drop(file);
+                let _ = fs::remove_file(path);
+            }
+        }
+        for files in &mut self.levels { files.sort_by_key(|file| original[&file.id].1); }
+        for level in 0..self.levels.len() { self.refresh_level_ranges(level); }
+        self.stats_dirty = true;
+        self.reevaluate_cache_capacity();
     }
 
     /// 把一层里范围连续重叠的文件折成不重叠的新文件。
@@ -2332,16 +2385,16 @@ impl LSMTree {
     /// 过滤与保留删除屏障沿用本次 compaction 的 action（TTL / Drop / 用户 filter），
     /// 与常规合并共享同一份外部来源判定。
     ///
-    /// ✅ 内存：M33 起这条与常规压实**走同一条流式源**（`iter_all()` 一块一块读）。
+    /// 内存：与常规压实共用 `compaction_input`，每源一块，读取失败停止发布。
     /// 旧写法在这里也 `iter_entries()` 把段里每个文件整篇读进 `Vec`，与压实共用那条账单 ——
     /// 实测 600k 行 / 8 个输入文件时那一步峰值涨 154 MB（条目本身 61.7 MB）。
     /// 尺子见本文件 `test_compaction_repairs_level_overlap` 里那条 `merge_inputs_materialized` 断言。
     ///
-    /// 被替换掉的旧文件路径追加进 `replaced`，**由调用方在 MANIFEST 记完之后**再删。
+    /// 被替换的旧文件按所有权保留到 MANIFEST 发布；失败可恢复原层归属和源序。
     fn repair_level_overlaps<F>(
         &mut self,
         files: &mut Vec<SstFile>,
-        replaced: &mut Vec<PathBuf>,
+        replaced: &mut Vec<SstFile>,
         keep: &F,
     ) -> std::io::Result<()>
     where
@@ -2377,18 +2430,18 @@ impl LSMTree {
         let ns = Self::dir_cache_ns(&self.dir);
         let next_id = &self.next_sst_id;
 
-        let mut out: Vec<SstFile> = Vec::new();
-        for run in runs {
+        enum RunRewrite { Keep, Rewritten(UnpublishedSsts) }
+        let mut planned = Vec::new();
+        for run in &runs {
             if run.len() <= 1 {
-                out.extend(run);
+                planned.push(RunRewrite::Keep);
                 continue;
             }
-            let old_paths: Vec<PathBuf> = run.iter().map(|s| s.path.clone()).collect();
             // M33：修复重叠与常规压实**共用同一条流式源账单**。旧写法在这里也 `iter_entries()`
             // 整篇读进 Vec，而修复恰恰多在崩溃恢复之后跑 —— 那时正是内存最紧的时候。
-            let mut merged = merge_to_ssts_with_action(
+            let result = merge_to_ssts_with_action(
                 run.iter()
-                    .map(|s| Box::new(s.iter_all()) as MergeInput<'_, StoredEntry>)
+                    .map(|s| Box::new(s.compaction_input()) as TryMergeInput<'_, StoredEntry, std::io::Error>)
                     .collect(),
                 keep,
                 || {
@@ -2398,7 +2451,11 @@ impl LSMTree {
                         .with_bloom_bits(bloom_bits)
                 },
                 target,
-            )?;
+            );
+            let mut merged = match result {
+                Ok(files) => files,
+                Err(error) => { *files = runs.into_iter().flatten().collect(); return Err(error); }
+            };
             for sst in &mut merged {
                 sst.set_cache_ns(ns);
                 sst.set_block_cache(cache.clone());
@@ -2406,8 +2463,14 @@ impl LSMTree {
                     let _ = sst.enable_mmap();
                 }
             }
-            replaced.extend(old_paths);
-            out.extend(merged);
+            planned.push(RunRewrite::Rewritten(UnpublishedSsts(merged)));
+        }
+        let mut out = Vec::new();
+        for (run, result) in runs.into_iter().zip(planned) {
+            match result {
+                RunRewrite::Keep => out.extend(run),
+                RunRewrite::Rewritten(mut files) => { replaced.extend(run); out.append(&mut files.0); }
+            }
         }
         out.sort_by(|a, b| a.min_key.cmp(&b.min_key));
         *files = out;
@@ -2521,7 +2584,6 @@ impl LSMTree {
                 f.sync_all()?;
             }
         }
-        let _ = fs::remove_file(&path);
         fs::rename(&tmp, &path)?;
         // Best-effort history, as before; build one line before appending.
         let hist = self.dir.join("MANIFEST.LOG");
@@ -3063,6 +3125,60 @@ mod tests {
     /// 返回 **RAII 句柄**（M82）：声明在引擎之前即可，用例结束（含 panic 展开）自动删目录。
     fn tmp_dir(tag: &str) -> crate::common::ScratchPath {
         crate::common::ScratchPath::new("lsm", tag, "")
+    }
+
+    #[test]
+    fn failed_compaction_input_restores_manifest_and_sources() {
+        let dir = tmp_dir("compaction_read_error");
+        let mut opts = pruning_options();
+        opts.sst_block_entries = 1;
+        opts.target_sst_bytes = 1;
+        let mut db = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+        db.block_cache.lock().unwrap().set_capacity(0);
+        db.inject_sst_stream_for_test(0, (0..20_u64).map(|i| (i.to_be_bytes().to_vec(), StoredEntry::put(1, Some(vec![1]))))).unwrap();
+        db.inject_sst_stream_for_test(0, (0..10_u64).map(|i| (i.to_be_bytes().to_vec(), StoredEntry::put(2, Some(vec![2]))))).unwrap();
+        let manifest = fs::read(db.manifest_path()).unwrap();
+        let layout: Vec<Vec<_>> = db.levels.iter().map(|files| files.iter().map(|file| file.id).collect()).collect();
+        let path = db.levels[0][0].path.clone();
+        let clean = fs::read(&path).unwrap();
+        let mut bad = clean.clone();
+        // Corrupt only the data region, preserving footer/index so the source stays openable.
+        bad[150] ^= 1;
+        fs::write(&path, &bad).unwrap();
+        assert!(db.compact_level(0).is_err(), "a bad input must stop publication");
+        assert_eq!(fs::read(db.manifest_path()).unwrap(), manifest);
+        assert_eq!(db.levels.iter().map(|files| files.iter().map(|file| file.id).collect::<Vec<_>>()).collect::<Vec<_>>(), layout);
+        let files = fs::read_dir(db.dir.join("sst")).unwrap().count();
+        assert_eq!(files, 2, "failed merge must remove all its unpublished outputs");
+        assert_eq!(db.get(&0_u64.to_be_bytes()), Some(vec![2]));
+        fs::write(&path, clean).unwrap();
+        db.compact_level(0).unwrap();
+        for i in 0..20_u64 { assert_eq!(db.get(&i.to_be_bytes()), Some(vec![if i < 10 { 2 } else { 1 }])); }
+        drop(db);
+        let db = LSMTree::open_with_config(&dir, opts).unwrap();
+        for i in 0..20_u64 { assert_eq!(db.get(&i.to_be_bytes()), Some(vec![if i < 10 { 2 } else { 1 }])); }
+    }
+
+    #[test]
+    fn failed_compaction_publish_restores_repaired_sources() {
+        let dir = tmp_dir("compaction_publish_error");
+        let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
+        db.inject_sst_for_test(0, vec![(b"a".to_vec(), StoredEntry::put(2, Some(vec![2])))]).unwrap();
+        db.inject_sst_for_test(0, vec![(b"a".to_vec(), StoredEntry::put(3, Some(vec![3])))]).unwrap();
+        for seq in [1, 4] { db.inject_sst_for_test(1, vec![(b"x".to_vec(), StoredEntry::put(seq, Some(vec![seq as u8])))]).unwrap(); }
+        let manifest = fs::read(db.manifest_path()).unwrap();
+        let layout: Vec<Vec<_>> = db.levels.iter().map(|files| files.iter().map(|file| file.id).collect()).collect();
+        fs::create_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+        assert!(db.compact_level(0).is_err());
+        assert_eq!(fs::read(db.manifest_path()).unwrap(), manifest);
+        assert_eq!(db.levels.iter().map(|files| files.iter().map(|file| file.id).collect::<Vec<_>>()).collect::<Vec<_>>(), layout);
+        assert_eq!(fs::read_dir(db.dir.join("sst")).unwrap().count(), 4);
+        assert_eq!(db.get(b"a"), Some(vec![3]));
+        assert_eq!(db.get(b"x"), Some(vec![4]));
+        fs::remove_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+        db.compact_level(0).unwrap();
+        assert_eq!(db.get(b"a"), Some(vec![3]));
+        assert_eq!(db.get(b"x"), Some(vec![4]));
     }
 
     fn pruning_options() -> LSMTreeOptions {

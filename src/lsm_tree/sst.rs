@@ -960,6 +960,15 @@ impl SstFile {
         }
     }
 
+    pub(crate) fn compaction_input(&self) -> CompactionRows<'_> {
+        #[cfg(test)]
+        if compaction_reference::enabled() { return CompactionRows::CachedReference(self.iter_all()); }
+        match &self.entries_cache {
+            Some(entries) => CompactionRows::LegacyShared(entries.iter()),
+            None => CompactionRows::OwnedBlocks { sst: self, block: 0, rows: Vec::new().into_iter() },
+        }
+    }
+
     /// 把**整个文件**读进一个 `Vec`。
     ///
     /// ⚠️ 只有"文件本来就在内存里（v1 / 小文件）"或"调用方确实要随机访问这份 `Vec`"时该用它。
@@ -1115,6 +1124,58 @@ pub struct SstEntryIter<'a> {
     entry_i: usize,
     cur: Option<Arc<DataBlock>>,
     cache_i: usize,
+}
+
+/// Modern blocks are decoded once and moved. V1's resident entries require an
+/// explicit shared fallback; compaction never fills the point-read cache.
+pub(crate) enum CompactionRows<'a> {
+    OwnedBlocks { sst: &'a SstFile, block: usize, rows: std::vec::IntoIter<(Vec<u8>, StoredEntry)> },
+    LegacyShared(std::slice::Iter<'a, (Vec<u8>, StoredEntry)>),
+    #[cfg(test)]
+    CachedReference(SstEntryIter<'a>),
+}
+
+impl Iterator for CompactionRows<'_> {
+    type Item = std::io::Result<(Vec<u8>, StoredEntry)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::LegacyShared(rows) => rows.next().map(|row| {
+                #[cfg(test)]
+                crate::lsm_tree::lsm_tree::maintenance_probe::input_row(1);
+                Ok(row.clone())
+            }),
+            #[cfg(test)]
+            Self::CachedReference(rows) => rows.next().map(|row| {
+                crate::lsm_tree::lsm_tree::maintenance_probe::input_row(2);
+                Ok(row)
+            }),
+            Self::OwnedBlocks { sst, block, rows } => loop {
+                if let Some(row) = rows.next() {
+                    #[cfg(test)]
+                    crate::lsm_tree::lsm_tree::maintenance_probe::input_row(0);
+                    return Some(Ok(row));
+                }
+                let ie = sst.index.get(*block)?;
+                *block += 1;
+                #[cfg(test)]
+                crate::lsm_tree::lsm_tree::maintenance_probe::input_block();
+                match sst.read_slice(ie.offset, ie.len as usize).and_then(|raw| decode_block(&raw, sst.has_seq)) {
+                    Ok(decoded) => *rows = decoded.entries.into_iter(),
+                    Err(error) => { *block = sst.index.len(); return Some(Err(error)); }
+                }
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod compaction_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
 }
 
 impl Iterator for SstEntryIter<'_> {
@@ -1906,6 +1967,7 @@ impl LightEntry {
 /// SST 是 `SstEntryIter`、读路径还带 `filter`），泛型要么要求同构要么逼每个调用点写类型名；
 /// 而"一路一个盒子"的开销 = 输入文件数（个位数到几十），相比每行的克隆可以忽略。
 pub type MergeInput<'a, T> = Box<dyn Iterator<Item = (Vec<u8>, T)> + 'a>;
+pub(crate) type TryMergeInput<'a, T, E> = Box<dyn Iterator<Item = Result<(Vec<u8>, T), E>> + 'a>;
 
 /// 把"本来就物化在内存里"的源接到 `MergeInput` 上（M33）。
 ///
@@ -1918,10 +1980,19 @@ pub fn vec_inputs<T: 'static>(srcs: Vec<Vec<(Vec<u8>, T)>>) -> Vec<MergeInput<'s
         .collect()
 }
 
-pub fn merge_streaming<T, F, K>(sources: Vec<MergeInput<'_, T>>, mut keep: K, mut emit: F)
+pub fn merge_streaming<'a, T, F, K>(sources: Vec<MergeInput<'a, T>>, keep: K, mut emit: F)
+where T: MergeSeq + 'a, F: FnMut(Vec<u8>, T), K: FnMut(&[u8], &T) -> bool {
+    use std::convert::Infallible;
+    let sources = sources.into_iter().map(|s| Box::new(s.map(Ok::<_, Infallible>)) as TryMergeInput<'a, T, Infallible>).collect();
+    match try_merge_streaming(sources, keep, |key, row| { emit(key, row); Ok(()) }) {
+        Ok(()) => {}, Err(impossible) => match impossible {},
+    }
+}
+
+fn try_merge_streaming<T, E, F, K>(mut sources: Vec<TryMergeInput<'_, T, E>>, mut keep: K, mut emit: F) -> Result<(), E>
 where
     T: MergeSeq,
-    F: FnMut(Vec<u8>, T),
+    F: FnMut(Vec<u8>, T) -> Result<(), E>,
     K: FnMut(&[u8], &T) -> bool,
 {
     struct Node<T> {
@@ -1953,42 +2024,33 @@ where
     }
     impl<T: MergeSeq> Eq for Node<T> {}
 
-    // 每源一个 `Peekable`：堆里的 Node 是该源**当前头部的一份克隆**（还没消费掉）。
-    // 所以推进节奏必须是"弹出 Node → `next()` 消费那个头部 → 再 `peek()` 推下一个"——
-    // 旧写法靠索引读 `Vec`，索引本身就是游标，改成迭代器后这一步要显式做。
-    let mut srcs: Vec<std::iter::Peekable<MergeInput<T>>> =
-        sources.into_iter().map(|s| s.peekable()).collect();
+    // The heap owns each consumed head. Advancing moves the next row directly,
+    // preserving maximum seq / earliest source ties without cloning payloads.
+    let heap_row = |key: Vec<u8>, row: T| {
+        #[cfg(test)]
+        if compaction_reference::enabled() { return (key.clone(), row.clone()); }
+        (key, row)
+    };
     let mut heap = BinaryHeap::new();
-    for s in 0..srcs.len() {
-        if let Some((k, se)) = srcs[s].peek() {
-            heap.push(Node {
-                key: k.clone(),
-                se: se.clone(),
-                src: s,
-            });
+    for (s, source) in sources.iter_mut().enumerate() {
+        if let Some(row) = source.next() {
+            let (key, se) = row?;
+            let (key, se) = heap_row(key, se);
+            heap.push(Node { key, se, src: s });
         }
     }
-    // 不捕获任何变量：源与堆都当参数传进来。写成闭包捕获 `srcs` 会把这vec 长期借住，
-    // 主循环里再 `srcs[..].next()` 就是第二次可变借用，编译不过。
-    let advance = |srcs: &mut [std::iter::Peekable<MergeInput<T>>],
+    let advance = |srcs: &mut [TryMergeInput<T, E>],
                    heap: &mut BinaryHeap<Node<T>>,
-                   s: usize| {
-        srcs[s].next();
-        if let Some((k, se)) = srcs[s].peek() {
-            heap.push(Node {
-                key: k.clone(),
-                se: se.clone(),
-                src: s,
-            });
+                   s: usize| -> Result<(), E> {
+        if let Some(row) = srcs[s].next() {
+            let (key, se) = row?;
+            let (key, se) = heap_row(key, se);
+            heap.push(Node { key, se, src: s });
         }
+        Ok(())
     };
-    let mut last_key: Option<Vec<u8>> = None;
     while let Some(n) = heap.pop() {
-        advance(&mut srcs, &mut heap, n.src);
-
-        if last_key.as_ref().map(|k| k == &n.key).unwrap_or(false) {
-            continue;
-        }
+        advance(&mut sources, &mut heap, n.src)?;
 
         // 收集所有同 key 条目，选最优：**seq 大者赢**；seq 相同才回到"源序小者赢"。
         let key = n.key;
@@ -1996,7 +2058,7 @@ where
         let mut best = n.se;
         while heap.peek().map(|p| p.key == key).unwrap_or(false) {
             let m = heap.pop().unwrap();
-            advance(&mut srcs, &mut heap, m.src);
+            advance(&mut sources, &mut heap, m.src)?;
             if m.se.seq() > best.seq() || (m.se.seq() == best.seq() && m.src < best_src) {
                 best_src = m.src;
                 best = m.se;
@@ -2004,10 +2066,12 @@ where
         }
 
         if keep(&key, &best) {
-            emit(key.clone(), best);
+            #[cfg(test)]
+            let key = if compaction_reference::enabled() { key.clone() } else { key };
+            emit(key, best)?;
         }
-        last_key = Some(key);
     }
+    Ok(())
 }
 
 /// 兼容：归并到 Vec
@@ -2042,6 +2106,7 @@ pub fn merge_to_ssts<F>(
 where
     F: FnMut(&[u8], &StoredEntry) -> bool,
 {
+    let sources = sources.into_iter().map(|s| Box::new(s.map(Ok)) as TryMergeInput<'_, StoredEntry, std::io::Error>).collect();
     merge_to_ssts_with_action(sources, |key, entry| {
         if keep(key, entry) { CompactionAction::Keep } else { CompactionAction::Discard }
     }, new_builder, target_bytes)
@@ -2051,22 +2116,29 @@ where
 /// value. Otherwise keep its sequence number as a deletion barrier.
 pub(crate) enum CompactionAction { Keep, Discard, RetainDeletion }
 
+/// Errors discard all completed unpublished outputs, including their handles.
+pub(crate) struct UnpublishedSsts(pub(crate) Vec<SstFile>);
+impl Drop for UnpublishedSsts {
+    fn drop(&mut self) {
+        for file in self.0.drain(..) {
+            let path = file.path.clone(); drop(file);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 pub(crate) fn merge_to_ssts_with_action(
-    sources: Vec<MergeInput<'_, StoredEntry>>,
+    sources: Vec<TryMergeInput<'_, StoredEntry, std::io::Error>>,
     mut action: impl FnMut(&[u8], &StoredEntry) -> CompactionAction,
     mut new_builder: impl FnMut() -> SstBuilder,
     target_bytes: usize,
 ) -> std::io::Result<Vec<SstFile>> {
-    let mut out = Vec::new();
+    let mut out = UnpublishedSsts(Vec::new());
     let mut builder: Option<SstBuilder> = None;
-    let mut err: Option<std::io::Error> = None;
-    merge_streaming(sources, |_, _| true, |k, mut se| {
-        if err.is_some() {
-            return;
-        }
+    try_merge_streaming(sources, |_, _| true, |k, mut se| {
         match action(&k, &se) {
             CompactionAction::Keep => {},
-            CompactionAction::Discard => return,
+            CompactionAction::Discard => return Ok(()),
             CompactionAction::RetainDeletion => se.value = EntryValue::Drop,
         }
         if builder.is_none() {
@@ -2075,21 +2147,16 @@ pub(crate) fn merge_to_ssts_with_action(
         let b = builder.as_mut().unwrap();
         b.add(k, se);
         if b.estimated_bytes() >= target_bytes {
-            match builder.take().unwrap().finish() {
-                Ok(sst) => out.push(sst),
-                Err(e) => err = Some(e),
-            }
+            out.0.push(builder.take().unwrap().finish()?);
         }
-    });
-    if let Some(e) = err {
-        return Err(e);
-    }
+        Ok(())
+    })?;
     if let Some(b) = builder {
         if !b.is_empty() {
-            out.push(b.finish()?);
+            out.0.push(b.finish()?);
         }
     }
-    Ok(out)
+    Ok(std::mem::take(&mut out.0))
 }
 
 
@@ -2102,6 +2169,75 @@ mod tests {
     use std::eprintln;
     use std::format;
     use std::matches;
+
+    #[test]
+    fn compaction_owns_blocks_and_counts_legacy_fallback() {
+        use crate::lsm_tree::lsm_tree::maintenance_probe;
+        let path = tmp("owned_compaction");
+        let mut builder = SstBuilder::with_options(1, &path, 2, false);
+        for i in 0..9_u64 { builder.add(i.to_be_bytes().to_vec(), StoredEntry::put(i, Some(vec![i as u8; 11]))); }
+        let mut sst = builder.finish().unwrap();
+        let cache = Arc::new(Mutex::new(BlockCache::new(2)));
+        sst.set_block_cache(cache.clone());
+        let scope = maintenance_probe::Scope::start();
+        let clones = entry_value_clones();
+        let owned: Vec<_> = sst.compaction_input().collect::<std::io::Result<_>>().unwrap();
+        assert_eq!(entry_value_clones(), clones, "owned block input must not clone values");
+        assert_eq!(scope.stats().owned_input_rows, 9);
+        assert_eq!(scope.stats().compaction_blocks, 5);
+        assert!(cache.lock().unwrap().is_empty(), "compaction must not fill the point cache");
+        drop(scope);
+        assert_eq!(sst.iter_entries(), owned);
+        assert_eq!(cache.lock().unwrap().len(), 2);
+        let resident = cache.lock().unwrap().len();
+        let clones = entry_value_clones();
+        assert_eq!(sst.compaction_input().collect::<std::io::Result<Vec<_>>>().unwrap(), owned);
+        assert_eq!(entry_value_clones(), clones);
+        assert_eq!(cache.lock().unwrap().len(), resident);
+        sst.entries_cache = Some(owned);
+        assert!(matches!(sst.compaction_input(), CompactionRows::LegacyShared(_)));
+        let scope = maintenance_probe::Scope::start();
+        let clones = entry_value_clones();
+        assert_eq!(sst.compaction_input().collect::<std::io::Result<Vec<_>>>().unwrap().len(), 9);
+        assert_eq!(entry_value_clones() - clones, 9);
+        assert_eq!(scope.stats().legacy_input_clones, 9);
+        assert_eq!(scope.stats().owned_input_rows, 0);
+    }
+
+    #[test]
+    fn compaction_corruption_is_an_error_instead_of_eof() {
+        let path = tmp("strict_input");
+        let mut builder = SstBuilder::with_options(1, &path, 3, false);
+        for i in 0..9_u64 { builder.add(i.to_be_bytes().to_vec(), StoredEntry::put(i, Some(vec![7]))); }
+        let sst = builder.finish().unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[sst.index[1].offset as usize + 4] ^= 1;
+        std::fs::write(&path, raw).unwrap();
+        assert_eq!(sst.iter_all().count(), 3, "old read iterator silently truncates at the bad block");
+        let mut strict = sst.compaction_input();
+        for _ in 0..3 { assert!(strict.next().unwrap().is_ok()); }
+        assert_eq!(strict.next().unwrap().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(strict.next().is_none());
+    }
+
+    #[test]
+    fn merge_heap_moves_values_and_preserves_seq_source_ties() {
+        let sources = || vec![
+            vec![(b"a".to_vec(), StoredEntry::put(1, Some(vec![1]))),
+                (b"a".to_vec(), StoredEntry::put(3, Some(vec![3]))), (b"b".to_vec(), StoredEntry::put(4, None))],
+            vec![(b"a".to_vec(), StoredEntry::put(3, Some(vec![9]))),
+                (b"b".to_vec(), StoredEntry::put(2, Some(vec![2]))), (b"c".to_vec(), StoredEntry::drop_at(5))],
+        ];
+        let clones = entry_value_clones();
+        let rows = merge_latest(sources());
+        assert_eq!(entry_value_clones(), clones, "heap must move every consumed head");
+        assert_eq!(rows, vec![(b"a".to_vec(), StoredEntry::put(3, Some(vec![3]))),
+            (b"b".to_vec(), StoredEntry::put(4, None)), (b"c".to_vec(), StoredEntry::drop_at(5))]);
+        let _reference = compaction_reference::Scope::start();
+        let clones = entry_value_clones();
+        assert_eq!(merge_latest(sources()), rows);
+        assert_eq!(entry_value_clones() - clones, 6, "old heap would fail the zero-clone guard");
+    }
 
     /// 返回 **RAII 句柄**（M82）：把它声明在引擎之前，用例结束（含 panic 展开）自动删，
     /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
