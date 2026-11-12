@@ -25,6 +25,36 @@ use crate::lsm_tree::sst::{
     LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry,
 };
 
+/// A winning Put/tombstone observed by the strict maintenance reader while the
+/// caller holds the tree lock. Drop rows cannot authorize a second deletion.
+pub(crate) struct VacuumDelete {
+    key: Vec<u8>,
+    live: bool,
+}
+impl VacuumDelete {
+    pub(crate) fn observed(key: Vec<u8>, kind: u8) -> std::io::Result<Self> {
+        match kind {
+            0 | 1 => Ok(Self { key, live: kind == 0 }),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "vacuum cannot delete an unobserved Put")),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod vacuum_delete_probe {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! {
+        static OLD: Cell<bool> = const { Cell::new(false) };
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(crate) fn reference() -> bool { OLD.with(Cell::get) }
+    pub(crate) fn reads() -> u64 { READS.with(Cell::get) }
+    pub(super) fn read() { READS.with(|s| s.set(s.get() + 1)); }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|s| s.set(false)); } }
+}
+
 /// 一路可被"当场收手"的源（M46）：收到停止信号之后一律吐 `None`。
 ///
 /// 为什么要它：`merge_streaming` 是压实/修复共用的公开件，把它的 `emit` 改成返回 `bool`
@@ -1173,6 +1203,29 @@ impl LSMTree {
         true
     }
 
+    pub(crate) fn remove_vacuum_known(&mut self, row: VacuumDelete) -> std::io::Result<()> {
+        #[cfg(test)]
+        if vacuum_delete_probe::reference() {
+            assert!(self.remove(&row.key));
+            return Ok(());
+        }
+        let seq = self.write_seq.fetch_add(1, Ordering::SeqCst);
+        if let Some(wal) = self.mem_wal.as_mut() {
+            wal.append(MemWalRecord::Drop { key: row.key.clone(), seq })?;
+            if self.opts.mem_wal_sync_on_write { wal.sync()?; }
+        }
+        if row.live { self.cached_live = self.cached_live.saturating_sub(1); }
+        self.ttl_meta.remove(&row.key);
+        self.mem_insert_no_wal(row.key, StoredEntry::drop_at(seq));
+        self.dirty = true;
+        self.stats_dirty = true;
+        // Failures leave maintenance incomplete before blob reclamation.
+        self.maybe_flush_mem_checked()?;
+        #[cfg(test)]
+        crate::common::maintenance_probe::note_lsm_known_delete();
+        Ok(())
+    }
+
     fn mem_insert_no_wal(&mut self, key: Vec<u8>, val: StoredEntry) {
         let add = key.len() + val.estimate_bytes();
         let versions = self.mem.entry(key).or_default();
@@ -1501,6 +1554,10 @@ impl LSMTree {
 
 
     fn maybe_flush_mem(&mut self) {
+        let _ = self.maybe_flush_mem_checked();
+    }
+
+    fn maybe_flush_mem_checked(&mut self) -> std::io::Result<()> {
         // ⚠️ 读增量计数器，不是现算。旧写法 `self.mem.values().map(|v| v.len()).sum()` 每次
         // 插入都走一遍整表 ⇒ 灌 N 行 O(N²)。判定语义（"版本条数 ≥ 阈值就 flush"）一字未动。
         let by_entries = self.opts.mem_threshold_entries > 0
@@ -1515,8 +1572,9 @@ impl LSMTree {
             .saturating_add(self.mem_entries.saturating_mul(MEM_ENTRY_OVERHEAD))
             >= self.opts.mem_threshold_bytes;
         if by_entries || by_bytes {
-            let _ = self.flush_mem();
+            self.flush_mem()?;
         }
+        Ok(())
     }
 
     pub fn get_raw(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
@@ -1633,6 +1691,8 @@ impl LSMTree {
     /// `if b.estimated_bytes() >= target_bytes`）。层内又按 `min_key` 排序，而版本键大端有序
     /// ⇒ **同一个 raw key 的新版本住在后面那个文件**。先命中即停会读回旧版本，而且是静默读回。
     fn get_entry_at(&self, key: &[u8], snap_seq: u64) -> Option<StoredEntry> {
+        #[cfg(test)]
+        vacuum_delete_probe::read();
         let mut best: Option<StoredEntry> = None;
         let consider = |best: &mut Option<StoredEntry>, se: StoredEntry| {
             if !se.visible_at(snap_seq) {
@@ -2998,6 +3058,114 @@ impl Drop for LSMTree {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_vacuum_delete_matches_remove_without_point_reads() {
+        let mut results = Vec::new();
+        for reference in [true, false] {
+            let dir = tmp_dir("known_delete");
+            let mut db = LSMTree::open(&dir).unwrap();
+            db.opts.mem_threshold_entries = usize::MAX;
+            db.opts.mem_threshold_bytes = usize::MAX;
+            db.insert(b"live".to_vec(), Some(b"v".to_vec()));
+            db.insert(b"tomb".to_vec(), None);
+            db.ttl_meta.insert(b"live".to_vec(), u64::MAX);
+            let seq = db.write_seq.load(Ordering::SeqCst);
+            let before = vacuum_delete_probe::reads();
+            let mode = reference.then(vacuum_delete_probe::Scope::start);
+            db.remove_vacuum_known(VacuumDelete::observed(b"live".to_vec(), 0).unwrap()).unwrap();
+            db.remove_vacuum_known(VacuumDelete::observed(b"tomb".to_vec(), 1).unwrap()).unwrap();
+            drop(mode);
+            assert_eq!(vacuum_delete_probe::reads() - before, if reference { 4 } else { 0 });
+            assert_eq!(db.write_seq.load(Ordering::SeqCst), seq + 2);
+            assert_eq!(LSMTree::mem_get_at(&db.mem, b"live", seq - 1).unwrap().value, EntryValue::Put(Some(b"v".to_vec())));
+            assert!(db.ttl_meta.is_empty());
+            assert!(VacuumDelete::observed(b"live".to_vec(), 2).is_err());
+            assert!(VacuumDelete::observed(b"live".to_vec(), 255).is_err());
+            results.push((db.mem.clone(), db.mem_entries, db.mem_bytes, db.cached_live, db.dirty, db.stats_dirty));
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn known_vacuum_delete_wal_failure_does_not_apply_memory() {
+        use crate::lsm_tree::mem_wal::TestFailure;
+        for reference in [true, false] {
+            for failure in [TestFailure::Append, TestFailure::Sync] {
+                let dir = tmp_dir("known_delete_wal_failure");
+                let mut opts = LSMTreeOptions::default();
+                opts.enable_mem_wal = true;
+                opts.mem_wal_sync_on_write = true;
+                let mut db = LSMTree::open_with_config(&dir, opts).unwrap();
+                db.insert(b"key".to_vec(), Some(b"v".to_vec()));
+                db.ttl_meta.insert(b"key".to_vec(), u64::MAX);
+                let before = (db.mem.clone(), db.mem_entries, db.mem_bytes, db.cached_live, db.ttl_meta.clone());
+                db.mem_wal.as_mut().unwrap().fail_next = Some(failure);
+                let mode = reference.then(vacuum_delete_probe::Scope::start);
+                let result = db.remove_vacuum_known(VacuumDelete::observed(b"key".to_vec(), 0).unwrap());
+                drop(mode);
+                let after = (db.mem.clone(), db.mem_entries, db.mem_bytes, db.cached_live, db.ttl_meta.clone());
+                if reference {
+                    assert!(result.is_ok());
+                    assert_ne!(after, before, "old remove ignores WAL failures and applies Drop");
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(after, before);
+                }
+                // A sync failure may already have appended the record. It is an
+                // uncertain durable outcome, not proof the WAL was unchanged.
+            }
+        }
+    }
+
+    #[test]
+    fn known_vacuum_delete_wal_replay_and_deep_source_barrier() {
+        let dir = tmp_dir("known_delete_reopen");
+        let mut opts = LSMTreeOptions::default();
+        opts.enable_mem_wal = true;
+        opts.mem_wal_sync_on_write = true;
+        opts.mem_threshold_entries = usize::MAX;
+        opts.mem_threshold_bytes = usize::MAX;
+        let mut db = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+        db.inject_sst_for_test(3, vec![(b"key".to_vec(), StoredEntry::put(1, Some(b"deep".to_vec())))]).unwrap();
+        db.write_seq.store(2, Ordering::SeqCst);
+        db.insert(b"key".to_vec(), Some(b"new".to_vec()));
+        db.remove_vacuum_known(VacuumDelete::observed(b"key".to_vec(), 0).unwrap()).unwrap();
+        let next_seq = db.write_seq.load(Ordering::SeqCst);
+        // Discard only the volatile test state to simulate a crash, rather than
+        // allowing Drop to flush and bypass the mem WAL recovery gate.
+        db.mem.clear();
+        db.mem_entries = 0;
+        db.mem_bytes = 0;
+        db.dirty = false;
+        drop(db);
+        let mut recovered = LSMTree::open_with_config(&dir, opts.clone()).unwrap();
+        assert_eq!(recovered.get_raw(b"key"), None, "mem WAL Drop must hide the deep source");
+        assert_eq!(recovered.write_seq.load(Ordering::SeqCst), next_seq);
+        recovered.flush().unwrap();
+        recovered.compact_level(0).unwrap();
+        assert_eq!(recovered.get_raw(b"key"), None);
+        drop(recovered);
+        let recovered = LSMTree::open_with_config(&dir, opts).unwrap();
+        assert_eq!(recovered.get_raw(b"key"), None, "compaction/reopen cannot resurrect the old value");
+    }
+
+    #[test]
+    fn known_vacuum_delete_propagates_threshold_publish_failure() {
+        for reference in [true, false] {
+            let dir = tmp_dir("known_delete_publish_failure");
+            let mut db = LSMTree::open(&dir).unwrap();
+            db.insert(b"key".to_vec(), Some(b"v".to_vec()));
+            db.flush().unwrap();
+            db.opts.mem_threshold_entries = 1;
+            fs::create_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+            let mode = reference.then(vacuum_delete_probe::Scope::start);
+            let result = db.remove_vacuum_known(VacuumDelete::observed(b"key".to_vec(), 0).unwrap());
+            drop(mode);
+            assert_eq!(result.is_err(), !reference, "old threshold flush silently discards publication errors");
+            fs::remove_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+        }
+    }
+
     #[test]
     fn vacuum_merge_matches_light_merge_for_ties_drops_and_lazy_bounds() {
         let inputs = vec![

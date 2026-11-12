@@ -45,7 +45,13 @@ pub enum MemWalRecord {
 
 pub struct MemWal {
     file: DiskFile,
+    #[cfg(test)]
+    pub(crate) fail_next: Option<TestFailure>,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestFailure { Append, Sync }
 
 impl MemWal {
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
@@ -63,7 +69,7 @@ impl MemWal {
                 ));
             }
         }
-        Ok(Self { file })
+        Ok(Self { file, #[cfg(test)] fail_next: None })
     }
 
     fn write_header(file: &mut DiskFile) -> std::io::Result<()> {
@@ -75,6 +81,8 @@ impl MemWal {
     }
 
     pub fn append(&mut self, record: MemWalRecord) -> std::io::Result<()> {
+        #[cfg(test)]
+        self.test_failure(TestFailure::Append)?;
         let body = bincode::serialize(&record).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
         })?;
@@ -88,7 +96,18 @@ impl MemWal {
     }
 
     pub fn sync(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        self.test_failure(TestFailure::Sync)?;
         self.file.sync_at(SITE_LSM_MEM_WAL)
+    }
+
+    #[cfg(test)]
+    fn test_failure(&mut self, site: TestFailure) -> std::io::Result<()> {
+        if self.fail_next == Some(site) {
+            self.fail_next = None;
+            return Err(std::io::Error::other("injected mem WAL failure"));
+        }
+        Ok(())
     }
 
     pub fn read_all(&mut self) -> std::io::Result<Vec<MemWalRecord>> {

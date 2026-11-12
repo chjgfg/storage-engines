@@ -661,9 +661,9 @@ impl MVCC {
         let full_sweep = budget_rows == u64::MAX;
         let blob_plan = kv.blob_gc_plan(full_sweep)?;
         let collect_refs = blob_plan == BlobGcPlan::ScanReferences;
-        let mut groups: crate::common::order::KeyWindow<Vec<(u64, u64, bool, ())>> = crate::common::order::KeyWindow::new();
+        let mut groups: crate::common::order::KeyWindow<Vec<(u64, (u64, u8), bool, ())>> = crate::common::order::KeyWindow::new();
         let mut spare = Vec::new();
-        let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut to_delete: Vec<(Vec<u8>, u8)> = Vec::new();
         let mut keep_enc: Vec<Vec<u8>> = Vec::new();
         // 只数"真有大 value 的行"，一条一个 u64 ⇒ 没有大 value 时这一份一分钱不花
         let mut referenced: HashSet<u64> = HashSet::new();
@@ -692,7 +692,7 @@ impl MVCC {
                         continue;
                     }
                     while let Some((key, mut group)) = groups.pop_before(&enc, xmin) {
-                        vacuum_drain_group(&mut group, xmin, |version| to_delete.push(encode_key(&key, version)), |version, _| { if collect_refs { keep_enc.push(encode_key(&key, version)); } });
+                        vacuum_drain_group(&mut group, xmin, |(version, kind)| to_delete.push((encode_key(&key, version), kind)), |(version, _), _| { if collect_refs { keep_enc.push(encode_key(&key, version)); } });
                     if group.capacity() > spare.capacity() { spare = group; }
                         cur_raw = Some(key);
                     }
@@ -710,7 +710,7 @@ impl MVCC {
                         (key, std::mem::take(&mut spare))
                     });
                     if le.kind == 2 { continue; }
-                    group.push((version, version, le.kind == 1, ()));
+                    group.push((version, (version, le.kind), le.kind == 1, ()));
                     chunk_rows += 1;
                     if chunk_rows >= VAC_CHUNK_ROWS {
                         let mut bound = enc;
@@ -722,7 +722,7 @@ impl MVCC {
             }
             if done || next_lower.is_none() {
                 while let Some((key, mut group)) = groups.pop_first() {
-                    vacuum_drain_group(&mut group, xmin, |version| to_delete.push(encode_key(&key, version)), |version, _| { if collect_refs { keep_enc.push(encode_key(&key, version)); } });
+                    vacuum_drain_group(&mut group, xmin, |(version, kind)| to_delete.push((encode_key(&key, version), kind)), |(version, _), _| { if collect_refs { keep_enc.push(encode_key(&key, version)); } });
                     if group.capacity() > spare.capacity() { spare = group; }
                     cur_raw = Some(key);
                 }
@@ -733,8 +733,8 @@ impl MVCC {
             drop(scan_timer);
             #[cfg(test)]
             let delete_timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumDelete);
-            for enc in to_delete.drain(..) {
-                let _ = kv.remove(&enc);
+            for (enc, kind) in to_delete.drain(..) {
+                kv.remove_vacuum_known(crate::lsm_tree::lsm_tree::VacuumDelete::observed(enc, kind)?)?;
                 removed += 1;
             }
             #[cfg(test)]
@@ -1532,6 +1532,31 @@ impl Transaction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vacuum_delete_flush_failure_preserves_blobs() {
+        let path = tmp_db("vacuum_delete_flush_failure");
+        let mut opts = LSMTreeOptions::for_mvcc();
+        opts.l0_compact_threshold = usize::MAX / 4;
+        opts.max_compactions_per_flush = 0;
+        let db = MVCC::try_open_with(&path, Some(opts)).unwrap();
+        db.set_vacuum_auto_slice(0);
+        for pass in 0..2 {
+            let tx = db.begin_transaction();
+            assert!(tx.set_raw(b"large", vec![pass; 8192]));
+            tx.try_commit().unwrap();
+            db.try_flush().unwrap();
+        }
+        let blobs = || std::fs::read_dir(path.join("blobs")).unwrap().count();
+        assert_eq!(blobs(), 2);
+        let mut opts = db.options();
+        opts.mem_threshold_entries = 1;
+        db.set_options(opts);
+        std::fs::create_dir(path.join("MANIFEST.tmp")).unwrap();
+        assert!(db.vacuum().is_err());
+        assert_eq!(blobs(), 2, "failed deletion publication must precede blob reclamation");
+        std::fs::remove_dir(path.join("MANIFEST.tmp")).unwrap();
+    }
+
     #[test]
     fn vacuum_bad_sst_aborts_before_blob_gc_with_reference_control() {
         for reference in [true, false] {

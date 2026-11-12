@@ -23,6 +23,7 @@ pub(crate) struct Stats {
     pub bplus_backtrack_reuses: u64,
     pub bplus_maintenance_pages: u64,
     pub bplus_maintenance_rows: u64,
+    pub lsm_known_deletes: u64,
 }
 
 impl std::fmt::Debug for Stats {
@@ -44,7 +45,8 @@ impl std::fmt::Debug for Stats {
             .field("bplus_pack_buffers", &self.bplus_pack_buffers)
             .field("bplus_backtrack_reuses", &self.bplus_backtrack_reuses)
             .field("bplus_maintenance_pages", &self.bplus_maintenance_pages)
-            .field("bplus_maintenance_rows", &self.bplus_maintenance_rows).finish()
+            .field("bplus_maintenance_rows", &self.bplus_maintenance_rows)
+            .field("lsm_known_deletes", &self.lsm_known_deletes).finish()
     }
 }
 
@@ -83,6 +85,10 @@ pub(crate) fn note_bplus_maintenance_page(rows: usize) {
     ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
         stats.bplus_maintenance_pages += 1; stats.bplus_maintenance_rows += rows as u64;
     });
+}
+
+pub(crate) fn note_lsm_known_delete() {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.lsm_known_deletes += 1; });
 }
 
 pub(crate) struct Scope;
