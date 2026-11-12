@@ -553,6 +553,21 @@ impl std::fmt::Debug for SstFile {
 }
 
 impl SstFile {
+    /// Maintenance owns decoded blocks; legacy resident rows borrow their value.
+    pub(crate) fn vacuum_light_iter<'a>(&'a self, from: Option<&'a [u8]>, to: Option<&'a [u8]>, snap_seq: u64)
+        -> VacuumLightInput<'a> {
+        if !self.may_overlap_half_open(from, to) { return VacuumLightInput::Empty; }
+        if self.entries_cache.is_some() {
+            return VacuumLightInput::LegacyShared(Box::new(self.light_iter(from, to, snap_seq).map(|row| {
+                #[cfg(test)]
+                crate::common::maintenance_probe::note_lsm_vacuum_row(false);
+                Ok(row)
+            })));
+        }
+        VacuumLightInput::OwnedBlocks(VacuumLightRows { sst: self, block: from.and_then(|f| self.find_block(f)).unwrap_or(0),
+            rows: Vec::new().into_iter(), from, to, snap_seq, done: false })
+    }
+
     pub(crate) fn move_eligibility(&self) -> MoveEligibility { self.move_eligibility }
 
     pub fn num_entries(&self) -> usize {
@@ -2162,6 +2177,32 @@ pub(crate) fn merge_to_ssts_with_action(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vacuum_light_owned_blocks_match_cached_ranges_and_surface_bad_blocks() {
+        let path = tmp("vacuum_owned");
+        let mut builder = SstBuilder::with_options(1, &path, 3, false);
+        for i in 0..12_u64 { builder.add(i.to_be_bytes().to_vec(), StoredEntry::put(i, Some(vec![7; 32]))); }
+        let mut sst = builder.finish().unwrap();
+        let cache = Arc::new(Mutex::new(BlockCache::new(2)));
+        sst.set_block_cache(cache.clone());
+        for (lo, hi, snap) in [(0_u64, 12_u64, u64::MAX), (4, 9, 7), (3, 3, 4)] {
+            let (lo, hi) = (lo.to_be_bytes(), hi.to_be_bytes());
+            let expected: Vec<_> = sst.light_iter(Some(&lo), Some(&hi), snap).collect();
+            let resident = cache.lock().unwrap().len();
+            let clones = entry_value_clones();
+            let actual = sst.vacuum_light_iter(Some(&lo), Some(&hi), snap).collect::<std::io::Result<Vec<_>>>().unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(entry_value_clones(), clones, "metadata scan must never clone values");
+            assert_eq!(cache.lock().unwrap().len(), resident, "maintenance cannot refill point cache");
+        }
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[sst.index[1].offset as usize + 4] ^= 1;
+        std::fs::write(&path, raw).unwrap();
+        let mut rows = sst.vacuum_light_iter(None, None, u64::MAX);
+        for _ in 0..3 { assert!(rows.next().unwrap().is_ok()); }
+        assert_eq!(rows.next().unwrap().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(rows.next().is_none());
+    }
     use super::*;
     use std::assert;
     use std::assert_eq;
@@ -2878,6 +2919,52 @@ struct SstLightIter<'a> {
     from: Option<Vec<u8>>,
     to: Option<Vec<u8>>,
     snap_seq: u64,
+}
+
+pub(crate) enum VacuumLightInput<'a> {
+    Empty,
+    OwnedBlocks(VacuumLightRows<'a>),
+    LegacyShared(Box<dyn Iterator<Item = std::io::Result<(Vec<u8>, LightEntry)>> + 'a>),
+}
+impl Iterator for VacuumLightInput<'_> {
+    type Item = std::io::Result<(Vec<u8>, LightEntry)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { Self::Empty => None, Self::OwnedBlocks(rows) => rows.next(), Self::LegacyShared(rows) => rows.next() }
+    }
+}
+
+pub(crate) struct VacuumLightRows<'a> {
+    sst: &'a SstFile,
+    block: usize,
+    rows: std::vec::IntoIter<(Vec<u8>, StoredEntry)>,
+    from: Option<&'a [u8]>,
+    to: Option<&'a [u8]>,
+    snap_seq: u64,
+    done: bool,
+}
+
+impl Iterator for VacuumLightRows<'_> {
+    type Item = std::io::Result<(Vec<u8>, LightEntry)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done { return None; }
+        loop {
+            if let Some((key, entry)) = self.rows.next() {
+                if self.to.is_some_and(|to| key.as_slice() >= to) { self.done = true; return None; }
+                if self.from.is_some_and(|from| key.as_slice() < from) || !entry.visible_at(self.snap_seq) { continue; }
+                #[cfg(test)]
+                crate::common::maintenance_probe::note_lsm_vacuum_row(true);
+                return Some(Ok((key, LightEntry::of(&entry))));
+            }
+            let index = self.sst.index.get(self.block)?;
+            self.block += 1;
+            #[cfg(test)]
+            crate::common::maintenance_probe::note_lsm_vacuum_block();
+            match self.sst.read_slice(index.offset, index.len as usize).and_then(|raw| decode_block(&raw, self.sst.has_seq)) {
+                Ok(block) => self.rows = block.entries.into_iter(),
+                Err(error) => { self.done = true; return Some(Err(error)); }
+            }
+        }
+    }
 }
 
 impl<'a> Iterator for SstLightIter<'a> {

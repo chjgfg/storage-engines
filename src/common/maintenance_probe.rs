@@ -16,6 +16,9 @@ pub(crate) struct Stats {
     pub bitcask_empty_sweeps: u64,
     pub bitcask_reference_sweeps: u64,
     pub bitcask_value_reads: u64,
+    pub lsm_vacuum_owned_rows: u64,
+    pub lsm_vacuum_legacy_key_copies: u64,
+    pub lsm_vacuum_blocks: u64,
 }
 
 impl std::fmt::Debug for Stats {
@@ -30,7 +33,10 @@ impl std::fmt::Debug for Stats {
             .field("blob_point_reads", &self.blob_point_reads)
             .field("bitcask_empty_sweeps", &self.bitcask_empty_sweeps)
             .field("bitcask_reference_sweeps", &self.bitcask_reference_sweeps)
-            .field("bitcask_value_reads", &self.bitcask_value_reads).finish()
+            .field("bitcask_value_reads", &self.bitcask_value_reads)
+            .field("lsm_vacuum_owned_rows", &self.lsm_vacuum_owned_rows)
+            .field("lsm_vacuum_legacy_key_copies", &self.lsm_vacuum_legacy_key_copies)
+            .field("lsm_vacuum_blocks", &self.lsm_vacuum_blocks).finish()
     }
 }
 
@@ -47,6 +53,15 @@ pub(crate) fn note_bitcask_scan(inspect: bool) {
 }
 pub(crate) fn note_bitcask_value_read() {
     ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.bitcask_value_reads += 1; });
+}
+
+pub(crate) fn note_lsm_vacuum_row(owned: bool) {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+        if owned { stats.lsm_vacuum_owned_rows += 1; } else { stats.lsm_vacuum_legacy_key_copies += 1; }
+    });
+}
+pub(crate) fn note_lsm_vacuum_block() {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.lsm_vacuum_blocks += 1; });
 }
 
 pub(crate) struct Scope;

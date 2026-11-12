@@ -1422,6 +1422,60 @@ impl LSMTree {
         LightMerge::build(sources, bound)
     }
 
+    // Strict maintenance reader: a partial scan can never authorize reclamation.
+    pub(crate) fn vacuum_iter_range<'a>(
+        &'a self,
+        from: Option<&'a [u8]>,
+        to: Option<&'a [u8]>,
+        snap_seq: u64,
+    ) -> VacuumMerge<'a> {
+        let mut sources: Vec<Box<dyn Iterator<Item = std::io::Result<(Vec<u8>, LightEntry)>> + '_>> = Vec::new();
+        // 与 sources 一一对应的驻留键下界（`None` = 建堆当场激活）。见 `LightMerge` 的六条判据。
+        let mut bound: Vec<Option<&'a [u8]>> = Vec::new();
+        if matches!((from, to), (Some(lo), Some(hi)) if lo >= hi) {
+            return VacuumMerge::build(sources, bound);
+        }
+        // memtable 不排队：它没有"读块"这笔代价，拉首键只是 BTreeMap 上的一次 seek，
+        // 而它的下界要靠同一趟 seek 才拿得到 —— 排队省不下任何东西，只会让归并多一层状态。
+        if !self.mem.is_empty() {
+            sources.push(Box::new(Self::mem_light_iter(&self.mem, from, to, snap_seq).map(Ok)));
+            bound.push(None);
+        }
+        for imm in &self.immutables {
+            sources.push(Box::new(Self::mem_light_iter(imm, from, to, snap_seq).map(Ok)));
+            bound.push(None);
+        }
+        // 源顺序必须与 merge_all_at / scan_latest_light 一致：levels[0] 旧→新，反转成新→旧。
+        // 先把"有哪些 SST、按什么优先级"排成一个 Vec，再统一建迭代器 ——
+        // 用闭包 push 会把两个不同的生命周期搅在一起（编译器拒绝得有道理）。
+        let mut ssts: Vec<&SstFile> = Vec::new();
+        if let Some(l0) = self.levels.first() {
+            ssts.extend(l0.iter().rev());
+        }
+        for level in 1..self.levels.len() {
+            let files = match to {
+                Some(hi) => self.sst_candidates(level, from.unwrap_or(&[]), hi),
+                None => &self.levels[level],
+            };
+            ssts.extend(files.iter());
+        }
+        for sst in ssts {
+            // 无上界不造哨兵；有上界是半开区间，min_key == to 的源初始化也不应读块。
+            if !sst.may_overlap_half_open(from, to) {
+                continue;
+            }
+            // 这个源**可能**交出的最小键 = max(文件 min_key, from)：两个都是从元数据/调用方
+            // 手里直接读到的，不花一次块读。⚠️ 它是下界而不是真首键 —— 快照过滤会让真首键更大，
+            // 所以激活之后还要拿真实键重新比一轮（判据⑤）。
+            bound.push(Some(match from {
+                Some(lo) if lo >= sst.min_key.as_slice() => lo,
+                _ => sst.min_key.as_slice(),
+            }));
+            sources.push(Box::new(sst.vacuum_light_iter(from, to, snap_seq)));
+        }
+        VacuumMerge::build(sources, bound)
+    }
+
     /// mem / immutable 的轻量视图（惰性）：`MemMap` 每个 key 一条版本列表 ⇒ 范围内逐 key
     /// 取"≤ snap 的最大 seq"那一版，与 `mem_view_light_range` 同一判据。
     fn mem_light_iter<'a>(
@@ -2944,6 +2998,33 @@ impl Drop for LSMTree {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vacuum_merge_matches_light_merge_for_ties_drops_and_lazy_bounds() {
+        let inputs = vec![
+            vec![(b"a".to_vec(), LightEntry { seq: 3, kind: 1 }), (b"c".to_vec(), LightEntry { seq: 4, kind: 0 })],
+            vec![(b"a".to_vec(), LightEntry { seq: 3, kind: 0 }), (b"b".to_vec(), LightEntry { seq: 5, kind: 2 })],
+            vec![(b"z".to_vec(), LightEntry { seq: 6, kind: 0 })],
+        ];
+        let bounds = vec![Some(b"a".as_slice()), Some(b"a".as_slice()), Some(b"z".as_slice())];
+        let expected: Vec<_> = LightMerge::build(inputs.clone().into_iter().map(|v| Box::new(v.into_iter()) as Box<dyn Iterator<Item = _>>).collect(), bounds.clone()).collect();
+        let actual = VacuumMerge::build(inputs.into_iter().map(|v| Box::new(v.into_iter().map(Ok)) as Box<dyn Iterator<Item = _>>).collect(), bounds).collect::<std::io::Result<Vec<_>>>().unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0].1.kind, 1, "equal seq keeps earliest source");
+        assert_eq!(actual[1].1.kind, 2, "Drop must participate in key progress");
+        assert_eq!(actual.last().unwrap().0, b"z");
+    }
+
+    #[test]
+    fn vacuum_merge_late_error_stops_and_discards_pending_output() {
+        let source = vec![Ok((b"a".to_vec(), LightEntry { seq: 1, kind: 0 })),
+            Ok((b"b".to_vec(), LightEntry { seq: 2, kind: 0 })),
+            Ok((b"c".to_vec(), LightEntry { seq: 3, kind: 0 })),
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad later block"))];
+        let mut merge = VacuumMerge::build(vec![Box::new(source.into_iter())], vec![None]);
+        assert_eq!(merge.next().unwrap().unwrap().0, b"a");
+        assert_eq!(merge.next().unwrap().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(merge.next().is_none(), "failed scan cannot flush its unproven pending key");
+    }
     use super::*;
     use std::assert_eq;
     use std::panic;
@@ -5073,4 +5154,71 @@ mod trivial_move_probe {
     pub struct Scope;
     impl Scope { pub fn start() -> Self { REFERENCE.with(|c| assert!(!c.replace(true))); Self } }
     impl Drop for Scope { fn drop(&mut self) { REFERENCE.with(|c| c.set(false)); } }
+}
+
+/// Lazy maintenance merge. Heap heads own their keys and metadata.
+pub(crate) struct VacuumMerge<'a> {
+    sources: Vec<Box<dyn Iterator<Item = std::io::Result<(Vec<u8>, LightEntry)>> + 'a>>,
+    bound: Vec<Option<&'a [u8]>>,
+    waiting: Vec<usize>,
+    heap: BinaryHeap<VacuumNode>,
+    pending: Option<(Vec<u8>, LightEntry)>,
+    done: bool,
+}
+struct VacuumNode { key: Vec<u8>, entry: LightEntry, src: usize }
+impl Ord for VacuumNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { other.key.cmp(&self.key).then_with(|| other.src.cmp(&self.src)) }
+}
+impl PartialOrd for VacuumNode { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
+impl PartialEq for VacuumNode { fn eq(&self, other: &Self) -> bool { self.key == other.key && self.src == other.src } }
+impl Eq for VacuumNode {}
+impl<'a> VacuumMerge<'a> {
+    fn build(sources: Vec<Box<dyn Iterator<Item = std::io::Result<(Vec<u8>, LightEntry)>> + 'a>>, bound: Vec<Option<&'a [u8]>>) -> Self {
+        assert_eq!(sources.len(), bound.len());
+        let mut waiting: Vec<usize> = (0..sources.len()).collect();
+        waiting.sort_by(|&a, &b| bound[b].cmp(&bound[a]));
+        Self { sources, bound, waiting, heap: BinaryHeap::new(), pending: None, done: false }
+    }
+    fn advance(&mut self, src: usize) -> std::io::Result<()> {
+        if let Some(row) = self.sources[src].next() {
+            let (key, entry) = row?;
+            self.heap.push(VacuumNode { key, entry, src });
+        }
+        Ok(())
+    }
+    fn activate_covering_top(&mut self) -> std::io::Result<bool> {
+        let mut activated = false;
+        while let Some(&src) = self.waiting.last() {
+            if self.heap.peek().is_some_and(|n| self.bound[src].is_some_and(|b| b > n.key.as_slice())) { break; }
+            self.waiting.pop();
+            self.advance(src)?;
+            activated = true;
+        }
+        Ok(activated)
+    }
+    fn next_row(&mut self) -> std::io::Result<Option<(Vec<u8>, LightEntry)>> {
+        loop {
+            if self.activate_covering_top()? { continue; }
+            let Some(node) = self.heap.pop() else { return Ok(self.pending.take()); };
+            self.advance(node.src)?;
+            match self.pending.take() {
+                None => self.pending = Some((node.key, node.entry)),
+                Some((key, entry)) if key == node.key => {
+                    self.pending = Some((key, if entry.seq >= node.entry.seq { entry } else { node.entry }));
+                }
+                Some(previous) => { self.pending = Some((node.key, node.entry)); return Ok(Some(previous)); }
+            }
+        }
+    }
+}
+impl Iterator for VacuumMerge<'_> {
+    type Item = std::io::Result<(Vec<u8>, LightEntry)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done { return None; }
+        match self.next_row() {
+            Ok(Some(row)) => Some(Ok(row)),
+            Ok(None) => { self.done = true; None }
+            Err(error) => { self.done = true; self.pending = None; self.heap.clear(); Some(Err(error)) }
+        }
+    }
 }
