@@ -162,6 +162,8 @@ impl InsertStep {
 pub struct BPlusTree {
     /// 页管理器
     page_manager: PageManager,
+    /// One bounded serializer buffer, shared by node writes (not a parsed cache).
+    node_buffer: Vec<u8>,
     /// 根节点页ID
     root: PageId,
     /// 阶数
@@ -265,6 +267,7 @@ impl BPlusTree {
 
         Ok(Self {
             page_manager,
+            node_buffer: Vec::new(),
             root,
             order,
             node_cache: std::collections::HashMap::new(),
@@ -684,8 +687,13 @@ impl BPlusTree {
     /// 原先只有插入路径问过字节，delete 的借键/合并完全按条数走 ⇒ 见
     /// `test_reorg_never_drops_oversized_pages`。
     fn node_fits(node: &BTreeNode) -> bool {
-        match bincode::serialize(node) {
-            Ok(d) => d.len() <= MAX_PAYLOAD,
+        #[cfg(test)]
+        if delete_cost_reference::enabled() {
+            crate::common::maintenance_probe::note_bplus_pack_buffer();
+            return bincode::serialize(node).is_ok_and(|data| data.len() <= MAX_PAYLOAD);
+        }
+        match bincode::serialized_size(node) {
+            Ok(size) => size <= MAX_PAYLOAD as u64,
             Err(_) => false,
         }
     }
@@ -1291,8 +1299,18 @@ impl BPlusTree {
         if !Self::node_fits(node) {
             return false;
         }
-        let data = bincode::serialize(node).expect("serialize node");
-        self.page_manager.write_page(page_id, &data)
+        #[cfg(test)]
+        if delete_cost_reference::enabled() {
+            crate::common::maintenance_probe::note_bplus_pack_buffer();
+            let data = bincode::serialize(node).expect("serialize node");
+            return self.page_manager.write_page(page_id, &data);
+        }
+        self.node_buffer.clear();
+        #[cfg(test)]
+        if self.node_buffer.capacity() < MAX_PAYLOAD { crate::common::maintenance_probe::note_bplus_pack_buffer(); }
+        self.node_buffer.reserve(MAX_PAYLOAD);
+        bincode::serialize_into(&mut self.node_buffer, node).expect("serialize node");
+        self.page_manager.write_page(page_id, &self.node_buffer)
     }
 
     fn node_key_count(node: &BTreeNode) -> usize {
@@ -1820,6 +1838,200 @@ impl BPlusTree {
     /// ① 返回的 `used ≥ 1` —— 一段里第一把键一定会被这一层处理掉（哪怕它不在树里），否则调用方死循环；
     /// ② 本层一旦做过借位/合并（结构变了），**剩下的键交回调用方从根重下一趟**，绝不拿旧的 `children` 快照继续路由。
     fn delete_recursive(
+        &mut self,
+        node_page_id: PageId,
+        run: &[Key],
+        parent_page_id: Option<PageId>,
+    ) -> (Del, usize) {
+        #[cfg(test)]
+        if delete_cost_reference::enabled() { return self.delete_recursive_reference(node_page_id, run, parent_page_id); }
+        // M56 的段标注：下降那一次读记到"下降"，返回之后本层的所有读记到"回溯"
+        set_page_phase(PHASE_DESCENT);
+        let mut node = self.read_node(node_page_id);
+
+        match &mut node {
+            BTreeNode::Leaf { entries, .. } => {
+                // 父层已经按分隔键把这一段切到"只可能在这片叶子里" ⇒ 这里一定把整段吃掉，used = run.len()
+                let mut removed = 0usize;
+                let mut touched_min = false;
+                for key in run {
+                    if let Ok(idx) = entries.binary_search_by(|(k, _)| k.cmp(key)) {
+                        // 删的是本片最小键 ⇒ 本片所属子树的下界可能变了；删别的键一定没变
+                        touched_min |= idx == 0;
+                        entries.remove(idx);
+                        removed += 1;
+                        #[cfg(test)]
+                        note_delete_leaf(node_page_id);
+                    }
+                }
+                if removed == 0 {
+                    return (Del::NOOP, run.len());
+                }
+                let mut min_changed = touched_min;
+                self.write_node(node_page_id, &node);
+
+                // 非根叶子下溢 → 再平衡（**一片叶子一次**，不是每行一次）
+                let mut merged = false;
+                if node_page_id != self.root {
+                    if let Some(parent) = parent_page_id {
+                        if self.is_underflow(&node) {
+                            set_page_phase(PHASE_RESTRUCTURE);
+                            merged = self.handle_underflow(node_page_id, parent);
+                            set_page_phase(PHASE_BACKTRACK);
+                            // 借位/合并会挪分隔键与本层下界 ⇒ 一律上报"可能变了"，让上层去核对
+                            min_changed = true;
+                        }
+                    }
+                }
+                (
+                    Del {
+                        removed,
+                        min_changed,
+                        merged,
+                    },
+                    run.len(),
+                )
+            }
+            BTreeNode::Internal { keys, children } => {
+                // ⚠️ 路由用的分隔键/孩子表**每轮都刷新**：上一个孩子可能已经把自己合并进兄弟
+                // （本层的孩子表就少了一格，`chs` 里那一页也已被释放）—— 拿旧表继续路由就会去读
+                // 已释放的页。第一次用下降那一趟读到的内容（不再多读一次），之后每轮从
+                // "回溯那一趟读"的结果里拿 ⇒ 每层每孩子的页读次数与改前"每行一趟"同量级，
+                // 省下来的还是**下降**那一段（一趟下降带一整片叶子）。
+                let mut snap = (std::mem::take(keys), std::mem::take(children));
+                let mut i = 0usize;
+                let mut removed = 0usize;
+                let mut merged = false;
+                let mut min_changed_left = false;
+                while i < run.len() {
+                    let (ks, chs) = &snap;
+                    let child_idx = Self::child_index(ks, &run[i]);
+                    // 孩子 `c` 的键区间是 [keys[c-1], keys[c])；最后一个孩子无上界
+                    let hi = ks.get(child_idx);
+                    let mut j = i + 1;
+                    while j < run.len() && hi.map_or(true, |h| run[j].as_slice() < h.as_slice()) {
+                        j += 1;
+                    }
+                    let child_page_id = chs[child_idx];
+                    let (res, used) =
+                        self.delete_recursive(child_page_id, &run[i..j], Some(node_page_id));
+                    // 递归承诺 `used ≥ 1` ⇒ 一定推进，不会死循环
+                    i += used.max(1).min(j - i);
+                    if res.is_noop() {
+                        // 那一片子里一把键都不在（真空区间）⇒ 本层什么都没变，继续下一个孩子
+                        continue;
+                    }
+                    removed += res.removed;
+                    merged |= res.merged;
+                    min_changed_left |= res.min_changed && child_idx == 0;
+
+                    // A child that changed neither separators nor structure cannot
+                    // change this parent. Reuse the current routing snapshot only
+                    // when the parent was not already underfull.
+                    if !res.min_changed && !res.merged
+                        && (node_page_id == self.root || snap.0.len() >= self.min_entries()) {
+                        #[cfg(test)]
+                        crate::common::maintenance_probe::note_bplus_backtrack_reuse();
+                        continue;
+                    }
+                    set_page_phase(PHASE_BACKTRACK);
+                    // 回溯段一次读就够（M54b：改前是"先 `read_page` 问在不在、再 `read_node` 读一遍"，
+                    // 下溢检查那里**又**两遍 ⇒ 每层 4 次页读、3 次重复）。页已被合掉而读不到 ⇒ 保守上报。
+                    let Some(mut cur) = self.try_read_node(node_page_id) else {
+                        return (
+                            Del {
+                                removed,
+                                min_changed: true,
+                                merged: true,
+                            },
+                            i,
+                        );
+                    };
+
+                    // 只有"该子树的最小键可能变了"才去把它重新找出来写进分隔键
+                    if res.min_changed && child_idx > 0 {
+                        #[cfg(test)]
+                        SEP_REFRESHES.with(|c| c.set(c.get() + 1));
+                        // 这一趟要一路向左下走到叶子 ⇒ 单独一个桶（M56），别混进"回溯"里
+                        set_page_phase(PHASE_SEP_REFRESH);
+                        let min_key = self.subtree_min_key(child_page_id);
+                        set_page_phase(PHASE_BACKTRACK);
+                        if let Some(min_key) = min_key {
+                            if let BTreeNode::Internal {
+                                keys: ks2,
+                                children: ch2,
+                            } = &mut cur
+                            {
+                                // child 可能已变下标（兄弟间挪过），重新定位
+                                if let Some(new_idx) = ch2.iter().position(|&c| c == child_page_id) {
+                                    if new_idx > 0 && new_idx - 1 < ks2.len() && ks2[new_idx - 1] != min_key
+                                    {
+                                        ks2[new_idx - 1] = min_key;
+                                        self.write_node(node_page_id, &cur);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 检查本节点是否下溢（合并子节点后）
+                    let mut restructured = false;
+                    if node_page_id != self.root {
+                        if let Some(parent) = parent_page_id {
+                            if self.is_underflow(&cur) {
+                                set_page_phase(PHASE_RESTRUCTURE);
+                                merged |= self.handle_underflow(node_page_id, parent);
+                                set_page_phase(PHASE_BACKTRACK);
+                                restructured = true;
+                            }
+                        }
+                    }
+                    if restructured {
+                        // 本层被借/合并过 ⇒ 连"这一层是谁"都可能不再是手里这一页（父层的孩子表也变了）
+                        // ⇒ 剩下的键交回上层从根重下一趟，绝不拿旧快照继续路由。
+                        return (
+                            Del {
+                                removed,
+                                min_changed: true,
+                                merged,
+                            },
+                            i,
+                        );
+                    }
+                    // 用回溯那一趟读到的新鲜内容继续路由下一个孩子（不再多读一次页）
+                    let BTreeNode::Internal {
+                        keys: ks3,
+                        children: ch3,
+                    } = cur
+                    else {
+                        // 本层变成了叶子 ⇒ 结构变了，同上：交回上层重下
+                        return (
+                            Del {
+                                removed,
+                                min_changed: true,
+                                merged: true,
+                            },
+                            i,
+                        );
+                    };
+                    snap = (ks3, ch3);
+                    // 本层是根时**不在这里**问"要不要降层"（M56b）：`delete()`/`delete_batch()` 收尾按 `merged` 问一次。
+                }
+                // 往上只报"本子树的下界可能变了"：动的是**最左那棵子树**、或本节点自己借/合并过。
+                (
+                    Del {
+                        removed,
+                        min_changed: min_changed_left,
+                        merged,
+                    },
+                    i,
+                )
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn delete_recursive_reference(
         &mut self,
         node_page_id: PageId,
         run: &[Key],
@@ -2355,6 +2567,64 @@ impl fmt::Display for BPlusTree {
 // ===================== 测试代码 =====================
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delete_buffers_preserve_serialized_bytes_and_reject_oversized_node() {
+        let (_scratch, mut tree) = anon(64, 64);
+        let nodes = [
+            BTreeNode::Leaf { entries: vec![(vec![0, 1, 255], RowId(Some(vec![1; 80])))], next_leaf: None },
+            BTreeNode::Internal { keys: vec![vec![], vec![0, 255]], children: vec![PageId(2), PageId(3), PageId(4)] },
+        ];
+        for node in &nodes {
+            let expected = bincode::serialize(node).unwrap();
+            assert_eq!(bincode::serialized_size(node).unwrap(), expected.len() as u64);
+            assert!(tree.write_node(tree.root, node));
+            assert_eq!(tree.node_buffer, expected, "serializer must preserve the original bytes");
+            let mut expected_page = expected;
+            expected_page.resize(MAX_PAYLOAD, 0);
+            assert_eq!(tree.page_manager.read_page(tree.root).unwrap(), expected_page);
+        }
+        let pointer = tree.node_buffer.as_ptr();
+        let before = tree.page_manager.read_page(tree.root).unwrap();
+        let oversized = BTreeNode::Leaf { entries: vec![(vec![], RowId(Some(vec![1; MAX_PAYLOAD + 1])))], next_leaf: None };
+        assert!(!tree.write_node(tree.root, &oversized));
+        assert_eq!(tree.node_buffer.as_ptr(), pointer);
+        assert_eq!(tree.page_manager.read_page(tree.root).unwrap(), before, "oversized writes cannot mutate the page");
+    }
+
+    #[test]
+    fn batched_delete_reuses_unchanged_parent_with_old_path_control() {
+        let victims: Vec<_> = (0..1000).filter(|i| i % 8 == 5).map(|i| format!("{i:08}").into_bytes()).collect();
+        let mut previous = None;
+        for reference in [true, false] {
+            let (_scratch, mut tree) = anon(64, 4096);
+            for i in 0..1000 { assert!(tree.insert(format!("{i:08}").into_bytes(), RowId(Some(vec![7])))); }
+            assert_eq!(tree.node_buffer.capacity(), 0, "insertion uses its own page writer; delete starts cold");
+            let mode = reference.then(delete_cost_reference::Scope::start);
+            let scope = crate::common::maintenance_probe::Scope::start();
+            let before = crate::bplus_tree::page::page_reads();
+            assert_eq!(tree.delete_batch(&victims), victims.len());
+            let reads = crate::bplus_tree::page::page_reads() - before;
+            let stats = scope.stats();
+            if reference {
+                assert_eq!(stats.bplus_backtrack_reuses, 0);
+                assert!(stats.bplus_pack_buffers > 0, "reference must allocate serialized pages");
+                previous = Some(reads);
+            } else {
+                assert!(stats.bplus_backtrack_reuses > 0, "shared routing must actually skip parent rereads");
+                assert_eq!(stats.bplus_pack_buffers, 1, "lazy serializer must allocate once then be reused");
+                assert!(reads < previous.unwrap());
+            }
+            drop(scope); drop(mode);
+            for i in 0..1000 { assert_eq!(tree.get(format!("{i:08}").into_bytes()).is_some(), i % 8 != 5); }
+            if !reference {
+                let pointer = tree.node_buffer.as_ptr();
+                let warm = crate::common::maintenance_probe::Scope::start();
+                assert!(tree.update(format!("{:08}", 0).into_bytes(), RowId(Some(vec![9]))));
+                assert_eq!(warm.stats().bplus_pack_buffers, 0, "a subsequent node write must not grow the buffer");
+                assert_eq!(tree.node_buffer.as_ptr(), pointer);
+            }
+        }
+    }
     use std::vec;
 
     use super::*;
@@ -3230,4 +3500,14 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) mod delete_cost_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
 }

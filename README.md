@@ -3,7 +3,7 @@
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M115 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M116 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - 默认 5 个直接依赖：`serde` / `bincode` / `memmap2` / `fs4` / `log`。
   浏览器终端通过 `web` feature 额外启用 `serde_json` / `tokio` / `axum`；库与 shell 默认无需它们。
 - edition 2024；本轮验证工具链为 Rust **1.92.0**。edition 要求至少 1.85，但本轮未验证最低支持版本。
@@ -51,6 +51,10 @@ M112 B+ vacuum 复用分组缓冲，换出批次按页号去重并给脏元数�
 M113 LSM 压实按所有权消费解码块与归并堆，坏块或发布失败恢复原输入，点读缓存不接收压实读入的块。
 600k 两源重叠四轮 EntryValue 克隆 240 万→0 次、分配约 1149 万→608 万次；LegacyShared 回退单列成本。
 入口 `COMPACTION_ROWS=600000 cargo test --release --lib lsm_owned_compaction_cost -- --ignored --nocapture --test-threads=1`。
+M114 Bitcask vacuum 验证空 blob 后跳过保留值回查，借用解码与复用组；600k 四轮值回查 600000→0 次。
+M115 LSM vacuum 按所有权消费 SST 块与归并堆，坏源报错并保留 blob；600k 扫描分配约 459 万→142 万次。
+M116 B+ 批删移动父路由快照并复用节点写缓冲；600k 四轮节点序列化缓冲分配 83283→1 次，重开逐值验收通过。
+入口 `cargo test --offline --release --lib bplus_delete_buffer_cost -- --ignored --nocapture --test-threads=1`。
 
 ## 引入方式
 

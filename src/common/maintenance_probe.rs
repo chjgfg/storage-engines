@@ -19,6 +19,8 @@ pub(crate) struct Stats {
     pub lsm_vacuum_owned_rows: u64,
     pub lsm_vacuum_legacy_key_copies: u64,
     pub lsm_vacuum_blocks: u64,
+    pub bplus_pack_buffers: u64,
+    pub bplus_backtrack_reuses: u64,
 }
 
 impl std::fmt::Debug for Stats {
@@ -36,7 +38,9 @@ impl std::fmt::Debug for Stats {
             .field("bitcask_value_reads", &self.bitcask_value_reads)
             .field("lsm_vacuum_owned_rows", &self.lsm_vacuum_owned_rows)
             .field("lsm_vacuum_legacy_key_copies", &self.lsm_vacuum_legacy_key_copies)
-            .field("lsm_vacuum_blocks", &self.lsm_vacuum_blocks).finish()
+            .field("lsm_vacuum_blocks", &self.lsm_vacuum_blocks)
+            .field("bplus_pack_buffers", &self.bplus_pack_buffers)
+            .field("bplus_backtrack_reuses", &self.bplus_backtrack_reuses).finish()
     }
 }
 
@@ -62,6 +66,13 @@ pub(crate) fn note_lsm_vacuum_row(owned: bool) {
 }
 pub(crate) fn note_lsm_vacuum_block() {
     ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.lsm_vacuum_blocks += 1; });
+}
+
+pub(crate) fn note_bplus_pack_buffer() {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.bplus_pack_buffers += 1; });
+}
+pub(crate) fn note_bplus_backtrack_reuse() {
+    ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.bplus_backtrack_reuses += 1; });
 }
 
 pub(crate) struct Scope;
