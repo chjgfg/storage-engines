@@ -5646,6 +5646,134 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "memory scan and pagination old/new/new/old; release single thread"]
+    fn memory_scan_buffer_cost() {
+        use crate::common::store::scan_cost_reference;
+        let rows: usize = std::env::var("SCAN_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 1000);
+        for ttl in [false, true] {
+            let expiry = ttl.then_some(u64::MAX);
+            let db = crate::memory::MVCC::new();
+            db.set_vacuum_auto_slice(0);
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows) {
+                    let value = scale_val(i);
+                    let logical = match expiry { Some(e) => crate::common::pack_ttl(&value, e), None => crate::common::pack_plain(&value) };
+                    assert!(tx.set(&scale_key(i), logical));
+                }
+                tx.try_commit().unwrap();
+            }
+            let tx = db.begin_transaction();
+            for i in 0..rows / 10 {
+                let value = scale_val(i + rows);
+                let logical = match expiry { Some(e) => crate::common::pack_ttl(&value, e), None => crate::common::pack_plain(&value) };
+                assert!(tx.set(&scale_key(i), logical));
+            }
+            tx.try_commit().unwrap(); drop(tx);
+            let mut full_costs = Vec::new();
+            let mut page_costs = Vec::new();
+            for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+                let _mode = reference.then(scan_cost_reference::Scope::start);
+                let tx = db.begin_transaction();
+                let key_before = scan_cost_reference::key_copies();
+                let cursor_before = scan_cost_reference::fold_cursor_copies();
+                let before = crate::mem_probe::allocations();
+                let start = std::time::Instant::now();
+                let full = tx.scan(None, None);
+                let seconds = start.elapsed().as_secs_f64();
+                let allocations = crate::mem_probe::allocations() - before;
+                let key_copies = scan_cost_reference::key_copies() - key_before;
+                let fold_cursor_copies = scan_cost_reference::fold_cursor_copies() - cursor_before;
+                full_costs.push(allocations);
+                assert_eq!(full.len(), rows);
+                for (i, rec) in full.iter().enumerate() {
+                    assert_eq!(rec.key, scale_key(i));
+                    assert_eq!(rec.value, Some(scale_val(if i < rows / 10 { i + rows } else { i })));
+                    assert_eq!(rec.expire_unix_secs, expiry);
+                }
+                let mut cursor = None;
+                let cursor_before = scan_cost_reference::page_cursor_copies();
+                let (mut seen, mut pages, mut page_ns, mut page_allocations) = (0, 0, 0_u128, 0_u64);
+                loop {
+                    let before = crate::mem_probe::allocations();
+                    let start = std::time::Instant::now();
+                    let (chunk, next) = tx.scan_page(cursor.as_deref(), 500);
+                    page_ns += start.elapsed().as_nanos();
+                    page_allocations += crate::mem_probe::allocations() - before;
+                    assert_eq!(chunk, full[seen..seen + chunk.len()]);
+                    seen += chunk.len(); pages += 1;
+                    assert!(pages <= rows / 250 + 8, "pagination must progress");
+                    let Some(next) = next else { break; };
+                    assert!(cursor.as_ref().is_none_or(|old| old < &next));
+                    cursor = Some(next);
+                }
+                assert_eq!(seen, rows);
+                page_costs.push(page_allocations);
+                let chunks = rows.div_ceil(crate::common::kernel::FOLD_CHUNK);
+                let revisited: usize = (crate::common::kernel::FOLD_CHUNK..rows).step_by(crate::common::kernel::FOLD_CHUNK)
+                    .map(|handed| if handed - 1 < rows / 10 { 2 } else { 1 }).sum();
+                assert_eq!(key_copies, if reference { (rows + rows / 10 + revisited) as u64 } else { rows as u64 });
+                assert_eq!(fold_cursor_copies, if reference { rows as u64 } else { (chunks - 1) as u64 });
+                let page_cursor_copies = scan_cost_reference::page_cursor_copies() - cursor_before;
+                assert_eq!(page_cursor_copies, if reference { rows as u64 } else { (pages - 1) as u64 });
+                eprintln!("MEMORY_SCAN_BUFFER round={round} reference={reference} ttl={ttl} rows={rows} scan_seconds={seconds:.6} scan_allocations={allocations} scan_key_copies={key_copies} fold_cursor_copies={fold_cursor_copies} page_ms={:.3} page_allocations={page_allocations} page_cursor_copies={page_cursor_copies} pages={pages}", page_ns as f64 / 1e6);
+            }
+            for (old, new) in [(0, 1), (3, 2)] {
+                assert!(full_costs[old] >= full_costs[new] + 2 * rows as u64);
+                assert!(page_costs[old] >= page_costs[new] + 2 * rows as u64);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "memory stop input batches old/new/new/old; release single thread"]
+    fn memory_stop_batch_cost() {
+        use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer};
+        let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("stop_batches");
+            let db = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+            db.set_vacuum_auto_slice(0);
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows) { assert!(tx.set_raw(&scale_key(i), scale_val(i))); }
+                tx.try_commit().unwrap();
+            }
+            let mode = reference.then(crate::memory::memory_mvcc::stop_rows_reference::Scope::start);
+            let scope = snapshot_probe::Scope::start(false);
+            let before = crate::mem_probe::allocations();
+            let start = std::time::Instant::now();
+            drop(db);
+            let seconds = start.elapsed().as_secs_f64();
+            let allocations = crate::mem_probe::allocations() - before;
+            let stats = scope.stats();
+            assert_eq!(stats.consumed_rows, rows as u64);
+            if reference { assert_eq!(stats.input_batches, 0); }
+            else {
+                assert_eq!(stats.input_batches, rows.div_ceil(8192) as u64);
+                assert_eq!(stats.input_buffer_bytes, 8192 * std::mem::size_of::<(std::borrow::Cow<'_, [u8]>, Option<std::borrow::Cow<'_, [u8]>>)>());
+                assert!(stats.pull_ns + stats.fold_emit_ns <= stats.body_ns);
+            }
+            eprintln!("MEMORY_STOP_BATCH round={round} reference={reference} rows={rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");
+            drop(scope); drop(mode);
+            let mut seen = 0;
+            read_snapshot_with(&dir.0.join("snapshot.bxp"), ValueBuffer::Exact, &mut |r| {
+                assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                seen += 1; true
+            }).unwrap();
+            assert_eq!(seen, rows);
+            let reopened = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
+            let mut seen = 0;
+            reopened.export_latest_visible_for_each(false, |r| {
+                assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+        }
+    }
+
+    #[test]
     #[ignore = "B+ batched delete and serializer old/new/new/old; release single thread"]
     fn bplus_delete_buffer_cost() {
         use crate::common::maintenance_probe::{Scope, Stage};

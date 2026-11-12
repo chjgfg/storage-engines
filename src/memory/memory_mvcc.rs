@@ -220,25 +220,43 @@ impl MVCC {
         #[cfg(test)]
         if replay_reference::enabled() { return Self::replay_page_reference(mvcc, batch); }
         if batch.is_empty() { return Ok(()); }
-        let tx = mvcc.begin_transaction();
+        #[cfg(test)]
+        crate::common::kv_snapshot::recovery_probe::note(|s| { s.replay_pages += 1; s.replay_input_rows += batch.len() as u64; });
+        let tx = {
+            #[cfg(test)]
+            let _setup = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::ReplaySetup);
+            mvcc.begin_transaction()
+        };
+        {
+            // Seal the owned page before locking the registry/store. Replaying
+            // remains one normal transaction, including rollback of a rejected page.
+            #[cfg(test)]
+            let _encode = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::ReplayEncode);
+            for (_, value, expire) in batch.iter_mut() {
+                *value = value.take().map(|v| {
+                    #[cfg(test)]
+                    if replay_cost_reference::enabled() {
+                        return match expire { Some(e) => crate::common::pack_ttl(&v, *e), None => crate::common::pack_plain(&v) };
+                    }
+                    crate::common::codec::pack_owned(v, *expire).into_bytes()
+                });
+            }
+        }
         {
             // The unopened instance keeps normal conflict checks, registry ->
             // store lock ordering and bounded page transactions.
+            #[cfg(test)]
+            let _apply = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::ReplayApply);
             let mut reg = tx.core.lock_registry();
             let mut side = mvcc.store.lock().unwrap();
-            for (key, value, expire) in batch.drain(..) {
-                let logical = value.map(|v| {
-                    #[cfg(test)]
-                    if replay_cost_reference::enabled() {
-                        return match expire { Some(e) => crate::common::pack_ttl(&v, e), None => crate::common::pack_plain(&v) };
-                    }
-                    crate::common::codec::pack_owned(v, expire).into_bytes()
-                });
+            for (key, logical, _) in batch.drain(..) {
                 tx.core.try_write_owned(&mut reg, &mut *side, key, logical)
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
                         format!("快照重放被引擎拒收: {error:?}")))?;
             }
         }
+        #[cfg(test)]
+        let _commit = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::ReplayCommit);
         tx.try_commit().map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,
             format!("快照重放提交失败: {error:?}")))
     }
@@ -249,6 +267,8 @@ impl MVCC {
         batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
     ) -> std::io::Result<()> {
         if batch.is_empty() { return Ok(()); }
+        let _legacy = crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::ReplayLegacy);
+        crate::common::kv_snapshot::recovery_probe::note(|s| { s.replay_pages += 1; s.replay_input_rows += batch.len() as u64; });
         let tx = mvcc.begin_transaction();
         for (key, value, expire) in batch.drain(..) {
             match (value, expire) {
@@ -354,6 +374,92 @@ impl MVCC {
         ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
     ) -> std::io::Result<usize> {
         use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter}, order::KeyWindow, version::decode_key_ref};
+        #[cfg(test)]
+        if stop_rows_reference::enabled() {
+            return Self::write_snapshot_rows_reference(path, rows, ceiling, visible, mode);
+        }
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        let mut visited = 0_u64;
+        #[cfg(test)]
+        let mut detail = crate::common::kv_snapshot::snapshot_probe::Stats::default();
+        #[cfg(test)]
+        let measured = crate::common::kv_snapshot::snapshot_probe::is_active();
+        let stats = atomic_write_bin_v4(path, |sink| {
+            let mut groups: KeyWindow<(u64, Option<Cow<'a, [u8]>>)> = KeyWindow::new();
+            let mut spare = Vec::new();
+            let mut rows = rows;
+            const INPUT_BATCH: usize = 8192;
+            let mut batch = Vec::with_capacity(rows.size_hint().0.min(INPUT_BATCH));
+            let emit = |sink: &mut BinWriter, key: &[u8], value: Option<Cow<'a, [u8]>>| {
+                let (user, expire) = match value.as_deref() {
+                    Some(bytes) => crate::common::codec::snapshot_value(bytes),
+                    None => (None, None),
+                };
+                sink.write_borrowed(key, user, None, expire)
+            };
+            loop {
+                #[cfg(test)]
+                let pull = measured.then(std::time::Instant::now);
+                batch.extend(rows.by_ref().take(INPUT_BATCH));
+                #[cfg(test)]
+                if let Some(pull) = pull { detail.pull_ns += pull.elapsed().as_nanos(); }
+                #[cfg(test)]
+                { detail.input_buffer_bytes = detail.input_buffer_bytes.max(batch.capacity() * std::mem::size_of::<(Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>()); }
+                if batch.is_empty() { break; }
+                #[cfg(test)]
+                { detail.input_batches += 1; }
+                #[cfg(test)]
+                let fold = measured.then(std::time::Instant::now);
+                for (enc, value) in batch.drain(..) {
+                    visited += 1;
+                    while let Some((key, (_, value))) = groups.pop_before(&enc, ceiling) {
+                        emit(sink, &key, value)?;
+                        spare = key;
+                    }
+                    let Some((raw, version)) = decode_key_ref(&enc) else { continue; };
+                    if !visible(version) { continue; }
+                    let len = raw.len();
+                    let winner = match enc {
+                        Cow::Owned(mut key) => {
+                            key.truncate(len);
+                            groups.entry(key)
+                        }
+                        Cow::Borrowed(enc) => groups.entry_with(&enc[..len], || {
+                            let mut key = std::mem::take(&mut spare);
+                            key.clear(); key.extend_from_slice(&enc[..len]);
+                            (key, (0, None))
+                        }),
+                    };
+                    if version >= winner.0 { *winner = (version, value); }
+                }
+                #[cfg(test)]
+                if let Some(fold) = fold { detail.fold_emit_ns += fold.elapsed().as_nanos(); }
+            }
+            #[cfg(test)]
+            let tail = measured.then(std::time::Instant::now);
+            while let Some((key, (_, value))) = groups.pop_first() { emit(sink, &key, value)?; }
+            #[cfg(test)]
+            if let Some(tail) = tail { detail.fold_emit_ns += tail.elapsed().as_nanos(); }
+            Ok(())
+        })?;
+        #[cfg(test)]
+        crate::common::kv_snapshot::snapshot_probe::note(|s| {
+            s.stop_mode = mode; s.visited_rows = visited;
+            s.consumed_rows = if mode == "exclusive" { visited } else { 0 };
+            s.pull_ns = detail.pull_ns; s.fold_emit_ns = detail.fold_emit_ns;
+            s.input_batches = detail.input_batches; s.input_buffer_bytes = detail.input_buffer_bytes;
+        });
+        #[cfg(not(test))]
+        let _ = (mode, visited);
+        Ok(stats.records)
+    }
+
+    #[cfg(test)]
+    fn write_snapshot_rows_reference<'a>(path: &std::path::Path,
+        rows: impl Iterator<Item = (Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>,
+        ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
+    ) -> std::io::Result<usize> {
+        use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter}, order::KeyWindow, version::decode_key_ref};
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
         let mut visited = 0_u64;
         let stats = atomic_write_bin_v4(path, |sink| {
@@ -376,10 +482,7 @@ impl MVCC {
                 if !visible(version) { continue; }
                 let len = raw.len();
                 let winner = match enc {
-                    Cow::Owned(mut key) => {
-                        key.truncate(len);
-                        groups.entry(key)
-                    }
+                    Cow::Owned(mut key) => { key.truncate(len); groups.entry(key) }
                     Cow::Borrowed(enc) => groups.entry_with(&enc[..len], || {
                         let mut key = std::mem::take(&mut spare);
                         key.clear(); key.extend_from_slice(&enc[..len]);
@@ -391,13 +494,10 @@ impl MVCC {
             while let Some((key, (_, value))) = groups.pop_first() { emit(sink, &key, value)?; }
             Ok(())
         })?;
-        #[cfg(test)]
         crate::common::kv_snapshot::snapshot_probe::note(|s| {
             s.stop_mode = mode; s.visited_rows = visited;
             s.consumed_rows = if mode == "exclusive" { visited } else { 0 };
         });
-        #[cfg(not(test))]
-        let _ = (mode, visited);
         Ok(stats.records)
     }
 
@@ -1262,10 +1362,83 @@ mod tests {
     use std::format;
 
     #[test]
+    fn snapshot_batches_keep_cross_batch_versions_and_prefixes() {
+        use crate::common::{encode_key, pack_plain, pack_ttl, kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer}};
+        let mut rows = Vec::new();
+        for version in 1..=9000 { rows.push((encode_key(b"k", version), Some(pack_plain(&version.to_le_bytes())))); }
+        rows.push((encode_key(b"", 1), None));
+        rows.push((encode_key(b"k\0", 1), Some(pack_ttl(b"future", u64::MAX))));
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut golden = None;
+        for reference in [true, false] {
+            let path = crate::common::ScratchPath::new("memory", "snapshot_batches", ".bxp");
+            let _mode = reference.then(stop_rows_reference::Scope::start);
+            let scope = snapshot_probe::Scope::start(false);
+            let input = rows.clone().into_iter().map(|(k, v)| (Cow::Owned(k), v.map(Cow::Owned)));
+            assert_eq!(MVCC::write_snapshot_rows(&path, input, 9001, |v| v <= 9000, "exclusive").unwrap(), 3);
+            let stats = scope.stats();
+            assert_eq!(stats.consumed_rows, 9002);
+            assert_eq!(stats.input_batches, if reference { 0 } else { 2 });
+            drop(scope);
+            let bytes = std::fs::read(&path).unwrap();
+            if let Some(expected) = &golden { assert_eq!(&bytes, expected); } else { golden = Some(bytes); }
+            let mut records = Vec::new();
+            read_snapshot_with(&path, ValueBuffer::Exact, &mut |r| { records.push(r); true }).unwrap();
+            assert_eq!(records[0], crate::common::kv_snapshot::KvRecord::new(vec![], None));
+            assert_eq!(records[1].value, Some(9000_u64.to_le_bytes().to_vec()));
+            assert_eq!(records[2].key, b"k\0");
+            assert_eq!(records[2].value, Some(b"future".to_vec()));
+            assert_eq!(records[2].expire_unix_secs, Some(u64::MAX));
+        }
+    }
+
+    #[test]
+    fn scan_owned_pages_preserve_expiry_progress_and_visibility() {
+        let db = MVCC::new();
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..1003 {
+            let key = format!("{i:08}").into_bytes();
+            let logical = if i % 3 == 0 { crate::common::pack_ttl(b"expired", 0) }
+                else if i % 3 == 1 { crate::common::pack_ttl(&[0, 1, 255], u64::MAX) }
+                else { crate::common::pack_plain(b"") };
+            assert!(tx.set(&key, logical));
+        }
+        assert!(tx.delete(b"00000002"));
+        tx.try_commit().unwrap(); drop(tx);
+        let held = db.begin_transaction();
+        assert!(held.set_raw(b"00000001", vec![9]));
+        let mut golden = None;
+        for reference in [true, false] {
+            let _mode = reference.then(crate::common::store::scan_cost_reference::Scope::start);
+            let reader = db.begin_transaction();
+            let full = reader.scan(None, None);
+            assert_eq!(full.len(), 667);
+            let mut page_rows = Vec::new();
+            let mut cursor = None;
+            let mut pages = 0;
+            loop {
+                let (page, next) = reader.scan_page(cursor.as_deref(), 1);
+                pages += 1;
+                assert!(pages < 1100, "expired groups must still advance the cursor");
+                page_rows.extend(page);
+                let Some(next) = next else { break; };
+                assert!(cursor.as_ref().is_none_or(|old| old < &next));
+                cursor = Some(next);
+            }
+            assert_eq!(page_rows, full);
+            if let Some(expected) = &golden { assert_eq!(&full, expected); } else { golden = Some(full); }
+            assert_eq!(page_rows[0].value, Some(vec![0, 1, 255]));
+            assert_eq!(page_rows[0].expire_unix_secs, Some(u64::MAX));
+        }
+        held.rollback();
+    }
+
+    #[test]
     fn snapshot_stop_modes_preserve_bytes_and_shared_transactions() {
         use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer};
         let mut golden = None;
-        for mode in ["reference", "exclusive", "shared"] {
+        for (mode, old_rows) in [("reference", false), ("exclusive", true), ("exclusive", false), ("shared", true), ("shared", false)] {
             let path = crate::common::ScratchPath::new("memory", "stop_modes", ".bxp");
             let mut db = MVCC::new();
             db.set_vacuum_auto_slice(0);
@@ -1282,6 +1455,7 @@ mod tests {
             let held = (mode == "shared").then(|| db.begin_transaction());
             if let Some(tx) = &held { assert!(tx.set_raw(b"uncommitted", vec![7])); }
             let reference = (mode == "reference").then(stop_reference::Scope::start);
+            let rows_reference = old_rows.then(stop_rows_reference::Scope::start);
             let scope = snapshot_probe::Scope::start(false);
             let clones = crate::common::codec::user_value_copies();
             assert_eq!(db.write_stop_snapshot(&path).unwrap(), 6);
@@ -1292,7 +1466,13 @@ mod tests {
                 assert_eq!(stats.consumed_rows, 10);
                 assert_eq!(db.store.lock().unwrap().iter_keys().count(), 0, "exclusive snapshot must consume its input tree");
             } else { assert!(db.store.lock().unwrap().iter_keys().count() >= 10); }
-            drop(scope); drop(reference);
+            if mode != "reference" && !old_rows {
+                assert_eq!(stats.input_batches, 1);
+                assert_eq!(stats.input_buffer_bytes, stats.visited_rows.min(8192) as usize * std::mem::size_of::<(Cow<'_, [u8]>, Option<Cow<'_, [u8]>>)>());
+                assert!(stats.pull_ns > 0 && stats.fold_emit_ns > 0);
+                assert!(stats.pull_ns + stats.fold_emit_ns <= stats.body_ns);
+            } else { assert_eq!(stats.input_batches, 0); }
+            drop(scope); drop(reference); drop(rows_reference);
             let bytes = std::fs::read(&path).unwrap();
             if let Some(expected) = &golden { assert_eq!(&bytes, expected); } else { golden = Some(bytes); }
             let mut records = Vec::new();
@@ -1346,7 +1526,13 @@ mod tests {
             (b"locked".to_vec(), Some(vec![2]), None),
             (b"unread".to_vec(), Some(vec![3]), None),
         ];
+        let scope = crate::common::kv_snapshot::recovery_probe::Scope::start();
         let error = MVCC::replay_page(&db, &mut batch);
+        let stages = scope.stats();
+        assert_eq!(stages.replay_input_rows, 3);
+        assert_eq!(stages.replay_pages, 1);
+        assert!(stages.replay_encode_ns > 0 && stages.replay_apply_ns > 0);
+        assert_eq!(stages.replay_commit_ns, 0, "a rejected page must never reach commit");
         assert!(error.is_err());
         assert!(batch.is_empty());
         assert_eq!(db.health().total_rows, 1, "a rejected page must not publish its earlier rows");
@@ -1434,6 +1620,10 @@ mod tests {
             let stages = recovery.stats();
             assert!(stages.verify_ns > 0 && stages.decode_ns > 0 && stages.replay_ns > 0);
             assert!(stages.total_ns >= stages.verify_ns + stages.decode_ns + stages.replay_ns);
+            assert_eq!(stages.replay_input_rows, 1007);
+            assert_eq!(stages.replay_pages, 2);
+            assert!(stages.replay_setup_ns > 0 && stages.replay_encode_ns > 0 && stages.replay_apply_ns > 0 && stages.replay_commit_ns > 0);
+            assert!(stages.replay_ns >= stages.replay_setup_ns + stages.replay_encode_ns + stages.replay_apply_ns + stages.replay_commit_ns);
             drop(recovery);
             assert!(crate::common::kv_snapshot::recovery_probe::Timer::start(crate::common::kv_snapshot::recovery_probe::Kind::Total).is_none());
             let actual: BTreeMap<_, _> = db.export_latest_visible(true).into_iter()
@@ -2091,6 +2281,16 @@ impl crate::common::VersionedStore for Transaction {
 
 #[cfg(test)]
 pub(crate) mod vacuum_cost_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod stop_rows_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }

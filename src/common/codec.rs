@@ -130,17 +130,30 @@ pub(crate) fn snapshot_value(logical: &[u8]) -> (Option<&[u8]>, Option<u64>) {
     else { (Some(&logical[offset..]), expire) }
 }
 
-/// 逻辑 value → 用户可见 value；过期返回 None
-pub fn logical_to_user(mut logical: Vec<u8>) -> Option<Vec<u8>> {
+/// Keep expiry and ownership together when handing out a visible record.
+pub(crate) enum VisibleOwnedValue {
+    Expired,
+    Live { user: Vec<u8>, expire: Option<u64> },
+}
+
+pub(crate) fn visible_owned_value(mut logical: Vec<u8>, now: u64) -> VisibleOwnedValue {
     let (offset, expire) = envelope(&logical);
-    if expire.is_some_and(|e| now_unix_secs() >= e) {
-        None
+    if expire.is_some_and(|e| now >= e) {
+        VisibleOwnedValue::Expired
     } else {
         #[cfg(test)]
         note_user_value_copied();
         logical.copy_within(offset.., 0);
         logical.truncate(logical.len() - offset);
-        Some(logical)
+        VisibleOwnedValue::Live { user: logical, expire }
+    }
+}
+
+/// 逻辑 value → 用户可见 value；过期返回 None
+pub fn logical_to_user(logical: Vec<u8>) -> Option<Vec<u8>> {
+    match visible_owned_value(logical, now_unix_secs()) {
+        VisibleOwnedValue::Expired => None,
+        VisibleOwnedValue::Live { user, .. } => Some(user),
     }
 }
 

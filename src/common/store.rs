@@ -14,7 +14,7 @@
 use std::thread_local;
 use std::matches;
 use crate::common::codec::{
-    decode_value_meta, key_matches, logical_to_user, now_unix_secs, prefix_upper_bound,
+    key_matches, logical_to_user, now_unix_secs, prefix_upper_bound, visible_owned_value, VisibleOwnedValue,
 };
 use crate::common::{fold_window, fold_window_emit};
 use crate::common::types::{ExportRecord, KeyMatchMode, SearchPage, SearchQuery};
@@ -442,19 +442,24 @@ pub fn scan_page<S: VersionedStore>(
     let now = now_unix_secs();
     let (rows, more) = collect_rows(store, false, None, None, after, Some(limit.max(1)));
     let mut out = Vec::new();
-    let mut cursor: Option<Vec<u8>> = None;
+    #[cfg(test)]
+    let reference = scan_cost_reference::enabled();
+    #[cfg(not(test))]
+    let reference = false;
+    let mut cursor = if more && !reference {
+        rows.last().map(|(key, _, _)| {
+            #[cfg(test)]
+            scan_cost_reference::note_page_cursor_copy();
+            key.clone()
+        })
+    } else { None };
     for (key, _ver, raw) in rows {
-        cursor = Some(key.clone());
-        let Some(bytes) = raw else { continue };
-        let m = decode_value_meta(&bytes);
-        if m.is_expired_at(now) {
-            continue;
+        if reference {
+            #[cfg(test)]
+            scan_cost_reference::note_page_cursor_copy();
+            cursor = Some(key.clone());
         }
-        out.push(ExportRecord {
-            key,
-            value: Some(m.user().to_vec()),
-            expire_unix_secs: m.expire_unix_secs(),
-        });
+        if let Some(record) = live_record_of_logical(key, raw, now) { out.push(record); }
     }
     (out, if more { cursor } else { None })
 }
@@ -469,22 +474,70 @@ pub fn live_record_of_logical(
     logical: Option<Vec<u8>>,
     now: u64,
 ) -> Option<ExportRecord> {
-    let bytes = logical?;
-    let m = decode_value_meta(&bytes);
-    if m.is_expired_at(now) {
-        return None;
-    }
-    // M35 的尺子：这一行把用户字节拷出来了（`key_count`/total 改"只数不物化"之后，
-    // 那条路上应当一次都不走到这里）
     #[cfg(test)]
-    crate::common::codec::note_user_value_copied();
+    if scan_cost_reference::enabled() {
+        let bytes = logical?;
+        let m = crate::common::codec::decode_value_meta(&bytes);
+        if m.is_expired_at(now) { return None; }
+        crate::common::codec::note_user_value_copied();
+        return Some(ExportRecord { key, value: Some(m.user().to_vec()), expire_unix_secs: m.expire_unix_secs() });
+    }
+    let bytes = logical?;
+    let VisibleOwnedValue::Live { user, expire } = visible_owned_value(bytes, now) else {
+        return None;
+    };
     Some(ExportRecord {
         key,
-        value: Some(m.user().to_vec()),
+        value: Some(user),
         // ⚠️ 这一行就是 0.5.0 的那件事：这条门是 export / migrate / 快照文件**共用**的出口，
         // 以前只交 `m.user()` ⇒ 到期时刻在出口就被丢掉，导出去再导回来一律变永久。
-        expire_unix_secs: m.expire_unix_secs(),
+        expire_unix_secs: expire,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod scan_cost_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    thread_local! { static KEY_COPIES: Cell<u64> = const { Cell::new(0) }; }
+    thread_local! { static FOLD_CURSOR_COPIES: Cell<u64> = const { Cell::new(0) }; }
+    thread_local! { static PAGE_CURSOR_COPIES: Cell<u64> = const { Cell::new(0) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) fn note_key_copy() { KEY_COPIES.with(|s| s.set(s.get() + 1)); }
+    pub(crate) fn key_copies() -> u64 { KEY_COPIES.with(Cell::get) }
+    pub(crate) fn note_fold_cursor_copy() { FOLD_CURSOR_COPIES.with(|s| s.set(s.get() + 1)); }
+    pub(crate) fn fold_cursor_copies() -> u64 { FOLD_CURSOR_COPIES.with(Cell::get) }
+    pub(crate) fn note_page_cursor_copy() { PAGE_CURSOR_COPIES.with(|s| s.set(s.get() + 1)); }
+    pub(crate) fn page_cursor_copies() -> u64 { PAGE_CURSOR_COPIES.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+#[test]
+fn live_owned_record_keeps_buffer_and_exact_ttl_with_old_control() {
+    use std::{assert_eq, assert_ne, vec};
+    use crate::common::codec::{pack_plain, pack_ttl};
+    for bytes in [vec![], vec![0], vec![1, 2], vec![2, 0, 1], pack_plain(&[0, 1, 255]),
+        pack_ttl(b"future", 101), pack_ttl(b"boundary", 100), pack_ttl(b"expired", 99)] {
+        let old = {
+            let _mode = scan_cost_reference::Scope::start();
+            let logical = bytes.clone();
+            let pointer = logical.as_ptr();
+            let record = live_record_of_logical(vec![0, 255], Some(logical), 100);
+            if let Some(record) = &record {
+                let value = record.value.as_ref().unwrap();
+                if !value.is_empty() { assert_ne!(value.as_ptr(), pointer, "old decoding must allocate a separate user value"); }
+            }
+            record
+        };
+        let pointer = bytes.as_ptr();
+        let new = live_record_of_logical(vec![0, 255], Some(bytes), 100);
+        if let Some(record) = &new { assert_eq!(record.value.as_ref().unwrap().as_ptr(), pointer); }
+        assert_eq!(new, old);
+    }
+    assert_eq!(live_record_of_logical(vec![], None, 100), None);
 }
 
 /// 界内**存活行**的流式扫描 —— 四家 `scan_foreach` 的唯一实现（M35 收拢）。

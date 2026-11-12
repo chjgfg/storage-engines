@@ -250,6 +250,12 @@ pub(crate) mod snapshot_probe {
         pub stop_mode: &'static str,
         pub visited_rows: u64,
         pub consumed_rows: u64,
+        /// Disjoint input-pull and fold/emit spans inside body_ns. Fold/emit
+        /// still includes write_ns and crc_ns; these nested spans cannot be added.
+        pub pull_ns: u128,
+        pub fold_emit_ns: u128,
+        pub input_batches: u64,
+        pub input_buffer_bytes: usize,
     }
     thread_local! { static ACTIVE: RefCell<Option<(bool, Stats)>> = const { RefCell::new(None) }; }
     pub(crate) struct Scope;
@@ -262,6 +268,7 @@ pub(crate) mod snapshot_probe {
     }
     impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
     pub(super) fn options() -> Option<bool> { ACTIVE.with(|s| s.borrow().as_ref().map(|s| s.0)) }
+    pub(crate) fn is_active() -> bool { options().is_some() }
     pub(crate) fn note(f: impl FnOnce(&mut Stats)) {
         ACTIVE.with(|s| { if let Some((_, stats)) = s.borrow_mut().as_mut() { f(stats); } });
     }
@@ -292,6 +299,13 @@ pub(crate) mod recovery_probe {
         pub verify_ns: u128,
         pub decode_ns: u128,
         pub replay_ns: u128,
+        pub replay_setup_ns: u128,
+        pub replay_encode_ns: u128,
+        pub replay_apply_ns: u128,
+        pub replay_commit_ns: u128,
+        pub replay_legacy_ns: u128,
+        pub replay_pages: u64,
+        pub replay_input_rows: u64,
         pub reads: u64,
     }
     thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
@@ -301,7 +315,10 @@ pub(crate) mod recovery_probe {
         pub fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().as_ref().unwrap().clone()) }
     }
     impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
-    pub enum Kind { Total, Verify, Records, Replay }
+    pub fn note(f: impl FnOnce(&mut Stats)) {
+        ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { f(stats); });
+    }
+    pub enum Kind { Total, Verify, Records, Replay, ReplaySetup, ReplayEncode, ReplayApply, ReplayCommit, ReplayLegacy }
     pub struct Timer { kind: Kind, start: Instant, replay_before: u128 }
     impl Timer {
         pub fn start(kind: Kind) -> Option<Self> {
@@ -317,6 +334,11 @@ pub(crate) mod recovery_probe {
                     Kind::Verify => stats.verify_ns += ns,
                     Kind::Records => stats.decode_ns += ns.saturating_sub(stats.replay_ns - self.replay_before),
                     Kind::Replay => stats.replay_ns += ns,
+                    Kind::ReplaySetup => stats.replay_setup_ns += ns,
+                    Kind::ReplayEncode => stats.replay_encode_ns += ns,
+                    Kind::ReplayApply => stats.replay_apply_ns += ns,
+                    Kind::ReplayCommit => stats.replay_commit_ns += ns,
+                    Kind::ReplayLegacy => stats.replay_legacy_ns += ns,
                 }
             });
         }

@@ -8,7 +8,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::{debug_assert_eq, matches, unreachable};
 
-use super::{VersionedKey, WinCandidate, decode_key, encode_key};
+use super::{WinCandidate, decode_key, encode_key};
+#[cfg(test)]
+use super::VersionedKey;
+use super::version::decode_key_ref;
 
 #[cfg(test)]
 std::thread_local! {
@@ -234,23 +237,38 @@ impl<'a, R> CandidateFold<'a, R> {
                 return true;
             }
         }
-        let Some(VersionedKey {
-            raw_key: key,
-            version,
-        }) = decode_key(enc)
+        #[cfg(test)]
+        if super::store::scan_cost_reference::enabled() {
+            let Some(VersionedKey { raw_key: key, version }) = decode_key(enc) else { return false; };
+            super::store::scan_cost_reference::note_key_copy();
+            if !visible(version)
+                || self.start.is_some_and(|s| key.as_slice() < s)
+                || self.end.is_some_and(|e| key.as_slice() >= e)
+                || self.after.is_some_and(|a| key.as_slice() <= a)
+                || self.accept.is_some_and(|f| !f(&key)) { return false; }
+            self.window.insert(key, (version, row()));
+            return false;
+        }
+        let Some((key, version)) = decode_key_ref(enc)
         else {
             return false;
         };
         if !visible(version)
-            || self.start.is_some_and(|s| key.as_slice() < s)
-            || self.end.is_some_and(|e| key.as_slice() >= e)
-            || self.after.is_some_and(|a| key.as_slice() <= a)
-            || self.accept.is_some_and(|f| !f(&key))
+            || self.start.is_some_and(|s| key < s)
+            || self.end.is_some_and(|e| key >= e)
+            || self.after.is_some_and(|a| key <= a)
+            || self.accept.is_some_and(|f| !f(key))
         {
             return false;
         }
         // Equal logical keys have monotonically increasing physical versions.
-        self.window.insert(key, (version, row()));
+        let mut next = Some((version, row()));
+        let winner = self.window.entry_with(key, || {
+            #[cfg(test)]
+            super::store::scan_cost_reference::note_key_copy();
+            (key.to_vec(), next.take().unwrap())
+        });
+        if let Some(next) = next { *winner = next; }
         false
     }
 
@@ -577,4 +595,26 @@ fn lazy_window_factory_is_called_only_for_new_groups() {
     assert_eq!(window.pop_first(), Some((b"a".to_vec(), vec![1, 2, 4])));
     assert_eq!(window.pop_first(), Some((b"a\0".to_vec(), vec![3])));
     assert_eq!(window.pop_first(), None);
+}
+
+#[cfg(test)]
+#[test]
+fn candidates_copy_only_new_visible_groups_with_old_control() {
+    use std::{assert, assert_eq};
+    use super::store::scan_cost_reference;
+    for reference in [true, false] {
+        let _mode = reference.then(scan_cost_reference::Scope::start);
+        let before = scan_cost_reference::key_copies();
+        let accept = |key: &[u8]| key != b"rejected";
+        let mut fold = CandidateFold::new(None, None, None, Some(&accept), 100, 10);
+        for version in 1..=100 { assert!(!fold.push(&encode_key(b"key", version), |v| v % 2 == 0, || version)); }
+        assert!(!fold.push(&encode_key(b"rejected", 100), |_| true, || 100));
+        let copies = scan_cost_reference::key_copies() - before;
+        let (out, complete) = fold.finish();
+        assert!(complete);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, b"key");
+        assert_eq!((out[0].version, out[0].row), (100, 100));
+        assert_eq!(copies, if reference { 101 } else { 1 });
+    }
 }
