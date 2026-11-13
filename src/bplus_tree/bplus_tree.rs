@@ -1360,8 +1360,13 @@ impl BPlusTree {
         // 下一次命中，只多付了 `Arc` 分配、HashMap 插入、`pin` 检查与装满之后的整表 `retain`
         // （和 [`crate::bplus_tree::page::PageManager::read_page_for_walk`] 当年"装得下才回填"
         // 是同一个理由）。插入那条路的页会被连续几百行反复用到，所以它值得（见 `insert_recursive`）。
-        let data = self.page_manager.read_page(page_id).expect("read page");
-        bincode::deserialize(&data).expect("deserialize node")
+        #[cfg(test)]
+        if delete_read_reference::enabled() {
+            let data = self.page_manager.read_page(page_id).expect("read page");
+            return bincode::deserialize(&data).expect("deserialize node");
+        }
+        self.page_manager.read_page_project(page_id, |data|
+            bincode::deserialize(data).expect("deserialize node")).expect("read page")
     }
 
     /// 写回节点。**装不下就一个字节都不动**，并把失败告诉调用方。
@@ -2289,12 +2294,35 @@ impl BPlusTree {
 
     /// `read_node` 的"页可能已经被合并掉"版本（M54b：把回溯段那两遍"先问在不在、再读一遍"合成一次）
     fn try_read_node(&mut self, page_id: PageId) -> Option<BTreeNode> {
-        let data = self.page_manager.read_page(page_id)?;
-        bincode::deserialize(&data).ok()
+        #[cfg(test)]
+        if delete_read_reference::enabled() {
+            let data = self.page_manager.read_page(page_id)?;
+            return bincode::deserialize(&data).ok();
+        }
+        self.page_manager.read_page_project(page_id, |data| bincode::deserialize(data).ok()).flatten()
     }
 
     /// 子树最小键（一直向左走到叶子）
     fn subtree_min_key(&mut self, node_page_id: PageId) -> Option<Key> {
+        #[cfg(test)]
+        if delete_read_reference::enabled() { return self.subtree_min_key_reference(node_page_id); }
+        enum Step { Descend(PageId), Minimum(Option<Key>) }
+        let mut page = node_page_id;
+        loop {
+            let step = self.page_manager.read_page_project(page, |data| {
+                match MaintenanceNode::decode(data).ok()? {
+                    MaintenanceNode::Leaf { rows, count, .. } => Some(Step::Minimum(
+                        if count == 0 { None } else { Some(NodeBytes(rows).row().ok()?.0.to_vec()) })),
+                    MaintenanceNode::Internal { children, .. } =>
+                        Some(Step::Descend(PageId(NodeBytes(children).u64().ok()?))),
+                }
+            }).flatten()?;
+            match step { Step::Descend(child) => page = child, Step::Minimum(key) => return key }
+        }
+    }
+
+    #[cfg(test)]
+    fn subtree_min_key_reference(&mut self, node_page_id: PageId) -> Option<Key> {
         // 节点可能在合并中被释放
         let data = self.page_manager.read_page(node_page_id)?;
         let node: BTreeNode = bincode::deserialize(&data).ok()?;
@@ -2303,7 +2331,7 @@ impl BPlusTree {
             BTreeNode::Internal { children, .. } => children
                 .first()
                 .copied()
-                .and_then(|c| self.subtree_min_key(c)),
+                .and_then(|c| self.subtree_min_key_reference(c)),
         }
     }
 }
@@ -2774,6 +2802,35 @@ mod tests {
         let mut rows = 0;
         assert_eq!(tree.scan_maintenance_from(None, |_, _| { rows += 1; false }).unwrap(), MaintenanceEnd::Complete);
         assert_eq!(rows, 205);
+    }
+
+    #[test]
+    fn delete_page_projection_preserves_dirty_reads_and_restructure() {
+        let mut costs = Vec::new();
+        for old in [true, false] {
+            let (_scratch, mut tree) = anon(8, 4096);
+            for i in 0..2000 { assert!(tree.insert(format!("{i:08}").into_bytes(), RowId(Some(vec![7; 16])))); }
+            let mode = old.then(delete_read_reference::Scope::start);
+            let before = crate::mem_probe::allocations();
+            let read = tree.read_node(tree.root);
+            let allocations = crate::mem_probe::allocations() - before;
+            costs.push(allocations);
+            assert!(matches!(read, BTreeNode::Internal { .. }));
+            let before = crate::mem_probe::allocations();
+            assert_eq!(tree.subtree_min_key(tree.root), Some(b"00000000".to_vec()));
+            let min_allocations = crate::mem_probe::allocations() - before;
+            if !old { assert_eq!(min_allocations, 2, "one copied min key plus expected test key; no owned intermediate nodes"); }
+            let victims: Vec<_> = (0..1900).map(|i| format!("{i:08}").into_bytes()).collect();
+            assert_eq!(tree.delete_batch(&victims), victims.len());
+            drop(mode);
+            for i in 0..2000 { assert_eq!(tree.get(format!("{i:08}").into_bytes()).is_some(), i >= 1900); }
+            tree.try_flush_all().unwrap();
+            let path = tree.page_manager.path().to_path_buf();
+            drop(tree);
+            let mut tree = BPlusTree::open(&path, 8, 8);
+            for i in 0..2000 { assert_eq!(tree.get(format!("{i:08}").into_bytes()).is_some(), i >= 1900); }
+        }
+        assert_eq!(costs[0], costs[1] + 1, "old read must allocate the extra raw payload");
     }
 
     #[test]
@@ -3709,6 +3766,16 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) mod delete_read_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
 }
 
 #[cfg(test)]

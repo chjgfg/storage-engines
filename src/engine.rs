@@ -6075,6 +6075,16 @@ mod tests {
     #[test]
     #[ignore = "B+ batched delete and serializer old/new/new/old; release single thread"]
     fn bplus_delete_buffer_cost() {
+        bplus_delete_cost(false);
+    }
+
+    #[test]
+    #[ignore = "B+ delete page projection ABBA; release single thread"]
+    fn bplus_delete_read_cost() {
+        bplus_delete_cost(true);
+    }
+
+    fn bplus_delete_cost(read_projection: bool) {
         use crate::common::maintenance_probe::{Scope, Stage};
         let rows: usize = std::env::var("BPLUS_DEL_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
         let mut costs = Vec::new();
@@ -6092,7 +6102,8 @@ mod tests {
                 for i in base..(base + 1000).min(rows / 10) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
                 tx.try_commit().unwrap();
             }
-            let mode = reference.then(crate::bplus_tree::bplus_tree::delete_cost_reference::Scope::start);
+            let mode = (reference && !read_projection).then(crate::bplus_tree::bplus_tree::delete_cost_reference::Scope::start);
+            let read_mode = (reference && read_projection).then(crate::bplus_tree::bplus_tree::delete_read_reference::Scope::start);
             let scope = Scope::start();
             let start = std::time::Instant::now();
             let result = db.vacuum().unwrap();
@@ -6102,8 +6113,9 @@ mod tests {
             pack_buffers.push(stats.bplus_pack_buffers);
             assert_eq!(result.versions_removed, rows / 10);
             assert_eq!(result.rows_scanned, (rows + rows / 10) as u64);
-            eprintln!("BPLUS_DELETE_BUFFER round={round} reference={reference} rows={rows} seconds={seconds:.6} stages={stats:?}");
-            drop(scope); drop(mode); drop(db);
+            eprintln!("BPLUS_DELETE_BUFFER read_projection={read_projection} round={round} reference={reference} rows={rows} seconds={seconds:.6} delete_allocations={} stages={stats:?}",
+                stats.allocations[Stage::VacuumDelete as usize]);
+            drop(scope); drop(mode); drop(read_mode); drop(db);
             let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
             let mut seen = 0;
             db.export_latest_visible_for_each(false, |r| {
@@ -6116,6 +6128,7 @@ mod tests {
         assert!(costs[0] > costs[1]);
         assert!(costs[3] > costs[2]);
         assert!(pack_buffers[0] > 0 && pack_buffers[3] > 0);
+        if read_projection { assert_eq!(pack_buffers[0], 1); assert_eq!(pack_buffers[3], 1); }
         assert_eq!(pack_buffers[1], 1); assert_eq!(pack_buffers[2], 1);
     }
 

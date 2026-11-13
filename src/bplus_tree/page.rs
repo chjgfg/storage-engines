@@ -804,6 +804,12 @@ impl PageManager {
 
     /// 读页 payload
     pub fn read_page(&mut self, page_id: PageId) -> Option<Vec<u8>> {
+        self.read_page_project(page_id, <[u8]>::to_vec)
+    }
+
+    /// Project while borrowing the coherent cached payload. Decoders can build
+    /// their owned result without allocating another full raw page first.
+    pub(crate) fn read_page_project<T>(&mut self, page_id: PageId, project: impl FnOnce(&[u8]) -> T) -> Option<T> {
         // 测试专用：页访问次数（含页缓存命中）—— 用来断言点操作的代价不随版本链长度增长
         #[cfg(test)]
         PAGE_READS.with(|c| c.set(c.get() + 1));
@@ -820,7 +826,7 @@ impl PageManager {
             self.update_lru(page_id);
             let entry = self.cache.get_mut(&page_id).unwrap();
             entry.last_access = self.clock;
-            return Some(entry.data.clone());
+            return Some(project(&entry.data));
         }
 
         #[cfg(test)]
@@ -834,18 +840,18 @@ impl PageManager {
         };
         self.evict_if_needed();
         // Reads remain usable for inspection, without growing the failed cache.
-        if self.ensure_healthy().is_err() { return Some(payload); }
+        if self.ensure_healthy().is_err() { return Some(project(&payload)); }
         self.cache.insert(
             page_id,
             CacheEntry {
                 page_id,
-                data: payload.clone(),
+                data: payload,
                 state: PageState::Clean,
                 last_access: self.clock,
             },
         );
         self.lru_queue.push_back(page_id);
-        Some(payload)
+        Some(project(&self.cache.get(&page_id).unwrap().data))
     }
 
     /// 只为**一次性走查**准备的读页：命中缓存就用，未命中时**只有在还装得下时才回填**。

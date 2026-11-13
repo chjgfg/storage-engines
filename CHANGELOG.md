@@ -2,6 +2,18 @@
 
 ## 未发布（2026-11-13）
 
+### M125：test11 第三步，B+ 删除直接解析页与最小键投影
+
+- 页缓存增加借用投影入口，保留原页存活、脏缓存、LRU、换出和故障读取合同；read_page 仍返回拥有缓冲。
+  删除/重组的 read_node 与 try_read_node 直接解析借用 payload，省掉每次完整页复制，不增加解析缓存。
+  分隔键刷新沿左侧路径使用现有受检字节视图，只拥有最终最小键，不再分配每个中间节点全部键值。
+  当前 delete_recursive 已批量消费子区间并在结构变更后刷新路由，本轮未用陈旧父页强行跳过必要重下降。
+- 脏页读/根节点投影分配/连续删除 1900 键触发重组/重开逐值守卫通过。B+ debug 100 passed / 0 failed / 6 ignored（192.75 s）。
+  新入口 `cargo test --offline --release --lib bplus_delete_read_cost -- --ignored --nocapture --test-threads=1`，BPLUS_DEL_ROWS 默认 600000。
+  与原 bplus_delete_buffer_cost 共用 fixture，仅切读取门，原序列化控制保持独立。
+  1000 行 debug 四轮通过（20.94 s），各删 100 历史版本并重开逐值核对 1000 键；删除分配旧 5274 / 5266 次、新均 4669 次。
+  小档未作墙钟性能结论，大档和最终 release 验收待完成；Windows 重链接曾因上一测试仍占用 exe 被拒，待其正常退出后重跑通过。
+
 ### M124：test11 第二步，LSM 扫描复用胜出记录
 
 - 轻量扫描与携带值凭据的扫描共用泛型惰性归并，保留源优先级、下界延迟激活和最大可见 seq 判定。
