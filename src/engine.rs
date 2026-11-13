@@ -5530,13 +5530,20 @@ mod tests {
     #[test]
     #[ignore = "LSM shared scan rows ABBA; release single thread"]
     fn lsm_scan_row_cost() {
-        use crate::lsm_tree::{sst::{sst_probes, block_reads}, lsm_tree_mvcc::scan_row_reference};
+        use crate::lsm_tree::{sst::{sst_probes, block_reads, sst_entry_walks, entry_value_clones, point_read_reference}, lsm_tree_mvcc::scan_row_reference};
         let rows: usize = std::env::var("LSM_SCAN_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);
         assert!(rows >= 1000);
         crate::scale_probe::fingerprint();
-        let dir = ScaleScratch::new("lsm_scan_rows");
-        {
-            let db = crate::lsm_tree::MVCC::open(&dir.0);
+        // An explicitly supplied scale fixture is reused and never removed.
+        // Only directories this test creates belong to the cleanup guard.
+        let existing = std::env::var_os("LSM_SCAN_EXISTING").map(PathBuf::from);
+        let owned = existing.is_none().then(|| ScaleScratch::new("lsm_scan_rows"));
+        let path = existing.as_ref().unwrap_or_else(|| &owned.as_ref().unwrap().0);
+        let updates: usize = std::env::var("LSM_SCAN_UPDATES").map(|v| v.parse().unwrap()).unwrap_or(0);
+        assert!(updates <= rows && (existing.is_some() || updates == 0));
+        if existing.is_some() { assert!(path.join("MANIFEST").is_file(), "existing fixture must already be an LSM database"); }
+        if owned.is_some() {
+            let db = crate::lsm_tree::MVCC::open(path);
             let mut bulk = db.begin_bulk();
             for i in 0..rows {
                 bulk.put(&scale_key(i), scale_val(i));
@@ -5545,7 +5552,29 @@ mod tests {
             bulk.finish();
         }
         for (round, old) in [true, false, false, true].into_iter().enumerate() {
-            let db = crate::lsm_tree::MVCC::open(&dir.0);
+            let db = crate::lsm_tree::MVCC::open(path);
+            if existing.is_some() {
+                let mode = old.then(point_read_reference::Scope::start);
+                let copies = entry_value_clones(); let walks = sst_entry_walks();
+                let start = std::time::Instant::now();
+                let tx = db.begin_transaction();
+                let reads = rows.min(200_000);
+                for j in 0..reads {
+                    let i = j * 104729 % rows;
+                    assert_eq!(tx.get(&scale_key(i)), Some(scale_val(if i < updates { i + rows } else { i })));
+                }
+                tx.commit();
+                eprintln!("LSM_REUSE_GET round={round} reference={old} rows={rows} reads={reads} seconds={:.6} value_clones={} matching_or_walked_rows={}",
+                    start.elapsed().as_secs_f64(), entry_value_clones() - copies, sst_entry_walks() - walks);
+                let tx = db.begin_transaction();
+                let copies = entry_value_clones();
+                for j in 0..1000 { assert!(tx.set_raw(&scale_key(j * 104729 % rows), vec![7; 64])); }
+                let copies = entry_value_clones() - copies;
+                if old { assert!(copies > 0); } else { assert_eq!(copies, 0); }
+                tx.rollback();
+                eprintln!("LSM_REUSE_CONFLICT round={round} reference={old} writes=1000 value_clones={copies} rolled_back=true");
+                drop(mode);
+            }
             let mode = old.then(scan_row_reference::Scope::start);
             let probes = sst_probes(); let blocks = block_reads();
             let cpu = crate::scale_probe::Phase::start();
@@ -5553,7 +5582,7 @@ mod tests {
             let mut seen = 0;
             db.export_latest_visible_for_each(false, |row| {
                 assert_eq!(row.key, scale_key(seen));
-                assert_eq!(row.value, Some(scale_val(seen)));
+                assert_eq!(row.value, Some(scale_val(if seen < updates { seen + rows } else { seen })));
                 seen += 1; true
             });
             let probes = sst_probes() - probes;
