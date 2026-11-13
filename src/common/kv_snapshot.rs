@@ -298,6 +298,9 @@ pub(crate) mod snapshot_probe {
         pub fold_emit_ns: u128,
         pub input_batches: u64,
         pub input_buffer_bytes: usize,
+        /// Completed ordinary groups emitted without entering the overlap window.
+        pub fold_direct_rows: u64,
+        pub fold_window_rows: u64,
         pub record_buffer_bytes: usize,
         pub record_flushes: u64,
         pub record_buffered_rows: u64,

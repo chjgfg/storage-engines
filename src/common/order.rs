@@ -41,7 +41,7 @@ pub(crate) fn logical_floor(enc: &[u8], max_version: u64) -> &[u8] {
 
 /// Test only prefixes that can be <= this pending key. Prefixes beyond its
 /// shared bytes with enc are larger, so cannot prevent this key's completion.
-fn window_before(first: &[u8], enc: &[u8], max_version: u64) -> bool {
+pub(crate) fn window_before(first: &[u8], enc: &[u8], max_version: u64) -> bool {
     if first >= enc { return false; }
     let common = first.iter().zip(enc).take_while(|(a, b)| a == b).count();
     let ceiling = max_version.to_be_bytes();

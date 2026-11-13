@@ -5993,6 +5993,16 @@ mod tests {
     #[test]
     #[ignore = "memory stop record batches, first/bulk shapes ABBA; release single thread"]
     fn memory_stop_emit_cost() {
+        memory_stop_fold_or_emit_cost(false);
+    }
+
+    #[test]
+    #[ignore = "memory completed group folding, first/bulk shapes ABBA; release single thread"]
+    fn memory_stop_fold_cost() {
+        memory_stop_fold_or_emit_cost(true);
+    }
+
+    fn memory_stop_fold_or_emit_cost(fold_only: bool) {
         use crate::common::kv_snapshot::{snapshot_emit_reference, snapshot_probe, read_snapshot_with,
             ValueBuffer, RECORD_BATCH_BYTES};
         use std::io::{Read, Seek, SeekFrom};
@@ -6019,7 +6029,8 @@ mod tests {
                     for i in rows..total_rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
                     bulk.finish();
                 }
-                let mode = reference.then(snapshot_emit_reference::Scope::start);
+                let mode = (reference && !fold_only).then(snapshot_emit_reference::Scope::start);
+                let fold_mode = (reference && fold_only).then(crate::memory::memory_mvcc::stop_fold_reference::Scope::start);
                 let scope = snapshot_probe::Scope::start(false);
                 let before = crate::mem_probe::allocations();
                 let start = std::time::Instant::now();
@@ -6031,7 +6042,7 @@ mod tests {
                 assert_eq!(stats.consumed_rows, total_rows as u64);
                 assert_eq!(stats.input_batches, total_rows.div_ceil(8192) as u64);
                 assert!(stats.pull_ns + stats.fold_emit_ns <= stats.body_ns);
-                if reference {
+                if reference && !fold_only {
                     assert_eq!(stats.record_reference_rows, total_rows as u64);
                     assert_eq!(stats.record_buffer_bytes, 0);
                     assert_eq!(stats.record_flushes, 0);
@@ -6043,8 +6054,12 @@ mod tests {
                     assert!(stats.record_flushes > 0 && stats.record_flushes < total_rows as u64);
                     assert!(stats.record_flush_ns <= stats.fold_emit_ns);
                 }
-                eprintln!("MEMORY_STOP_EMIT round={round} reference={reference} appended={appended} rows={total_rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");
-                drop(scope); drop(mode);
+                if fold_only {
+                    assert_eq!(stats.fold_direct_rows, if reference { 0 } else { (total_rows - total_rows.div_ceil(8192)) as u64 });
+                    assert_eq!(stats.fold_window_rows, if reference { total_rows as u64 } else { total_rows.div_ceil(8192) as u64 });
+                }
+                eprintln!("MEMORY_STOP_EMIT fold_only={fold_only} round={round} reference={reference} appended={appended} rows={total_rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");
+                drop(scope); drop(mode); drop(fold_mode);
                 let path = dir.0.join("snapshot.bxp");
                 let mut file = std::fs::File::open(&path).unwrap();
                 file.seek(SeekFrom::End(-16)).unwrap();

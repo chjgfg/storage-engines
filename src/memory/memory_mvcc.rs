@@ -32,6 +32,10 @@ enum SnapshotOwnership {
     Shared,
 }
 
+/// A following encoded row can certify completion without owning a window key.
+/// Overlapping prefixes and batch tails retain the general folding path.
+enum SnapshotFoldRoute { Complete, Window }
+
 // 测试专用：本线程在「每个逻辑 key 的胜出行」那次折叠里**走了多少个版本键**。
 //
 // 内存引擎既没有磁盘读也没有 WAL，所以它的代价单位就是"比了多少把键"：
@@ -425,7 +429,8 @@ impl MVCC {
                 { detail.input_batches += 1; }
                 #[cfg(test)]
                 let fold = measured.then(std::time::Instant::now);
-                for (enc, value) in batch.drain(..) {
+                let mut input = batch.drain(..).peekable();
+                while let Some((enc, value)) = input.next() {
                     visited += 1;
                     while let Some((key, (_, value))) = groups.pop_before(&enc, ceiling) {
                         emit(sink, &key, value)?;
@@ -433,6 +438,26 @@ impl MVCC {
                     }
                     let Some((raw, version)) = decode_key_ref(&enc) else { continue; };
                     if !visible(version) { continue; }
+                    #[cfg(test)]
+                    let reference = stop_fold_reference::enabled();
+                    #[cfg(not(test))]
+                    let reference = false;
+                    let route = if !reference && groups.is_empty() && input.peek().is_some_and(|(next, _)|
+                        crate::common::order::window_before(raw, next, ceiling)) {
+                        SnapshotFoldRoute::Complete
+                    } else { SnapshotFoldRoute::Window };
+                    match route {
+                        SnapshotFoldRoute::Complete => {
+                            emit(sink, raw, value)?;
+                            #[cfg(test)]
+                            { detail.fold_direct_rows += 1; }
+                            continue;
+                        }
+                        SnapshotFoldRoute::Window => {
+                            #[cfg(test)]
+                            { detail.fold_window_rows += 1; }
+                        }
+                    }
                     let len = raw.len();
                     let winner = match enc {
                         Cow::Owned(mut key) => {
@@ -464,6 +489,7 @@ impl MVCC {
             s.consumed_rows = if mode == "exclusive" { visited } else { 0 };
             s.pull_ns = detail.pull_ns; s.fold_emit_ns = detail.fold_emit_ns;
             s.input_batches = detail.input_batches; s.input_buffer_bytes = detail.input_buffer_bytes;
+            s.fold_direct_rows = detail.fold_direct_rows; s.fold_window_rows = detail.fold_window_rows;
         });
         #[cfg(not(test))]
         let _ = (mode, visited);
@@ -1351,6 +1377,16 @@ pub(crate) mod scan_reference {
 }
 
 #[cfg(test)]
+pub(crate) mod stop_fold_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
 pub(crate) mod stop_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
@@ -1389,6 +1425,34 @@ mod tests {
     use std::format;
 
     #[test]
+    fn snapshot_completed_rows_bypass_window_with_real_reference() {
+        use crate::common::{encode_key, pack_plain, kv_snapshot::snapshot_probe};
+        let rows: Vec<_> = (0..8200_u64).map(|i|
+            (encode_key(format!("k{i:08}").as_bytes(), 1), Some(pack_plain(&i.to_le_bytes())))).collect();
+        let mut expected = None;
+        for borrowed in [false, true] {
+            for old in [true, false] {
+                let path = crate::common::ScratchPath::new("memory", "completed_snapshot", ".bxp");
+                let mode = old.then(stop_fold_reference::Scope::start);
+                let scope = snapshot_probe::Scope::start(false);
+                let input = rows.iter().map(|(key, value)| if borrowed {
+                    (Cow::Borrowed(key.as_slice()), value.as_deref().map(Cow::Borrowed))
+                } else { (Cow::Owned(key.clone()), value.clone().map(Cow::Owned)) });
+                assert_eq!(MVCC::write_snapshot_rows(&path, input, 2, |v| v < 2,
+                    if borrowed { "shared" } else { "exclusive" }).unwrap(), 8200);
+                let stats = scope.stats();
+                assert_eq!(stats.fold_direct_rows, if old { 0 } else { 8198 });
+                assert_eq!(stats.fold_window_rows, if old { 8200 } else { 2 });
+                assert_eq!(stats.record_buffered_rows, 8200);
+                assert_eq!(stats.input_batches, 2);
+                drop(scope); drop(mode);
+                let bytes = std::fs::read(&path).unwrap();
+                if let Some(expected) = &expected { assert_eq!(&bytes, expected); } else { expected = Some(bytes); }
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_batches_keep_cross_batch_versions_and_prefixes() {
         use crate::common::{encode_key, pack_plain, pack_ttl, kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer}};
         let mut rows = Vec::new();
@@ -1397,9 +1461,10 @@ mod tests {
         rows.push((encode_key(b"k\0", 1), Some(pack_ttl(b"future", u64::MAX))));
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         let mut golden = None;
-        for reference in [true, false] {
+        for (reference, old_fold) in [(true, false), (false, true), (false, false)] {
             let path = crate::common::ScratchPath::new("memory", "snapshot_batches", ".bxp");
             let _mode = reference.then(stop_rows_reference::Scope::start);
+            let _fold_mode = old_fold.then(stop_fold_reference::Scope::start);
             let scope = snapshot_probe::Scope::start(false);
             let input = rows.clone().into_iter().map(|(k, v)| (Cow::Owned(k), v.map(Cow::Owned)));
             assert_eq!(MVCC::write_snapshot_rows(&path, input, 9001, |v| v <= 9000, "exclusive").unwrap(), 3);
