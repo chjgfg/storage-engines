@@ -3705,7 +3705,7 @@ mod tests {
         db.inject_sst_for_test(0, vec![(b"k".to_vec(), StoredEntry::put(4, Some(vec![2])))]).unwrap();
         let (key, row) = db.row_iter_range(None, None, 4).next().unwrap();
         assert_eq!(key, b"k");
-        assert!(matches!(row.freeze(&key), ScanRow::AmbiguousLookup(_)));
+        assert!(matches!(row.freeze(|| key.clone()), ScanRow::AmbiguousLookup(_)));
         assert_eq!(db.get_value_at(&key, 4), Some(Some(vec![1])));
         let clones = crate::lsm_tree::sst::entry_value_clones();
         assert_eq!(db.row_iter_range(None, None, 4).count(), 1);

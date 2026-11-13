@@ -176,11 +176,11 @@ impl<'a> SourceRow<'a> {
         }
     }
     pub(crate) fn kind(&self) -> u8 { self.value().kind_byte() }
-    pub(crate) fn freeze(self, enc: &[u8]) -> ScanRow {
-        if self.ambiguous { return ScanRow::AmbiguousLookup(enc.to_vec()); }
+    pub(crate) fn freeze(self, enc: impl FnOnce() -> Vec<u8>) -> ScanRow {
+        if self.ambiguous { return ScanRow::AmbiguousLookup(enc()); }
         if let EntryValue::Put(Some(value)) = self.value() {
             if super::lsm_tree::LSMTree::blob_ptr_seq(value).is_some() {
-                return ScanRow::BlobLookup(enc.to_vec());
+                return ScanRow::BlobLookup(enc());
             }
         }
         ScanRow::Inline(InlineRow(match self.value {

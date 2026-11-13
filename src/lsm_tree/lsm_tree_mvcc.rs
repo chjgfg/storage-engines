@@ -1391,7 +1391,7 @@ impl Transaction {
     /// 折出**候选组**（一把逻辑 key 一组，值还没取）。
     ///
     /// ① 共享视图：归并带出胜者的 seq、种类和块引用，SST 值在交付时才复制。
-    ///    mem/旧格式借用在键过滤通过后才转为拥有值；blob 与同 seq 歧义保留显式点查回退。
+    ///    mem/旧格式借用在逻辑版本折叠结束后仅拥有化胜者；blob 与同 seq 歧义保留显式点查回退。
     ///    旧实现走 `iter()`，而它会先把每个源（含每个 SST 的每行）连 value 一起
     ///    `collect()` 进内存 ⇒ 一次全库折叠的峰值内存约等于整个库。
     ///    kind==2 即 `EntryValue::Drop`：与 `iter()` 的 filter 一致，整行不可见
@@ -1405,11 +1405,11 @@ impl Transaction {
     ) -> (Vec<crate::common::WinCandidate<crate::lsm_tree::sst::ScanRow>>, bool) {
         let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
         let lo = crate::common::fold_lower_bound(start, after);
-        let mut fold = crate::common::order::CandidateFold::new(
-            start, end, after, accept, self.core.version, budget);
         let kv = self.kv.lock().unwrap();
         #[cfg(test)]
         if scan_row_reference::enabled() {
+            let mut fold = crate::common::order::CandidateFold::new(
+                start, end, after, accept, self.core.version, budget);
             for (enc, row) in kv.light_iter_range(lo, hi.as_deref(), u64::MAX) {
                 crate::lsm_tree::sst::note_light_visit();
                 if row.kind == 2 { continue; }
@@ -1417,13 +1417,21 @@ impl Transaction {
             }
             return fold.finish();
         }
+        let mut fold = crate::common::order::CandidateFold::new(
+            start, end, after, accept, self.core.version, budget);
         for (enc, row) in kv.row_iter_range(lo, hi.as_deref(), u64::MAX) {
             #[cfg(test)]
             crate::lsm_tree::sst::note_light_visit();
             if row.kind() == 2 { continue; }
-            if fold.push(&enc, |v| self.is_visible(v), || row.freeze(&enc)) { break; }
+            if fold.push(&enc, |v| self.is_visible(v), || row) { break; }
         }
-        fold.finish()
+        // Borrowed mem/legacy values stay under the tree lock through logical
+        // folding. Only final winners become owned; superseded versions never copy.
+        let (rows, complete) = fold.finish();
+        (rows.into_iter().map(|candidate| {
+            let row = candidate.row.freeze(|| encode_key(&candidate.key, candidate.version));
+            crate::common::WinCandidate { key: candidate.key, version: candidate.version, row }
+        }).collect(), complete)
     }
 
     pub fn print_all(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
@@ -1556,6 +1564,34 @@ impl Transaction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scan_mem_versions_copy_only_the_logical_winner() {
+        use crate::common::VersionedStore;
+        let path = tmp_db("scan_mem_winner");
+        let db = MVCC::open(&path);
+        db.set_vacuum_auto_slice(0);
+        for i in 0..100 {
+            let tx = db.begin_transaction();
+            assert!(tx.set_raw(b"key", vec![i; 64])); tx.commit();
+        }
+        let tx = db.begin_transaction();
+        let before = crate::lsm_tree::sst::entry_value_clones();
+        {
+            let kv = tx.kv.lock().unwrap();
+            for (_, row) in kv.row_iter_range(None, None, u64::MAX) { drop(row.freeze(Vec::new)); }
+        }
+        assert_eq!(crate::lsm_tree::sst::entry_value_clones() - before, 100,
+            "owning before logical folding is the actual copying control");
+        let copies = crate::lsm_tree::sst::entry_value_clones();
+        let (mut rows, complete) = tx.scan_candidates(None, None, None, None, 4096);
+        assert!(complete); assert_eq!(rows.len(), 1);
+        assert_eq!(crate::lsm_tree::sst::entry_value_clones() - copies, 1,
+            "only the final logical winner may copy a borrowed payload");
+        assert_eq!(tx.materialize(rows.pop().unwrap().row),
+            crate::common::RowValue::Value(crate::common::pack_plain(&vec![99; 64])));
+        tx.commit();
+    }
+
     #[test]
     fn scan_rows_reuse_blocks_and_filter_before_copying_values() {
         use crate::common::VersionedStore;
