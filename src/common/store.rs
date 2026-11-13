@@ -39,7 +39,7 @@ pub enum RowValue {
 /// - [`Self::materialize`]：把一组的凭据换成实际字节
 pub trait VersionedStore {
     /// 这一家的"再拿到这一行的凭据"：memory/bplus 是顺手带出的存储字节，
-    /// bitcask/lsm 是编码键（值在另一处，要再读一次）。
+    /// bitcask 是编码键；LSM 普通值保留共享块，blob/同 seq 歧义保留显式点查凭据。
     type Row;
 
     /// 折出候选组：`start`/`end` 是逻辑键界（含下、不含上），`accept` 是**键级**过滤

@@ -5528,6 +5528,46 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "LSM shared scan rows ABBA; release single thread"]
+    fn lsm_scan_row_cost() {
+        use crate::lsm_tree::{sst::{sst_probes, block_reads}, lsm_tree_mvcc::scan_row_reference};
+        let rows: usize = std::env::var("LSM_SCAN_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 1000);
+        crate::scale_probe::fingerprint();
+        let dir = ScaleScratch::new("lsm_scan_rows");
+        {
+            let db = crate::lsm_tree::MVCC::open(&dir.0);
+            let mut bulk = db.begin_bulk();
+            for i in 0..rows {
+                bulk.put(&scale_key(i), scale_val(i));
+                if (i + 1) % 1_000_000 == 0 { eprintln!("LSM_SCAN_BUILD rows={}", i + 1); }
+            }
+            bulk.finish();
+        }
+        for (round, old) in [true, false, false, true].into_iter().enumerate() {
+            let db = crate::lsm_tree::MVCC::open(&dir.0);
+            let mode = old.then(scan_row_reference::Scope::start);
+            let probes = sst_probes(); let blocks = block_reads();
+            let cpu = crate::scale_probe::Phase::start();
+            let start = std::time::Instant::now();
+            let mut seen = 0;
+            db.export_latest_visible_for_each(false, |row| {
+                assert_eq!(row.key, scale_key(seen));
+                assert_eq!(row.value, Some(scale_val(seen)));
+                seen += 1; true
+            });
+            let probes = sst_probes() - probes;
+            assert_eq!(seen, rows);
+            if old { assert!(probes >= rows as u64); }
+            else { assert_eq!(probes, 0, "ordinary scan must use retained rows"); }
+            eprintln!("LSM_SCAN_ROWS round={round} reference={old} verified={seen} seconds={:.6} point_probes={probes} blocks={}",
+                start.elapsed().as_secs_f64(), block_reads() - blocks);
+            cpu.finish("lsm_tree", &format!("scan_rows_round_{round}"));
+            drop(mode);
+        }
+    }
+
+    #[test]
     #[ignore = "LSM vacuum old/new/new/old; release single thread"]
     fn lsm_vacuum_delete_cost() {
         let rows: usize = std::env::var("LSM_DEL_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);

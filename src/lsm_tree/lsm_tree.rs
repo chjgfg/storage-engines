@@ -22,7 +22,7 @@ use std::{
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
 use crate::lsm_tree::sst::{
     merge_latest_streaming, merge_streaming, merge_to_ssts_with_action, CompactionAction, TryMergeInput, UnpublishedSsts, vec_inputs, BlockCache, EntryValue,
-    LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry,
+    LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry, SourceRow, MergeRow,
 };
 
 /// A winning Put/tombstone observed by the strict maintenance reader while the
@@ -1439,7 +1439,23 @@ impl LSMTree {
         to: Option<&'a [u8]>,
         snap_seq: u64,
     ) -> LightMerge<'a> {
-        let mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + '_>> = Vec::new();
+        self.projected_iter_range(from, to, snap_seq,
+            |seq, value| LightEntry { seq, kind: value.kind_byte() },
+            |sst, from, to, snap| Box::new(sst.light_iter(from, to, snap)))
+    }
+
+    pub(crate) fn row_iter_range<'a>(&'a self, from: Option<&'a [u8]>, to: Option<&'a [u8]>, snap_seq: u64)
+        -> LightMerge<'a, SourceRow<'a>> {
+        self.projected_iter_range(from, to, snap_seq, SourceRow::borrowed,
+            |sst, from, to, snap| sst.row_iter(from, to, snap))
+    }
+
+    fn projected_iter_range<'a, R: MergeRow + 'a>(&'a self, from: Option<&'a [u8]>, to: Option<&'a [u8]>,
+        snap_seq: u64, mem: fn(u64, &'a EntryValue) -> R,
+        sst_rows: impl Fn(&'a SstFile, Option<&'a [u8]>, Option<&'a [u8]>, u64)
+            -> Box<dyn Iterator<Item = (Vec<u8>, R)> + 'a>,
+    ) -> LightMerge<'a, R> {
+        let mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, R)> + '_>> = Vec::new();
         // 与 sources 一一对应的驻留键下界（`None` = 建堆当场激活）。见 `LightMerge` 的六条判据。
         let mut bound: Vec<Option<&'a [u8]>> = Vec::new();
         if matches!((from, to), (Some(lo), Some(hi)) if lo >= hi) {
@@ -1448,11 +1464,11 @@ impl LSMTree {
         // memtable 不排队：它没有"读块"这笔代价，拉首键只是 BTreeMap 上的一次 seek，
         // 而它的下界要靠同一趟 seek 才拿得到 —— 排队省不下任何东西，只会让归并多一层状态。
         if !self.mem.is_empty() {
-            sources.push(Box::new(Self::mem_light_iter(&self.mem, from, to, snap_seq)));
+            sources.push(Box::new(Self::mem_projected_iter(&self.mem, from, to, snap_seq, mem)));
             bound.push(None);
         }
         for imm in &self.immutables {
-            sources.push(Box::new(Self::mem_light_iter(imm, from, to, snap_seq)));
+            sources.push(Box::new(Self::mem_projected_iter(imm, from, to, snap_seq, mem)));
             bound.push(None);
         }
         // 源顺序必须与 merge_all_at / scan_latest_light 一致：levels[0] 旧→新，反转成新→旧。
@@ -1481,7 +1497,7 @@ impl LSMTree {
                 Some(lo) if lo >= sst.min_key.as_slice() => lo,
                 _ => sst.min_key.as_slice(),
             }));
-            sources.push(Box::new(sst.light_iter(from, to, snap_seq)));
+            sources.push(sst_rows(sst, from, to, snap_seq));
         }
         LightMerge::build(sources, bound)
     }
@@ -1548,6 +1564,13 @@ impl LSMTree {
         to: Option<&'a [u8]>,
         snap_seq: u64,
     ) -> impl Iterator<Item = (Vec<u8>, LightEntry)> + 'a {
+        Self::mem_projected_iter(map, from, to, snap_seq,
+            |seq, value| LightEntry { seq, kind: value.kind_byte() })
+    }
+
+    fn mem_projected_iter<'a, R: 'a>(map: &'a MemMap, from: Option<&'a [u8]>, to: Option<&'a [u8]>,
+        snap_seq: u64, project: fn(u64, &'a EntryValue) -> R,
+    ) -> impl Iterator<Item = (Vec<u8>, R)> + 'a {
         use std::ops::Bound;
         let lo = match from {
             Some(k) => Bound::Included(k),
@@ -1559,7 +1582,7 @@ impl LSMTree {
         };
         map.range::<[u8], _>((lo, hi)).filter_map(move |(k, vers)| {
             let (seq, ev) = vers.iter().rev().find(|(s, _)| **s <= snap_seq)?;
-            Some((k.clone(), LightEntry { seq: *seq, kind: ev.kind_byte() }))
+            Some((k.clone(), project(*seq, ev)))
         })
     }
 
@@ -3674,6 +3697,22 @@ mod tests {
     }
 
     #[test]
+    fn scan_row_ties_keep_point_read_fallback() {
+        use crate::lsm_tree::sst::ScanRow;
+        let dir = tmp_dir("scan_tied_sources");
+        let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
+        db.inject_sst_for_test(1, vec![(b"k".to_vec(), StoredEntry::put(4, Some(vec![1])))]).unwrap();
+        db.inject_sst_for_test(0, vec![(b"k".to_vec(), StoredEntry::put(4, Some(vec![2])))]).unwrap();
+        let (key, row) = db.row_iter_range(None, None, 4).next().unwrap();
+        assert_eq!(key, b"k");
+        assert!(matches!(row.freeze(&key), ScanRow::AmbiguousLookup(_)));
+        assert_eq!(db.get_value_at(&key, 4), Some(Some(vec![1])));
+        let clones = crate::lsm_tree::sst::entry_value_clones();
+        assert_eq!(db.row_iter_range(None, None, 4).count(), 1);
+        assert_eq!(crate::lsm_tree::sst::entry_value_clones(), clones);
+    }
+
+    #[test]
     fn key_lookup_full_scan_is_explicit_and_keeps_the_byte_interval() {
         let dir = tmp_dir("key_back_fallback");
         let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
@@ -5224,8 +5263,8 @@ fn note_source_activation() {
 /// ⑥ 与 eager 形状逐字节对拍：守卫
 ///    `test_lazy_source_activation_first_page_does_not_scale_with_files` 与
 ///    `test_lazy_source_activation_agrees_with_eager_everywhere`
-pub struct LightMerge<'a> {
-    sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>,
+pub struct LightMerge<'a, R = LightEntry> {
+    sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, R)> + 'a>>,
     /// 每个源**可能交出的最小键**（含）。取不到驻留下界的源（memtable：本来就在内存里，
     /// 拉首键不花 I/O）这里是 `None`，建堆时当场激活；`Some` 的源进 `waiting` 排队。
     /// 用 `&'a [u8]` 不复制：这些切片就是 `SstFile::min_key` / 调用方给的 `from`。
@@ -5233,9 +5272,9 @@ pub struct LightMerge<'a> {
     /// `bound` 里仍为 `Some` 的源序号，**按下界降序**存放 ⇒ `last()` 永远是最小下界，
     /// 补齐覆盖时从尾部 `pop`，每个源至多被看一次（不是每轮全表扫描）。
     waiting: Vec<usize>,
-    head: Vec<Option<(Vec<u8>, LightEntry)>>,
+    head: Vec<Option<(Vec<u8>, R)>>,
     heap: BinaryHeap<MergeNode>,
-    pending: Option<(Vec<u8>, LightEntry)>,
+    pending: Option<(Vec<u8>, R)>,
 }
 
 struct MergeNode {
@@ -5272,11 +5311,11 @@ impl PartialEq for MergeNode {
 
 impl Eq for MergeNode {}
 
-impl<'a> LightMerge<'a> {
+impl<'a, R: MergeRow> LightMerge<'a, R> {
     /// `bound` 与 `sources` 一一对应：`Some(b)` = 先不碰这个源，`b` 是它的驻留键下界；
     /// `None` = 当场拉第一个键。长度不一致会把"什么时候拉"和"谁更新"错位，所以钉死。
     fn build(
-        mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, LightEntry)> + 'a>>,
+        mut sources: Vec<Box<dyn Iterator<Item = (Vec<u8>, R)> + 'a>>,
         bound: Vec<Option<&'a [u8]>>,
     ) -> Self {
         assert_eq!(
@@ -5364,8 +5403,8 @@ impl<'a> LightMerge<'a> {
     }
 }
 
-impl<'a> Iterator for LightMerge<'a> {
-    type Item = (Vec<u8>, LightEntry);
+impl<R: MergeRow> Iterator for LightMerge<'_, R> {
+    type Item = (Vec<u8>, R);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -5383,10 +5422,11 @@ impl<'a> Iterator for LightMerge<'a> {
             self.advance(src);
             match self.pending.take() {
                 None => self.pending = Some((key, le)),
-                Some((pk, ple)) if pk == key => {
+                Some((pk, mut ple)) if pk == key => {
                     // 同一个键：**这道比较才是胜者判据** —— 先出的是源序里更新的那个，
                     // 但层内重叠文件的"更新"只有 seq 能回答 ⇒ 后到的 seq 更大就换掉它。
-                    self.pending = Some((pk, if ple.seq >= le.seq { ple } else { le }));
+                    if ple.seq() == le.seq() { ple.equal_seq(); }
+                    self.pending = Some((pk, if ple.seq() >= le.seq() { ple } else { le }));
                 }
                 Some((pk, ple)) => {
                     // 换键了 ⇒ 前一个键已经收齐，可以吐

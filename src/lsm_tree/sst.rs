@@ -124,6 +124,82 @@ struct DataBlock {
     entries: Vec<(Vec<u8>, StoredEntry)>,
 }
 
+/// Candidate ownership survives releasing the tree lock without copying an SST
+/// payload. Blob pointers deliberately retain the existing locked lookup path:
+/// their files can be reclaimed after this scan releases the lock.
+pub enum ScanRow {
+    Inline(InlineRow),
+    BlobLookup(Vec<u8>),
+    /// Historical metadata ties prefer the first source, whereas point values
+    /// prefer the last. Preserve that contract without guessing from one row.
+    AmbiguousLookup(Vec<u8>),
+    #[cfg(test)]
+    ReferenceLookup(Vec<u8>),
+}
+
+pub struct InlineRow(InlineStorage);
+enum InlineStorage {
+    Owned(EntryValue),
+    Block(Arc<DataBlock>, usize),
+}
+impl InlineRow {
+    pub(crate) fn materialize(self) -> crate::common::RowValue {
+        let value = match self.0 {
+            InlineStorage::Owned(value) => value,
+            InlineStorage::Block(block, pos) => block.entries[pos].1.value.clone(),
+        };
+        match value {
+            EntryValue::Put(Some(value)) => crate::common::RowValue::Value(value),
+            EntryValue::Put(None) => crate::common::RowValue::Tombstone,
+            EntryValue::Drop => crate::common::RowValue::Missing,
+        }
+    }
+}
+
+pub(crate) struct SourceRow<'a> {
+    pub(crate) seq: u64,
+    value: SourceValue<'a>,
+    ambiguous: bool,
+}
+enum SourceValue<'a> {
+    Borrowed(&'a EntryValue),
+    Block(Arc<DataBlock>, usize),
+}
+impl<'a> SourceRow<'a> {
+    pub(crate) fn borrowed(seq: u64, value: &'a EntryValue) -> Self {
+        Self { seq, value: SourceValue::Borrowed(value), ambiguous: false }
+    }
+    fn value(&self) -> &EntryValue {
+        match &self.value {
+            SourceValue::Borrowed(value) => value,
+            SourceValue::Block(block, pos) => &block.entries[*pos].1.value,
+        }
+    }
+    pub(crate) fn kind(&self) -> u8 { self.value().kind_byte() }
+    pub(crate) fn freeze(self, enc: &[u8]) -> ScanRow {
+        if self.ambiguous { return ScanRow::AmbiguousLookup(enc.to_vec()); }
+        if let EntryValue::Put(Some(value)) = self.value() {
+            if super::lsm_tree::LSMTree::blob_ptr_seq(value).is_some() {
+                return ScanRow::BlobLookup(enc.to_vec());
+            }
+        }
+        ScanRow::Inline(InlineRow(match self.value {
+            SourceValue::Borrowed(value) => InlineStorage::Owned(value.clone()),
+            SourceValue::Block(block, pos) => InlineStorage::Block(block, pos),
+        }))
+    }
+}
+
+pub trait MergeRow {
+    fn seq(&self) -> u64;
+    fn equal_seq(&mut self) {}
+}
+impl MergeRow for LightEntry { fn seq(&self) -> u64 { self.seq } }
+impl MergeRow for SourceRow<'_> {
+    fn seq(&self) -> u64 { self.seq }
+    fn equal_seq(&mut self) { self.ambiguous = true; }
+}
+
 /// Freeze the pre-M123 block walk and value-copying lookup for paired probes.
 #[cfg(test)]
 pub(crate) mod point_read_reference {
@@ -943,14 +1019,29 @@ impl SstFile {
         to: Option<&[u8]>,
         snap_seq: u64,
     ) -> impl Iterator<Item = (Vec<u8>, LightEntry)> + '_ {
+        self.projected_iter(from, to, snap_seq, LightEntry::of,
+            |block, pos| LightEntry::of(&block.entries[pos].1))
+    }
+
+    pub(crate) fn row_iter<'a>(&'a self, from: Option<&[u8]>, to: Option<&[u8]>, snap_seq: u64)
+        -> Box<dyn Iterator<Item = (Vec<u8>, SourceRow<'a>)> + 'a> {
+        self.projected_iter(from, to, snap_seq,
+            |entry| SourceRow::borrowed(entry.seq, &entry.value),
+            |block, pos| SourceRow { seq: block.entries[pos].1.seq,
+                value: SourceValue::Block(block.clone(), pos), ambiguous: false })
+    }
+
+    fn projected_iter<'a, R: 'a>(&'a self, from: Option<&[u8]>, to: Option<&[u8]>, snap_seq: u64,
+        legacy: fn(&'a StoredEntry) -> R, project: fn(&Arc<DataBlock>, usize) -> R,
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, R)> + 'a> {
         if !self.may_overlap_half_open(from, to) {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>;
         }
-        let filter = move |(k, se): &(Vec<u8>, StoredEntry)| -> Option<(Vec<u8>, LightEntry)> {
+        let filter = move |(k, se): &'a (Vec<u8>, StoredEntry)| -> Option<(Vec<u8>, R)> {
             if !se.visible_at(snap_seq) {
                 return None;
             }
-            Some((k.clone(), LightEntry::of(se)))
+            Some((k.clone(), legacy(se)))
         };
         if let Some(all) = &self.entries_cache {
             // v1 / 小文件：条目本来就在内存里，切片扫一遍即可（无块可读）
@@ -984,6 +1075,7 @@ impl SstFile {
             from: from.map(|k| k.to_vec()),
             to: to.map(|k| k.to_vec()),
             snap_seq,
+            project,
         }) as Box<dyn Iterator<Item = _>>
     }
 
@@ -3026,7 +3118,7 @@ mod tests {
 /// [`SstFile::light_iter`] 的状态机：一块一块读、一条一条吐。
 ///
 /// ⚠️ 只前进不回退：块内条目按 key 升序 ⇒ 越过 `to` 就 `None` 收尾，后面的块不再读。
-struct SstLightIter<'a> {
+struct SstLightIter<'a, R> {
     sst: &'a SstFile,
     block: usize,
     pos: usize,
@@ -3034,6 +3126,7 @@ struct SstLightIter<'a> {
     from: Option<Vec<u8>>,
     to: Option<Vec<u8>>,
     snap_seq: u64,
+    project: fn(&Arc<DataBlock>, usize) -> R,
 }
 
 pub(crate) enum VacuumLightInput<'a> {
@@ -3082,8 +3175,8 @@ impl Iterator for VacuumLightRows<'_> {
     }
 }
 
-impl<'a> Iterator for SstLightIter<'a> {
-    type Item = (Vec<u8>, LightEntry);
+impl<R> Iterator for SstLightIter<'_, R> {
+    type Item = (Vec<u8>, R);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -3112,7 +3205,7 @@ impl<'a> Iterator for SstLightIter<'a> {
                 if !se.visible_at(self.snap_seq) {
                     continue;
                 }
-                return Some((k.clone(), LightEntry::of(se)));
+                return Some((k.clone(), (self.project)(block, self.pos - 1)));
             }
             self.cur = None;
             self.block += 1;

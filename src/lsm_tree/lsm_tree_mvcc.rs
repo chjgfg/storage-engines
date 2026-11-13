@@ -1390,7 +1390,8 @@ impl Transaction {
 
     /// 折出**候选组**（一把逻辑 key 一组，值还没取）。
     ///
-    /// ① 轻量视图：每个 enc key 只拿到「胜者的 seq + 种类」，**不克隆任何 value**。
+    /// ① 共享视图：归并带出胜者的 seq、种类和块引用，SST 值在交付时才复制。
+    ///    mem/旧格式借用在键过滤通过后才转为拥有值；blob 与同 seq 歧义保留显式点查回退。
     ///    旧实现走 `iter()`，而它会先把每个源（含每个 SST 的每行）连 value 一起
     ///    `collect()` 进内存 ⇒ 一次全库折叠的峰值内存约等于整个库。
     ///    kind==2 即 `EntryValue::Drop`：与 `iter()` 的 filter 一致，整行不可见
@@ -1401,17 +1402,26 @@ impl Transaction {
     pub(crate) fn scan_candidates(
         &self, start: Option<&[u8]>, end: Option<&[u8]>,
         accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
-    ) -> (Vec<crate::common::WinCandidate<Vec<u8>>>, bool) {
+    ) -> (Vec<crate::common::WinCandidate<crate::lsm_tree::sst::ScanRow>>, bool) {
         let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
         let lo = crate::common::fold_lower_bound(start, after);
         let mut fold = crate::common::order::CandidateFold::new(
             start, end, after, accept, self.core.version, budget);
         let kv = self.kv.lock().unwrap();
-        for (enc, row) in kv.light_iter_range(lo, hi.as_deref(), u64::MAX) {
+        #[cfg(test)]
+        if scan_row_reference::enabled() {
+            for (enc, row) in kv.light_iter_range(lo, hi.as_deref(), u64::MAX) {
+                crate::lsm_tree::sst::note_light_visit();
+                if row.kind == 2 { continue; }
+                if fold.push(&enc, |v| self.is_visible(v), || crate::lsm_tree::sst::ScanRow::ReferenceLookup(enc.clone())) { break; }
+            }
+            return fold.finish();
+        }
+        for (enc, row) in kv.row_iter_range(lo, hi.as_deref(), u64::MAX) {
             #[cfg(test)]
             crate::lsm_tree::sst::note_light_visit();
-            if row.kind == 2 { continue; }
-            if fold.push(&enc, |v| self.is_visible(v), || enc.clone()) { break; }
+            if row.kind() == 2 { continue; }
+            if fold.push(&enc, |v| self.is_visible(v), || row.freeze(&enc)) { break; }
         }
         fold.finish()
     }
@@ -1546,6 +1556,57 @@ impl Transaction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scan_rows_reuse_blocks_and_filter_before_copying_values() {
+        use crate::common::VersionedStore;
+        use crate::lsm_tree::sst::{ScanRow, sst_probes, entry_value_clones};
+        let path = tmp_db("scan_row_ownership");
+        let db = MVCC::open(&path);
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..128 { assert!(tx.set_raw(format!("k{i:03}").as_bytes(), vec![i as u8; 64])); }
+        tx.commit(); db.flush();
+        let tx = db.begin_transaction();
+        for old in [true, false] {
+            let mode = old.then(super::scan_row_reference::Scope::start);
+            let (rows, complete) = tx.scan_candidates(None, None, None, None, 256);
+            assert!(complete); assert_eq!(rows.len(), 128);
+            let probes = sst_probes();
+            for (i, row) in rows.into_iter().enumerate() {
+                assert_eq!(tx.materialize(row.row), crate::common::RowValue::Value(crate::common::codec::pack_plain(&vec![i as u8; 64])));
+            }
+            let probes = sst_probes() - probes;
+            if old { assert!(probes >= 128, "old materialization must exercise the real point lookup"); }
+            else { assert_eq!(probes, 0, "shared SST rows must be used, not looked up again"); }
+            drop(mode);
+        }
+        let copies = entry_value_clones();
+        let (rows, complete) = tx.scan_candidates(None, None, Some(&|_| false), None, 256);
+        assert!(complete && rows.is_empty());
+        assert_eq!(entry_value_clones(), copies, "rejected keys must not copy values");
+        let (rows, _) = tx.scan_candidates(None, None, None, None, 7);
+        assert_eq!(rows.len(), 7);
+        assert!(rows.iter().all(|r| matches!(r.row, ScanRow::Inline(_))));
+        // A retained row outlives its scan and any cache eviction/replacement.
+        db.flush();
+        for (i, row) in rows.into_iter().enumerate() {
+            assert_eq!(tx.materialize(row.row), crate::common::RowValue::Value(crate::common::codec::pack_plain(&vec![i as u8; 64])));
+        }
+        tx.commit();
+        let tx = db.begin_transaction();
+        assert!(tx.set_raw(b"blob", vec![9; 16384]));
+        tx.commit(); db.flush();
+        let tx = db.begin_transaction();
+        let (mut rows, _) = tx.scan_candidates(Some(b"blob"), Some(b"blob\0"), None, None, 1);
+        assert_eq!(rows.len(), 1);
+        let row = rows.pop().unwrap().row;
+        assert!(matches!(&row, ScanRow::BlobLookup(_)), "blob lifetime fallback must be explicit");
+        let probes = sst_probes();
+        assert_eq!(tx.materialize(row), crate::common::RowValue::Value(crate::common::codec::pack_plain(&vec![9; 16384])));
+        assert!(sst_probes() > probes, "blob fallback has a separate real lookup cost");
+        tx.commit();
+    }
+
     #[test]
     fn conflict_key_lookup_does_not_copy_values_and_keeps_visibility() {
         use crate::lsm_tree::sst::{entry_value_clones, point_read_reference};
@@ -4884,8 +4945,8 @@ mod tests {
 }
 
 impl crate::common::VersionedStore for Transaction {
-    /// 
-    type Row = Vec<u8>;
+    /// Shared inline rows; separately typed blob and ambiguous-seq lookup costs.
+    type Row = crate::lsm_tree::sst::ScanRow;
 
     fn scan_candidates(
         &self,
@@ -4894,15 +4955,31 @@ impl crate::common::VersionedStore for Transaction {
         accept: Option<&dyn Fn(&[u8]) -> bool>,
         after: Option<&[u8]>,
         budget: usize,
-    ) -> (Vec<crate::common::WinCandidate<Vec<u8>>>, bool) {
+    ) -> (Vec<crate::common::WinCandidate<Self::Row>>, bool) {
         // 走本类型上的同名 inherent 方法（inherent 优先于 trait ⇒ 不会自我递归）
         self.scan_candidates(start, end, accept, after, budget)
     }
 
-    fn materialize(&self, row: Vec<u8>) -> crate::common::RowValue {
-        self.read_row(&row)
+    fn materialize(&self, row: Self::Row) -> crate::common::RowValue {
+        use crate::lsm_tree::sst::ScanRow;
+        match row {
+            ScanRow::Inline(row) => row.materialize(),
+            ScanRow::BlobLookup(enc) | ScanRow::AmbiguousLookup(enc) => self.read_row(&enc),
+            #[cfg(test)]
+            ScanRow::ReferenceLookup(enc) => self.read_row(&enc),
+        }
     }
 
+}
+
+#[cfg(test)]
+pub(crate) mod scan_row_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
 }
 
 #[cfg(test)]
