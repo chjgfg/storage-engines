@@ -1215,8 +1215,16 @@ impl Drop for Transaction {
 /// 判冲突如果整链扫，热点 key 的每一次写都要陪跑版本链。
 impl WriteSide for TxnSide<'_, '_> {
     fn latest_version(&mut self, key: &[u8]) -> Option<u64> {
-        Transaction::find_version_back(self.kv, key, |_| true)
-            .and_then(|(enc, _)| decode_key(&enc).map(|vk| vk.version))
+        #[cfg(test)]
+        if crate::lsm_tree::sst::point_read_reference::enabled() {
+            return Transaction::find_version_back(self.kv, key, |_| true)
+                .and_then(|(enc, _)| decode_key(&enc).map(|vk| vk.version));
+        }
+        let low = encode_key(key, 0);
+        let high = encode_key(key, u64::MAX);
+        self.kv.find_key_back(&low, &high, u64::MAX, |enc| {
+            crate::common::version::decode_key_ref(enc).is_some_and(|(raw, _)| raw == key)
+        }).into_key().and_then(|enc| crate::common::version::decode_key_ref(&enc).map(|(_, version)| version))
     }
 
     fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool {
@@ -1359,7 +1367,11 @@ impl Transaction {
         let kvengine = self.kv.lock().unwrap();
         // 从链尾往回走，第一个可见版本就是答案（旧实现把整条链读出来再取最后一个）
         let (enc, val) = Self::find_version_back(&kvengine, key, |v| self.is_visible(v))?;
-        Some((decode_key(&enc)?.version, val))
+        #[cfg(test)]
+        if crate::lsm_tree::sst::point_read_reference::enabled() {
+            return Some((decode_key(&enc)?.version, val));
+        }
+        Some((crate::common::version::decode_key_ref(&enc)?.1, val))
     }
 
     /// 取一组的值：跨源点查（`get_value_at` 而不是 `get_raw_key_at` —— 大 value 存的是 blob
@@ -1522,9 +1534,11 @@ impl Transaction {
         let low = encode_key(key, 0);
         let high = encode_key(key, u64::MAX);
         kv.find_back(&low, &high, u64::MAX, |enc, _val| {
-            decode_key(enc)
-                .map(|vk| vk.raw_key.as_slice() == key && accept(vk.version))
-                .unwrap_or(false)
+            #[cfg(test)]
+            if crate::lsm_tree::sst::point_read_reference::enabled() {
+                return decode_key(enc).is_some_and(|vk| vk.raw_key.as_slice() == key && accept(vk.version));
+            }
+            crate::common::version::decode_key_ref(enc).is_some_and(|(raw, version)| raw == key && accept(version))
         })
     }
 
@@ -1532,6 +1546,44 @@ impl Transaction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conflict_key_lookup_does_not_copy_values_and_keeps_visibility() {
+        use crate::lsm_tree::sst::{entry_value_clones, point_read_reference};
+        let path = tmp_db("conflict_metadata");
+        let mv = MVCC::open(&path);
+        mv.set_vacuum_auto_slice(0);
+        let tx = mv.begin_transaction();
+        assert!(tx.set_raw(b"k", vec![7; 256]));
+        tx.commit();
+        mv.flush();
+        // Prime the actual SST read cache; decode allocations are not payload copies.
+        let reader = mv.begin_transaction();
+        assert_eq!(reader.get(b"k"), Some(vec![7; 256]));
+        reader.commit();
+        for old in [true, false] {
+            let mode = old.then(point_read_reference::Scope::start);
+            let tx = mv.begin_transaction();
+            let clones = entry_value_clones();
+            assert!(tx.set_raw(b"k", vec![8; 256]));
+            let used = entry_value_clones() - clones;
+            if old { assert!(used > 0, "old conflict gate is the negative control"); }
+            else { assert_eq!(used, 0, "conflict detection only needs keys/kinds"); }
+            tx.rollback();
+            drop(mode);
+        }
+        let old_reader = mv.begin_transaction();
+        let newer = mv.begin_transaction();
+        assert!(newer.set_raw(b"k", b"new".to_vec()));
+        assert!(!old_reader.set_raw(b"k", b"conflict".to_vec()));
+        assert_eq!(old_reader.get(b"k"), Some(vec![7; 256]));
+        newer.rollback();
+        old_reader.rollback();
+        drop(mv);
+        let reopened = MVCC::open(&path);
+        let tx = reopened.begin_transaction();
+        assert_eq!(tx.get(b"k"), Some(vec![7; 256]));
+        tx.commit();
+    }
     #[test]
     fn vacuum_delete_flush_failure_preserves_blobs() {
         let path = tmp_db("vacuum_delete_flush_failure");

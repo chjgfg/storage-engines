@@ -124,6 +124,22 @@ struct DataBlock {
     entries: Vec<(Vec<u8>, StoredEntry)>,
 }
 
+/// Freeze the pre-M123 block walk and value-copying lookup for paired probes.
+#[cfg(test)]
+pub(crate) mod point_read_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub(crate) fn start() -> Self {
+            OLD.with(|old| assert!(!old.replace(true)));
+            Self
+        }
+    }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|old| old.set(false)); } }
+}
+
 // 测试专用：本线程的块访问次数（含块缓存命中）。
 //
 // LSM 的代价对应物是「读了多少个数据块」—— 用来把「点操作代价不随版本链长度/库总量
@@ -612,6 +628,23 @@ impl SstFile {
 
     /// 在 snapshot `snap_seq` 下查找（取 `seq <= snap_seq` 的最新）
     pub fn get_at(&self, key: &[u8], snap_seq: u64) -> Option<StoredEntry> {
+        #[cfg(test)]
+        if point_read_reference::enabled() { return self.get_at_reference(key, snap_seq); }
+        self.get_at_project(key, snap_seq, Clone::clone)
+    }
+
+    pub(crate) fn get_light_at(&self, key: &[u8], snap_seq: u64) -> Option<LightEntry> {
+        self.get_at_project(key, snap_seq, LightEntry::of)
+    }
+
+    /// Search the key interval, inspect every matching seq, project only its winner.
+    /// Holding the block Arc keeps a winner valid while older blocks are loaded.
+    fn get_at_project<T>(&self, key: &[u8], snap_seq: u64,
+        project: impl Fn(&StoredEntry) -> T) -> Option<T> {
+        #[cfg(test)]
+        if point_read_reference::enabled() {
+            return self.get_at_reference(key, snap_seq).as_ref().map(project);
+        }
         if !self.may_overlap(key, key) {
             return None;
         }
@@ -622,15 +655,51 @@ impl SstFile {
         note_sst_probe();
         if let Some(e) = &self.entries_cache {
             // 可能同 key 多版本：取 seq 最大且 <= snap
-            let mut best: Option<StoredEntry> = None;
-            for (k, se) in e {
-                if k.as_slice() == key && se.visible_at(snap_seq) {
-                    if best.as_ref().map(|b| se.seq >= b.seq).unwrap_or(true) {
-                        best = Some(se.clone());
-                    }
+            let lo = e.partition_point(|(k, _)| k.as_slice() < key);
+            let hi = e.partition_point(|(k, _)| k.as_slice() <= key);
+            let mut best: Option<&StoredEntry> = None;
+            for (_, se) in e[lo..hi].iter().rev() {
+                if se.visible_at(snap_seq) && best.is_none_or(|b| se.seq > b.seq) { best = Some(se); }
+            }
+            #[cfg(test)]
+            note_sst_entry_walks((hi - lo) as u64);
+            return best.map(project);
+        }
+        let mut bi = self.find_block(key)?;
+        let mut best: Option<(Arc<DataBlock>, usize)> = None;
+        loop {
+            let block = self.load_block(bi).ok()?;
+            let lo = block.entries.partition_point(|(k, _)| k.as_slice() < key);
+            let hi = block.entries.partition_point(|(k, _)| k.as_slice() <= key);
+            for i in (lo..hi).rev() {
+                let se = &block.entries[i].1;
+                if se.visible_at(snap_seq)
+                    && best.as_ref().is_none_or(|(b, j)| se.seq > b.entries[*j].1.seq) {
+                    best = Some((block.clone(), i));
                 }
             }
             #[cfg(test)]
+            note_sst_entry_walks((hi - lo) as u64);
+            // 同键的 seq 可横跨任意多块，甚至不按 seq 排；不能只看 find_block 的最后一块。
+            // 本块首键更小则之前全小；首键等于 key 时前块尾部仍可能有同键。
+            if bi == 0 || self.index[bi].first_key.as_slice() < key {
+                break;
+            }
+            bi -= 1;
+        }
+        best.map(|(block, i)| project(&block.entries[i].1))
+    }
+
+    #[cfg(test)]
+    fn get_at_reference(&self, key: &[u8], snap_seq: u64) -> Option<StoredEntry> {
+        if !self.may_overlap(key, key) || !self.bloom.may_contain(key) { return None; }
+        note_sst_probe();
+        if let Some(e) = &self.entries_cache {
+            let mut best: Option<StoredEntry> = None;
+            for (k, se) in e {
+                if k.as_slice() == key && se.visible_at(snap_seq)
+                    && best.as_ref().is_none_or(|b| se.seq >= b.seq) { best = Some(se.clone()); }
+            }
             note_sst_entry_walks(e.len() as u64);
             return best;
         }
@@ -639,19 +708,11 @@ impl SstFile {
         loop {
             let block = self.load_block(bi).ok()?;
             for (k, se) in block.entries.iter().rev() {
-                if k.as_slice() == key && se.visible_at(snap_seq) {
-                    if best.as_ref().is_none_or(|b| se.seq > b.seq) {
-                        best = Some(se.clone());
-                    }
-                }
+                if k.as_slice() == key && se.visible_at(snap_seq)
+                    && best.as_ref().is_none_or(|b| se.seq > b.seq) { best = Some(se.clone()); }
             }
-            #[cfg(test)]
             note_sst_entry_walks(block.entries.len() as u64);
-            // 同键的 seq 可横跨任意多块，甚至不按 seq 排；不能只看 find_block 的最后一块。
-            // 本块首键更小则之前全小；首键等于 key 时前块尾部仍可能有同键。
-            if bi == 0 || self.index[bi].first_key.as_slice() < key {
-                break;
-            }
+            if bi == 0 || self.index[bi].first_key.as_slice() < key { break; }
             bi -= 1;
         }
         best
@@ -731,29 +792,40 @@ impl SstFile {
         low: &[u8],
         high: &[u8],
         snap_seq: u64,
-        mut accept: impl FnMut(&[u8], &StoredEntry) -> bool,
+        accept: impl FnMut(&[u8], &StoredEntry) -> bool,
     ) -> Option<(Vec<u8>, StoredEntry)> {
+        self.find_back_project(low, high, snap_seq, Clone::clone, accept)
+    }
+
+    pub(crate) fn find_back_light(&self, low: &[u8], high: &[u8], snap_seq: u64,
+        accept: impl FnMut(&[u8], &LightEntry) -> bool) -> Option<(Vec<u8>, LightEntry)> {
+        self.find_back_project(low, high, snap_seq, LightEntry::of, accept)
+    }
+
+    fn find_back_project<T>(&self, low: &[u8], high: &[u8], snap_seq: u64,
+        project: impl Fn(&StoredEntry) -> T,
+        mut accept: impl FnMut(&[u8], &T) -> bool) -> Option<(Vec<u8>, T)> {
         if !self.may_overlap(low, high) {
             return None;
         }
 
-        let mut pending: Option<(Vec<u8>, StoredEntry)> = None;
+        let mut pending: Option<(Vec<u8>, u64, T)> = None;
         // None 表示越界/文件结束，收口最后一个组。反向只用 > 替换，保留同 seq 时
         // 正向 range_at 取最后一条的规则。pending 跨块保留，不能每块重置。
         let mut feed = |entry: Option<(&[u8], &StoredEntry)>| {
-            if pending.as_ref().is_some_and(|(pk, _)| {
+            if pending.as_ref().is_some_and(|(pk, _, _)| {
                 entry.is_none_or(|(k, _)| k != pk.as_slice())
             }) {
-                let (k, se) = pending.take().unwrap();
+                let (k, _, se) = pending.take().unwrap();
                 if accept(&k, &se) {
                     return Some((k, se));
                 }
             }
             if let Some((k, se)) = entry {
                 if se.visible_at(snap_seq)
-                    && pending.as_ref().is_none_or(|(_, best)| se.seq > best.seq)
+                    && pending.as_ref().is_none_or(|(_, seq, _)| se.seq > *seq)
                 {
-                    pending = Some((k.to_vec(), se.clone()));
+                    pending = Some((k.to_vec(), se.seq, project(se)));
                 }
             }
             None
@@ -777,7 +849,13 @@ impl SstFile {
         let mut block_i = self.find_block(high)?;
         loop {
             let block = self.load_block(block_i).ok()?;
-            for (k, se) in block.entries.iter().rev() {
+            #[cfg(test)]
+            let old = point_read_reference::enabled();
+            #[cfg(not(test))]
+            let old = false;
+            let hi = if old { block.entries.len() }
+                else { block.entries.partition_point(|(k, _)| k.as_slice() <= high) };
+            for (k, se) in block.entries[..hi].iter().rev() {
                 if k.as_slice() > high {
                     continue;
                 }
@@ -887,10 +965,17 @@ impl SstFile {
         // 起点定位到含 `from` 的那个块：前面的块一块都不读。
         // ⚠️ `from` 比第 0 块首键还小 ⇒ 从第 0 块开始（`unwrap_or(0)`，不是 `index.len()`，
         // 那是 M11e 踩过的"真前缀扫直接返回空"）
-        let start_block = match from {
+        let mut start_block = match from {
             Some(f) => self.find_block(f).unwrap_or(0),
             None => 0,
         };
+        // find_block returns the last block starting at or below from. A key can
+        // span several blocks, with its greatest seq in any of them.
+        if let Some(from) = from {
+            while start_block > 0 && self.index[start_block].first_key.as_slice() >= from {
+                start_block -= 1;
+            }
+        }
         Box::new(SstLightIter {
             sst: self,
             block: start_block,
@@ -2708,6 +2793,10 @@ mod tests {
                     }
                 }
                 assert_eq!(sst.get_at(b"b", snap), expected.get(b"b".as_slice()).cloned());
+                let scanned = sst.light_iter(Some(b"b"), Some(b"c"), snap).max_by_key(|(_, row)| row.seq);
+                assert_eq!(scanned.map(|(_, row)| (row.seq, row.kind)),
+                    expected.get(b"b".as_slice()).map(|row| (row.seq, row.value.kind_byte())),
+                    "forward fallback must include the entire key across block boundaries");
                 assert_eq!(sst.range_at(b"b", b"b", snap), expected.iter()
                     .filter(|(k, _)| k.as_slice() == b"b").map(|(k, se)| (k.clone(), se.clone())).collect::<Vec<_>>());
                 let want = expected.iter().rev().find(|(_, se)| !matches!(se.value, EntryValue::Drop))
@@ -2723,6 +2812,32 @@ mod tests {
         }
         drop(sst);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn point_get_projects_only_matching_rows_and_winning_value() {
+        let path = tmp("point_key_interval");
+        let mut builder = SstBuilder::with_options(1, &path, 128, false);
+        for i in 0..100 { builder.add(format!("k{i:03}").into_bytes(), StoredEntry::put(1, Some(vec![i as u8; 64]))); }
+        let mut sst = builder.finish().unwrap();
+        let all: Vec<_> = sst.iter_all().collect();
+        for resident in [false, true] {
+            if resident { sst.entries_cache = Some(all.clone()); }
+            assert!(sst.get(b"k050").is_some()); // Warm both arms before counting.
+            for old in [true, false] {
+                let mode = old.then(point_read_reference::Scope::start);
+                let walks = sst_entry_walks();
+                let clones = entry_value_clones();
+                let light = sst.get_light_at(b"k050", 1).unwrap();
+                assert_eq!((light.seq, light.kind), (1, 0));
+                assert_eq!(sst_entry_walks() - walks, if old { 100 } else { 1 });
+                assert_eq!(entry_value_clones() - clones, u64::from(old), "metadata lookup must not copy payload");
+                let clones = entry_value_clones();
+                assert_eq!(sst.get_at(b"k050", 1).unwrap().value, EntryValue::Put(Some(vec![50; 64])));
+                assert_eq!(entry_value_clones() - clones, 1, "reference must not clone the winning payload a second time");
+                drop(mode);
+            }
+        }
     }
 
     #[test]

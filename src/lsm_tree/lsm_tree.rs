@@ -31,6 +31,17 @@ pub(crate) struct VacuumDelete {
     key: Vec<u8>,
     live: bool,
 }
+
+/// The full-range fallback has a distinct resource cost from indexed lookup.
+pub(crate) enum KeyBackResult {
+    Indexed(Option<Vec<u8>>),
+    FullScan(Option<Vec<u8>>),
+}
+impl KeyBackResult {
+    pub(crate) fn into_key(self) -> Option<Vec<u8>> {
+        match self { Self::Indexed(key) | Self::FullScan(key) => key }
+    }
+}
 impl VacuumDelete {
     pub(crate) fn observed(key: Vec<u8>, kind: u8) -> std::io::Result<Self> {
         match kind {
@@ -1799,35 +1810,7 @@ impl LSMTree {
 
         let mut excluded: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         loop {
-            let mut cand: Option<Vec<u8>> = None;
-            let mut consider = |k: Option<Vec<u8>>| {
-                if let Some(k) = k {
-                    if cand.as_ref().map_or(true, |b| k.as_slice() > b.as_slice()) {
-                        cand = Some(k);
-                    }
-                }
-            };
-
-            consider(Self::mem_max_key(&self.mem, low, high, snap_seq, &excluded));
-            for imm in &self.immutables {
-                consider(Self::mem_max_key(imm, low, high, snap_seq, &excluded));
-            }
-            for level in 0..self.levels.len() {
-                let files = self.sst_candidates(level, low, high);
-                if level > 0 && self.level_ranges_ordered[level] {
-                    Self::sst_max_key(files.iter().rev(), low, high, snap_seq, &excluded, &mut cand);
-                } else {
-                    // L0 可任意重叠，MANIFEST 恢复也不保证 L1+ 的范围有序。
-                    // 只排序候选引用；不能按文件 id/层次推断 seq 新旧。
-                    let mut by_max: Vec<_> = files.iter()
-                        .filter(|sst| sst.may_overlap(low, high))
-                        .collect();
-                    by_max.sort_unstable_by(|a, b| b.max_key.cmp(&a.max_key));
-                    Self::sst_max_key(by_max.into_iter(), low, high, snap_seq, &excluded, &mut cand);
-                }
-            }
-
-            let Some(key) = cand else { return None };
+            let Some(key) = self.max_key_excluding(low, high, snap_seq, &excluded) else { return None };
             if excluded.len() >= BACK_SCAN_FALLBACK {
                 // 退化形状：回退成一次正向全扫再反向挑（代价与旧实现同阶）
                 return self
@@ -1861,7 +1844,16 @@ impl LSMTree {
             if cand.as_ref().is_some_and(|k| k.as_slice() >= high || sst.max_key.as_slice() <= k.as_slice()) {
                 break;
             }
-            if let Some((k, _)) = sst.find_back(low, high, snap_seq, |k, _| !excluded.contains(k)) {
+            #[cfg(test)]
+            let old = crate::lsm_tree::sst::point_read_reference::enabled();
+            #[cfg(not(test))]
+            let old = false;
+            let candidate = if old {
+                sst.find_back(low, high, snap_seq, |k, _| !excluded.contains(k)).map(|(key, _)| key)
+            } else {
+                sst.find_back_light(low, high, snap_seq, |k, _| !excluded.contains(k)).map(|(key, _)| key)
+            };
+            if let Some(k) = candidate {
                 if cand.as_ref().is_none_or(|best| k > *best) {
                     *cand = Some(k);
                 }
@@ -1882,6 +1874,79 @@ impl LSMTree {
             .filter(|(k, _)| !excluded.contains(k.as_slice()))
             .find(|(_, vers)| vers.iter().rev().any(|(s, _)| *s <= snap_seq))
             .map(|(k, _)| k.clone())
+    }
+
+    /// Conflict checks require an existing Put's key and seq, never its payload.
+    /// A physical Drop masks older Put records before logical-key acceptance.
+    pub(crate) fn find_key_back(&self, low: &[u8], high: &[u8], snap_seq: u64,
+        accept: impl Fn(&[u8]) -> bool) -> KeyBackResult {
+        #[cfg(test)]
+        if crate::lsm_tree::sst::point_read_reference::enabled() {
+            return KeyBackResult::Indexed(self.find_back(low, high, snap_seq, |k, _| accept(k)).map(|(k, _)| k));
+        }
+        if low > high { return KeyBackResult::Indexed(None); }
+        let mut excluded = HashSet::new();
+        loop {
+            let Some(key) = self.max_key_excluding(low, high, snap_seq, &excluded) else { return KeyBackResult::Indexed(None); };
+            if excluded.len() >= 4096 {
+                // Same byte interval, one forward merge; the accepted key need not
+                // be the first raw-prefix match and seq need not be layer-ordered.
+                let mut found = None;
+                for (key, row) in self.light_iter_range(Some(low), None, snap_seq) {
+                    if key.as_slice() > high { break; }
+                    if row.kind != 2 && accept(&key) { found = Some(key); }
+                }
+                return KeyBackResult::FullScan(found);
+            }
+            excluded.insert(key.clone());
+            if self.get_light_entry_at(&key, snap_seq).is_some_and(|row| row.kind != 2)
+                && accept(&key) { return KeyBackResult::Indexed(Some(key)); }
+        }
+    }
+
+    fn max_key_excluding(&self, low: &[u8], high: &[u8], snap_seq: u64,
+        excluded: &HashSet<Vec<u8>>) -> Option<Vec<u8>> {
+        let mut candidate = Self::mem_max_key(&self.mem, low, high, snap_seq, excluded);
+        for imm in &self.immutables {
+            if let Some(key) = Self::mem_max_key(imm, low, high, snap_seq, excluded) {
+                if candidate.as_ref().is_none_or(|best| key > *best) { candidate = Some(key); }
+            }
+        }
+        for level in 0..self.levels.len() {
+            let files = self.sst_candidates(level, low, high);
+            if level > 0 && self.level_ranges_ordered[level] {
+                Self::sst_max_key(files.iter().rev(), low, high, snap_seq, excluded, &mut candidate);
+            } else {
+                // L0 and recovered overlapping levels have no seq order by file.
+                let mut by_max: Vec<_> = files.iter().filter(|s| s.may_overlap(low, high)).collect();
+                by_max.sort_unstable_by(|a, b| b.max_key.cmp(&a.max_key));
+                Self::sst_max_key(by_max.into_iter(), low, high, snap_seq, excluded, &mut candidate);
+            }
+        }
+        candidate
+    }
+
+    fn get_light_entry_at(&self, key: &[u8], snap_seq: u64) -> Option<LightEntry> {
+        let mut best: Option<LightEntry> = None;
+        let mut consider = |row: LightEntry| {
+            if best.as_ref().is_none_or(|old| row.seq >= old.seq) { best = Some(row); }
+        };
+        for mem in std::iter::once(&self.mem).chain(self.immutables.iter()) {
+            if let Some((seq, value)) = mem.get(key).and_then(|rows| rows.range(..=snap_seq).next_back()) {
+                consider(LightEntry { seq: *seq, kind: value.kind_byte() });
+            }
+        }
+        if let Some(l0) = self.levels.first() {
+            for sst in l0.iter().rev() {
+                if let Some(row) = sst.get_light_at(key, snap_seq) { consider(row); }
+            }
+        }
+        for level in 1..self.levels.len() {
+            for sst in self.sst_candidates(level, key, key) {
+                if let Some(row) = sst.get_light_at(key, snap_seq) { consider(row); }
+            }
+        }
+        best
     }
 
     /// `get_raw` 的按 seq 版本：跨源取胜后给出该 key 的逻辑 value。
@@ -3563,6 +3628,11 @@ mod tests {
                         };
                         let want = rows.iter().rev().find(|(k, v)| accept(k, v)).cloned();
                         assert_eq!(db.find_back(lo, hi, snap, accept), want, "snap={snap}, mode={mode}, abnormal={abnormal}");
+                        if mode != 2 {
+                            let key_accept = |key: &[u8]| accept(key, &None);
+                            assert_eq!(db.find_key_back(lo, hi, snap, key_accept).into_key(), want.as_ref().map(|(k, _)| k.clone()),
+                                "key-only gate must preserve Drop/seq rules: snap={snap}, mode={mode}, abnormal={abnormal}");
+                        }
                     }
                 }
             }
@@ -3601,6 +3671,22 @@ mod tests {
             assert_eq!(block_reads() - before, 0);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_lookup_full_scan_is_explicit_and_keeps_the_byte_interval() {
+        let dir = tmp_dir("key_back_fallback");
+        let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
+        for i in 0..4200_u64 {
+            db.mem_insert_no_wal(i.to_be_bytes().to_vec(), StoredEntry::put(1, Some(vec![1])));
+        }
+        db.mem_insert_no_wal(0_u64.to_be_bytes().to_vec(), StoredEntry::drop_at(2));
+        let outcome = db.find_key_back(&0_u64.to_be_bytes(), &4199_u64.to_be_bytes(), 2,
+            |key| key == 1_u64.to_be_bytes());
+        assert!(matches!(outcome, KeyBackResult::FullScan(Some(ref key)) if key == &1_u64.to_be_bytes()),
+            "4096 rejected keys must enter the separately typed full-scan fallback");
+        assert!(matches!(db.find_key_back(&0_u64.to_be_bytes(), &4199_u64.to_be_bytes(), 2,
+            |key| key == 0_u64.to_be_bytes()), KeyBackResult::FullScan(None)), "Drop cannot revive in fallback");
     }
 
     /// M81 第 1 项 · **计数**判据：首页（`to = None`）拉过的源数与块读**不随 L1+ 篇数涨**。

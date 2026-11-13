@@ -5576,6 +5576,81 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "LSM ordinary fill/get/update ABBA; release single thread"]
+    fn lsm_ordinary_rw_cost() {
+        use crate::lsm_tree::sst::{point_read_reference, block_reads, block_misses, sst_entry_walks, entry_value_clones};
+        let rows: usize = std::env::var("LSM_RW_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);
+        let reads: usize = std::env::var("LSM_RW_READS").map(|v| v.parse().unwrap()).unwrap_or(rows.min(200_000));
+        assert!(rows >= 1000 && reads > 0 && reads <= rows);
+        crate::scale_probe::fingerprint();
+        for (round, old) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("lsm_ordinary_rw");
+            eprintln!("LSM_RW_BEGIN round={round} reference={old} rows={rows} reads={reads} scratch={}", dir.0.display());
+            let db = crate::lsm_tree::MVCC::open(&dir.0);
+            let mode = old.then(point_read_reference::Scope::start);
+            let maint = crate::lsm_tree::lsm_tree::maintenance_probe::Scope::start();
+            let mut stages = [0_u128; 3];
+            let cpu = crate::scale_probe::Phase::start();
+            let allocations = crate::mem_probe::allocations();
+            let start = std::time::Instant::now();
+            for base in (0..rows).step_by(1000) {
+                let items: Vec<_> = (base..(base + 1000).min(rows)).map(|i| (scale_key(i), scale_val(i))).collect();
+                let clock = std::time::Instant::now();
+                let tx = db.begin_transaction();
+                stages[0] += clock.elapsed().as_nanos();
+                let clock = std::time::Instant::now();
+                assert!(tx.batch_set(&items).is_ok());
+                stages[1] += clock.elapsed().as_nanos();
+                let clock = std::time::Instant::now();
+                tx.commit();
+                stages[2] += clock.elapsed().as_nanos();
+                if (base + 1000) % 1_000_000 == 0 { eprintln!("LSM_RW_FILL_PROGRESS round={round} inserted={}", base + 1000); }
+            }
+            eprintln!("LSM_RW_FILL round={round} reference={old} rows={rows} seconds={:.6} allocations={} begin_ns={} write_ns={} commit_ns={} maintenance={:?}",
+                start.elapsed().as_secs_f64(), crate::mem_probe::allocations() - allocations, stages[0], stages[1], stages[2], maint.stats());
+            cpu.finish("lsm_tree", &format!("rw_fill_round_{round}"));
+            db.flush(); db.checkpoint();
+            drop(maint); drop(mode); drop(db);
+            let db = crate::lsm_tree::MVCC::open(&dir.0);
+            let order = shuffled(rows);
+            let mode = old.then(point_read_reference::Scope::start);
+            let blocks = block_reads(); let misses = block_misses(); let walks = sst_entry_walks();
+            let clones = entry_value_clones(); let allocations = crate::mem_probe::allocations();
+            let cpu = crate::scale_probe::Phase::start();
+            let start = std::time::Instant::now();
+            let tx = db.begin_transaction();
+            for &i in &order[..reads] { assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i))); }
+            tx.commit();
+            eprintln!("LSM_RW_GET round={round} reference={old} rows={rows} reads={reads} seconds={:.6} allocations={} blocks={} misses={} matching_or_walked_rows={} value_clones={}",
+                start.elapsed().as_secs_f64(), crate::mem_probe::allocations() - allocations, block_reads() - blocks,
+                block_misses() - misses, sst_entry_walks() - walks, entry_value_clones() - clones);
+            cpu.finish("lsm_tree", &format!("rw_get_round_{round}"));
+            let updates = rows / 10;
+            let cpu = crate::scale_probe::Phase::start();
+            let start = std::time::Instant::now();
+            let clones = entry_value_clones();
+            for base in (0..updates).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(updates) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+                tx.commit();
+            }
+            eprintln!("LSM_RW_UPDATE round={round} reference={old} rows={rows} updates={updates} seconds={:.6} value_clones={}",
+                start.elapsed().as_secs_f64(), entry_value_clones() - clones);
+            cpu.finish("lsm_tree", &format!("rw_update_round_{round}"));
+            drop(mode); drop(db);
+            let db = crate::lsm_tree::MVCC::open(&dir.0);
+            let mut seen = 0;
+            db.export_latest_visible_for_each(false, |record| {
+                assert_eq!(record.key, scale_key(seen));
+                assert_eq!(record.value, Some(scale_val(if seen < updates { seen + rows } else { seen })));
+                seen += 1; true
+            });
+            assert_eq!(seen, rows);
+            eprintln!("LSM_RW_VERIFIED round={round} reference={old} unique_keys={seen}");
+        }
+    }
+
+    #[test]
     #[ignore = "LSM vacuum old/new/new/old; release single thread"]
     fn lsm_vacuum_buffer_cost() {
         let rows: usize = std::env::var("LSM_VAC_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);
