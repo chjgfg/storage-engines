@@ -6177,6 +6177,52 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "LSM packed point blocks old/new/new/old; release single thread"]
+    fn lsm_packed_point_cost() {
+        use crate::lsm_tree::sst::{packed_point_reference, block_reads, block_misses, sst_probes};
+        let rows: usize = std::env::var("LSM_POINT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        let reads: usize = std::env::var("POINT_READS").map(|s| s.parse().unwrap()).unwrap_or(rows.min(200_000));
+        assert!(rows > 0 && reads > 0);
+        let dir = ScaleScratch::new("lsm_packed_point");
+        let path = dir.0.clone();
+        let db = crate::lsm_tree::MVCC::open(&path);
+        db.set_vacuum_auto_slice(0);
+        eprintln!("LSM_POINT_BUILD rows={rows}");
+        let mut bulk = db.begin_bulk();
+        for i in 0..rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
+        bulk.finish(); drop(db);
+        let mut costs = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let db = crate::lsm_tree::MVCC::open(&path);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin_transaction();
+            let mode = reference.then(packed_point_reference::Scope::start);
+            let before = (crate::mem_probe::allocations(), sst_probes(), block_reads(), block_misses());
+            let start = std::time::Instant::now();
+            let mut state = 42_u64;
+            for _ in 0..reads {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let i = (state % rows as u64) as usize;
+                assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i)));
+            }
+            let seconds = start.elapsed().as_secs_f64();
+            let allocations = crate::mem_probe::allocations() - before.0;
+            eprintln!("LSM_POINT round={round} reference={reference} rows={rows} reads={reads} seconds={seconds:.6} allocations={allocations} sst_probes={} block_reads={} block_misses={}", sst_probes()-before.1, block_reads()-before.2, block_misses()-before.3);
+            costs.push(allocations);
+            drop(mode); tx.commit(); drop(db);
+        }
+        assert!(costs[1] < costs[0]); assert!(costs[2] < costs[3]);
+        let db = crate::lsm_tree::MVCC::open(&path);
+        let mut seen = 0;
+        db.export_latest_visible_for_each(false, |r| {
+            assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+            seen += 1; true
+        });
+        assert_eq!(seen, rows);
+        eprintln!("LSM_POINT_VERIFIED rows={seen}");
+    }
+
+    #[test]
     #[ignore = "B+ point projection old/new/new/old; release single thread"]
     fn bplus_point_projection_cost() {
         use crate::bplus_tree::{bplus_tree::{point_projection_reference, node_parses}, page};

@@ -124,6 +124,93 @@ struct DataBlock {
     entries: Vec<(Vec<u8>, StoredEntry)>,
 }
 
+#[derive(Debug)]
+struct PackedRow {
+    key: std::ops::Range<u32>,
+    value: std::ops::Range<u32>,
+    seq: u64,
+    kind: u8,
+}
+
+#[derive(Debug)]
+struct PackedBlock { raw: Vec<u8>, rows: Vec<PackedRow> }
+
+#[derive(Clone, Copy)]
+struct EntryRef<'a> { seq: u64, kind: u8, value: &'a [u8] }
+impl<'a> EntryRef<'a> {
+    fn of(entry: &'a StoredEntry) -> Self {
+        Self { seq: entry.seq, kind: entry.value.kind_byte(), value: match &entry.value {
+            EntryValue::Put(Some(value)) => value, _ => &[],
+        } }
+    }
+    fn light(self) -> LightEntry { LightEntry { seq: self.seq, kind: self.kind } }
+    fn owned(self) -> StoredEntry {
+        #[cfg(test)]
+        ENTRY_VALUE_CLONES.with(|c| c.set(c.get() + 1));
+        StoredEntry { seq: self.seq, value: match self.kind {
+            0 => EntryValue::Put(Some(self.value.to_vec())),
+            1 => EntryValue::Put(None), _ => EntryValue::Drop,
+        } }
+    }
+}
+
+impl PackedBlock {
+    fn decode(raw: Vec<u8>, with_seq: bool) -> std::io::Result<Self> {
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid packed SST block");
+        if raw.len() < 8 || raw.len() > u32::MAX as usize { return Err(invalid()); }
+        let count = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        let end = raw.len() - 4;
+        if crc32(&raw[4..end]) != u32::from_le_bytes(raw[end..].try_into().unwrap()) { return Err(invalid()); }
+        let minimum = if with_seq { 13 } else { 5 };
+        if count > (end - 4) / minimum { return Err(invalid()); }
+        fn take(raw: &[u8], pos: &mut usize, end: usize, size: usize) -> std::io::Result<std::ops::Range<usize>> {
+            let next = pos.checked_add(size).filter(|n| *n <= end)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "packed SST field"))?;
+            let range = *pos..next; let _ = &raw[range.clone()]; *pos = next; Ok(range)
+        }
+        let mut pos = 4;
+        let mut rows: Vec<PackedRow> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let size = u32::from_le_bytes(raw[take(&raw, &mut pos, end, 4)?].try_into().unwrap()) as usize;
+            let key = take(&raw, &mut pos, end, size)?;
+            let kind = raw[take(&raw, &mut pos, end, 1)?.start];
+            if kind > 2 { return Err(invalid()); }
+            let seq = if with_seq { u64::from_le_bytes(raw[take(&raw, &mut pos, end, 8)?].try_into().unwrap()) } else { 0 };
+            let value = if kind == 0 {
+                let size = u32::from_le_bytes(raw[take(&raw, &mut pos, end, 4)?].try_into().unwrap()) as usize;
+                take(&raw, &mut pos, end, size)?
+            } else { pos..pos };
+            if rows.last().is_some_and(|old| raw[old.key.start as usize..old.key.end as usize] > raw[key.clone()]) { return Err(invalid()); }
+            rows.push(PackedRow { key: key.start as u32..key.end as u32,
+                value: value.start as u32..value.end as u32, seq, kind });
+        }
+        if pos != end { return Err(invalid()); }
+        Ok(Self { raw, rows })
+    }
+    fn entry(&self, i: usize) -> (&[u8], EntryRef<'_>) {
+        let row = &self.rows[i];
+        (&self.raw[row.key.start as usize..row.key.end as usize], EntryRef {
+            seq: row.seq, kind: row.kind, value: &self.raw[row.value.start as usize..row.value.end as usize] })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CachedBlock { Decoded(Arc<DataBlock>), Packed(Arc<PackedBlock>) }
+impl CachedBlock {
+    fn len(&self) -> usize { match self { Self::Decoded(b) => b.entries.len(), Self::Packed(b) => b.rows.len() } }
+    fn entry(&self, i: usize) -> (&[u8], EntryRef<'_>) { match self {
+        Self::Decoded(b) => (&b.entries[i].0, EntryRef::of(&b.entries[i].1)), Self::Packed(b) => b.entry(i),
+    } }
+    fn partition(&self, key: &[u8], inclusive: bool) -> usize {
+        let mut lo = 0; let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2; let k = self.entry(mid).0;
+            if k < key || (inclusive && k == key) { lo = mid + 1; } else { hi = mid; }
+        }
+        lo
+    }
+}
+
 /// Candidate ownership survives releasing the tree lock without copying an SST
 /// payload. Blob pointers deliberately retain the existing locked lookup path:
 /// their files can be reclaimed after this scan releases the lock.
@@ -422,7 +509,7 @@ const NIL: usize = usize::MAX;
 #[derive(Debug)]
 struct Slot {
     key: CacheKey,
-    block: Arc<DataBlock>,
+    block: CachedBlock,
     prev: usize,
     next: usize,
 }
@@ -529,7 +616,7 @@ impl BlockCache {
             .expect("未满的缓存里必须有空闲槽（不变量：slots.len()==cap=map.len()+free.len()）")
     }
 
-    fn get(&mut self, ns: u64, sst_id: u64, offset: u64) -> Option<Arc<DataBlock>> {
+    fn get(&mut self, ns: u64, sst_id: u64, offset: u64) -> Option<CachedBlock> {
         let k = CacheKey { ns, sst_id, offset };
         let i = *self.map.get(&k)?;
         self.detach(i);
@@ -538,6 +625,10 @@ impl BlockCache {
     }
 
     fn put(&mut self, ns: u64, sst_id: u64, offset: u64, block: Arc<DataBlock>) {
+        self.put_cached(ns, sst_id, offset, CachedBlock::Decoded(block));
+    }
+
+    fn put_cached(&mut self, ns: u64, sst_id: u64, offset: u64, block: CachedBlock) {
         if self.cap == 0 {
             return;
         }
@@ -706,20 +797,20 @@ impl SstFile {
     pub fn get_at(&self, key: &[u8], snap_seq: u64) -> Option<StoredEntry> {
         #[cfg(test)]
         if point_read_reference::enabled() { return self.get_at_reference(key, snap_seq); }
-        self.get_at_project(key, snap_seq, Clone::clone)
+        self.get_at_project(key, snap_seq, |e| e.owned())
     }
 
     pub(crate) fn get_light_at(&self, key: &[u8], snap_seq: u64) -> Option<LightEntry> {
-        self.get_at_project(key, snap_seq, LightEntry::of)
+        self.get_at_project(key, snap_seq, |e| e.light())
     }
 
     /// Search the key interval, inspect every matching seq, project only its winner.
     /// Holding the block Arc keeps a winner valid while older blocks are loaded.
     fn get_at_project<T>(&self, key: &[u8], snap_seq: u64,
-        project: impl Fn(&StoredEntry) -> T) -> Option<T> {
+        project: impl Fn(EntryRef<'_>) -> T) -> Option<T> {
         #[cfg(test)]
         if point_read_reference::enabled() {
-            return self.get_at_reference(key, snap_seq).as_ref().map(project);
+            return self.get_at_reference(key, snap_seq).as_ref().map(|e| project(EntryRef::of(e)));
         }
         if !self.may_overlap(key, key) {
             return None;
@@ -739,18 +830,18 @@ impl SstFile {
             }
             #[cfg(test)]
             note_sst_entry_walks((hi - lo) as u64);
-            return best.map(project);
+            return best.map(|e| project(EntryRef::of(e)));
         }
         let mut bi = self.find_block(key)?;
-        let mut best: Option<(Arc<DataBlock>, usize)> = None;
+        let mut best: Option<(CachedBlock, usize)> = None;
         loop {
-            let block = self.load_block(bi).ok()?;
-            let lo = block.entries.partition_point(|(k, _)| k.as_slice() < key);
-            let hi = block.entries.partition_point(|(k, _)| k.as_slice() <= key);
+            let block = self.load_point_block(bi).ok()?;
+            let lo = block.partition(key, false);
+            let hi = block.partition(key, true);
             for i in (lo..hi).rev() {
-                let se = &block.entries[i].1;
-                if se.visible_at(snap_seq)
-                    && best.as_ref().is_none_or(|(b, j)| se.seq > b.entries[*j].1.seq) {
+                let se = block.entry(i).1;
+                if se.seq <= snap_seq
+                    && best.as_ref().is_none_or(|(b, j)| se.seq > b.entry(*j).1.seq) {
                     best = Some((block.clone(), i));
                 }
             }
@@ -763,7 +854,7 @@ impl SstFile {
             }
             bi -= 1;
         }
-        best.map(|(block, i)| project(&block.entries[i].1))
+        best.map(|(block, i)| project(block.entry(i).1))
     }
 
     #[cfg(test)]
@@ -870,16 +961,16 @@ impl SstFile {
         snap_seq: u64,
         accept: impl FnMut(&[u8], &StoredEntry) -> bool,
     ) -> Option<(Vec<u8>, StoredEntry)> {
-        self.find_back_project(low, high, snap_seq, Clone::clone, accept)
+        self.find_back_project(low, high, snap_seq, |e| e.owned(), accept)
     }
 
     pub(crate) fn find_back_light(&self, low: &[u8], high: &[u8], snap_seq: u64,
         accept: impl FnMut(&[u8], &LightEntry) -> bool) -> Option<(Vec<u8>, LightEntry)> {
-        self.find_back_project(low, high, snap_seq, LightEntry::of, accept)
+        self.find_back_project(low, high, snap_seq, |e| e.light(), accept)
     }
 
     fn find_back_project<T>(&self, low: &[u8], high: &[u8], snap_seq: u64,
-        project: impl Fn(&StoredEntry) -> T,
+        project: impl Fn(EntryRef<'_>) -> T,
         mut accept: impl FnMut(&[u8], &T) -> bool) -> Option<(Vec<u8>, T)> {
         if !self.may_overlap(low, high) {
             return None;
@@ -888,7 +979,7 @@ impl SstFile {
         let mut pending: Option<(Vec<u8>, u64, T)> = None;
         // None 表示越界/文件结束，收口最后一个组。反向只用 > 替换，保留同 seq 时
         // 正向 range_at 取最后一条的规则。pending 跨块保留，不能每块重置。
-        let mut feed = |entry: Option<(&[u8], &StoredEntry)>| {
+        let mut feed = |entry: Option<(&[u8], EntryRef<'_>)>| {
             if pending.as_ref().is_some_and(|(pk, _, _)| {
                 entry.is_none_or(|(k, _)| k != pk.as_slice())
             }) {
@@ -898,7 +989,7 @@ impl SstFile {
                 }
             }
             if let Some((k, se)) = entry {
-                if se.visible_at(snap_seq)
+                if se.seq <= snap_seq
                     && pending.as_ref().is_none_or(|(_, seq, _)| se.seq > *seq)
                 {
                     pending = Some((k.to_vec(), se.seq, project(se)));
@@ -915,7 +1006,7 @@ impl SstFile {
                 if k.as_slice() < low {
                     break;
                 }
-                if let Some(hit) = feed(Some((k, se))) {
+                if let Some(hit) = feed(Some((k, EntryRef::of(se)))) {
                     return Some(hit);
                 }
             }
@@ -924,18 +1015,18 @@ impl SstFile {
 
         let mut block_i = self.find_block(high)?;
         loop {
-            let block = self.load_block(block_i).ok()?;
+            let block = self.load_point_block(block_i).ok()?;
             #[cfg(test)]
             let old = point_read_reference::enabled();
             #[cfg(not(test))]
             let old = false;
-            let hi = if old { block.entries.len() }
-                else { block.entries.partition_point(|(k, _)| k.as_slice() <= high) };
-            for (k, se) in block.entries[..hi].iter().rev() {
-                if k.as_slice() > high {
+            let hi = if old { block.len() } else { block.partition(high, true) };
+            for i in (0..hi).rev() {
+                let (k, se) = block.entry(i);
+                if k > high {
                     continue;
                 }
-                if k.as_slice() < low {
+                if k < low {
                     return feed(None);
                 }
                 if let Some(hit) = feed(Some((k, se))) {
@@ -1224,7 +1315,14 @@ impl SstFile {
         if let Some(cache) = &self.block_cache {
             let mut c = cache.lock().unwrap();
             if let Some(b) = c.get(self.cache_ns, self.id, ie.offset) {
-                return Ok(b);
+                match b {
+                    CachedBlock::Decoded(b) => return Ok(b),
+                    CachedBlock::Packed(b) => {
+                        let decoded = Arc::new(decode_block(&b.raw, self.has_seq)?);
+                        c.put(self.cache_ns, self.id, ie.offset, decoded.clone());
+                        return Ok(decoded);
+                    }
+                }
             }
         }
         let raw = self.read_slice(ie.offset, ie.len as usize)?;
@@ -1234,6 +1332,25 @@ impl SstFile {
                 .lock()
                 .unwrap()
                 .put(self.cache_ns, self.id, ie.offset, block.clone());
+        }
+        Ok(block)
+    }
+
+    fn load_point_block(&self, index_i: usize) -> std::io::Result<CachedBlock> {
+        #[cfg(test)]
+        if packed_point_reference::enabled() || point_read_reference::enabled() {
+            return self.load_block(index_i).map(CachedBlock::Decoded);
+        }
+        #[cfg(test)]
+        BLOCK_READS.with(|c| c.set(c.get() + 1));
+        let ie = &self.index[index_i];
+        if let Some(cache) = &self.block_cache {
+            if let Some(block) = cache.lock().unwrap().get(self.cache_ns, self.id, ie.offset) { return Ok(block); }
+        }
+        let raw = self.read_slice(ie.offset, ie.len as usize)?;
+        let block = CachedBlock::Packed(Arc::new(PackedBlock::decode(raw, self.has_seq)?));
+        if let Some(cache) = &self.block_cache {
+            cache.lock().unwrap().put_cached(self.cache_ns, self.id, ie.offset, block.clone());
         }
         Ok(block)
     }
@@ -1758,6 +1875,16 @@ fn min_max_keys_stored(entries: &[(Vec<u8>, StoredEntry)]) -> (Vec<u8>, Vec<u8>)
 }
 
 // ─── SstBuilder ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub(crate) mod packed_point_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
 
 pub struct SstBuilder {
     path: PathBuf,
@@ -2930,6 +3057,47 @@ mod tests {
                 drop(mode);
             }
         }
+    }
+
+    #[test]
+    fn packed_point_blocks_preserve_records_crc_and_reduce_miss_allocations() {
+        let entries = vec![(vec![], StoredEntry::put(0, Some(vec![]))),
+            (b"a".to_vec(), StoredEntry::put(9, Some(vec![3; 1024]))),
+            (b"a".to_vec(), StoredEntry::put(2, None)),
+            (b"a\0".to_vec(), StoredEntry::drop_at(5))];
+        for seq in [false, true] {
+            let raw = encode_block(&entries, seq);
+            let packed = PackedBlock::decode(raw.clone(), seq).unwrap();
+            let decoded = decode_block(&raw, seq).unwrap();
+            for (i, (k, v)) in decoded.entries.iter().enumerate() {
+                assert_eq!(packed.entry(i).0, k); assert_eq!(packed.entry(i).1.owned(), *v);
+            }
+            for len in 0..raw.len() { assert!(PackedBlock::decode(raw[..len].to_vec(), seq).is_err()); }
+            let mut bad = raw.clone(); bad[8] ^= 1; assert!(PackedBlock::decode(bad, seq).is_err());
+            let mut bad = raw.clone(); bad[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(PackedBlock::decode(bad, seq).is_err());
+        }
+        let path = tmp("packed_point");
+        let mut builder = SstBuilder::with_options(1, &path, 128, false);
+        for i in 0..100 { builder.add(format!("k{i:03}").into_bytes(), StoredEntry::put(1, Some(vec![i as u8; 64]))); }
+        let mut sst = builder.finish().unwrap();
+        let mut costs = Vec::new();
+        for old in [true, false] {
+            let cache = Arc::new(Mutex::new(BlockCache::new(1)));
+            sst.set_block_cache(cache.clone());
+            let _mode = old.then(packed_point_reference::Scope::start);
+            let before = crate::mem_probe::allocations();
+            let got = sst.get_at(b"k050", 1).unwrap();
+            costs.push(crate::mem_probe::allocations() - before);
+            assert_eq!(got, StoredEntry::put(1, Some(vec![50; 64])));
+            let block = cache.lock().unwrap().get(0, 1, sst.index[0].offset).unwrap();
+            assert_eq!(matches!(block, CachedBlock::Decoded(_)), old);
+            assert_eq!(sst.get_light_at(b"k050", 1).unwrap().kind, 0);
+            assert_eq!(sst.find_back(b"k000", b"k099", 1, |k, _| k == b"k049").unwrap().0, b"k049");
+            assert_eq!(sst.iter_all().count(), 100, "packed cache must promote correctly for scans");
+            assert!(matches!(cache.lock().unwrap().get(0, 1, sst.index[0].offset), Some(CachedBlock::Decoded(_))));
+        }
+        assert!(costs[0] >= costs[1] + 190, "old decode must allocate each key/value, not just an output row");
     }
 
     #[test]
