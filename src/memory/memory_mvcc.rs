@@ -384,15 +384,12 @@ impl MVCC {
         }
     }
 
-    fn write_snapshot_rows<'a>(path: &std::path::Path,
+    #[cfg(test)]
+    fn write_snapshot_rows_batch<'a>(path: &std::path::Path,
         rows: impl Iterator<Item = (Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>,
         ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
     ) -> std::io::Result<usize> {
         use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter, RecordEncoding}, order::KeyWindow, version::decode_key_ref};
-        #[cfg(test)]
-        if stop_release_reference::enabled() {
-            return Self::write_snapshot_rows_eager(path, rows, ceiling, visible, mode);
-        }
         #[cfg(test)]
         if stop_rows_reference::enabled() {
             return Self::write_snapshot_rows_reference(path, rows, ceiling, visible, mode);
@@ -511,7 +508,6 @@ impl MVCC {
         Ok(stats.records)
     }
 
-    #[cfg(test)]
     fn write_snapshot_rows_eager<'a>(path: &std::path::Path,
         rows: impl Iterator<Item = (Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>,
         ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
@@ -622,6 +618,17 @@ impl MVCC {
         #[cfg(not(test))]
         let _ = (mode, visited);
         Ok(stats.records)
+    }
+
+    fn write_snapshot_rows<'a>(path: &std::path::Path,
+        rows: impl Iterator<Item = (Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>,
+        ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
+    ) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if stop_batch_release::enabled() {
+            return Self::write_snapshot_rows_batch(path, rows, ceiling, visible, mode);
+        }
+        Self::write_snapshot_rows_eager(path, rows, ceiling, visible, mode)
     }
 
     #[cfg(test)]
@@ -1515,7 +1522,7 @@ pub(crate) mod stop_fold_reference {
 }
 
 #[cfg(test)]
-pub(crate) mod stop_release_reference {
+pub(crate) mod stop_batch_release {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
@@ -1690,7 +1697,7 @@ mod tests {
             let reference = (mode == "reference").then(stop_reference::Scope::start);
             let rows_reference = old_rows.then(stop_rows_reference::Scope::start);
             let emit_reference = old_emit.then(crate::common::kv_snapshot::snapshot_emit_reference::Scope::start);
-            let release_reference = old_release.then(stop_release_reference::Scope::start);
+            let release_reference = (!old_release).then(stop_batch_release::Scope::start);
             let scope = snapshot_probe::Scope::start(false);
             let clones = crate::common::codec::user_value_copies();
             assert_eq!(db.write_stop_snapshot(&path).unwrap(), 6);

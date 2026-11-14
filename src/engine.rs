@@ -6092,7 +6092,7 @@ mod tests {
                 let mode = (reference && !fold_only && !release_only).then(snapshot_emit_reference::Scope::start);
                 let fold_mode = (reference && fold_only).then(crate::memory::memory_mvcc::stop_fold_reference::Scope::start);
                 // Older isolated gates retain their consuming input route.
-                let release_mode = (!release_only || reference).then(crate::memory::memory_mvcc::stop_release_reference::Scope::start);
+                let release_mode = (release_only && !reference).then(crate::memory::memory_mvcc::stop_batch_release::Scope::start);
                 let scope = snapshot_probe::Scope::start(false);
                 let before = crate::mem_probe::allocations();
                 let start = std::time::Instant::now();

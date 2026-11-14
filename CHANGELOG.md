@@ -2,6 +2,15 @@
 
 ## 未发布（2026-11-14）
 
+### M136：test13 第三步，memory 撤回未经证实的批尾释放默认
+
+- 生产及普通测试统一恢复逐行消费释放。批尾释放完整保留为 cfg(test) 的 stop_batch_release 实验门；不撤回流式消费、完整组快路和输出缓冲等其它改动。
+  memory_stop_release_cost 仍以 reference=true 表示逐行、false 表示批尾，明确新默认是逐行；旧 fold/emit 专项也冻结逐行路径。
+- 决策依据是 M133 大档 ABBA 未形成稳定收益，以及 test13 20M bulk 的 input_release 20.012 s；它只是移动释放时机，没有减少释放次数。
+  不据此断言 test13 的 memory 灌库、重开、vacuum 全面变慢已经修复。
+- memory debug 回归 59 passed / 0 failed / 13 ignored（14.34 s）；2000/2200 行首次及更新后 bulk 八轮均取得 VERIFIED，退出 0（1.34 s）。
+  旧新快照字节、footer/CRC、重开值与共享事务均验证，默认分支与实验分支的 release_rows 断言分别为 0 / 输入行数。
+
 ### M135：test13 第二步，LSM 惰性扫描直接共享 packed 缓存
 
 - light/row 扫描复用点读建立的字节索引，只复制最终交付值；缓存挤出后冻结行持有原块，blob 与歧义回退保持显式。
