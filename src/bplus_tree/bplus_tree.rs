@@ -156,6 +156,44 @@ enum PointStep {
     Missing,
 }
 
+enum DeleteRead {
+    Owned(BTreeNode),
+    PackedLeaf { remaining: usize, removed: usize, min_changed: bool },
+}
+
+impl DeleteRead {
+    fn project(payload: &[u8], run: &[Key], output: &mut Vec<u8>) -> std::io::Result<Self> {
+        let node = MaintenanceNode::decode(payload)?;
+        let MaintenanceNode::Leaf { rows, count, .. } = node else {
+            return bincode::deserialize(payload).map(Self::Owned)
+                .map_err(|_| NodeBytes::invalid());
+        };
+        output.clear();
+        if output.capacity() < MAX_PAYLOAD {
+            #[cfg(test)]
+            crate::common::maintenance_probe::note_bplus_pack_buffer();
+            output.reserve(MAX_PAYLOAD);
+        }
+        output.extend_from_slice(&payload[..12]);
+        let mut cursor = NodeBytes(rows);
+        let mut removed = 0;
+        let mut min_changed = false;
+        for i in 0..count {
+            let before = cursor.0;
+            let (key, _) = cursor.row()?;
+            if run.binary_search_by(|candidate| candidate.as_slice().cmp(key)).is_ok() {
+                removed += 1; min_changed |= i == 0;
+            } else {
+                output.extend_from_slice(&before[..before.len() - cursor.0.len()]);
+            }
+        }
+        let remaining = count - removed;
+        output[4..12].copy_from_slice(&(remaining as u64).to_le_bytes());
+        output.extend_from_slice(&payload[12 + rows.len()..]);
+        Ok(Self::PackedLeaf { remaining, removed, min_changed })
+    }
+}
+
 impl PointStep {
     fn leaf<'a>(rows: impl DoubleEndedIterator<Item = (&'a [u8], Option<&'a [u8]>)>,
         low: &[u8], high: &[u8], accept: &mut impl FnMut(&[u8]) -> bool) -> Self {
@@ -1972,7 +2010,37 @@ impl BPlusTree {
         if delete_cost_reference::enabled() { return self.delete_recursive_reference(node_page_id, run, parent_page_id); }
         // M56 的段标注：下降那一次读记到"下降"，返回之后本层的所有读记到"回溯"
         set_page_phase(PHASE_DESCENT);
-        let mut node = self.read_node(node_page_id);
+        #[cfg(test)]
+        let packed = !delete_leaf_reference::enabled() && !delete_read_reference::enabled();
+        #[cfg(not(test))]
+        let packed = true;
+        // Unsorted callers retain the original binary-search-per-victim route.
+        let input = if packed && run.windows(2).all(|w| w[0] <= w[1]) {
+            let output = &mut self.node_buffer;
+            self.page_manager.read_page_project(node_page_id, |payload|
+                DeleteRead::project(payload, run, output)).expect("read page").expect("decode node")
+        } else { DeleteRead::Owned(self.read_node(node_page_id)) };
+        let mut node = match input {
+            DeleteRead::Owned(node) => node,
+            DeleteRead::PackedLeaf { remaining, removed, mut min_changed } => {
+                if removed == 0 { return (Del::NOOP, run.len()); }
+                #[cfg(test)]
+                for _ in 0..removed { note_delete_leaf(node_page_id); }
+                if !self.page_manager.write_page(node_page_id, &self.node_buffer) {
+                    return (Del::NOOP, run.len());
+                }
+                let mut merged = false;
+                if node_page_id != self.root && remaining < self.min_entries() {
+                    if let Some(parent) = parent_page_id {
+                        set_page_phase(PHASE_RESTRUCTURE);
+                        merged = self.handle_underflow(node_page_id, parent);
+                        set_page_phase(PHASE_BACKTRACK);
+                        min_changed = true;
+                    }
+                }
+                return (Del { removed, min_changed, merged }, run.len());
+            }
+        };
 
         match &mut node {
             BTreeNode::Leaf { entries, .. } => {
@@ -2984,6 +3052,48 @@ mod tests {
     }
 
     #[test]
+    fn packed_leaf_delete_matches_owned_bytes_and_rebalances() {
+        let entries: Vec<_> = (0..30_u64).map(|i|
+            (i.to_be_bytes().to_vec(), RowId(if i % 3 == 0 { None } else { Some(vec![i as u8; 32]) }))).collect();
+        for victims in [vec![0, 1, 4, 7, 29, 99], vec![99], (0..30).collect::<Vec<_>>()] {
+            let keys: Vec<_> = victims.iter().map(|i| (*i as u64).to_be_bytes().to_vec()).collect();
+            let payload = bincode::serialize(&BTreeNode::Leaf { entries: entries.clone(), next_leaf: Some(PageId(77)) }).unwrap();
+            let mut out = Vec::with_capacity(MAX_PAYLOAD);
+            let before = crate::mem_probe::allocations();
+            let got = DeleteRead::project(&payload, &keys, &mut out).unwrap();
+            assert_eq!(crate::mem_probe::allocations() - before, 0);
+            let expected: Vec<_> = entries.iter().filter(|(k, _)| !keys.contains(k)).cloned().collect();
+            assert!(matches!(got, DeleteRead::PackedLeaf { remaining, removed, min_changed }
+                if remaining == expected.len() && removed == entries.len() - expected.len() && min_changed == victims.contains(&0)));
+            assert_eq!(out, bincode::serialize(&BTreeNode::Leaf { entries: expected, next_leaf: Some(PageId(77)) }).unwrap());
+        }
+        let mut costs = Vec::new();
+        for old in [true, false] {
+            let (_scratch, mut tree) = anon(64, 64);
+            for (k, v) in entries.clone() { assert!(tree.insert(k, v)); }
+            let victims = vec![4_u64.to_be_bytes().to_vec()];
+            let mode = old.then(delete_leaf_reference::Scope::start);
+            let before = crate::mem_probe::allocations();
+            assert_eq!(tree.delete_batch(&victims), 1);
+            costs.push(crate::mem_probe::allocations() - before);
+            drop(mode);
+        }
+        assert!(costs[0] >= costs[1] + 30, "owned reference must allocate surviving rows");
+        for old in [true, false] {
+            let (_scratch, mut tree) = anon(8, 64);
+            for i in 0..400_u64 { assert!(tree.insert(i.to_be_bytes().to_vec(), RowId(Some(vec![i as u8; 32])))); }
+            let mode = old.then(delete_leaf_reference::Scope::start);
+            let victims: Vec<_> = (0..350_u64).map(|i| i.to_be_bytes().to_vec()).collect();
+            assert_eq!(tree.delete_batch(&victims), 350);
+            drop(mode); tree.try_flush_all().unwrap();
+            let path = tree.page_manager.path().to_path_buf(); drop(tree);
+            let mut tree = BPlusTree::open(&path, 8, 64);
+            for i in 0..400_u64 { assert_eq!(tree.get(i.to_be_bytes().to_vec()),
+                if i < 350 { None } else { Some(RowId(Some(vec![i as u8; 32]))) }); }
+        }
+    }
+
+    #[test]
     fn delete_buffers_preserve_serialized_bytes_and_reject_oversized_node() {
         let (_scratch, mut tree) = anon(64, 64);
         let nodes = [
@@ -3930,6 +4040,16 @@ pub(crate) mod delete_read_reference {
 
 #[cfg(test)]
 pub(crate) mod point_projection_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod delete_leaf_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
