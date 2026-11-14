@@ -301,6 +301,10 @@ pub(crate) mod snapshot_probe {
         /// Completed ordinary groups emitted without entering the overlap window.
         pub fold_direct_rows: u64,
         pub fold_window_rows: u64,
+        /// Clearing bounded input batches; nested in body_ns, separate from fold/emit.
+        pub input_release_ns: u128,
+        /// Input slots cleared by the deferred route, including moved/window slots.
+        pub release_rows: u64,
         pub record_buffer_bytes: usize,
         pub record_flushes: u64,
         pub record_buffered_rows: u64,

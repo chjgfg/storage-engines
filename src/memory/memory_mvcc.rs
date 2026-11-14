@@ -390,6 +390,134 @@ impl MVCC {
     ) -> std::io::Result<usize> {
         use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter, RecordEncoding}, order::KeyWindow, version::decode_key_ref};
         #[cfg(test)]
+        if stop_release_reference::enabled() {
+            return Self::write_snapshot_rows_eager(path, rows, ceiling, visible, mode);
+        }
+        #[cfg(test)]
+        if stop_rows_reference::enabled() {
+            return Self::write_snapshot_rows_reference(path, rows, ceiling, visible, mode);
+        }
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        let mut visited = 0_u64;
+        #[cfg(test)]
+        let mut detail = crate::common::kv_snapshot::snapshot_probe::Stats::default();
+        #[cfg(test)]
+        let measured = crate::common::kv_snapshot::snapshot_probe::is_active();
+        let stats = atomic_write_bin_v4(path, |sink| {
+            let mut groups: KeyWindow<(u64, Option<Cow<'a, [u8]>>)> = KeyWindow::new();
+            let mut spare = Vec::new();
+            let mut rows = rows;
+            const INPUT_BATCH: usize = 8192;
+            let mut batch = Vec::with_capacity(rows.size_hint().0.min(INPUT_BATCH));
+            let emit = |sink: &mut BinWriter, key: &[u8], value: Option<&[u8]>| -> std::io::Result<()> {
+                let (user, expire) = match value {
+                    Some(bytes) => crate::common::codec::snapshot_value(bytes),
+                    None => (None, None),
+                };
+                match sink.write_snapshot_batched(key, user, expire)? {
+                    RecordEncoding::Buffered | RecordEncoding::DirectLarge => Ok(()),
+                    #[cfg(test)]
+                    RecordEncoding::DirectReference => Ok(()),
+                }
+            };
+            loop {
+                #[cfg(test)]
+                let pull = measured.then(std::time::Instant::now);
+                batch.extend(rows.by_ref().take(INPUT_BATCH));
+                #[cfg(test)]
+                if let Some(pull) = pull { detail.pull_ns += pull.elapsed().as_nanos(); }
+                #[cfg(test)]
+                { detail.input_buffer_bytes = detail.input_buffer_bytes.max(batch.capacity() * std::mem::size_of::<(Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>()); }
+                if batch.is_empty() { break; }
+                #[cfg(test)]
+                { detail.input_batches += 1; }
+                #[cfg(test)]
+                let fold = measured.then(std::time::Instant::now);
+                let batch_rows = batch.len();
+                for index in 0..batch_rows {
+                    let (enc, value) = &batch[index];
+                    visited += 1;
+                    while let Some((key, (_, value))) = groups.pop_before(&enc, ceiling) {
+                        emit(sink, &key, value.as_deref())?;
+                        spare = key;
+                    }
+                    let Some((raw, version)) = decode_key_ref(enc) else { continue; };
+                    if !visible(version) { continue; }
+                    #[cfg(test)]
+                    let reference = stop_fold_reference::enabled();
+                    #[cfg(not(test))]
+                    let reference = false;
+                    let route = if !reference && groups.is_empty() && batch.get(index + 1).is_some_and(|(next, _)|
+                        crate::common::order::window_before(raw, next, ceiling)) {
+                        SnapshotFoldRoute::Complete
+                    } else { SnapshotFoldRoute::Window };
+                    match route {
+                        SnapshotFoldRoute::Complete => {
+                            emit(sink, raw, value.as_deref())?;
+                            #[cfg(test)]
+                            { detail.fold_direct_rows += 1; }
+                            continue;
+                        }
+                        SnapshotFoldRoute::Window => {
+                            #[cfg(test)]
+                            { detail.fold_window_rows += 1; }
+                        }
+                    }
+                    let len = raw.len();
+                    let (enc, value) = std::mem::replace(&mut batch[index], (Cow::Borrowed(&[]), None));
+                    let winner = match enc {
+                        Cow::Owned(mut key) => {
+                            key.truncate(len);
+                            groups.entry(key)
+                        }
+                        Cow::Borrowed(enc) => groups.entry_with(&enc[..len], || {
+                            let mut key = std::mem::take(&mut spare);
+                            key.clear(); key.extend_from_slice(&enc[..len]);
+                            (key, (0, None))
+                        }),
+                    };
+                    if version >= winner.0 { *winner = (version, value); }
+                }
+                #[cfg(test)]
+                if let Some(fold) = fold { detail.fold_emit_ns += fold.elapsed().as_nanos(); }
+                #[cfg(test)]
+                let release = measured.then(std::time::Instant::now);
+                batch.clear();
+                #[cfg(test)]
+                {
+                    if let Some(release) = release { detail.input_release_ns += release.elapsed().as_nanos(); }
+                    detail.release_rows += batch_rows as u64;
+                }
+            }
+            #[cfg(test)]
+            let tail = measured.then(std::time::Instant::now);
+            while let Some((key, (_, value))) = groups.pop_first() { emit(sink, &key, value.as_deref())?; }
+            sink.flush_record_batch()?;
+            #[cfg(test)]
+            if let Some(tail) = tail { detail.fold_emit_ns += tail.elapsed().as_nanos(); }
+            Ok(())
+        })?;
+        #[cfg(test)]
+        crate::common::kv_snapshot::snapshot_probe::note(|s| {
+            s.stop_mode = mode; s.visited_rows = visited;
+            s.consumed_rows = if mode == "exclusive" { visited } else { 0 };
+            s.pull_ns = detail.pull_ns; s.fold_emit_ns = detail.fold_emit_ns;
+            s.input_batches = detail.input_batches; s.input_buffer_bytes = detail.input_buffer_bytes;
+            s.fold_direct_rows = detail.fold_direct_rows; s.fold_window_rows = detail.fold_window_rows;
+            s.input_release_ns = detail.input_release_ns; s.release_rows = detail.release_rows;
+        });
+        #[cfg(not(test))]
+        let _ = (mode, visited);
+        Ok(stats.records)
+    }
+
+    #[cfg(test)]
+    fn write_snapshot_rows_eager<'a>(path: &std::path::Path,
+        rows: impl Iterator<Item = (Cow<'a, [u8]>, Option<Cow<'a, [u8]>>)>,
+        ceiling: u64, visible: impl Fn(u64) -> bool, mode: &'static str,
+    ) -> std::io::Result<usize> {
+        use crate::common::{kv_snapshot::{atomic_write_bin_v4, BinWriter, RecordEncoding}, order::KeyWindow, version::decode_key_ref};
+        #[cfg(test)]
         if stop_rows_reference::enabled() {
             return Self::write_snapshot_rows_reference(path, rows, ceiling, visible, mode);
         }
@@ -1387,6 +1515,16 @@ pub(crate) mod stop_fold_reference {
 }
 
 #[cfg(test)]
+pub(crate) mod stop_release_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
 pub(crate) mod stop_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
@@ -1530,6 +1668,7 @@ mod tests {
     fn snapshot_stop_modes_preserve_bytes_and_shared_transactions() {
         use crate::common::kv_snapshot::{snapshot_probe, read_snapshot_with, ValueBuffer};
         let mut golden = None;
+        for old_release in [true, false] {
         for (mode, old_rows, old_emit) in [("reference", false, true), ("exclusive", true, true),
             ("exclusive", false, true), ("exclusive", false, false), ("shared", true, true),
             ("shared", false, true), ("shared", false, false)] {
@@ -1551,6 +1690,7 @@ mod tests {
             let reference = (mode == "reference").then(stop_reference::Scope::start);
             let rows_reference = old_rows.then(stop_rows_reference::Scope::start);
             let emit_reference = old_emit.then(crate::common::kv_snapshot::snapshot_emit_reference::Scope::start);
+            let release_reference = old_release.then(stop_release_reference::Scope::start);
             let scope = snapshot_probe::Scope::start(false);
             let clones = crate::common::codec::user_value_copies();
             assert_eq!(db.write_stop_snapshot(&path).unwrap(), 6);
@@ -1559,6 +1699,8 @@ mod tests {
             if mode != "reference" { assert_eq!(crate::common::codec::user_value_copies(), clones); }
             if mode == "exclusive" {
                 assert_eq!(stats.consumed_rows, 10);
+                assert_eq!(stats.release_rows, if old_release || old_rows { 0 } else { 10 });
+                if !old_rows && !old_release { assert!(stats.input_release_ns > 0); }
                 assert_eq!(db.store.lock().unwrap().iter_keys().count(), 0, "exclusive snapshot must consume its input tree");
             } else { assert!(db.store.lock().unwrap().iter_keys().count() >= 10); }
             if mode != "reference" && !old_rows {
@@ -1572,7 +1714,7 @@ mod tests {
                 assert_eq!(stats.record_reference_rows, 0);
                 assert_eq!(stats.record_flushes, 1);
             } else { assert_eq!(stats.record_buffered_rows, 0); }
-            drop(scope); drop(reference); drop(rows_reference); drop(emit_reference);
+            drop(scope); drop(reference); drop(rows_reference); drop(emit_reference); drop(release_reference);
             let bytes = std::fs::read(&path).unwrap();
             if let Some(expected) = &golden { assert_eq!(&bytes, expected); } else { golden = Some(bytes); }
             let mut records = Vec::new();
@@ -1590,6 +1732,7 @@ mod tests {
             let mut reopened = MVCC::new();
             reopened.load_snapshot_from(&path).unwrap();
             assert_eq!(reopened.export_latest_visible(true).len(), 6);
+        }
         }
     }
 

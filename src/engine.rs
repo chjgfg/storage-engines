@@ -6022,22 +6022,31 @@ mod tests {
     #[test]
     #[ignore = "memory stop record batches, first/bulk shapes ABBA; release single thread"]
     fn memory_stop_emit_cost() {
-        memory_stop_fold_or_emit_cost(false);
+        memory_stop_fold_or_emit_cost(false, false);
     }
 
     #[test]
     #[ignore = "memory completed group folding, first/bulk shapes ABBA; release single thread"]
     fn memory_stop_fold_cost() {
-        memory_stop_fold_or_emit_cost(true);
+        memory_stop_fold_or_emit_cost(true, false);
     }
 
-    fn memory_stop_fold_or_emit_cost(fold_only: bool) {
+    #[test]
+    #[ignore = "memory bounded batch release, first/updated-vacuum-migrated-bulk ABBA; release single thread"]
+    fn memory_stop_release_cost() {
+        memory_stop_fold_or_emit_cost(false, true);
+    }
+
+    fn memory_stop_fold_or_emit_cost(fold_only: bool, release_only: bool) {
         use crate::common::kv_snapshot::{snapshot_emit_reference, snapshot_probe, read_snapshot_with,
             ValueBuffer, RECORD_BATCH_BYTES};
         use std::io::{Read, Seek, SeekFrom};
         let rows: usize = std::env::var("SNAPSHOT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
         assert!(rows >= 1000);
+        let shape = std::env::var("SNAPSHOT_SHAPE").unwrap_or_else(|_| "all".into());
+        assert!(matches!(shape.as_str(), "all" | "first" | "bulk"));
         for appended in [false, true] {
+            if (shape == "first" && appended) || (shape == "bulk" && !appended) { continue; }
             let total_rows = rows + if appended { rows / 10 } else { 0 };
             let mut golden_footer = None;
             let mut golden_bytes = None;
@@ -6054,12 +6063,28 @@ mod tests {
                     drop(db);
                     db = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
                     db.set_vacuum_auto_slice(0);
+                    if release_only {
+                        for base in (0..rows / 10).step_by(1000) {
+                            let tx = db.begin_transaction();
+                            for i in base..(base + 1000).min(rows / 10) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+                            tx.try_commit().unwrap();
+                        }
+                        db.vacuum();
+                        let migrated = crate::memory::MVCC::new();
+                        let mut bulk = migrated.begin_bulk();
+                        db.export_latest_visible_for_each(false, |r| {
+                            bulk.put(&r.key, crate::common::pack_plain(&r.value.unwrap())); true
+                        });
+                        bulk.finish(); drop(migrated);
+                    }
                     let mut bulk = db.begin_bulk();
                     for i in rows..total_rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
                     bulk.finish();
                 }
-                let mode = (reference && !fold_only).then(snapshot_emit_reference::Scope::start);
+                let mode = (reference && !fold_only && !release_only).then(snapshot_emit_reference::Scope::start);
                 let fold_mode = (reference && fold_only).then(crate::memory::memory_mvcc::stop_fold_reference::Scope::start);
+                // Older isolated gates retain their consuming input route.
+                let release_mode = (!release_only || reference).then(crate::memory::memory_mvcc::stop_release_reference::Scope::start);
                 let scope = snapshot_probe::Scope::start(false);
                 let before = crate::mem_probe::allocations();
                 let start = std::time::Instant::now();
@@ -6071,7 +6096,7 @@ mod tests {
                 assert_eq!(stats.consumed_rows, total_rows as u64);
                 assert_eq!(stats.input_batches, total_rows.div_ceil(8192) as u64);
                 assert!(stats.pull_ns + stats.fold_emit_ns <= stats.body_ns);
-                if reference && !fold_only {
+                if reference && !fold_only && !release_only {
                     assert_eq!(stats.record_reference_rows, total_rows as u64);
                     assert_eq!(stats.record_buffer_bytes, 0);
                     assert_eq!(stats.record_flushes, 0);
@@ -6087,8 +6112,13 @@ mod tests {
                     assert_eq!(stats.fold_direct_rows, if reference { 0 } else { (total_rows - total_rows.div_ceil(8192)) as u64 });
                     assert_eq!(stats.fold_window_rows, if reference { total_rows as u64 } else { total_rows.div_ceil(8192) as u64 });
                 }
-                eprintln!("MEMORY_STOP_EMIT fold_only={fold_only} round={round} reference={reference} appended={appended} rows={total_rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");
-                drop(scope); drop(mode); drop(fold_mode);
+                if release_only {
+                    assert_eq!(stats.release_rows, if reference { 0 } else { total_rows as u64 });
+                    assert_eq!(stats.input_release_ns > 0, !reference);
+                    assert!(stats.pull_ns + stats.fold_emit_ns + stats.input_release_ns <= stats.body_ns);
+                }
+                eprintln!("MEMORY_STOP_EMIT fold_only={fold_only} release_only={release_only} round={round} reference={reference} appended={appended} rows={total_rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");
+                drop(scope); drop(mode); drop(fold_mode); drop(release_mode);
                 let path = dir.0.join("snapshot.bxp");
                 let mut file = std::fs::File::open(&path).unwrap();
                 file.seek(SeekFrom::End(-16)).unwrap();
@@ -6100,14 +6130,14 @@ mod tests {
                 }
                 let mut seen = 0;
                 read_snapshot_with(&path, ValueBuffer::Exact, &mut |r| {
-                    assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                    assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(if release_only && appended && seen < rows / 10 { seen + rows } else { seen })));
                     assert_eq!(r.expire_unix_secs, None); seen += 1; true
                 }).unwrap();
                 assert_eq!(seen, total_rows);
                 let reopened = crate::memory::MVCC::open_with_snapshot(&dir.0).unwrap();
                 let mut seen = 0;
                 reopened.export_latest_visible_for_each(false, |r| {
-                    assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+                    assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(if release_only && appended && seen < rows / 10 { seen + rows } else { seen })));
                     assert_eq!(r.expire_unix_secs, None); seen += 1; true
                 });
                 assert_eq!(seen, total_rows);
@@ -6139,10 +6169,12 @@ mod tests {
         let rows: usize = std::env::var("BPLUS_DEL_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
         let mut costs = Vec::new();
         let mut pack_buffers = Vec::new();
-        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
-            let dir = ScaleScratch::new("bplus_delete_buffers");
-            let path = dir.0.join("bplus.db");
-            let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+        // A closed seed preserves the same physical tree for every deletion
+        // arm, without paying for four full large-library insert/update runs.
+        let seed = leaf_projection.then(|| ScaleScratch::new("bplus_delete_seed"));
+        if let Some(seed) = &seed {
+            eprintln!("BPLUS_DELETE_SEED rows={rows}");
+            let db = crate::bplus_tree::MVCC::open(seed.0.join("bplus.db"), 64, 1024);
             db.set_vacuum_auto_slice(0);
             let mut bulk = db.begin_bulk();
             for i in 0..rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
@@ -6151,6 +6183,28 @@ mod tests {
                 let tx = db.begin_transaction();
                 for i in base..(base + 1000).min(rows / 10) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
                 tx.try_commit().unwrap();
+            }
+        }
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let dir = ScaleScratch::new("bplus_delete_buffers");
+            if let Some(seed) = &seed {
+                for entry in std::fs::read_dir(&seed.0).unwrap() {
+                    let entry = entry.unwrap(); assert!(entry.file_type().unwrap().is_file());
+                    std::fs::copy(entry.path(), dir.0.join(entry.file_name())).unwrap();
+                }
+            }
+            let path = dir.0.join("bplus.db");
+            let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+            db.set_vacuum_auto_slice(0);
+            if seed.is_none() {
+            let mut bulk = db.begin_bulk();
+            for i in 0..rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
+            bulk.try_finish().unwrap();
+            for base in (0..rows / 10).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows / 10) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+                tx.try_commit().unwrap();
+            }
             }
             let mode = (reference && !read_projection && !leaf_projection).then(crate::bplus_tree::bplus_tree::delete_cost_reference::Scope::start);
             let read_mode = (reference && read_projection).then(crate::bplus_tree::bplus_tree::delete_read_reference::Scope::start);

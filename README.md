@@ -1,6 +1,6 @@
 # storage-engines
 
-test12 后四步优化进度见 [CHANGELOG](CHANGELOG.md) M129 起；新增复现入口见 [压测手册](docs/大规模压测手册.md)。
+test12 后四项改动见 [CHANGELOG](CHANGELOG.md) M129–M133；M133 记录 2000 万/2200 万行专项与最终回归，memory 暂未证实稳定停机提速。复现入口见 [压测手册](docs/大规模压测手册.md)。
 
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
