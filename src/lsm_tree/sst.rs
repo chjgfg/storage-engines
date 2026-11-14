@@ -192,6 +192,23 @@ impl PackedBlock {
         (&self.raw[row.key.start as usize..row.key.end as usize], EntryRef {
             seq: row.seq, kind: row.kind, value: &self.raw[row.value.start as usize..row.value.end as usize] })
     }
+
+    /// Promote a packed point-read block for scan/compaction without parsing
+    /// the block header, CRC, and every field a second time. `decode` already
+    /// validated all ranges and ordering before this object entered the cache.
+    fn to_decoded(&self) -> DataBlock {
+        let mut entries = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let key = self.raw[row.key.start as usize..row.key.end as usize].to_vec();
+            let value = match row.kind {
+                0 => EntryValue::Put(Some(self.raw[row.value.start as usize..row.value.end as usize].to_vec())),
+                1 => EntryValue::Put(None),
+                _ => EntryValue::Drop,
+            };
+            entries.push((key, StoredEntry { seq: row.seq, value }));
+        }
+        DataBlock { entries }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -227,13 +244,13 @@ pub enum ScanRow {
 pub struct InlineRow(InlineStorage);
 enum InlineStorage {
     Owned(EntryValue),
-    Block(Arc<DataBlock>, usize),
+    Block(CachedBlock, usize),
 }
 impl InlineRow {
     pub(crate) fn materialize(self) -> crate::common::RowValue {
         let value = match self.0 {
             InlineStorage::Owned(value) => value,
-            InlineStorage::Block(block, pos) => block.entries[pos].1.value.clone(),
+            InlineStorage::Block(block, pos) => block.entry(pos).1.owned().value,
         };
         match value {
             EntryValue::Put(Some(value)) => crate::common::RowValue::Value(value),
@@ -250,23 +267,24 @@ pub(crate) struct SourceRow<'a> {
 }
 enum SourceValue<'a> {
     Borrowed(&'a EntryValue),
-    Block(Arc<DataBlock>, usize),
+    Block(CachedBlock, usize),
 }
 impl<'a> SourceRow<'a> {
     pub(crate) fn borrowed(seq: u64, value: &'a EntryValue) -> Self {
         Self { seq, value: SourceValue::Borrowed(value), ambiguous: false }
     }
-    fn value(&self) -> &EntryValue {
+    fn entry(&self) -> EntryRef<'_> {
         match &self.value {
-            SourceValue::Borrowed(value) => value,
-            SourceValue::Block(block, pos) => &block.entries[*pos].1.value,
+            SourceValue::Borrowed(value) => EntryRef { seq: self.seq, kind: value.kind_byte(), value: match value { EntryValue::Put(Some(v)) => v, _ => &[] } },
+            SourceValue::Block(block, pos) => block.entry(*pos).1,
         }
     }
-    pub(crate) fn kind(&self) -> u8 { self.value().kind_byte() }
+    pub(crate) fn kind(&self) -> u8 { self.entry().kind }
     pub(crate) fn freeze(self, enc: impl FnOnce() -> Vec<u8>) -> ScanRow {
         if self.ambiguous { return ScanRow::AmbiguousLookup(enc()); }
-        if let EntryValue::Put(Some(value)) = self.value() {
-            if super::lsm_tree::LSMTree::blob_ptr_seq(value).is_some() {
+        let entry = self.entry();
+        if entry.kind == 0 {
+            if super::lsm_tree::LSMTree::blob_ptr_seq(entry.value).is_some() {
                 return ScanRow::BlobLookup(enc());
             }
         }
@@ -302,6 +320,20 @@ pub(crate) mod point_read_reference {
     }
     impl Drop for Scope { fn drop(&mut self) { OLD.with(|old| old.set(false)); } }
 }
+
+#[cfg(test)]
+pub(crate) mod packed_scan_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|v| assert!(!v.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|v| v.set(false)); } }
+}
+#[cfg(test)]
+thread_local! { static PACKED_PROMOTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn packed_promotions() -> u64 { PACKED_PROMOTIONS.with(std::cell::Cell::get) }
 
 // 测试专用：本线程的块访问次数（含块缓存命中）。
 //
@@ -1111,19 +1143,19 @@ impl SstFile {
         snap_seq: u64,
     ) -> impl Iterator<Item = (Vec<u8>, LightEntry)> + '_ {
         self.projected_iter(from, to, snap_seq, LightEntry::of,
-            |block, pos| LightEntry::of(&block.entries[pos].1))
+            |block, pos| block.entry(pos).1.light())
     }
 
     pub(crate) fn row_iter<'a>(&'a self, from: Option<&[u8]>, to: Option<&[u8]>, snap_seq: u64)
         -> Box<dyn Iterator<Item = (Vec<u8>, SourceRow<'a>)> + 'a> {
         self.projected_iter(from, to, snap_seq,
             |entry| SourceRow::borrowed(entry.seq, &entry.value),
-            |block, pos| SourceRow { seq: block.entries[pos].1.seq,
+            |block, pos| SourceRow { seq: block.entry(pos).1.seq,
                 value: SourceValue::Block(block.clone(), pos), ambiguous: false })
     }
 
     fn projected_iter<'a, R: 'a>(&'a self, from: Option<&[u8]>, to: Option<&[u8]>, snap_seq: u64,
-        legacy: fn(&'a StoredEntry) -> R, project: fn(&Arc<DataBlock>, usize) -> R,
+        legacy: fn(&'a StoredEntry) -> R, project: fn(&CachedBlock, usize) -> R,
     ) -> Box<dyn Iterator<Item = (Vec<u8>, R)> + 'a> {
         if !self.may_overlap_half_open(from, to) {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>;
@@ -1318,7 +1350,9 @@ impl SstFile {
                 match b {
                     CachedBlock::Decoded(b) => return Ok(b),
                     CachedBlock::Packed(b) => {
-                        let decoded = Arc::new(decode_block(&b.raw, self.has_seq)?);
+                        #[cfg(test)]
+                        PACKED_PROMOTIONS.with(|c| c.set(c.get() + 1));
+                        let decoded = Arc::new(b.to_decoded());
                         c.put(self.cache_ns, self.id, ie.offset, decoded.clone());
                         return Ok(decoded);
                     }
@@ -1334,6 +1368,12 @@ impl SstFile {
                 .put(self.cache_ns, self.id, ie.offset, block.clone());
         }
         Ok(block)
+    }
+
+    fn load_scan_block(&self, index_i: usize) -> std::io::Result<CachedBlock> {
+        #[cfg(test)]
+        if packed_scan_reference::enabled() { return self.load_block(index_i).map(CachedBlock::Decoded); }
+        self.load_point_block(index_i)
     }
 
     fn load_point_block(&self, index_i: usize) -> std::io::Result<CachedBlock> {
@@ -3060,6 +3100,37 @@ mod tests {
     }
 
     #[test]
+    fn packed_scan_reuses_point_blocks_and_keeps_rows_alive_after_eviction() {
+        let path = tmp("packed_mixed_scan");
+        let mut builder = SstBuilder::with_options(1, &path, 128, false);
+        for i in 0..100 { builder.add(format!("k{i:03}").into_bytes(), StoredEntry::put(1, Some(vec![i as u8; 64]))); }
+        let mut sst = builder.finish().unwrap();
+        let mut costs = Vec::new();
+        for reference in [true, false] {
+            let cache = Arc::new(Mutex::new(BlockCache::new(1)));
+            sst.set_block_cache(cache.clone());
+            assert!(sst.get_at(b"k050", 1).is_some());
+            let mode = reference.then(packed_scan_reference::Scope::start);
+            let before = crate::mem_probe::allocations();
+            let promotions = packed_promotions();
+            let rows: Vec<_> = sst.row_iter(None, None, 1)
+                .map(|(key, row)| { let frozen = row.freeze(|| key.clone()); (key, frozen) }).collect();
+            costs.push(crate::mem_probe::allocations() - before);
+            assert_eq!(packed_promotions() - promotions, u64::from(reference));
+            assert_eq!(rows.len(), 100);
+            cache.lock().unwrap().evict_lru();
+            assert!(cache.lock().unwrap().map.is_empty());
+            for (i, (key, row)) in rows.into_iter().enumerate() {
+                assert_eq!(key, format!("k{i:03}").as_bytes());
+                let ScanRow::Inline(row) = row else { panic!("ordinary row must stay inline"); };
+                assert_eq!(row.materialize(), crate::common::RowValue::Value(vec![i as u8; 64]));
+            }
+            drop(mode);
+        }
+        assert!(costs[0] >= costs[1] + 200, "reference must own every cached key/value again");
+    }
+
+    #[test]
     fn packed_point_blocks_preserve_records_crc_and_reduce_miss_allocations() {
         let entries = vec![(vec![], StoredEntry::put(0, Some(vec![]))),
             (b"a".to_vec(), StoredEntry::put(9, Some(vec![3; 1024]))),
@@ -3290,11 +3361,11 @@ struct SstLightIter<'a, R> {
     sst: &'a SstFile,
     block: usize,
     pos: usize,
-    cur: Option<Arc<DataBlock>>,
+    cur: Option<CachedBlock>,
     from: Option<Vec<u8>>,
     to: Option<Vec<u8>>,
     snap_seq: u64,
-    project: fn(&Arc<DataBlock>, usize) -> R,
+    project: fn(&CachedBlock, usize) -> R,
 }
 
 pub(crate) enum VacuumLightInput<'a> {
@@ -3352,7 +3423,7 @@ impl<R> Iterator for SstLightIter<'_, R> {
                 return None;
             }
             if self.cur.is_none() {
-                self.cur = self.sst.load_block(self.block).ok();
+                self.cur = self.sst.load_scan_block(self.block).ok();
                 self.pos = 0;
                 if self.cur.is_none() {
                     // 坏块：跳过这一块而不是整篇放弃（与 eager 版 `match load_block(i)` 同口径）
@@ -3361,19 +3432,19 @@ impl<R> Iterator for SstLightIter<'_, R> {
                 }
             }
             let block = self.cur.as_ref().expect("上面保证有块");
-            while self.pos < block.entries.len() {
-                let (k, se) = &block.entries[self.pos];
+            while self.pos < block.len() {
+                let (k, se) = block.entry(self.pos);
                 self.pos += 1;
-                if self.to.as_deref().is_some_and(|t| k.as_slice() >= t) {
+                if self.to.as_deref().is_some_and(|t| k >= t) {
                     return None; // 越界：后面的块只会更大
                 }
-                if self.from.as_deref().is_some_and(|f| k.as_slice() < f) {
+                if self.from.as_deref().is_some_and(|f| k < f) {
                     continue;
                 }
-                if !se.visible_at(self.snap_seq) {
+                if se.seq > self.snap_seq {
                     continue;
                 }
-                return Some((k.clone(), (self.project)(block, self.pos - 1)));
+                return Some((k.to_vec(), (self.project)(block, self.pos - 1)));
             }
             self.cur = None;
             self.block += 1;

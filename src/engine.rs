@@ -6249,6 +6249,95 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "LSM packed mixed reads ABBA, then updates/reopen; release single thread"]
+    fn lsm_mixed_read_cost() {
+        let _run = crate::scale_probe::RunGuard::acquire("lsm_mixed_read_cost");
+        use crate::lsm_tree::sst::{packed_scan_reference, packed_promotions, block_reads, block_misses};
+        let rows: usize = std::env::var("LSM_POINT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        let reads: usize = std::env::var("POINT_READS").map(|s| s.parse().unwrap()).unwrap_or(rows.min(200_000));
+        assert!(rows > 0 && reads > 0);
+        let dir = ScaleScratch::new("lsm_mixed_read");
+        let db = crate::lsm_tree::MVCC::open(&dir.0);
+        db.set_vacuum_auto_slice(0);
+        eprintln!("LSM_MIXED_BUILD rows={rows} shape=bulk_plus_10_percent_updates");
+        let mut bulk = db.begin_bulk();
+        for i in 0..rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
+        bulk.finish();
+        for base in (0..rows / 10).step_by(1000) {
+            let tx = db.begin_transaction();
+            for i in base..(base + 1000).min(rows / 10) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+            tx.try_commit().unwrap();
+        }
+        db.try_flush().unwrap(); drop(db);
+        let expected = |i| scale_val(if i < rows / 10 { i + rows } else { i });
+        let mut scan_costs = Vec::new();
+        // Reopen the same immutable physical seed for each arm. Only the scan gate changes.
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let db = crate::lsm_tree::MVCC::open(&dir.0);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin_transaction();
+            let _mode = reference.then(packed_scan_reference::Scope::start);
+            eprintln!("LSM_MIXED_ARM round={round} reference={reference} rows={rows} reads={reads}");
+            timed_phase("lsm_mixed", "random", || {
+                let mut state = 42_u64;
+                for _ in 0..reads {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let i = (state % rows as u64) as usize;
+                    assert_eq!(tx.get(&scale_key(i)), Some(expected(i)));
+                }
+            });
+            timed_phase("lsm_mixed", "ordered", || {
+                for i in 0..reads.min(rows) { assert_eq!(tx.get(&scale_key(i)), Some(expected(i))); }
+            });
+            let before = (packed_promotions(), block_reads(), block_misses());
+            let allocations_before = crate::mem_probe::allocations();
+            timed_phase("lsm_mixed", "scan", || {
+                let mut seen = 0;
+                tx.scan_foreach(None, None, |r| {
+                    assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(expected(seen)));
+                    seen += 1; true
+                });
+                assert_eq!(seen, rows);
+            });
+            scan_costs.push(crate::mem_probe::allocations() - allocations_before);
+            let promoted = packed_promotions() - before.0;
+            if !reference { assert_eq!(promoted, 0); }
+            eprintln!("LSM_MIXED_SCAN round={round} promotions={promoted} block_reads={} block_misses={}", block_reads()-before.1, block_misses()-before.2);
+            timed_phase("lsm_mixed", "pages", || {
+                let mut after = None;
+                let mut seen = 0;
+                while seen < reads.min(rows) {
+                    let (page, next) = tx.scan_page(after.as_deref(), (reads.min(rows) - seen).min(1000));
+                    assert!(!page.is_empty());
+                    for r in page { assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(expected(seen))); seen += 1; }
+                    after = next;
+                    if after.is_none() { break; }
+                }
+                assert_eq!(seen, reads.min(rows));
+            });
+            tx.commit(); drop(db);
+        }
+        assert!(scan_costs[1] < scan_costs[0] && scan_costs[2] < scan_costs[3]);
+        let db = crate::lsm_tree::MVCC::open(&dir.0);
+        db.set_vacuum_auto_slice(0);
+        timed_phase("lsm_mixed", "update", || {
+            let tx = db.begin_transaction();
+            for i in 0..rows.min(1000) { assert!(tx.set_raw(&scale_key(i), scale_val(i + 2 * rows))); }
+            tx.try_commit().unwrap();
+        });
+        drop(db);
+        let db = crate::lsm_tree::MVCC::open(&dir.0);
+        let mut seen = 0;
+        db.export_latest_visible_for_each(false, |r| {
+            assert_eq!(r.key, scale_key(seen));
+            assert_eq!(r.value, Some(if seen < rows.min(1000) { scale_val(seen + 2 * rows) } else { expected(seen) }));
+            seen += 1; true
+        });
+        assert_eq!(seen, rows);
+        eprintln!("LSM_MIXED_VERIFIED rows={seen} scan_allocations={scan_costs:?}");
+    }
+
+    #[test]
     #[ignore = "LSM packed point blocks old/new/new/old; release single thread"]
     fn lsm_packed_point_cost() {
         let _run = crate::scale_probe::RunGuard::acquire("lsm_packed_point_cost");
