@@ -6177,6 +6177,52 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "B+ point projection old/new/new/old; release single thread"]
+    fn bplus_point_projection_cost() {
+        use crate::bplus_tree::{bplus_tree::{point_projection_reference, node_parses}, page};
+        let rows: usize = std::env::var("BPLUS_POINT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
+        let reads: usize = std::env::var("POINT_READS").map(|s| s.parse().unwrap()).unwrap_or(rows.min(200_000));
+        assert!(rows > 0 && reads > 0);
+        let dir = ScaleScratch::new("bplus_point_projection");
+        let path = dir.0.join("bplus.db");
+        let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+        db.set_vacuum_auto_slice(0);
+        eprintln!("BPLUS_POINT_BUILD rows={rows}");
+        let mut bulk = db.begin_bulk();
+        for i in 0..rows { bulk.put(&scale_key(i), crate::common::pack_plain(&scale_val(i))); }
+        bulk.try_finish().unwrap(); drop(db);
+        let mut costs = Vec::new();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin_transaction();
+            let mode = reference.then(point_projection_reference::Scope::start);
+            let before = (crate::mem_probe::allocations(), node_parses(), page::cache_hits(), page::cache_misses());
+            let start = std::time::Instant::now();
+            let mut state = 42_u64;
+            for _ in 0..reads {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let i = (state % rows as u64) as usize;
+                assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i)));
+            }
+            let seconds = start.elapsed().as_secs_f64();
+            let allocations = crate::mem_probe::allocations() - before.0;
+            eprintln!("BPLUS_POINT round={round} reference={reference} rows={rows} reads={reads} seconds={seconds:.6} allocations={allocations} parses={} hits={} misses={}", node_parses()-before.1, page::cache_hits()-before.2, page::cache_misses()-before.3);
+            costs.push(allocations);
+            drop(mode); tx.commit(); drop(db);
+        }
+        assert!(costs[1] < costs[0]); assert!(costs[2] < costs[3]);
+        let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+        let mut seen = 0;
+        db.export_latest_visible_for_each(false, |r| {
+            assert_eq!(r.key, scale_key(seen)); assert_eq!(r.value, Some(scale_val(seen)));
+            seen += 1; true
+        });
+        assert_eq!(seen, rows);
+        eprintln!("BPLUS_POINT_VERIFIED rows={seen}");
+    }
+
+    #[test]
     #[ignore = "B+ borrowed maintenance scan old/new/new/old; release single thread"]
     fn bplus_maintenance_large_cost() {
         use crate::bplus_tree::bplus_tree::{maintenance_reference, MaintenanceEnd};

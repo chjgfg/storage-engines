@@ -4,6 +4,7 @@ use std::thread_local;
 use std::vec;
 use std::format;
 use std::matches;
+use std::unreachable;
 use std::{fmt, path::Path, write};
 
 use serde::{Deserialize, Serialize};
@@ -146,6 +147,51 @@ impl<'a> NodeBytes<'a> {
 enum MaintenanceNode<'a> {
     Leaf { rows: &'a [u8], count: usize, next: Option<PageId> },
     Internal { keys: &'a [u8], count: usize, children: &'a [u8] },
+}
+
+enum PointStep {
+    Child(PageId),
+    Hit(Key, RowId),
+    Previous(Key),
+    Missing,
+}
+
+impl PointStep {
+    fn leaf<'a>(rows: impl DoubleEndedIterator<Item = (&'a [u8], Option<&'a [u8]>)>,
+        low: &[u8], high: &[u8], accept: &mut impl FnMut(&[u8]) -> bool) -> Self {
+        let mut minimum = None;
+        for (key, value) in rows.rev() {
+            minimum = Some(key);
+            if key > high { continue; }
+            if key < low { return Self::Missing; }
+            if accept(key) { return Self::Hit(key.to_vec(), RowId(value.map(<[u8]>::to_vec))); }
+        }
+        minimum.map_or(Self::Missing, |key| Self::Previous(key.to_vec()))
+    }
+
+    fn borrowed(payload: &[u8], low: &[u8], high: &[u8],
+        accept: &mut impl FnMut(&[u8]) -> bool) -> std::io::Result<Self> {
+        let MaintenanceNode::Leaf { rows, count, .. } = MaintenanceNode::decode(payload)? else {
+            return Err(NodeBytes::invalid());
+        };
+        // A row needs at least an eight-byte key length and an option tag.
+        // Offsets stay on the stack; rejected rows never own keys or values.
+        let mut offsets = [0_u16; MAX_PAYLOAD / 9];
+        if count > offsets.len() { return Err(NodeBytes::invalid()); }
+        let mut cursor = NodeBytes(rows);
+        for offset in &mut offsets[..count] {
+            *offset = (rows.len() - cursor.0.len()).try_into().map_err(|_| NodeBytes::invalid())?;
+            cursor.row()?;
+        }
+        let end = offsets[..count].partition_point(|offset|
+            NodeBytes(&rows[*offset as usize..]).row().unwrap().0 <= high);
+        if end == 0 {
+            return Ok(if count == 0 { Self::Missing }
+                else { Self::Previous(NodeBytes(rows).row()?.0.to_vec()) });
+        }
+        Ok(Self::leaf(offsets[..end].iter().map(|offset|
+            NodeBytes(&rows[*offset as usize..]).row().unwrap()), low, high, accept))
+    }
 }
 impl<'a> MaintenanceNode<'a> {
     fn decode(payload: &'a [u8]) -> std::io::Result<Self> {
@@ -2389,6 +2435,67 @@ impl BPlusTree {
         high: &[u8],
         mut accept: impl FnMut(&[u8]) -> bool,
     ) -> Option<(Key, RowId)> {
+        #[cfg(test)]
+        if point_projection_reference::enabled() { return self.find_back_reference(low, high, accept); }
+        let mut bound = high.to_vec();
+        let mut previous: Option<Key> = None;
+        loop {
+            let mut page = self.root;
+            let step = loop {
+                let seen = self.page_manager.write_count(page);
+                let cached = self.node_cache.get(&page).filter(|(at, _)| *at == seen)
+                    .map(|(_, node)| node.clone());
+                let step = if let Some(node) = cached {
+                    Self::point_step(&node, low, &bound, &mut accept)
+                } else {
+                    enum Read { Internal(BTreeNode), Leaf(PointStep) }
+                    let read = self.page_manager.read_page_project(page, |payload| {
+                        if payload.get(..4) == Some(1_u32.to_le_bytes().as_slice()) {
+                            #[cfg(test)]
+                            NODE_PARSES.with(|c| c.set(c.get() + 1));
+                            bincode::deserialize(payload).ok().map(Read::Internal)
+                        } else {
+                            PointStep::borrowed(payload, low, &bound, &mut accept).ok().map(Read::Leaf)
+                        }
+                    })??;
+                    match read {
+                        Read::Leaf(step) => step,
+                        Read::Internal(node) => {
+                            let node = self.memoize_node(page, seen, std::sync::Arc::new(node))?;
+                            Self::point_step(&node, low, &bound, &mut accept)
+                        }
+                    }
+                };
+                match step { PointStep::Child(child) => page = child, step => break step }
+            };
+            match step {
+                PointStep::Hit(key, value) => return Some((key, value)),
+                PointStep::Previous(minimum) => {
+                    if minimum.len() <= 1 || previous.as_ref().is_some_and(|p| minimum >= *p) { return None; }
+                    bound.clear(); bound.extend_from_slice(&minimum[..minimum.len() - 1]);
+                    previous = Some(minimum);
+                }
+                PointStep::Missing => return None,
+                PointStep::Child(_) => unreachable!(),
+            }
+        }
+    }
+
+    fn point_step(node: &BTreeNode, low: &[u8], high: &Key,
+        accept: &mut impl FnMut(&[u8]) -> bool) -> PointStep {
+        match node {
+            BTreeNode::Internal { keys, children } => PointStep::Child(children[Self::child_index(keys, high)]),
+            BTreeNode::Leaf { entries, .. } => {
+                let end = entries.partition_point(|(k, _)| k <= high);
+                if end == 0 { return entries.first().map_or(PointStep::Missing, |(k, _)| PointStep::Previous(k.clone())); }
+                PointStep::leaf(entries[..end].iter().map(|(k, v)| (k.as_slice(), v.0.as_deref())), low, high, accept)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn find_back_reference(&mut self, low: &[u8], high: &[u8],
+        mut accept: impl FnMut(&[u8]) -> bool) -> Option<(Key, RowId)> {
         let mut bound = high.to_vec();
         // 上一跳那片叶子的最小键。每跳都必须严格小于它，否则说明下降又回到了同一片叶子
         // （典型情形：已经走到最左叶子，它下面没有叶子了）—— 此时区间内再无未考察的行。
@@ -2802,6 +2909,49 @@ mod tests {
         let mut rows = 0;
         assert_eq!(tree.scan_maintenance_from(None, |_, _| { rows += 1; false }).unwrap(), MaintenanceEnd::Complete);
         assert_eq!(rows, 205);
+    }
+
+    #[test]
+    fn point_projection_matches_reference_and_avoids_leaf_materialization() {
+        let (_scratch, mut tree) = anon(64, 64);
+        for i in 0..30_u64 { assert!(tree.insert(i.to_be_bytes().to_vec(), RowId(Some(vec![i as u8; 32])))); }
+        let mut costs = Vec::new();
+        for old in [true, false] {
+            tree.node_cache.clear();
+            let _mode = old.then(point_projection_reference::Scope::start);
+            let before = crate::mem_probe::allocations();
+            let parses = node_parses();
+            let hit = tree.find_back(&0_u64.to_be_bytes(), &4_u64.to_be_bytes(), |_| true);
+            costs.push(crate::mem_probe::allocations() - before);
+            assert_eq!(hit, Some((4_u64.to_be_bytes().to_vec(), RowId(Some(vec![4; 32])))));
+            assert_eq!(node_parses() - parses, u64::from(old));
+        }
+        assert!(costs[0] > costs[1] + 30, "reference must actually materialize the other leaf rows");
+        for i in 30..250_u64 { assert!(tree.insert(i.to_be_bytes().to_vec(), RowId(if i % 7 == 0 { None } else { Some(vec![i as u8; 32]) }))); }
+        for high in [0_u64, 1, 63, 120, 249, 300] {
+            for reject in [false, true] {
+                let mut results = Vec::new();
+                for old in [true, false] {
+                    tree.node_cache.clear();
+                    let _mode = old.then(point_projection_reference::Scope::start);
+                    let mut seen = Vec::new();
+                    let hit = tree.find_back(&0_u64.to_be_bytes(), &high.to_be_bytes(), |k| {
+                        seen.push(k.to_vec()); !reject || k[7] % 11 == 0
+                    });
+                    results.push((hit, seen));
+                }
+                assert_eq!(results[0], results[1]);
+            }
+        }
+        let key = 120_u64.to_be_bytes().to_vec();
+        assert!(tree.update(key.clone(), RowId(Some(vec![99]))));
+        assert_eq!(tree.find_back(&key, &key, |_| true).unwrap().1, RowId(Some(vec![99])));
+        assert!(tree.delete(key.clone()));
+        assert!(tree.find_back(&key, &key, |_| true).is_none());
+        tree.try_flush_all().unwrap();
+        let path = tree.page_manager.path().to_path_buf(); drop(tree);
+        let mut tree = BPlusTree::open(&path, 64, 64);
+        assert!(tree.find_back(&key, &key, |_| true).is_none());
     }
 
     #[test]
@@ -3770,6 +3920,16 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod delete_read_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod point_projection_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
