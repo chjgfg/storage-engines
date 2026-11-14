@@ -2514,7 +2514,7 @@ impl BPlusTree {
                 let cached = self.node_cache.get(&page).filter(|(at, _)| *at == seen)
                     .map(|(_, node)| node.clone());
                 let step = if let Some(node) = cached {
-                    Self::point_step(&node, low, &bound, &mut accept)
+                    Self::point_step(&node, low, high, &bound, &mut accept)
                 } else {
                     enum Read { Internal(BTreeNode), Leaf(PointStep) }
                     let read = self.page_manager.read_page_project(page, |payload| {
@@ -2523,14 +2523,14 @@ impl BPlusTree {
                             NODE_PARSES.with(|c| c.set(c.get() + 1));
                             bincode::deserialize(payload).ok().map(Read::Internal)
                         } else {
-                            PointStep::borrowed(payload, low, &bound, &mut accept).ok().map(Read::Leaf)
+                            PointStep::borrowed(payload, low, high, &mut accept).ok().map(Read::Leaf)
                         }
                     })??;
                     match read {
                         Read::Leaf(step) => step,
                         Read::Internal(node) => {
                             let node = self.memoize_node(page, seen, std::sync::Arc::new(node))?;
-                            Self::point_step(&node, low, &bound, &mut accept)
+                            Self::point_step(&node, low, high, &bound, &mut accept)
                         }
                     }
                 };
@@ -2549,12 +2549,12 @@ impl BPlusTree {
         }
     }
 
-    fn point_step(node: &BTreeNode, low: &[u8], high: &Key,
+    fn point_step(node: &BTreeNode, low: &[u8], high: &[u8], descent_bound: &Key,
         accept: &mut impl FnMut(&[u8]) -> bool) -> PointStep {
         match node {
-            BTreeNode::Internal { keys, children } => PointStep::Child(children[Self::child_index(keys, high)]),
+            BTreeNode::Internal { keys, children } => PointStep::Child(children[Self::child_index(keys, descent_bound)]),
             BTreeNode::Leaf { entries, .. } => {
-                let end = entries.partition_point(|(k, _)| k <= high);
+                let end = entries.partition_point(|(k, _)| k.as_slice() <= high);
                 if end == 0 { return entries.first().map_or(PointStep::Missing, |(k, _)| PointStep::Previous(k.clone())); }
                 PointStep::leaf(entries[..end].iter().map(|(k, v)| (k.as_slice(), v.0.as_deref())), low, high, accept)
             }
