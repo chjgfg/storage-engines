@@ -4268,6 +4268,13 @@ mod tests {
     /// 直接取 `peak() - peak()` 之前那个高点的话，**排在后面的操作只会报 +0.0 MB**，哪怕它
     /// 自己瞬时涨了 50 MB（M33 记过这个盲区，M36 又踩了一遍：那一轮 lsm/bplus/memory 三家
     /// 的 `vacuum()` 峰值读数全是 0，等于没量）。压回去之后 `peak − 基准` 才是**这一段**的瞬时增量。
+    fn timed_phase<T>(engine: &str, phase: &str, f: impl FnOnce() -> T) -> (std::time::Duration, i64, u64, T) {
+        let probe = crate::scale_probe::Phase::begin(engine, phase);
+        let result = timed(f);
+        probe.finish(engine, phase);
+        result
+    }
+
     fn timed<T>(f: impl FnOnce() -> T) -> (std::time::Duration, i64, u64, T) {
         let base = crate::mem_probe::reset_peak();
         let l0 = crate::mem_probe::live() as i64;
@@ -6038,6 +6045,7 @@ mod tests {
     }
 
     fn memory_stop_fold_or_emit_cost(fold_only: bool, release_only: bool) {
+        let _run = crate::scale_probe::RunGuard::acquire("memory_stop_fold_or_emit_cost");
         use crate::common::kv_snapshot::{snapshot_emit_reference, snapshot_probe, read_snapshot_with,
             ValueBuffer, RECORD_BATCH_BYTES};
         use std::io::{Read, Seek, SeekFrom};
@@ -6165,6 +6173,7 @@ mod tests {
     }
 
     fn bplus_delete_cost(read_projection: bool, leaf_projection: bool) {
+        let _run = crate::scale_probe::RunGuard::acquire("bplus_delete_cost");
         use crate::common::maintenance_probe::{Scope, Stage};
         let rows: usize = std::env::var("BPLUS_DEL_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
         let mut costs = Vec::new();
@@ -6242,6 +6251,7 @@ mod tests {
     #[test]
     #[ignore = "LSM packed point blocks old/new/new/old; release single thread"]
     fn lsm_packed_point_cost() {
+        let _run = crate::scale_probe::RunGuard::acquire("lsm_packed_point_cost");
         use crate::lsm_tree::sst::{packed_point_reference, block_reads, block_misses, sst_probes};
         let rows: usize = std::env::var("LSM_POINT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
         let reads: usize = std::env::var("POINT_READS").map(|s| s.parse().unwrap()).unwrap_or(rows.min(200_000));
@@ -6288,6 +6298,7 @@ mod tests {
     #[test]
     #[ignore = "B+ point projection old/new/new/old; release single thread"]
     fn bplus_point_projection_cost() {
+        let _run = crate::scale_probe::RunGuard::acquire("bplus_point_projection_cost");
         use crate::bplus_tree::{bplus_tree::{point_projection_reference, node_parses}, page};
         let rows: usize = std::env::var("BPLUS_POINT_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
         let reads: usize = std::env::var("POINT_READS").map(|s| s.parse().unwrap()).unwrap_or(rows.min(200_000));
@@ -7045,6 +7056,7 @@ mod tests {
     }
 
     fn run_scale_baseline(rows: usize) {
+        let _run = crate::scale_probe::RunGuard::acquire(&format!("scale_rows_{rows}"));
         assert!(rows > 0 && rows.checked_mul(16).is_some(), "SCALE_ROWS 必须为非零且不溢出的行数");
         // 键 ≈ 35 字节、值 ≈ 60 字节：照下游真实形状（也都远小于任何 blob 阈值）
         use self::{scale_key as key, scale_val as val};
@@ -7075,11 +7087,11 @@ mod tests {
             };
             let arg = arg.as_deref();
 
-            let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+            let (d, live, peak, db) = timed_phase(label, "open", || open_engine(kind, arg).unwrap());
             line(label, "open 空库", d.as_secs_f64() * 1e6, "µs", live, peak, "");
 
             // ---- 写入：每 1000 行一个事务（commit 带 fsync） ----
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "insert", || {
                 for base in (0..rows).step_by(1000) {
                     let end = (base + 1000).min(rows);
                     let items: Vec<(Vec<u8>, Vec<u8>)> =
@@ -7094,7 +7106,7 @@ mod tests {
             line(label, &format!("灌 {rows} 行(事务)"), d.as_secs_f64() * 1e6 / rows as f64, "µs/行", live, peak, "");
             scale_note_maintenance(&*db, "insert", &maintenance);
 
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "checkpoint", || {
                 db.flush().unwrap();
                 db.checkpoint().unwrap();
             });
@@ -7110,6 +7122,7 @@ mod tests {
             let db = {
                 let st_base = open_stages_begin();
                 let snapshot = (kind == EngineKind::Memory).then(|| crate::common::kv_snapshot::snapshot_probe::Scope::start(false));
+                let stop_phase = crate::scale_probe::Phase::begin(label, "first_stop");
                 let t_stop = std::time::Instant::now();
                 drop(db);
                 if kind == EngineKind::Memory {
@@ -7124,9 +7137,10 @@ mod tests {
                     eprintln!("SCALE_SNAPSHOT engine={label} release_ms={:.3} stages={stats:?}",
                         t_stop.elapsed().as_nanos().saturating_sub(stats.total_ns) as f64 / 1e6);
                 }
+                stop_phase.finish(label, "first_stop");
                 crate::scale_probe::memory(label, "first_before_reopen");
                 let recovery = (kind == EngineKind::Memory).then(crate::common::kv_snapshot::recovery_probe::Scope::start);
-                let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+                let (d, live, peak, db) = timed_phase(label, "first_reopen", || open_engine(kind, arg).unwrap());
                 if let Some(scope) = recovery { eprintln!("SCALE_RECOVERY phase=first stages={:?}", scope.stats()); }
                 crate::scale_probe::memory(label, "first_after_reopen");
                 line(
@@ -7145,7 +7159,7 @@ mod tests {
             let order = shuffled(rows);
 
             // ---- 点读：乱序 / 有序 ----
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "random_read", || {
                 let tx = db.begin();
                 let mut hits = 0;
                 for &i in &order {
@@ -7157,7 +7171,7 @@ mod tests {
             });
             line(label, "点读×N 乱序", d.as_secs_f64() * 1e6 / rows as f64, "µs/次", live, peak, "");
 
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "ordered_read", || {
                 let tx = db.begin();
                 for i in 0..rows {
                     assert!(tx.get(&key(i)).is_some(), "{label}: 有序点读落空");
@@ -7167,7 +7181,7 @@ mod tests {
 
             // ---- multi_get（门面是 map(get)：批量到底省不省钱，量了才知道） ----
             let chunk: Vec<Vec<u8>> = order[..1000.min(rows)].iter().map(|&i| key(i)).collect();
-            let (d, live, peak, got) = timed(|| {
+            let (d, live, peak, got) = timed_phase(label, "multi_get", || {
                 let tx = db.begin();
                 tx.multi_get(&chunk)
             });
@@ -7176,7 +7190,7 @@ mod tests {
             // 命中与未命中**必须分开数**：混在一个平均值里，"点查 0.86 ms" 那种症状就归不了因
             // （M10 的教训）。这 1000 把键全是不存在的键，单价就是"查无此键"的成本。
             let miss_chunk: Vec<Vec<u8>> = (0..1000.min(rows)).map(|i| key(rows * 8 + i)).collect();
-            let (d, live, peak, got) = timed(|| {
+            let (d, live, peak, got) = timed_phase(label, "multi_miss", || {
                 let tx = db.begin();
                 tx.multi_get(&miss_chunk)
             });
@@ -7184,7 +7198,7 @@ mod tests {
             line(label, "multi_get×1000 全miss", d.as_secs_f64() * 1e6 / miss_chunk.len() as f64, "µs/键", live, peak, &format!("读到 {hit} 条(应为 0)"));
 
             // ---- 扫描：全量 / 1% 窗口 ----
-            let (d, live, peak, scanned) = timed(|| {
+            let (d, live, peak, scanned) = timed_phase(label, "scan", || {
                 let tx = db.begin();
                 tx.scan(None, None)
             });
@@ -7193,7 +7207,7 @@ mod tests {
 
             let lo = key(rows / 2);
             let hi = key(((rows / 2) + rows / 100).max(1));
-            let (d, live, peak, window) = timed(|| {
+            let (d, live, peak, window) = timed_phase(label, "window_scan", || {
                 let tx = db.begin();
                 tx.scan(Some(&lo), Some(&hi))
             });
@@ -7201,7 +7215,7 @@ mod tests {
             line(label, "窗口 scan(1%)", d.as_secs_f64() * 1e6 / w as f64, "µs/行", live, peak, &format!("{w} 行"));
             drop(window);
 
-            let (d, live, peak, pref) = timed(|| {
+            let (d, live, peak, pref) = timed_phase(label, "prefix_scan", || {
                 let tx = db.begin();
                 tx.prefix_scan(&key(0)[..2])
             });
@@ -7210,7 +7224,7 @@ mod tests {
             drop(pref);
 
             // ---- 游标翻页：把整库一页一页翻完（长跑进程真正在用的那条路，M17） ----
-            let (d, live, peak, (pages, moved)) = timed(|| {
+            let (d, live, peak, (pages, moved)) = timed_phase(label, "scan_page", || {
                 let tx = db.begin();
                 let mut cursor: Option<Vec<u8>> = None;
                 let mut pages = 0usize;
@@ -7229,13 +7243,13 @@ mod tests {
             assert_eq!(moved, rows, "{label}: scan_page 翻完整库必须正好交出 {rows} 行（少一行=游标走不动，多走=翻页有洞）");
 
             // ---- 反向与定位：B+ 树只有单向 next_leaf，最容易在这两条上露形状 ----
-            let (d, live, peak, back) = timed(|| {
+            let (d, live, peak, back) = timed_phase(label, "seek_prev", || {
                 let tx = db.begin();
                 tx.seek_prev(&key(rows / 2))
             });
             line(label, "seek_prev 中间键", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("命中 {}", back.is_some()));
 
-            let (d, live, peak, rwin) = timed(|| {
+            let (d, live, peak, rwin) = timed_phase(label, "reverse_scan", || {
                 let tx = db.begin();
                 tx.reverse_scan(Some(&lo), Some(&hi))
             });
@@ -7245,7 +7259,7 @@ mod tests {
             // ---- 管理面：分页搜索（首页 vs 深页 —— 深翻是最常见的"一次调用打满 CPU"） ----
             let page_size = 100usize;
             let last_page = scale_last_page_index(rows, page_size);
-            let (d, live, peak, one) = timed(|| {
+            let (d, live, peak, one) = timed_phase(label, "search_first", || {
                 let tx = db.begin();
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, page_size))
             });
@@ -7253,13 +7267,13 @@ mod tests {
 
             // 同一页、只是**不要精确 total**：这一行存在的意义就是和上面那条并排看
             // （翻页的 UI 只要"还有没有下一页"，而数 total 的代价是走完整库）
-            let (d, live, peak, one_nt) = timed(|| {
+            let (d, live, peak, one_nt) = timed_phase(label, "search_first_no_total", || {
                 let tx = db.begin();
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, page_size).without_total())
             });
             line(label, "search 首页(免 total)", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("拿了 {} 条, has_next={}", one_nt.items.len(), one_nt.has_next()));
-            let (d, live, peak, deep) = timed(|| {
+            let (d, live, peak, deep) = timed_phase(label, "search_last", || {
                 let tx = db.begin();
                 tx.search_keys(&crate::common::SearchQuery::contains(b"", last_page, page_size))
             });
@@ -7275,13 +7289,13 @@ mod tests {
             // 三家停在 trait 默认**（`reverse_scan` 截尾 = O(库)：20M 档 88~106 / 55~71 / 64~69 s、
             // 常驻 +2147.5 MB、峰值 +4771 MB）——跨这条线比这一格没有意义；那支现在只剩
             // "退过 8 Ki 步仍凑不够页宽"的兜底，由四家 `back_n_fallbacks == 0` 的计数守卫看着。
-            let (d, live, peak, last_nt) = timed(|| {
+            let (d, live, peak, last_nt) = timed_phase(label, "search_last_no_total", || {
                 let tx = db.begin();
                 tx.search_last_page(page_size)
             });
             line(label, "search 末页(免 total)", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("拿了 {} 条, total=None", last_nt.items.len()));
-            let (d, live, peak, cnt) = timed(|| {
+            let (d, live, peak, cnt) = timed_phase(label, "key_count", || {
                 let tx = db.begin();
                 tx.key_count(&key(0)[..2])
             });
@@ -7290,7 +7304,7 @@ mod tests {
             // ---- TTL 往返：写 1000 个带过期时间的键，再把剩余时间读回来 ----
             // （长跑里"会话键续期"就是这个形状；只量写不量读会把信封解析的成本藏掉）
             let ttl_rows = 1000.min(rows);
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "set_ttl", || {
                 let tx = db.begin();
                 for i in 0..ttl_rows {
                     tx.set_with_ttl(&key(rows * 4 + i), val(i), std::time::Duration::from_secs(3600));
@@ -7298,7 +7312,7 @@ mod tests {
                 tx.commit();
             });
             line(label, "set_with_ttl×1000", d.as_secs_f64() * 1e6 / ttl_rows as f64, "µs/次", live, peak, "");
-            let (d, live, peak, hits) = timed(|| {
+            let (d, live, peak, hits) = timed_phase(label, "get_ttl", || {
                 let tx = db.begin();
                 (0..ttl_rows)
                     .filter(|i| tx.get_ttl(&key(rows * 4 + i)).flatten().is_some())
@@ -7313,7 +7327,7 @@ mod tests {
             eprintln!("{label}: 验收准备(不计时) persist {ttl_rows} 辅助键，新增 {ttl_rows} 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状");
 
             // ---- TTL / 计数器 ----
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "incr", || {
                 let tx = db.begin();
                 for expected in 1..=1000 {
                     assert_eq!(tx.incr(b"counter:hits", 1), Ok(expected), "{label}: incr 不许忽略失败");
@@ -7326,7 +7340,7 @@ mod tests {
             // ---- 更新 10% 的键（制造版本链，看点写是否被链拖住） ----
             let updates: usize = (rows / 10).max(1);
             let update_stages = crate::common::maintenance_probe::Scope::start();
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "update", || {
                 for base in (0..updates).step_by(500) {
                     let end = (base + 500).min(updates);
                     let items: Vec<(Vec<u8>, Vec<u8>)> =
@@ -7344,14 +7358,12 @@ mod tests {
             scale_note_maintenance(&*db, "update", &maintenance);
 
             // ---- 观测与回收 ----
-            let (d, live, peak, h) = timed(|| db.health());
+            let (d, live, peak, h) = timed_phase(label, "health", || db.health());
             line(label, "health()", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("rows={} max_chain={}", h.total_rows, h.max_chain));
 
             let vacuum_stages = crate::common::maintenance_probe::Scope::start();
             crate::scale_probe::memory(label, "before_vacuum");
-            let vacuum_phase = crate::scale_probe::Phase::start();
-            let (d, live, peak, v) = timed(|| db.vacuum().unwrap());
-            vacuum_phase.finish(label, "vacuum");
+            let (d, live, peak, v) = timed_phase(label, "vacuum", || db.vacuum().unwrap());
             crate::scale_probe::memory(label, "after_vacuum");
             line(label, "vacuum() 全库", d.as_secs_f64() * 1e6, "µs/次", live, peak, &format!("裁掉 {} 行", v.versions_removed));
             eprintln!("SCALE_VACUUM_STAGES engine={label} doors={:?}", vacuum_stages.stats());
@@ -7359,7 +7371,7 @@ mod tests {
             eprintln!("SCALE_VACUUM engine={label} rows_scanned={} versions_removed={} skipped={}", v.rows_scanned, v.versions_removed, v.skipped_active_txn);
             scale_note_maintenance(&*db, "vacuum", &maintenance);
 
-            let (d, live, peak, vr) = timed(|| db.vacuum_bounded(None, 2048).unwrap());
+            let (d, live, peak, vr) = timed_phase(label, "vacuum_bounded", || db.vacuum_bounded(None, 2048).unwrap());
             line(label, "vacuum_bounded 一片", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("扫 {} 行、裁 {} 行（预算 2048）", vr.stats.rows_scanned, vr.stats.versions_removed));
 
@@ -7367,12 +7379,12 @@ mod tests {
             // 原先合成一格时 bitcask 那一格里几乎全是 merge（`docs/test1.txt`：5M 同格 21.4s，
             // 而 bplus 同格 18.5µs ⇒ flush 那一半在 bitcask 上是零头）。拆格本身一秒不省，
             // 它的作用是让"merge 已从 vacuum 拆出去"那笔省下的时间在下一格露出来。
-            let (d, live, peak, ()) = timed(|| db.flush().unwrap());
+            let (d, live, peak, ()) = timed_phase(label, "flush", || db.flush().unwrap());
             let disk_after_flush = disk_bytes(arg.unwrap());
             line(label, "flush", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("磁盘 {:.1} MB", disk_after_flush as f64 / 1e6));
 
-            let (d, live, peak, m) = timed(|| db.merge());
+            let (d, live, peak, m) = timed_phase(label, "merge", || db.merge());
             // ⚠️ M43 那条铁律在这儿落地：`Unsupported` 是"本引擎没有这一步"，其余错**不许吞**——
             // merge 失败意味着引擎已进入隔离态，后面每一格的读数都是假的，必须当场红。
             if let Err(e) = &m {
@@ -7392,7 +7404,7 @@ mod tests {
             // ---- bulk 导入（另一条写路径：无 WAL、无冲突检测） ----
             // ---- 物化全库的出口：`Vec` 有多大、峰值多少 MB，就是这条的意义 ----
             // （翻页请走 scan_page；这条留在台架里就是为了把"别用它"量化出来）
-            let (d, live, peak, exp) = timed(|| db.export_latest_visible(false));
+            let (d, live, peak, exp) = timed_phase(label, "export_owned", || db.export_latest_visible(false));
             let en = exp.len().max(1);
             line(label, "export 全库(物化)", d.as_secs_f64() * 1e6 / en as f64, "µs/行", live, peak, &format!("{en} 行进 Vec"));
             drop(exp);
@@ -7402,7 +7414,7 @@ mod tests {
             // 峰值不该再随库大小涨（那是调用方要的那份 `Vec`，不是遍历的账）。
             let snap = dir.join("export_stream.bin");
             // ScaleScratch 已在计时外建好目录，包括不落盘的 memory 一家。
-            let (d, live, peak, n) = timed(|| {
+            let (d, live, peak, n) = timed_phase(label, "export_stream", || {
                 let mut w = crate::common::kv_snapshot::ExportWriter::bin(&snap, false).unwrap();
                 let handed = db.export_latest_visible_for_each(false, &mut |rec| w.push(rec));
                 let stats = w.finish().unwrap();
@@ -7419,7 +7431,7 @@ mod tests {
             // 绝不问源库 health 要期望：源端非 TTL 丢失也必须红，不能一起少而自洽。
             let want = (rows + ttl_rows + 1) as u64;
             let target = open_engine(EngineKind::Memory, None).unwrap();
-            let (d, live, peak, ms) = timed(|| migrate(&*db, &*target, 1000).unwrap());
+            let (d, live, peak, ms) = timed_phase(label, "migrate", || migrate(&*db, &*target, 1000).unwrap());
             line(label, "migrate → memory", d.as_secs_f64() * 1e6 / rows.max(1) as f64, "µs/行", live, peak,
                  &format!("搬 {} 行 / {} 页 / {} B", ms.rows, ms.pages, ms.bytes));
             // 验收在计时外逐行流过目标，不在 O(N) 内存的目标旁再攒第二份全库 Vec。
@@ -7434,7 +7446,7 @@ mod tests {
                 heap_before_release.saturating_sub(heap_after_release));
             crate::scale_probe::memory(label, "migration_after_release");
             let bulk_rows = (rows / 10).max(1);
-            let (d, live, peak, ()) = timed(|| {
+            let (d, live, peak, ()) = timed_phase(label, "bulk", || {
                 let mut bulk = db.begin_bulk();
                 let items: Vec<(Vec<u8>, Vec<u8>)> =
                     (0..bulk_rows).map(|i| (key(rows + i), val(i))).collect();
@@ -7450,6 +7462,7 @@ mod tests {
             let db = {
                 let st_base = open_stages_begin();
                 let snapshot = (kind == EngineKind::Memory).then(|| crate::common::kv_snapshot::snapshot_probe::Scope::start(false));
+                let stop_phase = crate::scale_probe::Phase::begin(label, "bulk_stop");
                 let stop = std::time::Instant::now();
                 drop(db);
                 if let Some(scope) = snapshot {
@@ -7458,9 +7471,10 @@ mod tests {
                         stop.elapsed().as_secs_f64() * 1e3,
                         stop.elapsed().as_nanos().saturating_sub(stats.total_ns) as f64 / 1e6);
                 }
+                stop_phase.finish(label, "bulk_stop");
                 crate::scale_probe::memory(label, "bulk_before_reopen");
                 let recovery = (kind == EngineKind::Memory).then(crate::common::kv_snapshot::recovery_probe::Scope::start);
-                let (d, live, peak, db) = timed(|| open_engine(kind, arg).unwrap());
+                let (d, live, peak, db) = timed_phase(label, "bulk_reopen", || open_engine(kind, arg).unwrap());
                 if let Some(scope) = recovery { eprintln!("SCALE_RECOVERY phase=bulk stages={:?}", scope.stats()); }
                 crate::scale_probe::memory(label, "bulk_after_reopen");
                 line(

@@ -1,6 +1,35 @@
 //! Scale-harness diagnostics, outside timed regions. Never enabled in the library.
 use std::{assert, eprintln, format, io, panic, process::Command};
 
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis()
+}
+
+/// One OS lock for this checkout, independent of the scratch directory and PID.
+/// Keep the file in place: unlinking a held lock would permit a second lock inode.
+pub(crate) struct RunGuard { _file: std::fs::File, name: String, started: std::time::Instant }
+impl RunGuard {
+    pub(crate) fn acquire(name: &str) -> Self {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/scale-bench.lock");
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&path).expect("open scale benchmark lock");
+        let wait = std::time::Instant::now();
+        eprintln!("SCALE_LOCK_WAIT name={name} pid={} unix_ms={} path={}", std::process::id(), unix_ms(), path.display());
+        fs4::FileExt::lock_exclusive(&file).expect("lock scale benchmark");
+        eprintln!("SCALE_LOCK_ACQUIRED name={name} pid={} unix_ms={} wait_ms={:.3}",
+            std::process::id(), unix_ms(), wait.elapsed().as_secs_f64() * 1000.0);
+        Self { _file: file, name: name.into(), started: std::time::Instant::now() }
+    }
+}
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        eprintln!("SCALE_LOCK_RELEASE name={} pid={} unix_ms={} active_ms={:.3}",
+            self.name, std::process::id(), unix_ms(), self.started.elapsed().as_secs_f64() * 1000.0);
+        // Closing the file releases the OS lock, including on unwind/process exit.
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ProcessMemory {
     Available { rss_bytes: u64, private_bytes: u64, page_faults: u64 },
@@ -93,6 +122,10 @@ pub(crate) struct Phase {
     process: io::Result<ProcessMemory>,
 }
 impl Phase {
+    pub(crate) fn begin(engine: &str, phase: &str) -> Self {
+        eprintln!("SCALE_PHASE_BEGIN engine={engine} phase={phase} pid={} unix_ms={}", std::process::id(), unix_ms());
+        Self::start()
+    }
     pub(crate) fn start() -> Self {
         let process = read_memory();
         let cpu = cpu_ns();
@@ -105,9 +138,39 @@ impl Phase {
             (ProcessMemory::Available { page_faults: a, .. }, ProcessMemory::Available { page_faults: b, .. }) => Ok(b.saturating_sub(a)),
             _ => Err(io::Error::other("process page fault counters unavailable")),
         }));
-        eprintln!("SCALE_PHASE engine={engine} phase={phase} wall_ms={wall_ms:.3} cpu_ms={cpu_ms:?} allocations={} page_faults_delta={faults:?}",
-            crate::mem_probe::allocations().saturating_sub(self.allocations));
+        eprintln!("SCALE_PHASE engine={engine} phase={phase} wall_ms={wall_ms:.3} cpu_ms={cpu_ms:?} allocations={} page_faults_delta={faults:?} unix_ms={}",
+            crate::mem_probe::allocations().saturating_sub(self.allocations), unix_ms());
     }
+}
+
+#[test]
+#[ignore = "subprocess helper for scale lock test"]
+fn scale_lock_child() {
+    let path = std::env::var_os("SCALE_LOCK_TEST_PATH").expect("parent supplies lock path");
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let locked = fs4::FileExt::try_lock_exclusive(&file);
+    if std::env::var("SCALE_LOCK_TEST_HELD").unwrap() == "yes" {
+        let error = locked.expect_err("another process owns the benchmark lock");
+        #[cfg(windows)]
+        assert!(error.raw_os_error() == Some(33), "expected ERROR_LOCK_VIOLATION: {error}");
+        #[cfg(not(windows))]
+        assert!(error.kind() == io::ErrorKind::WouldBlock, "unexpected lock error: {error}");
+    } else { locked.expect("closing the owner must release the lock"); }
+}
+
+#[test]
+fn scale_lock_excludes_other_process_and_releases_on_close() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/scale-bench.lock");
+    let owner = RunGuard::acquire("cross_process_guard");
+    let child = |held| {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "scale_probe::scale_lock_child", "--ignored", "--nocapture"])
+            .env("SCALE_LOCK_TEST_PATH", &path).env("SCALE_LOCK_TEST_HELD", held).output().unwrap();
+        assert!(out.status.success(), "child failed: {} {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    };
+    child("yes");
+    drop(owner);
+    child("no");
 }
 
 fn output(command: &mut Command) -> io::Result<String> {
