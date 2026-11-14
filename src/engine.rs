@@ -6157,22 +6157,28 @@ mod tests {
     #[test]
     #[ignore = "B+ batched delete and serializer old/new/new/old; release single thread"]
     fn bplus_delete_buffer_cost() {
-        bplus_delete_cost(false, false);
+        bplus_delete_cost(false, false, false);
     }
 
     #[test]
     #[ignore = "B+ delete page projection ABBA; release single thread"]
     fn bplus_delete_read_cost() {
-        bplus_delete_cost(true, false);
+        bplus_delete_cost(true, false, false);
     }
 
     #[test]
     #[ignore = "B+ packed leaf deletion ABBA; release single thread"]
     fn bplus_delete_leaf_cost() {
-        bplus_delete_cost(false, true);
+        bplus_delete_cost(false, true, false);
     }
 
-    fn bplus_delete_cost(read_projection: bool, leaf_projection: bool) {
+    #[test]
+    #[ignore = "B+ vacuum redundant blob sync ABBA; release single thread"]
+    fn bplus_vacuum_sync_cost() {
+        bplus_delete_cost(false, false, true);
+    }
+
+    fn bplus_delete_cost(read_projection: bool, leaf_projection: bool, sync_only: bool) {
         let _run = crate::scale_probe::RunGuard::acquire("bplus_delete_cost");
         use crate::common::maintenance_probe::{Scope, Stage};
         let rows: usize = std::env::var("BPLUS_DEL_ROWS").map(|s| s.parse().unwrap()).unwrap_or(600_000);
@@ -6180,7 +6186,7 @@ mod tests {
         let mut pack_buffers = Vec::new();
         // A closed seed preserves the same physical tree for every deletion
         // arm, without paying for four full large-library insert/update runs.
-        let seed = leaf_projection.then(|| ScaleScratch::new("bplus_delete_seed"));
+        let seed = (leaf_projection || sync_only).then(|| ScaleScratch::new("bplus_delete_seed"));
         if let Some(seed) = &seed {
             eprintln!("BPLUS_DELETE_SEED rows={rows}");
             let db = crate::bplus_tree::MVCC::open(seed.0.join("bplus.db"), 64, 1024);
@@ -6215,22 +6221,27 @@ mod tests {
                 tx.try_commit().unwrap();
             }
             }
-            let mode = (reference && !read_projection && !leaf_projection).then(crate::bplus_tree::bplus_tree::delete_cost_reference::Scope::start);
+            let mode = (reference && !read_projection && !leaf_projection && !sync_only).then(crate::bplus_tree::bplus_tree::delete_cost_reference::Scope::start);
             let read_mode = (reference && read_projection).then(crate::bplus_tree::bplus_tree::delete_read_reference::Scope::start);
             let leaf_mode = (reference && leaf_projection).then(crate::bplus_tree::bplus_tree::delete_leaf_reference::Scope::start);
-            let freeze_leaf = (!leaf_projection && !reference).then(crate::bplus_tree::bplus_tree::delete_leaf_reference::Scope::start);
+            let freeze_leaf = (!leaf_projection && !reference && !sync_only).then(crate::bplus_tree::bplus_tree::delete_leaf_reference::Scope::start);
+            let sync_mode = (sync_only && reference).then(crate::bplus_tree::bplus_tree_mvcc::vacuum_sync_reference::Scope::start);
+            let blob_syncs = crate::common::disk::fsync_counts()[crate::common::disk::SITE_BLOB];
             let scope = Scope::start();
+            let phase = crate::scale_probe::Phase::begin("bplus", "vacuum_abba");
             let start = std::time::Instant::now();
             let result = db.vacuum().unwrap();
             let seconds = start.elapsed().as_secs_f64();
             let stats = scope.stats();
+            phase.finish("bplus", "vacuum_abba");
             costs.push(stats.allocations[Stage::VacuumDelete as usize]);
             pack_buffers.push(stats.bplus_pack_buffers);
             assert_eq!(result.versions_removed, rows / 10);
             assert_eq!(result.rows_scanned, (rows + rows / 10) as u64);
-            eprintln!("BPLUS_DELETE_BUFFER read_projection={read_projection} leaf_projection={leaf_projection} round={round} reference={reference} rows={rows} seconds={seconds:.6} delete_allocations={} stages={stats:?}",
+            if sync_only { assert_eq!(crate::common::disk::fsync_counts()[crate::common::disk::SITE_BLOB] - blob_syncs, u64::from(reference)); }
+            eprintln!("BPLUS_DELETE_BUFFER read_projection={read_projection} leaf_projection={leaf_projection} sync_only={sync_only} round={round} reference={reference} rows={rows} seconds={seconds:.6} delete_allocations={} stages={stats:?}",
                 stats.allocations[Stage::VacuumDelete as usize]);
-            drop(scope); drop(mode); drop(read_mode); drop(leaf_mode); drop(freeze_leaf); drop(db);
+            drop(scope); drop(mode); drop(read_mode); drop(leaf_mode); drop(freeze_leaf); drop(sync_mode); drop(db);
             let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
             let mut seen = 0;
             db.export_latest_visible_for_each(false, |r| {
@@ -6241,6 +6252,7 @@ mod tests {
             assert_eq!(seen, rows);
             eprintln!("BPLUS_DELETE_VERIFIED round={round} rows={seen}");
         }
+        if sync_only { return; } // This gate removes a sync, not deletion allocations.
         assert!(costs[0] > costs[1]);
         assert!(costs[3] > costs[2]);
         assert!(pack_buffers[0] > 0 && pack_buffers[3] > 0);

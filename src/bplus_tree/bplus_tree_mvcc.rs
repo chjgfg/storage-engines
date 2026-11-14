@@ -747,7 +747,11 @@ impl MVCC {
         #[cfg(test)]
         let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
         kv.try_flush_all()?;
-        blob.sync()?;
+        // vacuum never appends blobs; clear_in_place already syncs when a full
+        // blob rewrite was actually required. Avoid an unconditional blob fsync
+        // on every bounded round.
+        #[cfg(test)]
+        if vacuum_sync_reference::enabled() { blob.sync()?; }
 
         Ok(VacuumRound {
             stats: VacuumStats {
@@ -927,7 +931,7 @@ impl MVCC {
         #[cfg(test)]
         let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
         kv.try_flush_all()?;
-        blob.sync()?;
+        if vacuum_sync_reference::enabled() { blob.sync()?; }
 
         Ok(VacuumRound {
             stats: VacuumStats {
@@ -940,6 +944,16 @@ impl MVCC {
             next_cursor,
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) mod vacuum_sync_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
 }
 
 #[cfg(test)]
@@ -1559,6 +1573,44 @@ mod tests {
     /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
     fn tmp_db(tag: &str) -> crate::common::ScratchPath {
         crate::common::ScratchPath::new("mvcc", tag, ".db")
+    }
+
+    #[test]
+    fn vacuum_sync_skips_unchanged_blobs_but_persists_reclamation() {
+        use crate::common::disk::{fsync_counts, SITE_BLOB};
+        for reference in [true, false] {
+            let path = tmp_db("vacuum_blob_sync");
+            let db = MVCC::open(&path, 64, 128);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin_transaction();
+            assert!(tx.set_raw(b"large", vec![7; 4096]));
+            assert!(tx.set_raw(b"small", vec![8; 4]));
+            tx.try_commit().unwrap(); drop(tx);
+            let mode = reference.then(vacuum_sync_reference::Scope::start);
+            for _ in 0..2 {
+                let before = fsync_counts()[SITE_BLOB];
+                let round = db.vacuum_bounded(None, 1).unwrap();
+                assert!(!round.stats.blob_rewritten.unwrap());
+                assert_eq!(fsync_counts()[SITE_BLOB] - before, u64::from(reference));
+            }
+            let tx = db.begin_transaction();
+            assert_eq!(tx.get(b"large"), Some(vec![7; 4096]));
+            assert!(tx.delete(b"large"));
+            tx.try_commit().unwrap(); drop(tx);
+            let before = fsync_counts()[SITE_BLOB];
+            let round = db.vacuum_bounded(None, u64::MAX).unwrap();
+            assert!(round.stats.blob_rewritten.unwrap());
+            assert_eq!(fsync_counts()[SITE_BLOB] - before, 1 + u64::from(reference));
+            let before = fsync_counts()[SITE_BLOB];
+            db.vacuum_bounded(None, u64::MAX).unwrap();
+            assert_eq!(fsync_counts()[SITE_BLOB] - before, u64::from(reference));
+            drop(mode); drop(db);
+            let db = MVCC::open(&path, 64, 128);
+            let tx = db.begin_transaction();
+            assert_eq!(tx.get(b"large"), None);
+            assert_eq!(tx.get(b"small"), Some(vec![8; 4]));
+            tx.commit();
+        }
     }
 
     fn cleanup(path: &Path) {

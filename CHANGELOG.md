@@ -2,6 +2,16 @@
 
 ## 未发布（2026-11-14）
 
+### M137：test13 第四步，移除 B+ 回收的重复 blob 同步
+
+- vacuum 本身不追加 blob；普通写已经同步 blob，bulk finish 也有同步边界，实际 clear_in_place 内部同步一次。
+  因此移除每次 bounded/full vacuum 尾部无条件 blob.sync；保留主文件、双写、freelist 与清空 blob 的必要持久化。
+  没有给 vacuum 开 bulk 模式，也没有合并或跳过双写发布屏障。每片省一次同步，不声称能解释全部 20M 回收耗时。
+- 同一实现的 vacuum_sync_reference 门恢复原同步，守卫证明未变更 blob 时旧/新同步为 1/0，实际清空时为 2/1；连续回收与重开逐值通过。
+  B+ debug 回归 103 passed / 0 failed / 6 ignored（118.60 s）。
+- bplus_vacuum_sync_cost 复用同一关闭种子，四臂只切尾部同步；接入锁与阶段计量，断言同步次数并重开全量核对。
+  2000 行四臂 VERIFIED、退出 0（2.30 s）；删除分配不是本项验收指标，不用墙钟波动当收益证明。
+
 ### M136：test13 第三步，memory 撤回未经证实的批尾释放默认
 
 - 生产及普通测试统一恢复逐行消费释放。批尾释放完整保留为 cfg(test) 的 stop_batch_release 实验门；不撤回流式消费、完整组快路和输出缓冲等其它改动。
