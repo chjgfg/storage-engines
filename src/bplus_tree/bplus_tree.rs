@@ -118,6 +118,58 @@ enum BTreeNode {
     },
 }
 
+/// Read-only internal nodes keep one key slab rather than one allocation per
+/// separator. Both cache representations share the page write generation and
+/// the existing slot/pin budget. Mutating callers explicitly promote to Owned.
+#[derive(Clone)]
+enum CachedNode {
+    Owned(std::sync::Arc<BTreeNode>),
+    Internal(std::sync::Arc<PointInternal>),
+}
+
+struct PointInternal {
+    payload: Vec<u8>,
+    key_offsets: Vec<(u16, u16)>,
+    children_offset: usize,
+}
+
+impl PointInternal {
+    fn decode(payload: &[u8]) -> std::io::Result<Self> {
+        let MaintenanceNode::Internal { keys, count, children } = MaintenanceNode::decode(payload)? else {
+            return Err(NodeBytes::invalid());
+        };
+        let mut cursor = NodeBytes(keys);
+        let mut key_offsets = Vec::with_capacity(count);
+        for _ in 0..count {
+            let start = 20 + keys.len() - cursor.0.len();
+            cursor.bytes()?;
+            let end = 12 + keys.len() - cursor.0.len();
+            key_offsets.push((u16::try_from(start).map_err(|_| NodeBytes::invalid())?,
+                u16::try_from(end).map_err(|_| NodeBytes::invalid())?));
+        }
+        let children_offset = 12 + keys.len() + 8;
+        // Do not retain the page's zero padding in the parsed cache.
+        Ok(Self { payload: payload[..children_offset + children.len()].to_vec(), key_offsets, children_offset })
+    }
+
+    fn child(&self, bound: &[u8]) -> PageId {
+        let index = self.key_offsets.partition_point(|&(start, end)|
+            &self.payload[start as usize..end as usize] <= bound);
+        let at = self.children_offset + index * 8;
+        PageId(u64::from_le_bytes(self.payload[at..at + 8].try_into().unwrap()))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static POINT_INTERNAL_PACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static POINT_INTERNAL_PROMOTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn point_internal_packs() -> u64 { POINT_INTERNAL_PACKS.with(|c| c.get()) }
+#[cfg(test)]
+pub(crate) fn point_internal_promotions() -> u64 { POINT_INTERNAL_PROMOTIONS.with(|c| c.get()) }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MaintenanceEnd { Complete, Stopped }
 
@@ -334,7 +386,7 @@ pub struct BPlusTree {
     /// 上限跟着 `max_cache_pages` 走：超了就把**没钉住的**整批丢掉（解析缓存的意义是让点读
     /// 不重解析，而不是再维护一个无限增长的堆）。⚠️ 不许退回"整表 clear"：那会把上层页的
     /// 解析结果一起丢掉，而每一次点读都要用它们（见 [`BPlusTree::node_of`]）。
-    node_cache: std::collections::HashMap<PageId, (u64, std::sync::Arc<BTreeNode>)>,
+    node_cache: std::collections::HashMap<PageId, (u64, CachedNode)>,
     /// 容量是不是**自动档**（调用方传的 `max_cache_pages == 0`）
     auto_cache: bool,
     /// 自动档的**上限**，初值 = [`AUTO_MAX_PAGES`]；M32 让它可改。
@@ -748,7 +800,18 @@ impl BPlusTree {
         let seen = self.page_manager.write_count(page_id);
         if let Some((at, node)) = self.node_cache.get(&page_id) {
             if *at == seen {
-                return Some(node.clone());
+                match node {
+                    CachedNode::Owned(node) => return Some(node.clone()),
+                    CachedNode::Internal(packed) => {
+                        let node = std::sync::Arc::new(bincode::deserialize::<BTreeNode>(&packed.payload).ok()?);
+                        #[cfg(test)]
+                        {
+                            NODE_PARSES.with(|c| c.set(c.get() + 1));
+                            POINT_INTERNAL_PROMOTIONS.with(|c| c.set(c.get() + 1));
+                        }
+                        return self.memoize_node(page_id, seen, node);
+                    }
+                }
             }
         }
         let data = self.page_manager.read_page(page_id)?;
@@ -768,11 +831,19 @@ impl BPlusTree {
         seen: u64,
         node: std::sync::Arc<BTreeNode>,
     ) -> Option<std::sync::Arc<BTreeNode>> {
+        self.memoize_cached(page_id, seen, CachedNode::Owned(node.clone()));
+        Some(node)
+    }
+
+    fn memoize_cached(&mut self, page_id: PageId, seen: u64, node: CachedNode) {
         // **上层页钉住**（M22）：根与内部节点是结构性小的一小撮（实测占全库 3.0%），而每一次
         // 点读、每一次反向游走都要用它们。不钉住时，全库走查把 LRU 转几圈就把它们挤出去 ——
         // 实测 200k 行的库里"走查后一次随机点读"因此从 45.2 µs 涨到 58.6 µs（+30%）。
         // 只钉 `Internal`：叶子占 97% 的页，钉叶子等于把整个库再复制一份进内存。
-        if matches!(&*node, BTreeNode::Internal { .. }) {
+        if match &node {
+            CachedNode::Owned(node) => matches!(&**node, BTreeNode::Internal { .. }),
+            CachedNode::Internal(_) => true,
+        } {
             self.page_manager.pin(page_id);
         }
         if self.node_cache.len() >= self.page_manager.cache_capacity() {
@@ -787,8 +858,7 @@ impl BPlusTree {
             let pm = &self.page_manager;
             self.node_cache.retain(|id, _| pm.is_pinned(*id));
         }
-        self.node_cache.insert(page_id, (seen, node.clone()));
-        Some(node)
+        self.node_cache.insert(page_id, (seen, node));
     }
 
     /// 刚落盘的页**直接回填**解析缓存。
@@ -2514,14 +2584,31 @@ impl BPlusTree {
                 let cached = self.node_cache.get(&page).filter(|(at, _)| *at == seen)
                     .map(|(_, node)| node.clone());
                 let step = if let Some(node) = cached {
-                    Self::point_step(&node, low, high, &bound, &mut accept)
+                    match node {
+                        CachedNode::Owned(node) => Self::point_step(&node, low, high, &bound, &mut accept),
+                        CachedNode::Internal(node) => PointStep::Child(node.child(&bound)),
+                    }
                 } else {
-                    enum Read { Internal(BTreeNode), Leaf(PointStep) }
+                    enum Read { Internal(CachedNode), Leaf(PointStep) }
+                    // Pinned upper levels are parsed once and hit on every
+                    // descent: retain their faster owned-key binary search.
+                    // Only the churn beyond the pin budget needs compact keys.
+                    let owned = self.page_manager.is_pinned(page)
+                        || self.page_manager.pinned_pages() < self.page_manager.effective_pin_limit();
+                    #[cfg(test)]
+                    let owned = owned || point_internal_reference::enabled();
                     let read = self.page_manager.read_page_project(page, |payload| {
                         if payload.get(..4) == Some(1_u32.to_le_bytes().as_slice()) {
+                            if owned {
+                                #[cfg(test)]
+                                NODE_PARSES.with(|c| c.set(c.get() + 1));
+                                return bincode::deserialize(payload).ok()
+                                    .map(|node| Read::Internal(CachedNode::Owned(std::sync::Arc::new(node))));
+                            }
+                            let node = PointInternal::decode(payload).ok()?;
                             #[cfg(test)]
-                            NODE_PARSES.with(|c| c.set(c.get() + 1));
-                            bincode::deserialize(payload).ok().map(Read::Internal)
+                            POINT_INTERNAL_PACKS.with(|c| c.set(c.get() + 1));
+                            Some(Read::Internal(CachedNode::Internal(std::sync::Arc::new(node))))
                         } else {
                             PointStep::borrowed(payload, low, high, &mut accept).ok().map(Read::Leaf)
                         }
@@ -2529,8 +2616,12 @@ impl BPlusTree {
                     match read {
                         Read::Leaf(step) => step,
                         Read::Internal(node) => {
-                            let node = self.memoize_node(page, seen, std::sync::Arc::new(node))?;
-                            Self::point_step(&node, low, high, &bound, &mut accept)
+                            let step = match &node {
+                                CachedNode::Owned(node) => Self::point_step(node, low, high, &bound, &mut accept),
+                                CachedNode::Internal(node) => PointStep::Child(node.child(&bound)),
+                            };
+                            self.memoize_cached(page, seen, node);
+                            step
                         }
                     }
                 };
@@ -2977,6 +3068,82 @@ mod tests {
         let mut rows = 0;
         assert_eq!(tree.scan_maintenance_from(None, |_, _| { rows += 1; false }).unwrap(), MaintenanceEnd::Complete);
         assert_eq!(rows, 205);
+    }
+
+    #[test]
+    fn compact_internal_routes_match_owned_and_reject_invalid_nodes() {
+        for count in [0, 1, 16, 63] {
+            let keys: Vec<Key> = (0..count).map(|i| format!("{i:04}{}", "x".repeat(i % 19)).into_bytes()).collect();
+            let children = (0..=count).map(|i| PageId(i as u64 + 1)).collect();
+            let node = BTreeNode::Internal { keys: keys.clone(), children };
+            let payload = bincode::serialize(&node).unwrap();
+            let packed = PointInternal::decode(&payload).unwrap();
+            for key in keys.iter().chain([Vec::new(), vec![255]].iter()) {
+                assert_eq!(packed.child(key), PageId(BPlusTree::child_index(&keys, key) as u64 + 1));
+            }
+            for end in [0, 4, 11, payload.len() - 1] {
+                assert!(PointInternal::decode(&payload[..end]).is_err());
+            }
+            let mut bad = payload.clone(); bad.push(1);
+            assert!(PointInternal::decode(&bad).is_err());
+            let before = crate::mem_probe::allocations();
+            let owned: BTreeNode = bincode::deserialize(&payload).unwrap();
+            let owned_cost = crate::mem_probe::allocations() - before;
+            let before = crate::mem_probe::allocations();
+            let compact = PointInternal::decode(&payload).unwrap();
+            let compact_cost = crate::mem_probe::allocations() - before;
+            if count > 1 { assert!(owned_cost >= compact_cost + count as u64); }
+            drop((owned, compact));
+        }
+        let duplicate = BTreeNode::Internal { keys: vec![vec![1], vec![1]], children: vec![PageId(1); 3] };
+        assert!(PointInternal::decode(&bincode::serialize(&duplicate).unwrap()).is_err());
+        let bad_children = BTreeNode::Internal { keys: vec![vec![1]], children: vec![PageId(1)] };
+        assert!(PointInternal::decode(&bincode::serialize(&bad_children).unwrap()).is_err());
+    }
+
+    #[test]
+    fn compact_internal_cache_promotes_and_invalidates_after_writes() {
+        let (_scratch, mut tree) = anon(8, 8);
+        for i in 0..600_u64 { assert!(tree.insert(i.to_be_bytes().to_vec(), RowId(Some(vec![i as u8; 32])))); }
+        tree.try_flush_all().unwrap();
+        for old in [true, false, false, true] {
+            tree.node_cache.clear();
+            let _mode = old.then(point_internal_reference::Scope::start);
+            let parses = node_parses(); let packs = point_internal_packs();
+            for i in (0..600_u64).map(|i| i * 199 % 600) {
+                let key = i.to_be_bytes();
+                assert_eq!(tree.find_back(&key, &key, |_| true), Some((key.to_vec(), RowId(Some(vec![i as u8; 32])))));
+            }
+            if old {
+                assert!(node_parses() > parses); assert_eq!(point_internal_packs(), packs);
+            } else {
+                assert!(node_parses() - parses <= tree.page_manager.effective_pin_limit() as u64);
+                assert!(point_internal_packs() > packs);
+            }
+        }
+        tree.node_cache.clear();
+        for i in 0..600_u64 { let key = i.to_be_bytes(); tree.find_back(&key, &key, |_| true).unwrap(); }
+        let packed_page = *tree.node_cache.iter().find(|(_, (_, node))|
+            matches!(node, CachedNode::Internal(_))).unwrap().0;
+        let before = point_internal_promotions();
+        tree.node_of(packed_page).unwrap();
+        assert_eq!(point_internal_promotions() - before, 1);
+        for i in 0..600_u64 {
+            let key = i.to_be_bytes().to_vec();
+            // Populate compact ancestors immediately before mutation/rebalancing.
+            tree.node_cache.clear(); tree.find_back(&key, &key, |_| true).unwrap();
+            assert!(tree.delete(key.clone()));
+            assert!(tree.find_back(&key, &key, |_| true).is_none());
+            if i % 3 == 0 { assert!(tree.insert(key, RowId(Some(vec![99; 32])))); }
+        }
+        tree.try_flush_all().unwrap();
+        let path = tree.page_manager.path().to_path_buf(); drop(tree);
+        let mut tree = BPlusTree::open(&path, 8, 8);
+        for i in 0..600_u64 {
+            let key = i.to_be_bytes();
+            let expected = (i % 3 == 0).then(|| (key.to_vec(), RowId(Some(vec![99; 32]))));
+            assert_eq!(tree.find_back(&key, &key, |_| true), expected);
+        }
     }
 
     #[test]
@@ -4030,6 +4197,16 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod delete_read_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod point_internal_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }

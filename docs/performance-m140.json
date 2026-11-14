@@ -1,0 +1,363 @@
+{
+  "schema_version": 1,
+  "milestone": "M140",
+  "date": "2026-11-15",
+  "base_commit": "fee25af2896905eb57d1904bdf3da37245eab977",
+  "final_executable_sha256": "cedbeb166b454d17f9db51fb4ba06bfbdfb58dd0895e9d845813e6077eb06590",
+  "scope": "B+ internal point-cache representation only; ordinary 1000-row transactions, default cache, automatic maintenance; ABBA reopens same physical database, then sequentially grows across scales. Random/ordered reads are min(1000000, rows), pagination verifies every row.",
+  "limitations": [
+    "In-process reference gate restores owned internal-node decoding, not a separate historical binary.",
+    "Build/write/vacuum speed is not A/B verified.",
+    "Shared host load observed; wall time has outliers. Ordered read and pagination do not have uniform improvements.",
+    "Full four-engine five-scale benchmark not run in this milestone."
+  ],
+  "final_measurements": [
+    {
+      "rows": 500000,
+      "round": 0,
+      "phase": "random_read",
+      "s": 6.941897,
+      "alloc": 6513737
+    },
+    {
+      "rows": 500000,
+      "round": 0,
+      "phase": "ordered_read",
+      "s": 1.8064,
+      "alloc": 5560028
+    },
+    {
+      "rows": 500000,
+      "round": 0,
+      "phase": "scan_page",
+      "s": 0.9024869999999999,
+      "alloc": 4219945
+    },
+    {
+      "rows": 500000,
+      "round": 1,
+      "phase": "random_read",
+      "s": 6.600454,
+      "alloc": 6513735
+    },
+    {
+      "rows": 500000,
+      "round": 1,
+      "phase": "ordered_read",
+      "s": 1.919052,
+      "alloc": 5560028
+    },
+    {
+      "rows": 500000,
+      "round": 1,
+      "phase": "scan_page",
+      "s": 0.914829,
+      "alloc": 4219940
+    },
+    {
+      "rows": 500000,
+      "round": 2,
+      "phase": "random_read",
+      "s": 12.416478999999999,
+      "alloc": 6513735
+    },
+    {
+      "rows": 500000,
+      "round": 2,
+      "phase": "ordered_read",
+      "s": 1.849633,
+      "alloc": 5560028
+    },
+    {
+      "rows": 500000,
+      "round": 2,
+      "phase": "scan_page",
+      "s": 0.923137,
+      "alloc": 4219940
+    },
+    {
+      "rows": 500000,
+      "round": 3,
+      "phase": "random_read",
+      "s": 7.673509,
+      "alloc": 6513735
+    },
+    {
+      "rows": 500000,
+      "round": 3,
+      "phase": "ordered_read",
+      "s": 2.063312,
+      "alloc": 5560028
+    },
+    {
+      "rows": 500000,
+      "round": 3,
+      "phase": "scan_page",
+      "s": 1.150262,
+      "alloc": 4219940
+    },
+    {
+      "rows": 5000000,
+      "round": 0,
+      "phase": "random_read",
+      "s": 28.605351,
+      "alloc": 45056280
+    },
+    {
+      "rows": 5000000,
+      "round": 0,
+      "phase": "ordered_read",
+      "s": 3.869929,
+      "alloc": 11180232
+    },
+    {
+      "rows": 5000000,
+      "round": 0,
+      "phase": "scan_page",
+      "s": 9.038473,
+      "alloc": 42502151
+    },
+    {
+      "rows": 5000000,
+      "round": 1,
+      "phase": "random_read",
+      "s": 24.125977,
+      "alloc": 17392298
+    },
+    {
+      "rows": 5000000,
+      "round": 1,
+      "phase": "ordered_read",
+      "s": 4.375775,
+      "alloc": 11128296
+    },
+    {
+      "rows": 5000000,
+      "round": 1,
+      "phase": "scan_page",
+      "s": 11.052430000000001,
+      "alloc": 42502151
+    },
+    {
+      "rows": 5000000,
+      "round": 2,
+      "phase": "random_read",
+      "s": 24.932765,
+      "alloc": 17392298
+    },
+    {
+      "rows": 5000000,
+      "round": 2,
+      "phase": "ordered_read",
+      "s": 3.7521750000000003,
+      "alloc": 11128296
+    },
+    {
+      "rows": 5000000,
+      "round": 2,
+      "phase": "scan_page",
+      "s": 9.20783,
+      "alloc": 42502151
+    },
+    {
+      "rows": 5000000,
+      "round": 3,
+      "phase": "random_read",
+      "s": 28.394938,
+      "alloc": 45056280
+    },
+    {
+      "rows": 5000000,
+      "round": 3,
+      "phase": "ordered_read",
+      "s": 3.751188,
+      "alloc": 11180232
+    },
+    {
+      "rows": 5000000,
+      "round": 3,
+      "phase": "scan_page",
+      "s": 9.399308999999999,
+      "alloc": 42502151
+    },
+    {
+      "rows": 10000000,
+      "round": 0,
+      "phase": "random_read",
+      "s": 34.889128,
+      "alloc": 53067656
+    },
+    {
+      "rows": 10000000,
+      "round": 0,
+      "phase": "ordered_read",
+      "s": 3.7417,
+      "alloc": 11184344
+    },
+    {
+      "rows": 10000000,
+      "round": 0,
+      "phase": "scan_page",
+      "s": 19.471401,
+      "alloc": 85042222
+    },
+    {
+      "rows": 10000000,
+      "round": 1,
+      "phase": "random_read",
+      "s": 25.916831,
+      "alloc": 18468538
+    },
+    {
+      "rows": 10000000,
+      "round": 1,
+      "phase": "ordered_read",
+      "s": 4.12479,
+      "alloc": 11128856
+    },
+    {
+      "rows": 10000000,
+      "round": 1,
+      "phase": "scan_page",
+      "s": 18.599586,
+      "alloc": 85042222
+    },
+    {
+      "rows": 10000000,
+      "round": 2,
+      "phase": "random_read",
+      "s": 26.767443,
+      "alloc": 18468538
+    },
+    {
+      "rows": 10000000,
+      "round": 2,
+      "phase": "ordered_read",
+      "s": 3.814947,
+      "alloc": 11128856
+    },
+    {
+      "rows": 10000000,
+      "round": 2,
+      "phase": "scan_page",
+      "s": 19.272361,
+      "alloc": 85042222
+    },
+    {
+      "rows": 10000000,
+      "round": 3,
+      "phase": "random_read",
+      "s": 31.80947,
+      "alloc": 53067656
+    },
+    {
+      "rows": 10000000,
+      "round": 3,
+      "phase": "ordered_read",
+      "s": 3.785072,
+      "alloc": 11184344
+    },
+    {
+      "rows": 10000000,
+      "round": 3,
+      "phase": "scan_page",
+      "s": 18.903986,
+      "alloc": 85042222
+    },
+    {
+      "rows": 20000000,
+      "round": 0,
+      "phase": "random_read",
+      "s": 37.757791,
+      "alloc": 65185500
+    },
+    {
+      "rows": 20000000,
+      "round": 0,
+      "phase": "ordered_read",
+      "s": 3.964508,
+      "alloc": 11186340
+    },
+    {
+      "rows": 20000000,
+      "round": 0,
+      "phase": "scan_page",
+      "s": 38.004265,
+      "alloc": 170123355
+    },
+    {
+      "rows": 20000000,
+      "round": 1,
+      "phase": "random_read",
+      "s": 31.618996,
+      "alloc": 20082621
+    },
+    {
+      "rows": 20000000,
+      "round": 1,
+      "phase": "ordered_read",
+      "s": 3.829064,
+      "alloc": 11129124
+    },
+    {
+      "rows": 20000000,
+      "round": 1,
+      "phase": "scan_page",
+      "s": 41.489853000000004,
+      "alloc": 170123355
+    },
+    {
+      "rows": 20000000,
+      "round": 2,
+      "phase": "random_read",
+      "s": 31.198557,
+      "alloc": 20082621
+    },
+    {
+      "rows": 20000000,
+      "round": 2,
+      "phase": "ordered_read",
+      "s": 3.684679,
+      "alloc": 11129124
+    },
+    {
+      "rows": 20000000,
+      "round": 2,
+      "phase": "scan_page",
+      "s": 37.065629,
+      "alloc": 170123355
+    },
+    {
+      "rows": 20000000,
+      "round": 3,
+      "phase": "random_read",
+      "s": 47.062926,
+      "alloc": 65185500
+    },
+    {
+      "rows": 20000000,
+      "round": 3,
+      "phase": "ordered_read",
+      "s": 7.304388,
+      "alloc": 11186340
+    },
+    {
+      "rows": 20000000,
+      "round": 3,
+      "phase": "scan_page",
+      "s": 48.938068,
+      "alloc": 170123355
+    }
+  ],
+  "final_stdout": "    Finished `release` profile [optimized] target(s) in 0.39s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 1 test\ntest engine::tests::bplus_internal_projection_cost ... SCALE_LOCK_WAIT name=bplus_internal_projection_cost pid=55688 unix_ms=1794684441223 path=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target/scale-bench.lock\nSCALE_LOCK_ACQUIRED name=bplus_internal_projection_cost pid=55688 unix_ms=1794684441223 wait_ms=0.061\nSCALE_BUILD harness=2 executable_sha256=\"cedbeb166b454d17f9db51fb4ba06bfbdfb58dd0895e9d845813e6077eb06590\" runtime_git=\"fee25af2896905eb57d1904bdf3da37245eab977\" tracked_dirty=Ok(true)\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=55688 unix_ms=1794684442688\nBPLUS_INTERNAL_BUILD rows=500000 completed=500000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=17393.254 cpu_ms=Ok(11546.875) allocations=38912835 page_faults_delta=Ok(59720) unix_ms=1794684460081\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=20 internal_packs=0 owned_promotions=0 page_reads=29397 cache_hits=28557 cache_misses=840 cache_sweeps=19 cache_visited=37837\nBPLUS_INTERNAL_ARM rows=500000 reads=500000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684460088\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=6941.897 cpu_ms=Ok(6906.25) allocations=6513737 page_faults_delta=Ok(2802) unix_ms=1794684467030\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=919 internal_packs=0 owned_promotions=0 page_reads=500919 cache_hits=17674 cache_misses=483245 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684467031\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=1806.400 cpu_ms=Ok(1812.5) allocations=5560028 page_faults_delta=Ok(41) unix_ms=1794684468837\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=500000 cache_hits=470610 cache_misses=29390 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684468837\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=902.487 cpu_ms=Ok(906.25) allocations=4219945 page_faults_delta=Ok(765) unix_ms=1794684469740\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1000 internal_packs=0 owned_promotions=0 page_reads=31584 cache_hits=1784 cache_misses=29800 cache_sweeps=0 cache_visited=0\nBPLUS_INTERNAL_VERIFIED rows=500000 round=0\nBPLUS_INTERNAL_ARM rows=500000 reads=500000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684469762\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=6600.454 cpu_ms=Ok(6593.75) allocations=6513735 page_faults_delta=Ok(2738) unix_ms=1794684476362\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=919 internal_packs=0 owned_promotions=0 page_reads=500919 cache_hits=17674 cache_misses=483245 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684476362\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=1919.052 cpu_ms=Ok(1921.875) allocations=5560028 page_faults_delta=Ok(50) unix_ms=1794684478281\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=500000 cache_hits=470610 cache_misses=29390 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684478281\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=914.829 cpu_ms=Ok(906.25) allocations=4219940 page_faults_delta=Ok(768) unix_ms=1794684479196\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1000 internal_packs=0 owned_promotions=0 page_reads=31584 cache_hits=1784 cache_misses=29800 cache_sweeps=0 cache_visited=0\nBPLUS_INTERNAL_VERIFIED rows=500000 round=1\nBPLUS_INTERNAL_ARM rows=500000 reads=500000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684479213\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=12416.479 cpu_ms=Ok(11234.375) allocations=6513735 page_faults_delta=Ok(2737) unix_ms=1794684491630\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=919 internal_packs=0 owned_promotions=0 page_reads=500919 cache_hits=17674 cache_misses=483245 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684491630\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=1849.633 cpu_ms=Ok(1843.75) allocations=5560028 page_faults_delta=Ok(64) unix_ms=1794684493480\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=500000 cache_hits=470610 cache_misses=29390 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684493480\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=923.137 cpu_ms=Ok(906.25) allocations=4219940 page_faults_delta=Ok(812) unix_ms=1794684494403\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1000 internal_packs=0 owned_promotions=0 page_reads=31584 cache_hits=1784 cache_misses=29800 cache_sweeps=0 cache_visited=0\nBPLUS_INTERNAL_VERIFIED rows=500000 round=2\nBPLUS_INTERNAL_ARM rows=500000 reads=500000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684494420\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=7673.509 cpu_ms=Ok(7671.875) allocations=6513735 page_faults_delta=Ok(2672) unix_ms=1794684502094\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=919 internal_packs=0 owned_promotions=0 page_reads=500919 cache_hits=17674 cache_misses=483245 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684502094\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=2063.312 cpu_ms=Ok(1984.375) allocations=5560028 page_faults_delta=Ok(88) unix_ms=1794684504157\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=500000 cache_hits=470610 cache_misses=29390 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684504157\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=1150.262 cpu_ms=Ok(1140.625) allocations=4219940 page_faults_delta=Ok(754) unix_ms=1794684505307\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1000 internal_packs=0 owned_promotions=0 page_reads=31584 cache_hits=1784 cache_misses=29800 cache_sweeps=0 cache_visited=0\nBPLUS_INTERNAL_VERIFIED rows=500000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=55688 unix_ms=1794684505325\nBPLUS_INTERNAL_BUILD rows=5000000 completed=1000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=2000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=3000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=4000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=5000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=171888.904 cpu_ms=Ok(121562.5) allocations=350111455 page_faults_delta=Ok(259849) unix_ms=1794684677214\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=942 internal_packs=681 owned_promotions=681 page_reads=270106 cache_hits=2716 cache_misses=267390 cache_sweeps=257 cache_visited=526336\nBPLUS_INTERNAL_ARM rows=5000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684677305\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=28605.351 cpu_ms=Ok(28500.0) allocations=45056280 page_faults_delta=Ok(4061) unix_ms=1794684705910\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=865434 internal_packs=0 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684705910\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3869.929 cpu_ms=Ok(3859.375) allocations=11180232 page_faults_delta=Ok(9) unix_ms=1794684709780\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1623 internal_packs=0 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684709780\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=9038.473 cpu_ms=Ok(9046.875) allocations=42502151 page_faults_delta=Ok(6204) unix_ms=1794684718819\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=0\nBPLUS_INTERNAL_ARM rows=5000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684718836\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=24125.977 cpu_ms=Ok(24031.25) allocations=17392298 page_faults_delta=Ok(3487) unix_ms=1794684742962\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=864410 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684742962\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4375.775 cpu_ms=Ok(4328.125) allocations=11128296 page_faults_delta=Ok(72) unix_ms=1794684747338\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1623 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684747338\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=11052.430 cpu_ms=Ok(10734.375) allocations=42502151 page_faults_delta=Ok(5775) unix_ms=1794684758390\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=1\nBPLUS_INTERNAL_ARM rows=5000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684758413\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=24932.765 cpu_ms=Ok(24906.25) allocations=17392298 page_faults_delta=Ok(3458) unix_ms=1794684783345\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=864410 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684783345\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3752.175 cpu_ms=Ok(3734.375) allocations=11128296 page_faults_delta=Ok(65) unix_ms=1794684787098\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1623 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684787098\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=9207.830 cpu_ms=Ok(9203.125) allocations=42502151 page_faults_delta=Ok(5128) unix_ms=1794684796306\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=2\nBPLUS_INTERNAL_ARM rows=5000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794684796322\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=28394.938 cpu_ms=Ok(28312.5) allocations=45056280 page_faults_delta=Ok(4146) unix_ms=1794684824717\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=865434 internal_packs=0 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794684824717\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3751.188 cpu_ms=Ok(3750.0) allocations=11180232 page_faults_delta=Ok(4) unix_ms=1794684828468\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1623 internal_packs=0 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794684828468\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=9399.309 cpu_ms=Ok(9375.0) allocations=42502151 page_faults_delta=Ok(5780) unix_ms=1794684837867\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=55688 unix_ms=1794684837887\nBPLUS_INTERNAL_BUILD rows=10000000 completed=6000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=7000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=8000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=9000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=10000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=180345.152 cpu_ms=Ok(123515.625) allocations=389009950 page_faults_delta=Ok(62004) unix_ms=1794685018232\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=780 internal_packs=489 owned_promotions=489 page_reads=300537 cache_hits=2052 cache_misses=298485 cache_sweeps=286 cache_visited=585728\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685018425\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=34889.128 cpu_ms=Ok(34609.375) allocations=53067656 page_faults_delta=Ok(4204) unix_ms=1794685053314\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1082232 internal_packs=0 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685053314\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3741.700 cpu_ms=Ok(3734.375) allocations=11184344 page_faults_delta=Ok(46) unix_ms=1794685057056\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1734 internal_packs=0 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685057056\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=19471.401 cpu_ms=Ok(19343.75) allocations=85042222 page_faults_delta=Ok(11855) unix_ms=1794685076527\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=0\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685076541\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=25916.831 cpu_ms=Ok(25906.25) allocations=18468538 page_faults_delta=Ok(3503) unix_ms=1794685102458\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685102458\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4124.790 cpu_ms=Ok(4093.75) allocations=11128856 page_faults_delta=Ok(91) unix_ms=1794685106583\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685106583\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=18599.586 cpu_ms=Ok(18546.875) allocations=85042222 page_faults_delta=Ok(9639) unix_ms=1794685125183\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=1\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685125199\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=26767.443 cpu_ms=Ok(26625.0) allocations=18468538 page_faults_delta=Ok(3449) unix_ms=1794685151967\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685151967\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3814.947 cpu_ms=Ok(3812.5) allocations=11128856 page_faults_delta=Ok(21) unix_ms=1794685155782\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685155782\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=19272.361 cpu_ms=Ok(19187.5) allocations=85042222 page_faults_delta=Ok(10359) unix_ms=1794685175054\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=2\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685175068\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=31809.470 cpu_ms=Ok(31750.0) allocations=53067656 page_faults_delta=Ok(4244) unix_ms=1794685206878\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1082232 internal_packs=0 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685206878\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3785.072 cpu_ms=Ok(3781.25) allocations=11184344 page_faults_delta=Ok(57) unix_ms=1794685210663\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1734 internal_packs=0 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685210663\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=18903.986 cpu_ms=Ok(18843.75) allocations=85042222 page_faults_delta=Ok(8983) unix_ms=1794685229567\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=55688 unix_ms=1794685229590\nBPLUS_INTERNAL_BUILD rows=20000000 completed=11000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=12000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=13000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=14000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=15000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=16000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=17000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=18000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=19000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=20000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=369560.985 cpu_ms=Ok(248609.375) allocations=758024869 page_faults_delta=Ok(119967) unix_ms=1794685599151\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=1667 internal_packs=1078 owned_promotions=1078 page_reads=601197 cache_hits=4082 cache_misses=597115 cache_sweeps=584 cache_visited=1196032\nBPLUS_INTERNAL_ARM rows=20000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685599577\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=37757.791 cpu_ms=Ok(37656.25) allocations=65185500 page_faults_delta=Ok(4316) unix_ms=1794685637334\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1410464 internal_packs=0 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685637335\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3964.508 cpu_ms=Ok(3921.875) allocations=11186340 page_faults_delta=Ok(82) unix_ms=1794685641299\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1788 internal_packs=0 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685641299\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=38004.265 cpu_ms=Ok(37781.25) allocations=170123355 page_faults_delta=Ok(20677) unix_ms=1794685679303\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=0\nBPLUS_INTERNAL_ARM rows=20000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685679320\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=31618.996 cpu_ms=Ok(31484.375) allocations=20082621 page_faults_delta=Ok(3571) unix_ms=1794685710939\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1409440 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685710939\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3829.064 cpu_ms=Ok(3812.5) allocations=11129124 page_faults_delta=Ok(42) unix_ms=1794685714768\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1788 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685714768\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=41489.853 cpu_ms=Ok(40546.875) allocations=170123355 page_faults_delta=Ok(20361) unix_ms=1794685756258\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=1\nBPLUS_INTERNAL_ARM rows=20000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685756273\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=31198.557 cpu_ms=Ok(30968.75) allocations=20082621 page_faults_delta=Ok(3410) unix_ms=1794685787472\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1409440 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685787472\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3684.679 cpu_ms=Ok(3687.5) allocations=11129124 page_faults_delta=Ok(27) unix_ms=1794685791157\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1788 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685791157\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=37065.629 cpu_ms=Ok(37015.625) allocations=170123355 page_faults_delta=Ok(23066) unix_ms=1794685828222\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=2\nBPLUS_INTERNAL_ARM rows=20000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=55688 unix_ms=1794685828239\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=47062.926 cpu_ms=Ok(45984.375) allocations=65185500 page_faults_delta=Ok(3857) unix_ms=1794685875302\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1410464 internal_packs=0 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=55688 unix_ms=1794685875304\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=7304.388 cpu_ms=Ok(6984.375) allocations=11186340 page_faults_delta=Ok(32) unix_ms=1794685882608\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1788 internal_packs=0 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=55688 unix_ms=1794685882608\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=48938.068 cpu_ms=Ok(48156.25) allocations=170123355 page_faults_delta=Ok(22387) unix_ms=1794685931546\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=3\nSCALE_LOCK_RELEASE name=bplus_internal_projection_cost pid=55688 unix_ms=1794685932041 active_ms=1490818.019\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 586 filtered out; finished in 1490.82s\n\n",
+  "earlier_experiments": [
+    {
+      "description": "First compact-key index, 200k reads, 5M/10M/20M; 10M load interference observed.",
+      "stdout": "    Finished `release` profile [optimized] target(s) in 0.79s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 1 test\ntest engine::tests::bplus_internal_projection_cost ... SCALE_LOCK_WAIT name=bplus_internal_projection_cost pid=63864 unix_ms=1794681191578 path=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target/scale-bench.lock\nSCALE_LOCK_ACQUIRED name=bplus_internal_projection_cost pid=63864 unix_ms=1794681191578 wait_ms=0.040\nSCALE_BUILD harness=2 executable_sha256=\"3e1a0ce59a6b6d09368d8af8d068e993b523f22391084a85c83fbfa8a8abfe85\" runtime_git=\"fee25af2896905eb57d1904bdf3da37245eab977\" tracked_dirty=Ok(true)\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=63864 unix_ms=1794681193610\nBPLUS_INTERNAL_BUILD rows=5000000 completed=1000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=2000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=3000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=4000000\nBPLUS_INTERNAL_BUILD rows=5000000 completed=5000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=232089.552 cpu_ms=Ok(164359.375) allocations=389026443 page_faults_delta=Ok(306218) unix_ms=1794681425699\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=993 internal_packs=705 owned_promotions=705 page_reads=300523 cache_hits=119364 cache_misses=181159 cache_sweeps=287 cache_visited=586701\nBPLUS_INTERNAL_ARM rows=5000000 reads=200000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681425812\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=6406.532 cpu_ms=Ok(6375.0) allocations=9030565 page_faults_delta=Ok(4598) unix_ms=1794681432219\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=173607 internal_packs=0 owned_promotions=0 page_reads=373607 cache_hits=2517 cache_misses=371090 cache_sweeps=168 cache_visited=344064\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681432219\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=885.484 cpu_ms=Ok(875.0) allocations=2235389 page_faults_delta=Ok(25) unix_ms=1794681433104\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=307 internal_packs=0 owned_promotions=0 page_reads=200307 cache_hits=188238 cache_misses=12069 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681433105\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=10560.658 cpu_ms=Ok(10437.5) allocations=42496853 page_faults_delta=Ok(6157) unix_ms=1794681443665\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18029 internal_packs=0 owned_promotions=0 page_reads=323907 cache_hits=17844 cache_misses=306063 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=0\nBPLUS_INTERNAL_ARM rows=5000000 reads=200000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681443704\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=5622.184 cpu_ms=Ok(5593.75) allocations=3507330 page_faults_delta=Ok(3714) unix_ms=1794681449326\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=172583 owned_promotions=0 page_reads=373607 cache_hits=2517 cache_misses=371090 cache_sweeps=168 cache_visited=344064\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681449326\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=1028.730 cpu_ms=Ok(1000.0) allocations=2225565 page_faults_delta=Ok(12) unix_ms=1794681450355\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=307 owned_promotions=0 page_reads=200307 cache_hits=188238 cache_misses=12069 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681450355\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=10320.659 cpu_ms=Ok(10187.5) allocations=42501678 page_faults_delta=Ok(6304) unix_ms=1794681460676\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18167 internal_packs=0 owned_promotions=139 page_reads=323906 cache_hits=17843 cache_misses=306063 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=1\nBPLUS_INTERNAL_ARM rows=5000000 reads=200000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681460690\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=5055.409 cpu_ms=Ok(5046.875) allocations=3507331 page_faults_delta=Ok(3515) unix_ms=1794681465746\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=172583 owned_promotions=0 page_reads=373607 cache_hits=2517 cache_misses=371090 cache_sweeps=168 cache_visited=344064\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681465746\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=789.359 cpu_ms=Ok(796.875) allocations=2225565 page_faults_delta=Ok(25) unix_ms=1794681466535\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=307 owned_promotions=0 page_reads=200307 cache_hits=188238 cache_misses=12069 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681466536\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=10201.129 cpu_ms=Ok(10171.875) allocations=42501677 page_faults_delta=Ok(6323) unix_ms=1794681476737\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18167 internal_packs=0 owned_promotions=139 page_reads=323906 cache_hits=17843 cache_misses=306063 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=2\nBPLUS_INTERNAL_ARM rows=5000000 reads=200000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681476753\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=7454.398 cpu_ms=Ok(7296.875) allocations=9030563 page_faults_delta=Ok(3788) unix_ms=1794681484208\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=173607 internal_packs=0 owned_promotions=0 page_reads=373607 cache_hits=2517 cache_misses=371090 cache_sweeps=168 cache_visited=344064\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681484208\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=796.313 cpu_ms=Ok(796.875) allocations=2235389 page_faults_delta=Ok(55) unix_ms=1794681485004\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=307 internal_packs=0 owned_promotions=0 page_reads=200307 cache_hits=188238 cache_misses=12069 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681485004\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=11928.541 cpu_ms=Ok(11531.25) allocations=42496848 page_faults_delta=Ok(5409) unix_ms=1794681496933\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18029 internal_packs=0 owned_promotions=0 page_reads=323907 cache_hits=17844 cache_misses=306063 cache_sweeps=18 cache_visited=36864\nBPLUS_INTERNAL_VERIFIED rows=5000000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=63864 unix_ms=1794681496950\nBPLUS_INTERNAL_BUILD rows=10000000 completed=6000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=7000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=8000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=9000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=10000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=244167.108 cpu_ms=Ok(166234.375) allocations=389009950 page_faults_delta=Ok(46987) unix_ms=1794681741117\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=780 internal_packs=489 owned_promotions=489 page_reads=300537 cache_hits=2052 cache_misses=298485 cache_sweeps=286 cache_visited=585728\nBPLUS_INTERNAL_ARM rows=10000000 reads=200000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681741307\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=7080.978 cpu_ms=Ok(7015.625) allocations=10619254 page_faults_delta=Ok(3814) unix_ms=1794681748388\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=216600 internal_packs=0 owned_promotions=0 page_reads=416600 cache_hits=3977 cache_misses=412623 cache_sweeps=210 cache_visited=430080\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681748389\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=854.948 cpu_ms=Ok(859.375) allocations=2236686 page_faults_delta=Ok(90) unix_ms=1794681749244\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=342 internal_packs=0 owned_promotions=0 page_reads=200342 cache_hits=188238 cache_misses=12104 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681749244\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=32124.695 cpu_ms=Ok(29625.0) allocations=85037459 page_faults_delta=Ok(10478) unix_ms=1794681781369\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37241 internal_packs=0 owned_promotions=0 page_reads=649000 cache_hits=35695 cache_misses=613305 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=0\nBPLUS_INTERNAL_ARM rows=10000000 reads=200000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681781403\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=8420.284 cpu_ms=Ok(7765.625) allocations=3720690 page_faults_delta=Ok(3498) unix_ms=1794681789824\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=215576 owned_promotions=0 page_reads=416600 cache_hits=3977 cache_misses=412623 cache_sweeps=210 cache_visited=430080\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681789824\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=1116.310 cpu_ms=Ok(1078.125) allocations=2225742 page_faults_delta=Ok(37) unix_ms=1794681790940\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=342 owned_promotions=0 page_reads=200342 cache_hits=188238 cache_misses=12104 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681790940\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=33665.707 cpu_ms=Ok(30562.5) allocations=85041902 page_faults_delta=Ok(7281) unix_ms=1794681824606\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37368 internal_packs=0 owned_promotions=128 page_reads=648999 cache_hits=35695 cache_misses=613304 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=1\nBPLUS_INTERNAL_ARM rows=10000000 reads=200000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681824660\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=14059.361 cpu_ms=Ok(11250.0) allocations=3720690 page_faults_delta=Ok(3565) unix_ms=1794681838720\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=215576 owned_promotions=0 page_reads=416600 cache_hits=3977 cache_misses=412623 cache_sweeps=210 cache_visited=430080\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681838720\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=2184.921 cpu_ms=Ok(1703.125) allocations=2225742 page_faults_delta=Ok(53) unix_ms=1794681840905\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=342 owned_promotions=0 page_reads=200342 cache_hits=188238 cache_misses=12104 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681840906\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=33092.157 cpu_ms=Ok(28890.625) allocations=85041902 page_faults_delta=Ok(7095) unix_ms=1794681873998\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37368 internal_packs=0 owned_promotions=128 page_reads=648999 cache_hits=35695 cache_misses=613304 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=2\nBPLUS_INTERNAL_ARM rows=10000000 reads=200000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794681874015\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=8227.811 cpu_ms=Ok(7875.0) allocations=10619254 page_faults_delta=Ok(3917) unix_ms=1794681882242\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=216600 internal_packs=0 owned_promotions=0 page_reads=416600 cache_hits=3977 cache_misses=412623 cache_sweeps=210 cache_visited=430080\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794681882243\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=864.125 cpu_ms=Ok(859.375) allocations=2236686 page_faults_delta=Ok(31) unix_ms=1794681883107\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=342 internal_packs=0 owned_promotions=0 page_reads=200342 cache_hits=188238 cache_misses=12104 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794681883107\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=31770.571 cpu_ms=Ok(29296.875) allocations=85037459 page_faults_delta=Ok(7088) unix_ms=1794681914877\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37241 internal_packs=0 owned_promotions=0 page_reads=649000 cache_hits=35695 cache_misses=613305 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=63864 unix_ms=1794681914903\nBPLUS_INTERNAL_BUILD rows=20000000 completed=11000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=12000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=13000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=14000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=15000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=16000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=17000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=18000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=19000000\nBPLUS_INTERNAL_BUILD rows=20000000 completed=20000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=473344.216 cpu_ms=Ok(313984.375) allocations=758024869 page_faults_delta=Ok(48833) unix_ms=1794682388247\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=1667 internal_packs=1078 owned_promotions=1078 page_reads=601197 cache_hits=4082 cache_misses=597115 cache_sweeps=584 cache_visited=1196032\nBPLUS_INTERNAL_ARM rows=20000000 reads=200000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794682388694\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=8104.854 cpu_ms=Ok(8093.75) allocations=13053925 page_faults_delta=Ok(4057) unix_ms=1794682396800\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=282538 internal_packs=0 owned_promotions=0 page_reads=482538 cache_hits=7522 cache_misses=475016 cache_sweeps=274 cache_visited=561152\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794682396800\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=883.747 cpu_ms=Ok(875.0) allocations=2237057 page_faults_delta=Ok(41) unix_ms=1794682397683\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=352 internal_packs=0 owned_promotions=0 page_reads=200352 cache_hits=188238 cache_misses=12114 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794682397684\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=40524.790 cpu_ms=Ok(40187.5) allocations=170113726 page_faults_delta=Ok(17027) unix_ms=1794682438208\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75529 internal_packs=0 owned_promotions=0 page_reads=1299054 cache_hits=71428 cache_misses=1227626 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=0\nBPLUS_INTERNAL_ARM rows=20000000 reads=200000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794682438225\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=6843.293 cpu_ms=Ok(6687.5) allocations=4045273 page_faults_delta=Ok(3437) unix_ms=1794682445068\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=281514 owned_promotions=0 page_reads=482538 cache_hits=7522 cache_misses=475016 cache_sweeps=274 cache_visited=561152\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794682445069\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=837.684 cpu_ms=Ok(843.75) allocations=2225793 page_faults_delta=Ok(48) unix_ms=1794682445906\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=352 owned_promotions=0 page_reads=200352 cache_hits=188238 cache_misses=12114 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794682445906\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=42952.359 cpu_ms=Ok(42187.5) allocations=170123036 page_faults_delta=Ok(15165) unix_ms=1794682488859\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75795 internal_packs=0 owned_promotions=266 page_reads=1299054 cache_hits=71428 cache_misses=1227626 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=1\nBPLUS_INTERNAL_ARM rows=20000000 reads=200000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794682488876\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=6622.354 cpu_ms=Ok(6546.875) allocations=4045273 page_faults_delta=Ok(3456) unix_ms=1794682495499\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=281514 owned_promotions=0 page_reads=482538 cache_hits=7522 cache_misses=475016 cache_sweeps=274 cache_visited=561152\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794682495499\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=789.820 cpu_ms=Ok(796.875) allocations=2225793 page_faults_delta=Ok(8) unix_ms=1794682496289\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=352 owned_promotions=0 page_reads=200352 cache_hits=188238 cache_misses=12114 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794682496289\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=46584.644 cpu_ms=Ok(45218.75) allocations=170123036 page_faults_delta=Ok(16030) unix_ms=1794682542874\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75795 internal_packs=0 owned_promotions=266 page_reads=1299054 cache_hits=71428 cache_misses=1227626 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=2\nBPLUS_INTERNAL_ARM rows=20000000 reads=200000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=63864 unix_ms=1794682542889\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=8730.990 cpu_ms=Ok(8656.25) allocations=13053925 page_faults_delta=Ok(3865) unix_ms=1794682551620\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=282538 internal_packs=0 owned_promotions=0 page_reads=482538 cache_hits=7522 cache_misses=475016 cache_sweeps=274 cache_visited=561152\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=63864 unix_ms=1794682551620\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=1242.153 cpu_ms=Ok(1234.375) allocations=2237057 page_faults_delta=Ok(35) unix_ms=1794682552862\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=352 internal_packs=0 owned_promotions=0 page_reads=200352 cache_hits=188238 cache_misses=12114 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=63864 unix_ms=1794682552862\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=61507.870 cpu_ms=Ok(57031.25) allocations=170113726 page_faults_delta=Ok(15449) unix_ms=1794682614370\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75529 internal_packs=0 owned_promotions=0 page_reads=1299054 cache_hits=71428 cache_misses=1227626 cache_sweeps=74 cache_visited=151552\nBPLUS_INTERNAL_VERIFIED rows=20000000 round=3\nSCALE_LOCK_RELEASE name=ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 586 filtered out; finished in 1423.31s\n\nbplus_internal_projection_cost pid=63864 unix_ms=1794682614884 active_ms=1423306.069\n"
+    },
+    {
+      "description": "First index 10M repeat with 1M reads; random improved but ordered consistently slower; superseded by stored key start/end offsets.",
+      "stdout": "    Finished `release` profile [optimized] target(s) in 0.42s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 1 test\ntest engine::tests::bplus_internal_projection_cost ... SCALE_LOCK_WAIT name=bplus_internal_projection_cost pid=68240 unix_ms=1794682670536 path=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target/scale-bench.lock\nSCALE_LOCK_ACQUIRED name=bplus_internal_projection_cost pid=68240 unix_ms=1794682670536 wait_ms=0.102\nSCALE_BUILD harness=2 executable_sha256=\"3e1a0ce59a6b6d09368d8af8d068e993b523f22391084a85c83fbfa8a8abfe85\" runtime_git=\"fee25af2896905eb57d1904bdf3da37245eab977\" tracked_dirty=Ok(true)\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=68240 unix_ms=1794682674746\nBPLUS_INTERNAL_BUILD rows=10000000 completed=1000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=2000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=3000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=4000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=5000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=6000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=7000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=8000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=9000000\nBPLUS_INTERNAL_BUILD rows=10000000 completed=10000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=413843.607 cpu_ms=Ok(287125.0) allocations=778047370 page_faults_delta=Ok(377929) unix_ms=1794683088589\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=2177 internal_packs=1591 owned_promotions=1591 page_reads=601479 cache_hits=121472 cache_misses=480007 cache_sweeps=585 cache_visited=1197005\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=68240 unix_ms=1794683088766\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=34503.269 cpu_ms=Ok(34265.625) allocations=53067658 page_faults_delta=Ok(7388) unix_ms=1794683123270\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1082232 internal_packs=0 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=68240 unix_ms=1794683123270\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4160.705 cpu_ms=Ok(4156.25) allocations=11184344 page_faults_delta=Ok(338) unix_ms=1794683127431\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1734 internal_packs=0 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=68240 unix_ms=1794683127431\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=19908.786 cpu_ms=Ok(19656.25) allocations=85042227 page_faults_delta=Ok(14640) unix_ms=1794683147340\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=0\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=68240 unix_ms=1794683147355\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=29271.762 cpu_ms=Ok(28968.75) allocations=18468538 page_faults_delta=Ok(3499) unix_ms=1794683176627\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=68240 unix_ms=1794683176627\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4807.243 cpu_ms=Ok(4750.0) allocations=11128856 page_faults_delta=Ok(34) unix_ms=1794683181435\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=68240 unix_ms=1794683181435\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=21798.166 cpu_ms=Ok(21640.625) allocations=85042222 page_faults_delta=Ok(14383) unix_ms=1794683203233\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=1\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=68240 unix_ms=1794683203246\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=29438.875 cpu_ms=Ok(29218.75) allocations=18468538 page_faults_delta=Ok(3443) unix_ms=1794683232685\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=68240 unix_ms=1794683232685\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4685.726 cpu_ms=Ok(4671.875) allocations=11128856 page_faults_delta=Ok(27) unix_ms=1794683237371\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=68240 unix_ms=1794683237371\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=22369.772 cpu_ms=Ok(22218.75) allocations=85042222 page_faults_delta=Ok(13456) unix_ms=1794683259741\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=2\nBPLUS_INTERNAL_ARM rows=10000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=68240 unix_ms=1794683259756\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=36416.686 cpu_ms=Ok(36171.875) allocations=53067656 page_faults_delta=Ok(4202) unix_ms=1794683296173\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1082232 internal_packs=0 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=68240 unix_ms=1794683296173\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3841.692 cpu_ms=Ok(3828.125) allocations=11184344 page_faults_delta=Ok(88) unix_ms=1794683300015\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=1734 internal_packs=0 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=68240 unix_ms=1794683300015\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=19083.972 cpu_ms=Ok(18906.25) allocations=85042222 page_faults_delta=Ok(8235) unix_ms=1794683319099\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_INTERNAL_VERIFIED rows=10000000 round=3\nSCALE_LOCK_RELEASE name=bplus_internal_projection_cost pid=68240 unix_ms=1794683319324 active_ms=648787.726\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 586 filtered out; finished in 648.79s\n\n"
+    }
+  ]
+}

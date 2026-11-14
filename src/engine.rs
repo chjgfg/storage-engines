@@ -6399,6 +6399,72 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ordinary-transaction B+ internal-node ABBA at 5M/10M/20M; release single thread"]
+    fn bplus_internal_projection_cost() {
+        use crate::bplus_tree::bplus_tree::point_internal_reference;
+        let _run = crate::scale_probe::RunGuard::acquire("bplus_internal_projection_cost");
+        crate::scale_probe::fingerprint();
+        let sizes: Vec<usize> = std::env::var("BPLUS_INTERNAL_ROWS")
+            .unwrap_or_else(|_| "5000000,10000000,20000000".into())
+            .split(',').map(|s| s.trim().parse().unwrap()).collect();
+        assert!(!sizes.is_empty() && sizes[0] > 0 && sizes.windows(2).all(|w| w[0] < w[1]));
+        let reads: usize = std::env::var("POINT_READS").map(|s| s.parse().unwrap()).unwrap_or(200_000);
+        assert!(reads > 0);
+        let scratch = ScaleScratch::new("bplus_internal_projection");
+        let path = scratch.0.join("bplus.db");
+        let mut built = 0;
+        for rows in sizes {
+            // Same seed, default cache, automatic maintenance and 1000-row
+            // normal transactions as run_scale_baseline; never use bulk mode.
+            // Grow one database between scales. Each ABBA arm reopens the same
+            // immutable physical database, so cache warmth starts identically.
+            let db = open_engine(EngineKind::BPlusTree, Some(&path)).unwrap();
+            let build_phase = crate::scale_probe::Phase::begin("bplus_tree", "ordinary_build");
+            for base in (built..rows).step_by(1000) {
+                let end = (base + 1000).min(rows);
+                let items: Vec<_> = (base..end).map(|i| (scale_key(i), scale_val(i))).collect();
+                let tx = db.begin(); tx.batch_set(&items).unwrap(); tx.commit();
+                if end % 1_000_000 == 0 || end == rows {
+                    eprintln!("BPLUS_INTERNAL_BUILD rows={rows} completed={end}");
+                }
+            }
+            db.flush().unwrap(); db.checkpoint().unwrap(); drop(db);
+            build_phase.finish("bplus_tree", "ordinary_build");
+            built = rows;
+            let order = shuffled(rows);
+            let reads = reads.min(rows);
+            for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+                let db = open_engine(EngineKind::BPlusTree, Some(&path)).unwrap();
+                let mode = reference.then(point_internal_reference::Scope::start);
+                eprintln!("BPLUS_INTERNAL_ARM rows={rows} reads={reads} round={round} reference={reference}");
+                let tx = db.begin();
+                let phase = crate::scale_probe::Phase::begin("bplus_tree", "random_read");
+                for &i in &order[..reads] { assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i))); }
+                phase.finish("bplus_tree", "random_read");
+                let phase = crate::scale_probe::Phase::begin("bplus_tree", "ordered_read");
+                for i in 0..reads { assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i))); }
+                phase.finish("bplus_tree", "ordered_read");
+                let phase = crate::scale_probe::Phase::begin("bplus_tree", "scan_page");
+                let mut cursor = None;
+                let mut seen = 0;
+                loop {
+                    let (page, next) = tx.scan_page(cursor.as_deref(), 500);
+                    if page.is_empty() { break; }
+                    for row in &page {
+                        assert_eq!(row.key, scale_key(seen)); assert_eq!(row.value, Some(scale_val(seen))); seen += 1;
+                    }
+                    cursor = next;
+                    if cursor.is_none() { break; }
+                }
+                assert_eq!(seen, rows);
+                phase.finish("bplus_tree", "scan_page");
+                tx.commit(); drop(tx); drop(mode); drop(db);
+                eprintln!("BPLUS_INTERNAL_VERIFIED rows={rows} round={round}");
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "B+ point projection old/new/new/old; release single thread"]
     fn bplus_point_projection_cost() {
         let _run = crate::scale_probe::RunGuard::acquire("bplus_point_projection_cost");
