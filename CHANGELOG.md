@@ -2,6 +2,23 @@
 
 ## 未发布（2026-11-14）
 
+### M138：20M 对照后收窄 LSM 扫描改动，保留原冷块路径
+
+- 初次验收代码来源 6a1edf8b2b1e2e665f0782cc856ef02251d7e4ac（M137），release 测试二进制 SHA256：
+  e1e714140accadd880b0d672068e07954509706aafeac84314e5ebc83e11e047。下述结果属于收窄前实现，不能充当最终实现验收。
+- Windows GNU release 库回归 512 passed / 0 failed / 72 ignored（125.79 s）；72 个专项不算已运行。
+  cargo check --offline --all-targets --all-features 通过（7.68 s），Linux GNU 交叉编译同项通过（15.66 s），Linux 未运行测试。
+  回归期间同时运行编译检查，125.79 s 只作测试完成记录，不作性能比较。
+- 本轮性能专项统一使用 C:/Users/Administrator/.codex/test-data/storage-engines 的 TEMP/TMP/SCALE_SCRATCH_DIR，串行执行。
+  不与前轮 D 盘数据直接做性能归因；小档、单引擎大档专项均不能代替完整五档台架。
+- lsm_mixed_read_cost：20M bulk + 2M 更新，四轮各随机读 200k、顺序读 200k、扫描全部 20M、分页前 200k，最后提交 1000 键并重开全量核对。
+  取得 LSM_MIXED_VERIFIED rows=20000000，退出 0（466.71 s）。全扫旧/新/新/旧为 44.100 / 53.387 / 46.839 / 46.572 s，
+  CPU 为 43.547 / 49.234 / 45.469 / 44.281 s；分配 190934670 / 146844663 / 146844663 / 190934663。
+  四臂块访问均 350195，未命中均 344604，转换均 0：本形状没有证实缓存转换是大档退化根因。
+- 决策修订：少约 4409 万次分配没有换来稳定吞吐收益，撤回“冷块也建立 packed”的默认路径。
+  最终仅共享点读已经建立的 packed 热块；冷扫描恢复原 Decoded，拥有化迭代仍复用已验证索引转换。
+  对应大档专项改为报告成本，不再要求不存在的全库分配下降；热块旧/新分配差、真实挤出存活、冷块必须 Decoded 均由确定性守卫断言，debug 1 passed（0.01 s）。
+
 ### M137：test13 第四步，移除 B+ 回收的重复 blob 同步
 
 - vacuum 本身不追加 blob；普通写已经同步 blob，bulk finish 也有同步边界，实际 clear_in_place 内部同步一次。

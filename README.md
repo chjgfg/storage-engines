@@ -1,11 +1,11 @@
 # storage-engines
 
-test12 后四项改动见 [CHANGELOG](CHANGELOG.md) M129–M133；M133 记录 2000 万/2200 万行专项与最终回归，memory 暂未证实稳定停机提速。复现入口见 [压测手册](docs/大规模压测手册.md)。
+test13 后四项改动见 [CHANGELOG](CHANGELOG.md) M134–M138：压测进程排队、LSM 惰性扫描共享 packed 热块（冷块保留原路径）、memory 恢复逐行释放默认、B+ 回收省去重复 blob 同步。M138 记录 20M 对照后的方案修订。复现入口见 [压测手册](docs/大规模压测手册.md)。完整五档结果仍需单独验证，不能把局部成本下降解释为全部退化已解决。
 
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M128 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M138 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - M127 将 LSM 内存表/旧格式的值复制延迟到逻辑版本胜者确定，100 版本守卫只复制最终 1 行。
 - M126 的 memory 停机快照直接编码已证完整的组，批尾/二进制重叠保留窗口折叠；memory debug 49 项通过。test11 四步代码已落实，最终 release 库回归通过，大档验收见 M128。
 - M128 已完成 LSM 20M 复用、B+ 20M 回收后重开、memory 20M/22M 停机专项及 50k 四引擎台架；memory 22M 最后一轮末尾验收两行未从终端取回，账本保留该证据边界。

@@ -1373,7 +1373,21 @@ impl SstFile {
     fn load_scan_block(&self, index_i: usize) -> std::io::Result<CachedBlock> {
         #[cfg(test)]
         if packed_scan_reference::enabled() { return self.load_block(index_i).map(CachedBlock::Decoded); }
-        self.load_point_block(index_i)
+        #[cfg(test)]
+        BLOCK_READS.with(|c| c.set(c.get() + 1));
+        let ie = &self.index[index_i];
+        if let Some(cache) = &self.block_cache {
+            if let Some(block) = cache.lock().unwrap().get(self.cache_ns, self.id, ie.offset) { return Ok(block); }
+        }
+        // Keep the sequential cold path decoded. The 20M ABBA showed fewer
+        // allocations from cold packed blocks, but no throughput benefit.
+        // Only reuse packed blocks already created by point reads.
+        let raw = self.read_slice(ie.offset, ie.len as usize)?;
+        let block = Arc::new(decode_block(&raw, self.has_seq)?);
+        if let Some(cache) = &self.block_cache {
+            cache.lock().unwrap().put(self.cache_ns, self.id, ie.offset, block.clone());
+        }
+        Ok(CachedBlock::Decoded(block))
     }
 
     fn load_point_block(&self, index_i: usize) -> std::io::Result<CachedBlock> {
@@ -3120,6 +3134,8 @@ mod tests {
             assert_eq!(rows.len(), 100);
             cache.lock().unwrap().evict_lru();
             assert!(cache.lock().unwrap().map.is_empty());
+            let cold = sst.load_scan_block(0).unwrap();
+            assert!(matches!(cold, CachedBlock::Decoded(_)), "cold scans must retain decoded blocks");
             for (i, (key, row)) in rows.into_iter().enumerate() {
                 assert_eq!(key, format!("k{i:03}").as_bytes());
                 let ScanRow::Inline(row) = row else { panic!("ordinary row must stay inline"); };
