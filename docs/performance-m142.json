@@ -1,0 +1,1906 @@
+{
+  "schema_version": 1,
+  "milestone": "M142",
+  "date": "2026-11-15",
+  "base_commit": "0d09d768d9b50cd14150c217397a89b2c4ff5dff",
+  "executable_sha256": "a05eba54d22362a7bd3b90246c8137f336664812d4b0648e9669132d8213b985",
+  "scope": "Ordinary 1000-row transactions grow one database through 600k/1M/5M/10M/20M with default cache and automatic maintenance. Each scale copies the closed base, updates its first 10% with auto vacuum disabled to retain exact history, and closes that seed. ABBA copies the same updated seed per arm; only node-reuse reference gate changes; each arm vacuums and reopens to verify every key/value.",
+  "limitations": [
+    "A same-binary reference restores previous underflow reads; not a separate historical executable.",
+    "Measures full vacuum only; build, update, point read, pagination, LSM and memory are not A/B performance results.",
+    "Database grows across scales; not five independent builds from empty.",
+    "Shared host and filesystem load; wall-time fluctuations remain. Allocation reduction is not proof of overall speedup.",
+    "Linux GNU cross-check only, no Linux runtime verification.",
+    "Pending LSM source edits during later measurement were not compiled into this executable; M142 commit excludes them."
+  ],
+  "validation": [
+    {
+      "name": "debug guards",
+      "result": {
+        "debug": "2 passed, 0 failed, 1.88s",
+        "negative_control": "replace Fresh with Reload: guard failed at now.0 > counts.0; exit 1,1.86s; restored"
+      }
+    },
+    {
+      "name": "Windows all-targets/all-features",
+      "result": "passed,31.02s"
+    },
+    {
+      "name": "Linux GNU all-targets/all-features cross-check",
+      "result": "passed,25.72s; not executed"
+    },
+    {
+      "name": "release suite",
+      "result": "516 passed,0 failed,74 ignored;133.93s"
+    },
+    {
+      "name": "50k rebalance ABBA smoke",
+      "result": "4 arms verified,1 passed,exit0,6.78s"
+    },
+    {
+      "name": "five-scale ABBA",
+      "result": "20 arms verified,exit0;2361.41s"
+    },
+    {
+      "name": "four-engine 50k final binary",
+      "result": "4 migration and 4 bulk reopen verifications; SCALE_DONE rows=50000 engines=4; exit0;15.17s. First output chunk truncated by tool; remaining output and final assertions retained."
+    }
+  ],
+  "reproduction": {
+    "shell": "PowerShell",
+    "environment": {
+      "CARGO_HOME": "D:/develop/rust/.cargo",
+      "TEMP": "C:/Users/Administrator/.codex/test-data/storage-engines",
+      "TMP": "C:/Users/Administrator/.codex/test-data/storage-engines",
+      "SCALE_SCRATCH_DIR": "C:/Users/Administrator/.codex/test-data/storage-engines",
+      "BPLUS_REBALANCE_ROWS": "600000,1000000,5000000,10000000,20000000"
+    },
+    "command": "cargo test --offline --release --lib engine::tests::bplus_rebalance_read_cost -- --exact --ignored --nocapture --test-threads=1"
+  },
+  "raw_release_suite": "    Finished `release` profile [optimized] target(s) in 0.26s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 590 tests\ni.i......................iii...............i...................i..............i........ 87/590\n...............iiii.......i............................................................ 174/590\n...............................................i...............i....................... 261/590\n.....i.....iiiiiiiiiii.i.i....ii...........i.iiiiii..iii.i...iiiiiiii..iiiiiii.....i... 348/590\n....ii....i.....................iii...................................i......i.iiii.... 435/590\n................i.......................i............................i................. 522/590\n...................................i................................\ntest result: ok. 516 passed; 0 failed; 74 ignored; 0 measured; 0 filtered out; finished in 133.93s\n\n",
+  "raw_smoke": "    Finished `release` profile [optimized] target(s) in 0.10s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 1 test\ntest engine::tests::bplus_rebalance_read_cost ... SCALE_LOCK_WAIT name=bplus_rebalance_read_cost pid=60496 unix_ms=1794721789344 path=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target/scale-bench.lock\nSCALE_LOCK_ACQUIRED name=bplus_rebalance_read_cost pid=60496 unix_ms=1794721789344 wait_ms=0.041\nSCALE_BUILD harness=2 executable_sha256=\"a05eba54d22362a7bd3b90246c8137f336664812d4b0648e9669132d8213b985\" runtime_git=\"0d09d768d9b50cd14150c217397a89b2c4ff5dff\" tracked_dirty=Ok(true)\nBPLUS_REBALANCE_BUILD rows=50000 completed=50000\nBPLUS_REBALANCE_ARM rows=50000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=60496 unix_ms=1794721794410\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=318.583 cpu_ms=Ok(203.125) allocations=219533 page_faults_delta=Ok(765) unix_ms=1794721794729\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=9383 cache_hits=6002 cache_misses=3374 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=50000 round=0 reused=0 reloads=633 page_reads=9383 reorg=(633, 477, 90) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 86.4665), vacuum_delete: (2, 110.2377), vacuum_sync: (1, 121.727), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 10.3903), dblwr_data: (5, 14.8672), dblwr_publish: (5, 8.023), dblwr_clear: (5, 4.5889), page_pack: (1, 2.0748), page_write: (5, 3.9918), page_sync: (5, 76.3399), freelist: (1, 1.1338), vacuum_scan_max_ms: 18.4986, vacuum_scan_allocations: 5032, vacuum_scan_histogram: [0, 0, 1, 6, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 32, bplus_maintenance_pages: 2999, bplus_maintenance_rows: 55108, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=50000 round=0\nBPLUS_REBALANCE_ARM rows=50000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=60496 unix_ms=1794721794933\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=163.959 cpu_ms=Ok(125.0) allocations=114599 page_faults_delta=Ok(689) unix_ms=1794721795097\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=6851 cache_hits=3470 cache_misses=3374 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=50000 round=1 reused=633 reloads=0 page_reads=6851 reorg=(633, 477, 90) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 46.7529), vacuum_delete: (2, 36.4338), vacuum_sync: (1, 80.4727), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 3.187), dblwr_data: (5, 14.5234), dblwr_publish: (5, 3.0607), dblwr_clear: (5, 5.2714), page_pack: (1, 1.7315), page_write: (5, 2.7668), page_sync: (5, 48.7487), freelist: (1, 0.9714), vacuum_scan_max_ms: 8.3927, vacuum_scan_allocations: 5032, vacuum_scan_histogram: [0, 0, 7, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 32, bplus_maintenance_pages: 2999, bplus_maintenance_rows: 55108, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=50000 round=1\nBPLUS_REBALANCE_ARM rows=50000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=60496 unix_ms=1794721795240\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=165.770 cpu_ms=Ok(93.75) allocations=114599 page_faults_delta=Ok(712) unix_ms=1794721795405\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=6851 cache_hits=3470 cache_misses=3374 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=50000 round=2 reused=633 reloads=0 page_reads=6851 reorg=(633, 477, 90) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 41.2611), vacuum_delete: (2, 37.2241), vacuum_sync: (1, 87.14), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 2.9616), dblwr_data: (5, 14.4875), dblwr_publish: (5, 5.6829), dblwr_clear: (5, 4.4383), page_pack: (1, 1.1599), page_write: (5, 2.1035), page_sync: (5, 54.046), freelist: (1, 2.0428), vacuum_scan_max_ms: 6.8436, vacuum_scan_allocations: 5032, vacuum_scan_histogram: [0, 1, 6, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 32, bplus_maintenance_pages: 2999, bplus_maintenance_rows: 55108, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=50000 round=2\nBPLUS_REBALANCE_ARM rows=50000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=60496 unix_ms=1794721795596\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=348.434 cpu_ms=Ok(187.5) allocations=219523 page_faults_delta=Ok(683) unix_ms=1794721795944\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=9383 cache_hits=6002 cache_misses=3374 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=50000 round=3 reused=0 reloads=633 page_reads=9383 reorg=(633, 477, 90) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 110.7126), vacuum_delete: (2, 123.1059), vacuum_sync: (1, 114.4646), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 12.4222), dblwr_data: (5, 17.9107), dblwr_publish: (5, 6.6743), dblwr_clear: (5, 7.5656), page_pack: (1, 1.6821), page_write: (5, 4.2713), page_sync: (5, 60.5157), freelist: (1, 2.8637), vacuum_scan_max_ms: 37.2257, vacuum_scan_allocations: 5032, vacuum_scan_histogram: [0, 0, 2, 5, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 32, bplus_maintenance_pages: 2999, bplus_maintenance_rows: 55108, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=50000 round=3\nSCALE_LOCK_RELEASE name=bplus_rebalance_read_cost pid=60496 unix_ms=1794721796126 active_ms=6781.642\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 589 filtered out; finished in 6.78s\n\n",
+  "decision": "Accept node reuse with explicit Reload fallback. Wall-time means improved at 600k/1M/10M/20M but 5M +0.34%; does not establish uniformly faster vacuum.",
+  "measurements": [
+    {
+      "rows": 600000,
+      "round": 0,
+      "reference": true,
+      "wall_ms": 2992.269,
+      "allocations": 2463741,
+      "cpu_ms": 1843.75,
+      "cache": {
+        "page_reads": 106137,
+        "cache_hits": 66735,
+        "cache_misses": 39297
+      },
+      "reused": 0,
+      "reloads": 7008,
+      "page_reads": 106137,
+      "reorg": [
+        7008,
+        6755,
+        185
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 81,
+          "ms": 601.6316
+        },
+        "vacuum_delete": {
+          "calls": 15,
+          "ms": 2171.138
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 219.0848
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 3.1189
+        },
+        "dblwr_data": {
+          "calls": 56,
+          "ms": 173.9885
+        },
+        "dblwr_publish": {
+          "calls": 56,
+          "ms": 80.2247
+        },
+        "dblwr_clear": {
+          "calls": 56,
+          "ms": 80.5956
+        },
+        "page_pack": {
+          "calls": 41,
+          "ms": 20.6537
+        },
+        "page_write": {
+          "calls": 56,
+          "ms": 51.1137
+        },
+        "page_sync": {
+          "calls": 56,
+          "ms": 754.3614
+        },
+        "freelist": {
+          "calls": 41,
+          "ms": 99.7788
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 600000,
+      "round": 1,
+      "reference": false,
+      "wall_ms": 1900.513,
+      "allocations": 1284064,
+      "cpu_ms": 1078.125,
+      "cache": {
+        "page_reads": 78105,
+        "cache_hits": 38703,
+        "cache_misses": 39297
+      },
+      "reused": 7008,
+      "reloads": 0,
+      "page_reads": 78105,
+      "reorg": [
+        7008,
+        6755,
+        185
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 81,
+          "ms": 532.0358
+        },
+        "vacuum_delete": {
+          "calls": 15,
+          "ms": 1174.0828
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 194.0044
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 4.5916
+        },
+        "dblwr_data": {
+          "calls": 56,
+          "ms": 165.9347
+        },
+        "dblwr_publish": {
+          "calls": 56,
+          "ms": 73.7943
+        },
+        "dblwr_clear": {
+          "calls": 56,
+          "ms": 75.316
+        },
+        "page_pack": {
+          "calls": 41,
+          "ms": 14.327
+        },
+        "page_write": {
+          "calls": 56,
+          "ms": 36.491
+        },
+        "page_sync": {
+          "calls": 56,
+          "ms": 517.409
+        },
+        "freelist": {
+          "calls": 41,
+          "ms": 56.0185
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 600000,
+      "round": 2,
+      "reference": false,
+      "wall_ms": 1881.784,
+      "allocations": 1284064,
+      "cpu_ms": 1046.875,
+      "cache": {
+        "page_reads": 78105,
+        "cache_hits": 38703,
+        "cache_misses": 39297
+      },
+      "reused": 7008,
+      "reloads": 0,
+      "page_reads": 78105,
+      "reorg": [
+        7008,
+        6755,
+        185
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 81,
+          "ms": 504.1868
+        },
+        "vacuum_delete": {
+          "calls": 15,
+          "ms": 1195.3986
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 181.8393
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 2.845
+        },
+        "dblwr_data": {
+          "calls": 56,
+          "ms": 165.0385
+        },
+        "dblwr_publish": {
+          "calls": 56,
+          "ms": 61.8642
+        },
+        "dblwr_clear": {
+          "calls": 56,
+          "ms": 64.5446
+        },
+        "page_pack": {
+          "calls": 41,
+          "ms": 14.1921
+        },
+        "page_write": {
+          "calls": 56,
+          "ms": 31.9315
+        },
+        "page_sync": {
+          "calls": 56,
+          "ms": 553.4796
+        },
+        "freelist": {
+          "calls": 41,
+          "ms": 69.6618
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 600000,
+      "round": 3,
+      "reference": true,
+      "wall_ms": 2399.34,
+      "allocations": 2463733,
+      "cpu_ms": 1578.125,
+      "cache": {
+        "page_reads": 106137,
+        "cache_hits": 66735,
+        "cache_misses": 39297
+      },
+      "reused": 0,
+      "reloads": 7008,
+      "page_reads": 106137,
+      "reorg": [
+        7008,
+        6755,
+        185
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 81,
+          "ms": 692.7686
+        },
+        "vacuum_delete": {
+          "calls": 15,
+          "ms": 1515.222
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 190.847
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 3.7361
+        },
+        "dblwr_data": {
+          "calls": 56,
+          "ms": 167.1626
+        },
+        "dblwr_publish": {
+          "calls": 56,
+          "ms": 64.2093
+        },
+        "dblwr_clear": {
+          "calls": 56,
+          "ms": 58.6722
+        },
+        "page_pack": {
+          "calls": 41,
+          "ms": 19.8978
+        },
+        "page_write": {
+          "calls": 56,
+          "ms": 37.3174
+        },
+        "page_sync": {
+          "calls": 56,
+          "ms": 519.2548
+        },
+        "freelist": {
+          "calls": 41,
+          "ms": 69.0978
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 1000000,
+      "round": 0,
+      "reference": true,
+      "wall_ms": 3604.037,
+      "allocations": 4096677,
+      "cpu_ms": 2328.125,
+      "cache": {
+        "page_reads": 176477,
+        "cache_hits": 110879,
+        "cache_misses": 65421
+      },
+      "reused": 0,
+      "reloads": 11641,
+      "page_reads": 176477,
+      "reorg": [
+        11641,
+        11317,
+        258
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 135,
+          "ms": 1002.4327
+        },
+        "vacuum_delete": {
+          "calls": 25,
+          "ms": 2389.4342
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 211.5378
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 2.8704
+        },
+        "dblwr_data": {
+          "calls": 93,
+          "ms": 278.2708
+        },
+        "dblwr_publish": {
+          "calls": 93,
+          "ms": 103.0056
+        },
+        "dblwr_clear": {
+          "calls": 93,
+          "ms": 92.9441
+        },
+        "page_pack": {
+          "calls": 78,
+          "ms": 23.0642
+        },
+        "page_write": {
+          "calls": 93,
+          "ms": 50.577
+        },
+        "page_sync": {
+          "calls": 93,
+          "ms": 875.3882
+        },
+        "freelist": {
+          "calls": 78,
+          "ms": 126.203
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 1000000,
+      "round": 1,
+      "reference": false,
+      "wall_ms": 3578.59,
+      "allocations": 2135928,
+      "cpu_ms": 1953.125,
+      "cache": {
+        "page_reads": 129913,
+        "cache_hits": 64315,
+        "cache_misses": 65421
+      },
+      "reused": 11641,
+      "reloads": 0,
+      "page_reads": 129913,
+      "reorg": [
+        11641,
+        11317,
+        258
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 135,
+          "ms": 884.8497
+        },
+        "vacuum_delete": {
+          "calls": 25,
+          "ms": 2460.2286
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 232.8635
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 2.7814
+        },
+        "dblwr_data": {
+          "calls": 93,
+          "ms": 264.2151
+        },
+        "dblwr_publish": {
+          "calls": 93,
+          "ms": 89.7936
+        },
+        "dblwr_clear": {
+          "calls": 93,
+          "ms": 90.0135
+        },
+        "page_pack": {
+          "calls": 78,
+          "ms": 24.7081
+        },
+        "page_write": {
+          "calls": 93,
+          "ms": 53.4117
+        },
+        "page_sync": {
+          "calls": 93,
+          "ms": 1203.314
+        },
+        "freelist": {
+          "calls": 78,
+          "ms": 139.5326
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 1000000,
+      "round": 2,
+      "reference": false,
+      "wall_ms": 3342.157,
+      "allocations": 2135928,
+      "cpu_ms": 1609.375,
+      "cache": {
+        "page_reads": 129913,
+        "cache_hits": 64315,
+        "cache_misses": 65421
+      },
+      "reused": 11641,
+      "reloads": 0,
+      "page_reads": 129913,
+      "reorg": [
+        11641,
+        11317,
+        258
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 135,
+          "ms": 748.5549
+        },
+        "vacuum_delete": {
+          "calls": 25,
+          "ms": 2385.0479
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 207.9778
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 2.9226
+        },
+        "dblwr_data": {
+          "calls": 93,
+          "ms": 281.8403
+        },
+        "dblwr_publish": {
+          "calls": 93,
+          "ms": 112.5952
+        },
+        "dblwr_clear": {
+          "calls": 93,
+          "ms": 107.4519
+        },
+        "page_pack": {
+          "calls": 78,
+          "ms": 22.07
+        },
+        "page_write": {
+          "calls": 93,
+          "ms": 52.871
+        },
+        "page_sync": {
+          "calls": 93,
+          "ms": 1297.9574
+        },
+        "freelist": {
+          "calls": 78,
+          "ms": 118.0496
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 1000000,
+      "round": 3,
+      "reference": true,
+      "wall_ms": 3571.029,
+      "allocations": 4096677,
+      "cpu_ms": 2234.375,
+      "cache": {
+        "page_reads": 176477,
+        "cache_hits": 110879,
+        "cache_misses": 65421
+      },
+      "reused": 0,
+      "reloads": 11641,
+      "page_reads": 176477,
+      "reorg": [
+        11641,
+        11317,
+        258
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 135,
+          "ms": 776.4479
+        },
+        "vacuum_delete": {
+          "calls": 25,
+          "ms": 2606.2173
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 187.8139
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 2.8315
+        },
+        "dblwr_data": {
+          "calls": 93,
+          "ms": 293.5124
+        },
+        "dblwr_publish": {
+          "calls": 93,
+          "ms": 87.3742
+        },
+        "dblwr_clear": {
+          "calls": 93,
+          "ms": 87.9411
+        },
+        "page_pack": {
+          "calls": 78,
+          "ms": 22.0939
+        },
+        "page_write": {
+          "calls": 93,
+          "ms": 51.7414
+        },
+        "page_sync": {
+          "calls": 93,
+          "ms": 869.0562
+        },
+        "freelist": {
+          "calls": 78,
+          "ms": 155.2139
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 5000000,
+      "round": 0,
+      "reference": true,
+      "wall_ms": 22183.193,
+      "allocations": 20411318,
+      "cpu_ms": 11484.375,
+      "cache": {
+        "page_reads": 880956,
+        "cache_hits": 552873,
+        "cache_misses": 327194
+      },
+      "reused": 0,
+      "reloads": 57989,
+      "page_reads": 880956,
+      "reorg": [
+        57989,
+        56950,
+        970
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 672,
+          "ms": 5721.8867
+        },
+        "vacuum_delete": {
+          "calls": 123,
+          "ms": 16279.5316
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 178.9145
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 3.6079
+        },
+        "dblwr_data": {
+          "calls": 467,
+          "ms": 1401.3666
+        },
+        "dblwr_publish": {
+          "calls": 467,
+          "ms": 623.4246
+        },
+        "dblwr_clear": {
+          "calls": 467,
+          "ms": 620.5999
+        },
+        "page_pack": {
+          "calls": 452,
+          "ms": 110.4118
+        },
+        "page_write": {
+          "calls": 467,
+          "ms": 270.9943
+        },
+        "page_sync": {
+          "calls": 467,
+          "ms": 7344.9294
+        },
+        "freelist": {
+          "calls": 452,
+          "ms": 685.4398
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 5000000,
+      "round": 1,
+      "reference": false,
+      "wall_ms": 25935.346,
+      "allocations": 10637049,
+      "cpu_ms": 14921.875,
+      "cache": {
+        "page_reads": 649000,
+        "cache_hits": 320917,
+        "cache_misses": 327194
+      },
+      "reused": 57989,
+      "reloads": 0,
+      "page_reads": 649000,
+      "reorg": [
+        57989,
+        56950,
+        970
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 672,
+          "ms": 8257.7875
+        },
+        "vacuum_delete": {
+          "calls": 123,
+          "ms": 17449.9546
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 223.9067
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 7.146
+        },
+        "dblwr_data": {
+          "calls": 467,
+          "ms": 1360.2978
+        },
+        "dblwr_publish": {
+          "calls": 467,
+          "ms": 518.9188
+        },
+        "dblwr_clear": {
+          "calls": 467,
+          "ms": 520.811
+        },
+        "page_pack": {
+          "calls": 452,
+          "ms": 154.8753
+        },
+        "page_write": {
+          "calls": 467,
+          "ms": 447.7964
+        },
+        "page_sync": {
+          "calls": 467,
+          "ms": 7793.0307
+        },
+        "freelist": {
+          "calls": 452,
+          "ms": 817.6114
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 5000000,
+      "round": 2,
+      "reference": false,
+      "wall_ms": 23893.682,
+      "allocations": 10637049,
+      "cpu_ms": 11765.625,
+      "cache": {
+        "page_reads": 649000,
+        "cache_hits": 320917,
+        "cache_misses": 327194
+      },
+      "reused": 57989,
+      "reloads": 0,
+      "page_reads": 649000,
+      "reorg": [
+        57989,
+        56950,
+        970
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 672,
+          "ms": 8386.08
+        },
+        "vacuum_delete": {
+          "calls": 123,
+          "ms": 15291.1443
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 213.0873
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 171.1941
+        },
+        "dblwr_data": {
+          "calls": 467,
+          "ms": 1366.5509
+        },
+        "dblwr_publish": {
+          "calls": 467,
+          "ms": 531.6294
+        },
+        "dblwr_clear": {
+          "calls": 467,
+          "ms": 478.3914
+        },
+        "page_pack": {
+          "calls": 452,
+          "ms": 134.4001
+        },
+        "page_write": {
+          "calls": 467,
+          "ms": 322.8008
+        },
+        "page_sync": {
+          "calls": 467,
+          "ms": 7477.3163
+        },
+        "freelist": {
+          "calls": 452,
+          "ms": 775.3625
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 5000000,
+      "round": 3,
+      "reference": true,
+      "wall_ms": 27478.478,
+      "allocations": 20411318,
+      "cpu_ms": 13921.875,
+      "cache": {
+        "page_reads": 880956,
+        "cache_hits": 552873,
+        "cache_misses": 327194
+      },
+      "reused": 0,
+      "reloads": 57989,
+      "page_reads": 880956,
+      "reorg": [
+        57989,
+        56950,
+        970
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 672,
+          "ms": 6114.1918
+        },
+        "vacuum_delete": {
+          "calls": 123,
+          "ms": 21150.8092
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 210.5175
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 3.0281
+        },
+        "dblwr_data": {
+          "calls": 467,
+          "ms": 1409.8104
+        },
+        "dblwr_publish": {
+          "calls": 467,
+          "ms": 480.8489
+        },
+        "dblwr_clear": {
+          "calls": 467,
+          "ms": 480.6615
+        },
+        "page_pack": {
+          "calls": 452,
+          "ms": 136.5851
+        },
+        "page_write": {
+          "calls": 467,
+          "ms": 328.6805
+        },
+        "page_sync": {
+          "calls": 467,
+          "ms": 10646.0494
+        },
+        "freelist": {
+          "calls": 452,
+          "ms": 803.5434
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 10000000,
+      "round": 0,
+      "reference": true,
+      "wall_ms": 46974.231,
+      "allocations": 40819155,
+      "cpu_ms": 22890.625,
+      "cache": {
+        "page_reads": 1761546,
+        "cache_hits": 1105491,
+        "cache_misses": 654276
+      },
+      "reused": 0,
+      "reloads": 115945,
+      "page_reads": 1761546,
+      "reorg": [
+        115945,
+        113992,
+        1861
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 1343,
+          "ms": 9240.5575
+        },
+        "vacuum_delete": {
+          "calls": 245,
+          "ms": 37552.7618
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 175.9234
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 9.2444
+        },
+        "dblwr_data": {
+          "calls": 935,
+          "ms": 4925.1614
+        },
+        "dblwr_publish": {
+          "calls": 935,
+          "ms": 1101.1309
+        },
+        "dblwr_clear": {
+          "calls": 935,
+          "ms": 1077.5908
+        },
+        "page_pack": {
+          "calls": 920,
+          "ms": 226.1363
+        },
+        "page_write": {
+          "calls": 935,
+          "ms": 540.9967
+        },
+        "page_sync": {
+          "calls": 935,
+          "ms": 16190.0667
+        },
+        "freelist": {
+          "calls": 920,
+          "ms": 1992.1458
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 10000000,
+      "round": 1,
+      "reference": false,
+      "wall_ms": 42968.053,
+      "allocations": 21274853,
+      "cpu_ms": 18937.5,
+      "cache": {
+        "page_reads": 1297766,
+        "cache_hits": 641711,
+        "cache_misses": 654276
+      },
+      "reused": 115945,
+      "reloads": 0,
+      "page_reads": 1297766,
+      "reorg": [
+        115945,
+        113992,
+        1861
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 1343,
+          "ms": 9555.4314
+        },
+        "vacuum_delete": {
+          "calls": 245,
+          "ms": 33236.6893
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 171.1877
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 6.2498
+        },
+        "dblwr_data": {
+          "calls": 935,
+          "ms": 5251.001
+        },
+        "dblwr_publish": {
+          "calls": 935,
+          "ms": 1672.9832
+        },
+        "dblwr_clear": {
+          "calls": 935,
+          "ms": 1440.9157
+        },
+        "page_pack": {
+          "calls": 920,
+          "ms": 236.2369
+        },
+        "page_write": {
+          "calls": 935,
+          "ms": 545.7976
+        },
+        "page_sync": {
+          "calls": 935,
+          "ms": 15096.9933
+        },
+        "freelist": {
+          "calls": 920,
+          "ms": 1797.1142
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 10000000,
+      "round": 2,
+      "reference": false,
+      "wall_ms": 44920.004,
+      "allocations": 21274853,
+      "cpu_ms": 18984.375,
+      "cache": {
+        "page_reads": 1297766,
+        "cache_hits": 641711,
+        "cache_misses": 654276
+      },
+      "reused": 115945,
+      "reloads": 0,
+      "page_reads": 1297766,
+      "reorg": [
+        115945,
+        113992,
+        1861
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 1343,
+          "ms": 9657.172
+        },
+        "vacuum_delete": {
+          "calls": 245,
+          "ms": 34925.765
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 332.3665
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 6.9347
+        },
+        "dblwr_data": {
+          "calls": 935,
+          "ms": 3808.6694
+        },
+        "dblwr_publish": {
+          "calls": 935,
+          "ms": 1246.9975
+        },
+        "dblwr_clear": {
+          "calls": 935,
+          "ms": 1225.9822
+        },
+        "page_pack": {
+          "calls": 920,
+          "ms": 245.1153
+        },
+        "page_write": {
+          "calls": 935,
+          "ms": 561.2956
+        },
+        "page_sync": {
+          "calls": 935,
+          "ms": 19139.663
+        },
+        "freelist": {
+          "calls": 920,
+          "ms": 1559.6631
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 10000000,
+      "round": 3,
+      "reference": true,
+      "wall_ms": 54896.576,
+      "allocations": 40819155,
+      "cpu_ms": 22921.875,
+      "cache": {
+        "page_reads": 1761546,
+        "cache_hits": 1105491,
+        "cache_misses": 654276
+      },
+      "reused": 0,
+      "reloads": 115945,
+      "page_reads": 1761546,
+      "reorg": [
+        115945,
+        113992,
+        1861
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 1343,
+          "ms": 9283.0811
+        },
+        "vacuum_delete": {
+          "calls": 245,
+          "ms": 45435.1172
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 172.9448
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 4.0517
+        },
+        "dblwr_data": {
+          "calls": 935,
+          "ms": 4028.8365
+        },
+        "dblwr_publish": {
+          "calls": 935,
+          "ms": 1113.7994
+        },
+        "dblwr_clear": {
+          "calls": 935,
+          "ms": 1095.8695
+        },
+        "page_pack": {
+          "calls": 920,
+          "ms": 242.5244
+        },
+        "page_write": {
+          "calls": 935,
+          "ms": 526.5918
+        },
+        "page_sync": {
+          "calls": 935,
+          "ms": 24969.1068
+        },
+        "freelist": {
+          "calls": 920,
+          "ms": 1791.7193
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 20000000,
+      "round": 0,
+      "reference": true,
+      "wall_ms": 118200.588,
+      "allocations": 94165605,
+      "cpu_ms": 49687.5,
+      "cache": {
+        "page_reads": 4014954,
+        "cache_hits": 2585152,
+        "cache_misses": 1428018
+      },
+      "reused": 0,
+      "reloads": 272745,
+      "page_reads": 4014954,
+      "reorg": [
+        272745,
+        116785,
+        88415
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 2686,
+          "ms": 32732.0945
+        },
+        "vacuum_delete": {
+          "calls": 489,
+          "ms": 83589.1892
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 1869.9718
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 2.8116
+        },
+        "dblwr_data": {
+          "calls": 1486,
+          "ms": 6388.6315
+        },
+        "dblwr_publish": {
+          "calls": 1486,
+          "ms": 2041.2849
+        },
+        "dblwr_clear": {
+          "calls": 1486,
+          "ms": 1617.7124
+        },
+        "page_pack": {
+          "calls": 1471,
+          "ms": 371.0335
+        },
+        "page_write": {
+          "calls": 1486,
+          "ms": 853.201
+        },
+        "page_sync": {
+          "calls": 1486,
+          "ms": 41829.6138
+        },
+        "freelist": {
+          "calls": 1471,
+          "ms": 5671.567
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 20000000,
+      "round": 1,
+      "reference": false,
+      "wall_ms": 96977.928,
+      "allocations": 49079649,
+      "cpu_ms": 40031.25,
+      "cache": {
+        "page_reads": 2923974,
+        "cache_hits": 1494172,
+        "cache_misses": 1428018
+      },
+      "reused": 272745,
+      "reloads": 0,
+      "page_reads": 2923974,
+      "reorg": [
+        272745,
+        116785,
+        88415
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 2686,
+          "ms": 19689.7244
+        },
+        "vacuum_delete": {
+          "calls": 489,
+          "ms": 77077.8851
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 201.0296
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 118.1488
+        },
+        "dblwr_data": {
+          "calls": 1486,
+          "ms": 5333.9437
+        },
+        "dblwr_publish": {
+          "calls": 1486,
+          "ms": 2399.3917
+        },
+        "dblwr_clear": {
+          "calls": 1486,
+          "ms": 2045.512
+        },
+        "page_pack": {
+          "calls": 1471,
+          "ms": 354.5536
+        },
+        "page_write": {
+          "calls": 1486,
+          "ms": 866.4753
+        },
+        "page_sync": {
+          "calls": 1486,
+          "ms": 44008.1593
+        },
+        "freelist": {
+          "calls": 1471,
+          "ms": 6057.7645
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 20000000,
+      "round": 2,
+      "reference": false,
+      "wall_ms": 100725.844,
+      "allocations": 49079649,
+      "cpu_ms": 40968.75,
+      "cache": {
+        "page_reads": 2923974,
+        "cache_hits": 1494172,
+        "cache_misses": 1428018
+      },
+      "reused": 272745,
+      "reloads": 0,
+      "page_reads": 2923974,
+      "reorg": [
+        272745,
+        116785,
+        88415
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 2686,
+          "ms": 20771.0416
+        },
+        "vacuum_delete": {
+          "calls": 489,
+          "ms": 79731.4866
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 213.1211
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 88.5324
+        },
+        "dblwr_data": {
+          "calls": 1486,
+          "ms": 6427.5183
+        },
+        "dblwr_publish": {
+          "calls": 1486,
+          "ms": 2272.7588
+        },
+        "dblwr_clear": {
+          "calls": 1486,
+          "ms": 1788.5108
+        },
+        "page_pack": {
+          "calls": 1471,
+          "ms": 365.8181
+        },
+        "page_write": {
+          "calls": 1486,
+          "ms": 856.707
+        },
+        "page_sync": {
+          "calls": 1486,
+          "ms": 45435.0004
+        },
+        "freelist": {
+          "calls": 1471,
+          "ms": 6898.7594
+        }
+      },
+      "verified": true
+    },
+    {
+      "rows": 20000000,
+      "round": 3,
+      "reference": true,
+      "wall_ms": 105497.412,
+      "allocations": 94165605,
+      "cpu_ms": 51359.375,
+      "cache": {
+        "page_reads": 4014954,
+        "cache_hits": 2585152,
+        "cache_misses": 1428018
+      },
+      "reused": 0,
+      "reloads": 272745,
+      "page_reads": 4014954,
+      "reorg": [
+        272745,
+        116785,
+        88415
+      ],
+      "stages": {
+        "checkpoint": {
+          "calls": 0,
+          "ms": 0
+        },
+        "commit": {
+          "calls": 0,
+          "ms": 0
+        },
+        "auto_vacuum": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_scan": {
+          "calls": 2686,
+          "ms": 18576.3763
+        },
+        "vacuum_delete": {
+          "calls": 489,
+          "ms": 86728.5072
+        },
+        "vacuum_sync": {
+          "calls": 1,
+          "ms": 183.6574
+        },
+        "vacuum_blob_refs": {
+          "calls": 0,
+          "ms": 0
+        },
+        "vacuum_blob_gc": {
+          "calls": 0,
+          "ms": 0
+        },
+        "dblwr_reset": {
+          "calls": 1,
+          "ms": 6.8046
+        },
+        "dblwr_data": {
+          "calls": 1486,
+          "ms": 6430.3569
+        },
+        "dblwr_publish": {
+          "calls": 1486,
+          "ms": 1800.5666
+        },
+        "dblwr_clear": {
+          "calls": 1486,
+          "ms": 2052.749
+        },
+        "page_pack": {
+          "calls": 1471,
+          "ms": 375.4442
+        },
+        "page_write": {
+          "calls": 1486,
+          "ms": 882.1515
+        },
+        "page_sync": {
+          "calls": 1486,
+          "ms": 40882.626
+        },
+        "freelist": {
+          "calls": 1471,
+          "ms": 6226.253
+        }
+      },
+      "verified": true
+    }
+  ],
+  "raw_benchmark": "    Finished `release` profile [optimized] target(s) in 0.79s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 1 test\ntest engine::tests::bplus_rebalance_read_cost ... SCALE_LOCK_WAIT name=bplus_rebalance_read_cost pid=67124 unix_ms=1794721813991 path=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target/scale-bench.lock\nSCALE_LOCK_ACQUIRED name=bplus_rebalance_read_cost pid=67124 unix_ms=1794721813991 wait_ms=0.283\nSCALE_BUILD harness=2 executable_sha256=\"a05eba54d22362a7bd3b90246c8137f336664812d4b0648e9669132d8213b985\" runtime_git=\"0d09d768d9b50cd14150c217397a89b2c4ff5dff\" tracked_dirty=Ok(true)\nBPLUS_REBALANCE_BUILD rows=600000 completed=600000\nBPLUS_REBALANCE_ARM rows=600000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721853284\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=2992.269 cpu_ms=Ok(1843.75) allocations=2463741 page_faults_delta=Ok(2168) unix_ms=1794721856276\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=106137 cache_hits=66735 cache_misses=39297 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=600000 round=0 reused=0 reloads=7008 page_reads=106137 reorg=(7008, 6755, 185) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (81, 601.6316), vacuum_delete: (15, 2171.138), vacuum_sync: (1, 219.0848), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 3.1189), dblwr_data: (56, 173.9885), dblwr_publish: (56, 80.2247), dblwr_clear: (56, 80.5956), page_pack: (41, 20.6537), page_write: (56, 51.1137), page_sync: (56, 754.3614), freelist: (41, 99.7788), vacuum_scan_max_ms: 12.8986, vacuum_scan_allocations: 60254, vacuum_scan_histogram: [0, 3, 74, 4, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 25, bplus_maintenance_pages: 35426, bplus_maintenance_rows: 661485, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=600000 round=0\nBPLUS_REBALANCE_ARM rows=600000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721857873\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=1900.513 cpu_ms=Ok(1078.125) allocations=1284064 page_faults_delta=Ok(2221) unix_ms=1794721859773\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=78105 cache_hits=38703 cache_misses=39297 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=600000 round=1 reused=7008 reloads=0 page_reads=78105 reorg=(7008, 6755, 185) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (81, 532.0358), vacuum_delete: (15, 1174.0828), vacuum_sync: (1, 194.0044), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 4.5916), dblwr_data: (56, 165.9347), dblwr_publish: (56, 73.7943), dblwr_clear: (56, 75.316), page_pack: (41, 14.327), page_write: (56, 36.491), page_sync: (56, 517.409), freelist: (41, 56.0185), vacuum_scan_max_ms: 10.0453, vacuum_scan_allocations: 60254, vacuum_scan_histogram: [0, 12, 68, 1, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 25, bplus_maintenance_pages: 35426, bplus_maintenance_rows: 661485, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=600000 round=1\nBPLUS_REBALANCE_ARM rows=600000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721861546\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=1881.784 cpu_ms=Ok(1046.875) allocations=1284064 page_faults_delta=Ok(2187) unix_ms=1794721863428\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=78105 cache_hits=38703 cache_misses=39297 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=600000 round=2 reused=7008 reloads=0 page_reads=78105 reorg=(7008, 6755, 185) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (81, 504.1868), vacuum_delete: (15, 1195.3986), vacuum_sync: (1, 181.8393), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 2.845), dblwr_data: (56, 165.0385), dblwr_publish: (56, 61.8642), dblwr_clear: (56, 64.5446), page_pack: (41, 14.1921), page_write: (56, 31.9315), page_sync: (56, 553.4796), freelist: (41, 69.6618), vacuum_scan_max_ms: 10.2452, vacuum_scan_allocations: 60254, vacuum_scan_histogram: [0, 12, 68, 1, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 25, bplus_maintenance_pages: 35426, bplus_maintenance_rows: 661485, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=600000 round=2\nBPLUS_REBALANCE_ARM rows=600000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721865197\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=2399.340 cpu_ms=Ok(1578.125) allocations=2463733 page_faults_delta=Ok(2136) unix_ms=1794721867597\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=106137 cache_hits=66735 cache_misses=39297 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=600000 round=3 reused=0 reloads=7008 page_reads=106137 reorg=(7008, 6755, 185) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (81, 692.7686), vacuum_delete: (15, 1515.222), vacuum_sync: (1, 190.847), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 3.7361), dblwr_data: (56, 167.1626), dblwr_publish: (56, 64.2093), dblwr_clear: (56, 58.6722), page_pack: (41, 19.8978), page_write: (56, 37.3174), page_sync: (56, 519.2548), freelist: (41, 69.0978), vacuum_scan_max_ms: 19.2002, vacuum_scan_allocations: 60254, vacuum_scan_histogram: [0, 8, 56, 17, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 25, bplus_maintenance_pages: 35426, bplus_maintenance_rows: 661485, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=600000 round=3\nBPLUS_REBALANCE_BUILD rows=1000000 completed=1000000\nBPLUS_REBALANCE_ARM rows=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721891317\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=3604.037 cpu_ms=Ok(2328.125) allocations=4096677 page_faults_delta=Ok(2220) unix_ms=1794721894921\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=176477 cache_hits=110879 cache_misses=65421 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=1000000 round=0 reused=0 reloads=11641 page_reads=176477 reorg=(11641, 11317, 258) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (135, 1002.4327), vacuum_delete: (25, 2389.4342), vacuum_sync: (1, 211.5378), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 2.8704), dblwr_data: (93, 278.2708), dblwr_publish: (93, 103.0056), dblwr_clear: (93, 92.9441), page_pack: (78, 23.0642), page_write: (93, 50.577), page_sync: (93, 875.3882), freelist: (78, 126.203), vacuum_scan_max_ms: 19.3823, vacuum_scan_allocations: 100416, vacuum_scan_histogram: [0, 20, 100, 15, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 23, bplus_maintenance_pages: 59010, bplus_maintenance_rows: 1102479, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=1000000 round=0\nBPLUS_REBALANCE_ARM rows=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721897400\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=3578.590 cpu_ms=Ok(1953.125) allocations=2135928 page_faults_delta=Ok(2246) unix_ms=1794721900979\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=129913 cache_hits=64315 cache_misses=65421 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=1000000 round=1 reused=11641 reloads=0 page_reads=129913 reorg=(11641, 11317, 258) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (135, 884.8497), vacuum_delete: (25, 2460.2286), vacuum_sync: (1, 232.8635), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 2.7814), dblwr_data: (93, 264.2151), dblwr_publish: (93, 89.7936), dblwr_clear: (93, 90.0135), page_pack: (78, 24.7081), page_write: (93, 53.4117), page_sync: (93, 1203.314), freelist: (78, 139.5326), vacuum_scan_max_ms: 15.9889, vacuum_scan_allocations: 100416, vacuum_scan_histogram: [0, 16, 114, 5, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 23, bplus_maintenance_pages: 59010, bplus_maintenance_rows: 1102479, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=1000000 round=1\nBPLUS_REBALANCE_ARM rows=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721903251\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=3342.157 cpu_ms=Ok(1609.375) allocations=2135928 page_faults_delta=Ok(2373) unix_ms=1794721906593\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=129913 cache_hits=64315 cache_misses=65421 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=1000000 round=2 reused=11641 reloads=0 page_reads=129913 reorg=(11641, 11317, 258) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (135, 748.5549), vacuum_delete: (25, 2385.0479), vacuum_sync: (1, 207.9778), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 2.9226), dblwr_data: (93, 281.8403), dblwr_publish: (93, 112.5952), dblwr_clear: (93, 107.4519), page_pack: (78, 22.07), page_write: (93, 52.871), page_sync: (93, 1297.9574), freelist: (78, 118.0496), vacuum_scan_max_ms: 9.235, vacuum_scan_allocations: 100416, vacuum_scan_histogram: [0, 24, 111, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 23, bplus_maintenance_pages: 59010, bplus_maintenance_rows: 1102479, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=1000000 round=2\nBPLUS_REBALANCE_ARM rows=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794721908970\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=3571.029 cpu_ms=Ok(2234.375) allocations=4096677 page_faults_delta=Ok(2308) unix_ms=1794721912541\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=176477 cache_hits=110879 cache_misses=65421 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=1000000 round=3 reused=0 reloads=11641 page_reads=176477 reorg=(11641, 11317, 258) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (135, 776.4479), vacuum_delete: (25, 2606.2173), vacuum_sync: (1, 187.8139), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 2.8315), dblwr_data: (93, 293.5124), dblwr_publish: (93, 87.3742), dblwr_clear: (93, 87.9411), page_pack: (78, 22.0939), page_write: (93, 51.7414), page_sync: (93, 869.0562), freelist: (78, 155.2139), vacuum_scan_max_ms: 8.4684, vacuum_scan_allocations: 100416, vacuum_scan_histogram: [0, 24, 111, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 23, bplus_maintenance_pages: 59010, bplus_maintenance_rows: 1102479, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=1000000 round=3\nBPLUS_REBALANCE_BUILD rows=5000000 completed=2000000\nBPLUS_REBALANCE_BUILD rows=5000000 completed=3000000\nBPLUS_REBALANCE_BUILD rows=5000000 completed=4000000\nBPLUS_REBALANCE_BUILD rows=5000000 completed=5000000\nBPLUS_REBALANCE_ARM rows=5000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722125969\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=22183.193 cpu_ms=Ok(11484.375) allocations=20411318 page_faults_delta=Ok(2969) unix_ms=1794722148152\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=880956 cache_hits=552873 cache_misses=327194 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=5000000 round=0 reused=0 reloads=57989 page_reads=880956 reorg=(57989, 56950, 970) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (672, 5721.8867), vacuum_delete: (123, 16279.5316), vacuum_sync: (1, 178.9145), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 3.6079), dblwr_data: (467, 1401.3666), dblwr_publish: (467, 623.4246), dblwr_clear: (467, 620.5999), page_pack: (452, 110.4118), page_write: (467, 270.9943), page_sync: (467, 7344.9294), freelist: (452, 685.4398), vacuum_scan_max_ms: 51.5026, vacuum_scan_allocations: 502029, vacuum_scan_histogram: [0, 97, 422, 152, 1, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 26, bplus_maintenance_pages: 294842, bplus_maintenance_rows: 5512418, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=5000000 round=0\nBPLUS_REBALANCE_ARM rows=5000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722162624\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=25935.346 cpu_ms=Ok(14921.875) allocations=10637049 page_faults_delta=Ok(2943) unix_ms=1794722188559\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=649000 cache_hits=320917 cache_misses=327194 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=5000000 round=1 reused=57989 reloads=0 page_reads=649000 reorg=(57989, 56950, 970) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (672, 8257.7875), vacuum_delete: (123, 17449.9546), vacuum_sync: (1, 223.9067), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 7.146), dblwr_data: (467, 1360.2978), dblwr_publish: (467, 518.9188), dblwr_clear: (467, 520.811), page_pack: (452, 154.8753), page_write: (467, 447.7964), page_sync: (467, 7793.0307), freelist: (452, 817.6114), vacuum_scan_max_ms: 81.0986, vacuum_scan_allocations: 502028, vacuum_scan_histogram: [0, 0, 142, 527, 3, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 26, bplus_maintenance_pages: 294842, bplus_maintenance_rows: 5512418, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=5000000 round=1\nBPLUS_REBALANCE_ARM rows=5000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722208185\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=23893.682 cpu_ms=Ok(11765.625) allocations=10637049 page_faults_delta=Ok(2981) unix_ms=1794722232078\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=649000 cache_hits=320917 cache_misses=327194 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=5000000 round=2 reused=57989 reloads=0 page_reads=649000 reorg=(57989, 56950, 970) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (672, 8386.08), vacuum_delete: (123, 15291.1443), vacuum_sync: (1, 213.0873), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 171.1941), dblwr_data: (467, 1366.5509), dblwr_publish: (467, 531.6294), dblwr_clear: (467, 478.3914), page_pack: (452, 134.4001), page_write: (467, 322.8008), page_sync: (467, 7477.3163), freelist: (452, 775.3625), vacuum_scan_max_ms: 82.3016, vacuum_scan_allocations: 502028, vacuum_scan_histogram: [0, 66, 202, 398, 6, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 26, bplus_maintenance_pages: 294842, bplus_maintenance_rows: 5512418, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=5000000 round=2\nBPLUS_REBALANCE_ARM rows=5000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722252999\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=27478.478 cpu_ms=Ok(13921.875) allocations=20411318 page_faults_delta=Ok(3110) unix_ms=1794722280478\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=880956 cache_hits=552873 cache_misses=327194 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=5000000 round=3 reused=0 reloads=57989 page_reads=880956 reorg=(57989, 56950, 970) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (672, 6114.1918), vacuum_delete: (123, 21150.8092), vacuum_sync: (1, 210.5175), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 3.0281), dblwr_data: (467, 1409.8104), dblwr_publish: (467, 480.8489), dblwr_clear: (467, 480.6615), page_pack: (452, 136.5851), page_write: (467, 328.6805), page_sync: (467, 10646.0494), freelist: (452, 803.5434), vacuum_scan_max_ms: 70.227, vacuum_scan_allocations: 502029, vacuum_scan_histogram: [0, 56, 424, 190, 2, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 26, bplus_maintenance_pages: 294842, bplus_maintenance_rows: 5512418, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=5000000 round=3\nBPLUS_REBALANCE_BUILD rows=10000000 completed=6000000\nBPLUS_REBALANCE_BUILD rows=10000000 completed=7000000\nBPLUS_REBALANCE_BUILD rows=10000000 completed=8000000\nBPLUS_REBALANCE_BUILD rows=10000000 completed=9000000\nBPLUS_REBALANCE_BUILD rows=10000000 completed=10000000\nBPLUS_REBALANCE_ARM rows=10000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722634616\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=46974.231 cpu_ms=Ok(22890.625) allocations=40819155 page_faults_delta=Ok(3519) unix_ms=1794722681590\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1761546 cache_hits=1105491 cache_misses=654276 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=10000000 round=0 reused=0 reloads=115945 page_reads=1761546 reorg=(115945, 113992, 1861) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (1343, 9240.5575), vacuum_delete: (245, 37552.7618), vacuum_sync: (1, 175.9234), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 9.2444), dblwr_data: (935, 4925.1614), dblwr_publish: (935, 1101.1309), dblwr_clear: (935, 1077.5908), page_pack: (920, 226.1363), page_write: (935, 540.9967), page_sync: (935, 16190.0667), freelist: (920, 1992.1458), vacuum_scan_max_ms: 37.6418, vacuum_scan_allocations: 1004043, vacuum_scan_histogram: [0, 187, 1091, 65, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 40, bplus_maintenance_pages: 589634, bplus_maintenance_rows: 11024845, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=10000000 round=0\nBPLUS_REBALANCE_ARM rows=10000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722708111\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=42968.053 cpu_ms=Ok(18937.5) allocations=21274853 page_faults_delta=Ok(3340) unix_ms=1794722751079\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1297766 cache_hits=641711 cache_misses=654276 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=10000000 round=1 reused=115945 reloads=0 page_reads=1297766 reorg=(115945, 113992, 1861) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (1343, 9555.4314), vacuum_delete: (245, 33236.6893), vacuum_sync: (1, 171.1877), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 6.2498), dblwr_data: (935, 5251.001), dblwr_publish: (935, 1672.9832), dblwr_clear: (935, 1440.9157), page_pack: (920, 236.2369), page_write: (935, 545.7976), page_sync: (935, 15096.9933), freelist: (920, 1797.1142), vacuum_scan_max_ms: 85.6678, vacuum_scan_allocations: 1004041, vacuum_scan_histogram: [0, 173, 1092, 76, 2, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 40, bplus_maintenance_pages: 589634, bplus_maintenance_rows: 11024845, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=10000000 round=1\nBPLUS_REBALANCE_ARM rows=10000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722786088\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=44920.004 cpu_ms=Ok(18984.375) allocations=21274853 page_faults_delta=Ok(3384) unix_ms=1794722831008\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1297766 cache_hits=641711 cache_misses=654276 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=10000000 round=2 reused=115945 reloads=0 page_reads=1297766 reorg=(115945, 113992, 1861) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (1343, 9657.172), vacuum_delete: (245, 34925.765), vacuum_sync: (1, 332.3665), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 6.9347), dblwr_data: (935, 3808.6694), dblwr_publish: (935, 1246.9975), dblwr_clear: (935, 1225.9822), page_pack: (920, 245.1153), page_write: (935, 561.2956), page_sync: (935, 19139.663), freelist: (920, 1559.6631), vacuum_scan_max_ms: 26.0499, vacuum_scan_allocations: 1004041, vacuum_scan_histogram: [0, 168, 1030, 145, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 40, bplus_maintenance_pages: 589634, bplus_maintenance_rows: 11024845, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=10000000 round=2\nBPLUS_REBALANCE_ARM rows=10000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794722859032\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=54896.576 cpu_ms=Ok(22921.875) allocations=40819155 page_faults_delta=Ok(3555) unix_ms=1794722913929\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1761546 cache_hits=1105491 cache_misses=654276 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=10000000 round=3 reused=0 reloads=115945 page_reads=1761546 reorg=(115945, 113992, 1861) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (1343, 9283.0811), vacuum_delete: (245, 45435.1172), vacuum_sync: (1, 172.9448), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 4.0517), dblwr_data: (935, 4028.8365), dblwr_publish: (935, 1113.7994), dblwr_clear: (935, 1095.8695), page_pack: (920, 242.5244), page_write: (935, 526.5918), page_sync: (935, 24969.1068), freelist: (920, 1791.7193), vacuum_scan_max_ms: 18.6363, vacuum_scan_allocations: 1004043, vacuum_scan_histogram: [0, 189, 1056, 98, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 40, bplus_maintenance_pages: 589634, bplus_maintenance_rows: 11024845, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=10000000 round=3\nBPLUS_REBALANCE_BUILD rows=20000000 completed=11000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=12000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=13000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=14000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=15000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=16000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=17000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=18000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=19000000\nBPLUS_REBALANCE_BUILD rows=20000000 completed=20000000\nBPLUS_REBALANCE_ARM rows=20000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794723559508\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=118200.588 cpu_ms=Ok(49687.5) allocations=94165605 page_faults_delta=Ok(9783) unix_ms=1794723677708\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=4014954 cache_hits=2585152 cache_misses=1428018 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=20000000 round=0 reused=0 reloads=272745 page_reads=4014954 reorg=(272745, 116785, 88415) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (2686, 32732.0945), vacuum_delete: (489, 83589.1892), vacuum_sync: (1, 1869.9718), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 2.8116), dblwr_data: (1486, 6388.6315), dblwr_publish: (1486, 2041.2849), dblwr_clear: (1486, 1617.7124), page_pack: (1471, 371.0335), page_write: (1486, 853.201), page_sync: (1486, 41829.6138), freelist: (1471, 5671.567), vacuum_scan_max_ms: 77.079, vacuum_scan_allocations: 2008076, vacuum_scan_histogram: [0, 16, 1218, 1450, 2, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 24723, bplus_maintenance_pages: 1238039, bplus_maintenance_rows: 22049383, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=20000000 round=0\nBPLUS_REBALANCE_ARM rows=20000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794723727743\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=96977.928 cpu_ms=Ok(40031.25) allocations=49079649 page_faults_delta=Ok(9286) unix_ms=1794723824721\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2923974 cache_hits=1494172 cache_misses=1428018 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=20000000 round=1 reused=272745 reloads=0 page_reads=2923974 reorg=(272745, 116785, 88415) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (2686, 19689.7244), vacuum_delete: (489, 77077.8851), vacuum_sync: (1, 201.0296), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 118.1488), dblwr_data: (1486, 5333.9437), dblwr_publish: (1486, 2399.3917), dblwr_clear: (1486, 2045.512), page_pack: (1471, 354.5536), page_write: (1486, 866.4753), page_sync: (1486, 44008.1593), freelist: (1471, 6057.7645), vacuum_scan_max_ms: 43.0155, vacuum_scan_allocations: 2008078, vacuum_scan_histogram: [0, 186, 2207, 293, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 24723, bplus_maintenance_pages: 1238039, bplus_maintenance_rows: 22049383, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=20000000 round=1\nBPLUS_REBALANCE_ARM rows=20000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794723875034\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=100725.844 cpu_ms=Ok(40968.75) allocations=49079649 page_faults_delta=Ok(9791) unix_ms=1794723975760\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2923974 cache_hits=1494172 cache_misses=1428018 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=20000000 round=2 reused=272745 reloads=0 page_reads=2923974 reorg=(272745, 116785, 88415) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (2686, 20771.0416), vacuum_delete: (489, 79731.4866), vacuum_sync: (1, 213.1211), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 88.5324), dblwr_data: (1486, 6427.5183), dblwr_publish: (1486, 2272.7588), dblwr_clear: (1486, 1788.5108), page_pack: (1471, 365.8181), page_write: (1486, 856.707), page_sync: (1486, 45435.0004), freelist: (1471, 6898.7594), vacuum_scan_max_ms: 41.7979, vacuum_scan_allocations: 2008078, vacuum_scan_histogram: [0, 205, 1882, 599, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 24723, bplus_maintenance_pages: 1238039, bplus_maintenance_rows: 22049383, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=20000000 round=2\nBPLUS_REBALANCE_ARM rows=20000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_abba pid=67124 unix_ms=1794724025869\nSCALE_PHASE engine=bplus_tree phase=vacuum_abba wall_ms=105497.412 cpu_ms=Ok(51359.375) allocations=94165605 page_faults_delta=Ok(9813) unix_ms=1794724131367\nSCALE_BPLUS engine=bplus_tree phase=vacuum_abba node_parses=0 internal_packs=0 owned_promotions=0 page_reads=4014954 cache_hits=2585152 cache_misses=1428018 cache_sweeps=0 cache_visited=0\nBPLUS_REBALANCE_COST rows=20000000 round=3 reused=0 reloads=272745 page_reads=4014954 reorg=(272745, 116785, 88415) stages=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (2686, 18576.3763), vacuum_delete: (489, 86728.5072), vacuum_sync: (1, 183.6574), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 6.8046), dblwr_data: (1486, 6430.3569), dblwr_publish: (1486, 1800.5666), dblwr_clear: (1486, 2052.749), page_pack: (1471, 375.4442), page_write: (1486, 882.1515), page_sync: (1486, 40882.626), freelist: (1471, 6226.253), vacuum_scan_max_ms: 69.8334, vacuum_scan_allocations: 2008076, vacuum_scan_histogram: [0, 238, 2294, 153, 1, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 24723, bplus_maintenance_pages: 1238039, bplus_maintenance_rows: 22049383, lsm_known_deletes: 0 }\nBPLUS_REBALANCE_VERIFIED rows=20000000 round=3\nSCALE_LOCK_RELEASE name=bplus_rebalance_read_cost pid=67124 unix_ms=1794724175374 active_ms=2361383.035\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 589 filtered out; finished in 2361.41s\n\n",
+  "raw_four_engine_smoke": "Warning: truncated output (original token count: 4613)\nTotal output lines: 140\n\n\nrunning 1 test\ntest engine::tests::scale_baseline_all_engines ... SCALE_LOCK_WAIT name=scale_rows_50000 pid=66240 unix_ms=1794724202331 path=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target/scale-bench.lock\nSCALE_LOCK_ACQUIRED name=scale_rows_50000 pid=66240 unix_ms=1794724202331 wait_ms=0.100\nSCALE_BUILD harness=2 executable_sha256=\"a05eba54d22362a7bd3b90246c8137f336664812d4b0648e9669132d8213b985\" runtime_git=\"0d09d768d9b50cd14150c217397a89b2c4ff5dff\" tracked_dirty=Ok(true)\nSCALE_BEGIN rows=50000 package=0.5.1 os=windows arch=x86_64 optimized=true\n=== 大库基线 rows=50000（µs/次 + 常驻/峰值 MB）===\n验收政策：TTL 两格后计时外 persist 同一批辅助键；迁移期望 rows+min(rows,1000)+1，bulk 重开再加 bulk_rows；逐键逐值验收不计入每引擎33格性能记录。\nbitcask: scratch=C:/Users/Administrator/.codex/test-data/storage-engines\\se_engine_66240_scale_bitcask_1794724204377818100_0\nSCALE_PHASE_BEGIN engine=bitcask phase=open pid=66240 unix_ms=1794724204378\nSCALE_PHASE engine=bitcask phase=open wall_ms=9.993 cpu_ms=Ok(0.0) allocations=83 page_faults_delta=Ok(51) unix_ms=1794724204388\nbitcask    open 空库                       9962.1 µs      常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=bitcask phase=insert pid=66240 unix_ms=1794724204388\nSCALE_PHASE engine=bitcask phase=insert wall_ms=1014.757 cpu_ms=Ok(750.0) allocations=759570 page_faults_delta=Ok(4672) unix_ms=1794724205403\nbitcask    灌 50000 行(事务)                   20.3 µs/行    常驻      11.1 MB  峰值 +    11.5 MB  \nSCALE_MAINT engine=bitcask phase=insert auto=Some(ReclamationStatus { pending_rows: 17232, committed_rows: 50000, completed_slices: 2, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: true, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=bitcask phase=checkpoint pid=66240 unix_ms=1794724205404\nSCALE_PHASE engine=bitcask phase=checkpoint wall_ms=48.718 cpu_ms=Ok(0.0) allocations=14 page_faults_delta=Ok(6) unix_ms=1794724205452\nbitcask    flush+checkpoint             48715.2 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 8.9 MB\nSCALE_MEMORY engine=bitcask phase=first_before_stop heap_bytes=11148858 rss_bytes=15785984 private_bytes=14221312 page_faults=5921\nSCALE_PHASE_BEGIN engine=bitcask phase=first_stop pid=66240 unix_ms=1794724205453\nSCALE_PHASE engine=bitcask phase=first_stop wall_ms=50.617 cpu_ms=Ok(15.625) allocations=11 page_faults_delta=Ok(2) unix_ms=1794724205504\nSCALE_MEMORY engine=bitcask phase=first_before_reopen heap_bytes=5711 rss_bytes=5623808 private_bytes=1581056 page_faults=5923\nSCALE_PHASE_BEGIN engine=bitcask phase=first_reopen pid=66240 unix_ms=1794724205504\nSCALE_PHASE engine=bitcask phase=first_reopen wall_ms=23.080 cpu_ms=Ok(15.625) allocations=54631 page_faults_delta=Ok(1929) unix_ms=1794724205527\nSCALE_MEMORY engine=bitcask phase=first_after_reopen heap_bytes=4818224 rss_bytes=11112448 private_bytes=7245824 page_faults=7853\nbitcask    冷重开(恢复)                      23076.8 µs      常驻       4.8 MB  峰值 +     7.2 MB  常驻 4.8 MB\nSCALE_PHASE_BEGIN engine=bitcask phase=random_read pid=66240 unix_ms=1794724205528\nSCALE_PHASE engine=bitcask phase=random_read wall_ms=460.443 cpu_ms=Ok(468.75) allocations=400004 page_faults_delta=Ok(4) unix_ms=1794724205988\nbitcask    点读×N 乱序                          9.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=bitcask phase=ordered_read pid=66240 unix_ms=1794724205989\nSCALE_PHASE engine=bitcask phase=ordered_read wall_ms=253.389 cpu_ms=Ok(250.0) allocations=400001 page_faults_delta=Ok(0) unix_ms=1794724206242\nbitcask    点读×N 有序                          5.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=bitcask phase=multi_get pid=66240 unix_ms=1794724206243\nSCALE_PHASE engine=bitcask phase=multi_get wall_ms=8.675 cpu_ms=Ok(15.625) allocations=7002 page_faults_delta=Ok(40) unix_ms=1794724206252\nbitcask    multi_get×1000                   8.7 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条\nSCALE_PHASE_BEGIN engine=bitcask phase=multi_miss pid=66240 unix_ms=1794724206252\nSCALE_PHASE engine=bitcask phase=multi_miss wall_ms=0.811 cpu_ms=Ok(0.0) allocations=2002 page_faults_delta=Ok(5) unix_ms=1794724206253\nbitcask    multi_get×1000 全miss             0.8 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)\nSCALE_PHASE_BEGIN engine=bitcask phase=scan pid=66240 unix_ms=1794724206253\nSCALE_PHASE engine=bitcask phase=scan wall_ms=265.228 cpu_ms=Ok(218.75) allocations=200173 page_faults_delta=Ok(3172) unix_ms=1794724206519\nbitcask    一次全量 scan                        5.3 µs/行    常驻       8.7 MB  峰值 +     9.8 MB  50000 行\nSCALE_PHASE_BEGIN engine=bitcask phase=window_scan pid=66240 unix_ms=1794724206529\nSCALE_PHASE engine=bitcask phase=window_scan wall_ms=2.123 cpu_ms=Ok(15.625) allocations=2018 page_faults_delta=Ok(25) unix_ms=1794724206531\nbitcask    窗口 scan(1%)                      4.2 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=bitcask phase=prefix_scan pid=66240 unix_ms=1794724206531\nSCALE_PHASE engine=bitcask phase=prefix_scan wall_ms=252.468 cpu_ms=Ok(234.375) allocations=200184 page_faults_delta=Ok(3087) unix_ms=1794724206784\nbitcask    prefix_scan 2B前缀                 5.0 µs/行    常驻       8.7 MB  峰值 +     9.8 MB  50000 行\nSCALE_PHASE_BEGIN engine=bitcask phase=scan_page pid=66240 unix_ms=1794724206793\nSCALE_PHASE engine=bitcask phase=scan_page wall_ms=204.181 cpu_ms=Ok(203.125) allocations=202997 page_faults_delta=Ok(51) unix_ms=1794724206997\nbitcask    scan_page 翻完整库                2041.8 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  100 页 / 50000 行（页宽 500）\nSCALE_PHASE_BEGIN engine=bitcask phase=seek_prev pid=66240 unix_ms=1794724206998\nSCALE_PHASE engine=bitcask phase=seek_prev wall_ms=0.112 cpu_ms=Ok(0.0) allocations=26 page_faults_delta=Ok(9) unix_ms=1794724206998\nbitcask    seek_prev 中间键                   90.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true\nSCALE_PHASE_BEGIN engine=bitcask phase=reverse_scan pid=66240 unix_ms=1794724206998\nSCALE_PHASE engine=bitcask phase=reverse_scan wall_ms=2.389 cpu_ms=Ok(15.625) allocations=2018 page_faults_delta=Ok(0) unix_ms=1794724207001\nbitcask    reverse_scan 1% 窗口               4.8 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=bitcask phase=search_first pid=66240 unix_ms=1794724207001\nSCALE_PHASE engine=bitcask phase=search_first wall_ms=206.156 cpu_ms=Ok(203.125) allocations=200155 page_faults_delta=Ok(204) unix_ms=1794724207207\nbitcask    search 首页                   206153.1 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 50000\nSCALE_PHASE_BEGIN engine=bitcask phase=search_first_no_total pid=66240 unix_ms=1794724207208\nSCALE_PHASE engine=bitcask phase=search_first_no_total wall_ms=3.761 cpu_ms=Ok(0.0) allocations=8407 page_faults_delta=Ok(0) unix_ms=1794724207211\nbitcask    search 首页(免 total)            3758.1 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true\nSCALE_PHASE_BEGIN engine=bitcask phase=search_last pid=66240 unix_ms=1794724207213\nSCALE_PHASE engine=bitcask phase=search_last wall_ms=252.049 cpu_ms=Ok(250.0) allocations=200155 page_faults_delta=Ok(0) unix_ms=1794724207465\nbitcask    search 末页(深翻)               252046.1 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  命中 50000，末页 100 条（已逐值验收）\nSCALE_PHASE_BEGIN engine=bitcask phase=search_last_no_total pid=66240 unix_ms=1794724207466\nSCALE_PHASE engine=bitcask…613 tokens truncated…, 0.0), vacuum_scan_max_ms: 0.0, vacuum_scan_allocations: 0, vacuum_scan_histogram: [0, 0, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 0, bplus_backtrack_reuses: 0, bplus_maintenance_pages: 0, bplus_maintenance_rows: 0, lsm_known_deletes: 0 }\nSCALE_MAINT engine=bitcask phase=update auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 7001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=bitcask phase=health pid=66240 unix_ms=1794724207863\nSCALE_PHASE engine=bitcask phase=health wall_ms=7.446 cpu_ms=Ok(0.0) allocations=1 page_faults_delta=Ok(2) unix_ms=1794724207870\nbitcask    health()                      7442.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=57001 max_chain=2\nSCALE_MEMORY engine=bitcask phase=before_vacuum heap_bytes=10884907 rss_bytes=14569472 private_bytes=14462976 page_faults=14852\nSCALE_PHASE_BEGIN engine=bitcask phase=vacuum pid=66240 unix_ms=1794724207870\nSCALE_PHASE engine=bitcask phase=vacuum wall_ms=26.003 cpu_ms=Ok(15.625) allocations=6032 page_faults_delta=Ok(143) unix_ms=1794724207896\nSCALE_MEMORY engine=bitcask phase=after_vacuum heap_bytes=10060235 rss_bytes=15155200 private_bytes=14462976 page_faults=14995\nbitcask    vacuum() 全库                  26000.6 µs/次    常驻      -0.8 MB  峰值 +     0.3 MB  裁掉 6000 行\nSCALE_VACUUM_STAGES engine=bitcask doors=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 11.6599), vacuum_delete: (7, 3.6829), vacuum_sync: (1, 10.268), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (1, 0.1407), dblwr_reset: (0, 0.0), dblwr_data: (0, 0.0), dblwr_publish: (0, 0.0), dblwr_clear: (0, 0.0), page_pack: (0, 0.0), page_write: (0, 0.0), page_sync: (0, 0.0), freelist: (0, 0.0), vacuum_scan_max_ms: 2.4906, vacuum_scan_allocations: 6025, vacuum_scan_histogram: [0, 7, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 1, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 0, bplus_backtrack_reuses: 0, bplus_maintenance_pages: 0, bplus_maintenance_rows: 0, lsm_known_deletes: 0 }\nSCALE_VACUUM engine=bitcask rows_scanned=57001 versions_removed=6000 skipped=false\nSCALE_MAINT engine=bitcask phase=vacuum auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 7001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=bitcask phase=vacuum_bounded pid=66240 unix_ms=1794724207898\nSCALE_PHASE engine=bitcask phase=vacuum_bounded wall_ms=0.804 cpu_ms=Ok(0.0) allocations=7 page_faults_delta=Ok(0) unix_ms=1794724207899\nbitcask    vacuum_bounded 一片              801.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）\nSCALE_PHASE_BEGIN engine=bitcask phase=flush pid=66240 unix_ms=1794724207899\nSCALE_PHASE engine=bitcask phase=flush wall_ms=0.063 cpu_ms=Ok(0.0) allocations=0 page_faults_delta=Ok(0) unix_ms=1794724207899\nbitcask    flush                           60.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 11.1 MB\nSCALE_PHASE_BEGIN engine=bitcask phase=merge pid=66240 unix_ms=1794724207900\nSCALE_PHASE engine=bitcask phase=merge wall_ms=264.125 cpu_ms=Ok(218.75) allocations=208741 page_faults_delta=Ok(4244) unix_ms=1794724208164\nbitcask    merge                       264122.7 µs/次    常驻      -4.3 MB  峰值 +    13.1 MB  磁盘 10.2 MB（merge 前 11.1）\nSCALE_PHASE_BEGIN engine=bitcask phase=export_owned pid=66240 unix_ms=1794724208165\nSCALE_PHASE engine=bitcask phase=export_owned wall_ms=290.940 cpu_ms=Ok(250.0) allocations=204173 page_faults_delta=Ok(3166) unix_ms=1794724208456\nbitcask    export 全库(物化)                    5.7 µs/行    常驻       8.8 MB  峰值 +     9.8 MB  51001 行进 Vec\nSCALE_PHASE_BEGIN engine=bitcask phase=export_stream pid=66240 unix_ms=1794724208470\nSCALE_PHASE engine=bitcask phase=export_stream wall_ms=284.271 cpu_ms=Ok(250.0) allocations=204162 page_faults_delta=Ok(143) unix_ms=1794724208754\nbitcask    export 流式(逐行落地)                  5.6 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  51001 行 → 磁盘 5.0 MB，内存里一行都不攒\nSCALE_PHASE_BEGIN engine=bitcask phase=migrate pid=66240 unix_ms=1794724208757\nSCALE_PHASE engine=bitcask phase=migrate wall_ms=554.840 cpu_ms=Ok(546.875) allocations=826846 page_faults_delta=Ok(2878) unix_ms=1794724209312\nbitcask    migrate → memory                11.1 µs/行    常驻       9.8 MB  峰值 +     9.9 MB  搬 51001 行 / 52 页 / 2644894 B\nbitcask: migrate 验收通过(不计时) 51001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0\nSCALE_MEMORY engine=bitcask phase=migration_before_release heap_bytes=15508206 rss_bytes=25817088 private_bytes=21753856 page_faults=25658\nSCALE_MIGRATION_RELEASE engine=bitcask released_heap_bytes=9783227\nSCALE_MEMORY engine=bitcask phase=migration_after_release heap_bytes=5724979 rss_bytes=13889536 private_bytes=10584064 page_faults=25663\nSCALE_PHASE_BEGIN engine=bitcask phase=bulk pid=66240 unix_ms=1794724209392\nSCALE_PHASE engine=bitcask phase=bulk wall_ms=50.859 cpu_ms=Ok(0.0) allocations=25853 page_faults_delta=Ok(420) unix_ms=1794724209443\nbitcask    bulk 灌 5000 行                   10.2 µs/行    常驻       4.9 MB  峰值 +     5.1 MB  \nSCALE_MEMORY engine=bitcask phase=bulk_before_stop heap_bytes=10615043 rss_bytes=15609856 private_bytes=15990784 page_faults=26083\nSCALE_PHASE_BEGIN engine=bitcask phase=bulk_stop pid=66240 unix_ms=1794724209443\nSCALE_PHASE engine=bitcask phase=bulk_stop wall_ms=41.197 cpu_ms=Ok(31.25) allocations=11 page_faults_delta=Ok(0) unix_ms=1794724209484\nSCALE_MEMORY engine=bitcask phase=bulk_before_reopen heap_bytes=815402 rss_bytes=8081408 private_bytes=3665920 page_faults=26083\nSCALE_PHASE_BEGIN engine=bitcask phase=bulk_reopen pid=66240 unix_ms=1794724209484\nSCALE_PHASE engine=bitcask phase=bulk_reopen wall_ms=18.726 cpu_ms=Ok(15.625) allocations=61176 page_faults_delta=Ok(2027) unix_ms=1794724209503\nSCALE_MEMORY engine=bitcask phase=bulk_after_reopen heap_bytes=6204719 rss_bytes=13680640 private_bytes=10158080 page_faults=28111\nbitcask    再冷重开                         18721.8 µs      常驻       5.4 MB  峰值 +     8.1 MB  常驻 5.4 MB\nbitcask: bulk 重开验收通过(不计时) 56001 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符\nSCALE_ENGINE_DONE rows=50000 engine=bitcask\n\nbplus_tree: scratch=C:/Users/Administrator/.codex/test-data/storage-engines\\se_engine_66240_scale_bplus_tree_1794724209823122900_1\nSCALE_PHASE_BEGIN engine=bplus_tree phase=open pid=66240 unix_ms=1794724209823\nSCALE_PHASE engine=bplus_tree phase=open wall_ms=24.503 cpu_ms=Ok(0.0) allocations=86 page_faults_delta=Ok(25) unix_ms=1794724209848\nSCALE_BPLUS engine=bplus_tree phase=open node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2 cache_hits=2 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree open 空库                      24499.8 µs      常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=bplus_tree phase=insert pid=66240 unix_ms=1794724209848\nSCALE_PHASE engine=bplus_tree phase=insert wall_ms=2139.406 cpu_ms=Ok(1687.5) allocations=3904349 page_faults_delta=Ok(8451) unix_ms=1794724211987\nSCALE_BPLUS engine=bplus_tree phase=insert node_parses=3 internal_packs=0 owned_promotions=0 page_reads=1954 cache_hits=1826 cache_misses=128 cache_sweeps=2 cache_visited=3021\nbplus_tree 灌 50000 行(事务)                   42.8 µs/行    常驻       9.1 MB  峰值 +    18.8 MB  \nSCALE_MAINT engine=bplus_tree phase=insert auto=Some(ReclamationStatus { pending_rows: 17232, committed_rows: 50000, completed_slices: 2, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: true, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=checkpoint pid=66240 unix_ms=1794724211988\nSCALE_PHASE engine=bplus_tree phase=checkpoint wall_ms=206.685 cpu_ms=Ok(0.0) allocations=1110 page_faults_delta=Ok(910) unix_ms=1794724212195\nSCALE_BPLUS engine=bplus_tree phase=checkpoint node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree flush+checkpoint            206682.1 µs      常驻       0.0 MB  峰值 +     4.6 MB  磁盘 12.4 MB\nSCALE_MEMORY engine=bplus_tree phase=first_before_stop heap_bytes=9136806 rss_bytes=21659648 private_bytes=17154048 page_faults=37687\nSCALE_PHASE_BEGIN engine=bplus_tree phase=first_stop pid=66240 unix_ms=1794724212195\nSCALE_PHASE engine=bplus_tree phase=first_stop wall_ms=4.053 cpu_ms=Ok(0.0) allocations=4 page_faults_delta=Ok(3) unix_ms=1794724212199\nSCALE_BPLUS engine=bplus_tree phase=first_stop node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nSCALE_MEMORY engine=bplus_tree phase=first_before_reopen heap_bytes=6851 rss_bytes=8114176 private_bytes=3530752 page_faults=37690\nSCALE_PHASE_BEGIN engine=bplus_tree phase=first_reopen pid=66240 unix_ms=1794724212199\nSCALE_PHASE engine=bplus_tree phase=first_reopen wall_ms=1.845 cpu_ms=Ok(0.0) allocations=64 page_faults_delta=Ok(0) unix_ms=1794724212201\nSCALE_BPLUS engine=bplus_tree phase=first_reopen node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nSCALE_MEMORY engine=bplus_tree phase=first_after_reopen heap_bytes=9100 rss_bytes=8114176 private_bytes=3530752 page_faults=37690\nbplus_tree 冷重开(恢复)                       1843.5 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=66240 unix_ms=1794724212202\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=347.455 cpu_ms=Ok(359.375) allocations=491246 page_faults_delta=Ok(2063) unix_ms=1794724212549\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=92 internal_packs=0 owned_promotions=0 page_reads=50092 cache_hits=31365 cache_misses=18727 cache_sweeps=0 cache_visited=0\nbplus_tree 点读×N 乱序                          6.9 µs/次    常驻       8.8 MB  峰值 +     9.0 MB  \nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=66240 unix_ms=1794724212550\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=201.233 cpu_ms=Ok(171.875) allocations=454171 page_faults_delta=Ok(2) unix_ms=1794724212751\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=50000 cache_hits=47966 cache_misses=2034 cache_sweeps=0 cache_visited=0\nbplus_tree 点读×N 有序                          4.0 µs/次    常驻      -0.1 MB  峰值 +     0.2 MB  \nSCALE_PHASE_BEGIN engine=bplus_tree phase=multi_get pid=66240 unix_ms=1794724212751\nSCALE_PHASE engine=bplus_tree phase=multi_get wall_ms=7.303 cpu_ms=Ok(0.0) allocations=8713 page_faults_delta=Ok(21) unix_ms=1794724212759\nSCALE_BPLUS engine=bplus_tree phase=multi_get node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1000 cache_hits=650 cache_misses=350 cache_sweeps=0 cache_visited=0\nbplus_tree multi_get×1000                   7.3 µs/键    常驻       0.2 MB  峰值 +     0.3 MB  读到 1000 条\nSCALE_PHASE_BEGIN engine=bplus_tree phase=multi_miss pid=66240 unix_ms=1794724212759\nSCALE_PHASE engine=bplus_tree phase=multi_miss wall_ms=1.599 cpu_ms=Ok(0.0) allocations=3002 page_faults_delta=Ok(1) unix_ms=1794724212761\nSCALE_BPLUS engine=bplus_tree phase=multi_miss node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1000 cache_hits=1000 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree multi_get×1000 全miss             1.6 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan pid=66240 unix_ms=1794724212761\nSCALE_PHASE engine=bplus_tree phase=scan wall_ms=51.635 cpu_ms=Ok(62.5) allocations=258566 page_faults_delta=Ok(3096) unix_ms=1794724212813\nSCALE_BPLUS engine=bplus_tree phase=scan node_parses=13 internal_packs=0 owned_promotions=0 page_reads=2964 cache_hits=1714 cache_misses=1250 cache_sweeps=0 cache_visited=0\nbplus_tree 一次全量 scan                        1.0 µs/行    常驻       8.8 MB  峰值 +    10.0 MB  50000 行\nSCALE_PHASE_BEGIN engine=bplus_tree phase=window_scan pid=66240 unix_ms=1794724212818\nSCALE_PHASE engine=bplus_tree phase=window_scan wall_ms=0.550 cpu_ms=Ok(0.0) allocations=2636 page_faults_delta=Ok(21) unix_ms=1794724212819\nSCALE_BPLUS engine=bplus_tree phase=window_scan node_parses=1 internal_packs=0 owned_promotions=0 page_reads=31 cache_hits=31 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree 窗口 scan(1%)                      1.1 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=bplus_tree phase=prefix_scan pid=66240 unix_ms=1794724212819\nSCALE_PHASE engine=bplus_tree phase=prefix_scan wall_ms=51.209 cpu_ms=Ok(46.875) allocations=257556 page_faults_delta=Ok(2508) unix_ms=1794724212871\nSCALE_BPLUS engine=bplus_tree phase=prefix_scan node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2951 cache_hits=1970 cache_misses=981 cache_sweeps=0 cache_visited=0\nbplus_tree prefix_scan 2B前缀                 1.0 µs/行    常驻       8.7 MB  峰值 +     9.9 MB  50000 行\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=66240 unix_ms=1794724212882\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=73.489 cpu_ms=Ok(78.125) allocations=270788 page_faults_delta=Ok(77) unix_ms=1794724212955\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=98 internal_packs=0 owned_promotions=0 page_reads=3152 cache_hits=797 cache_misses=2355 cache_sweeps=0 cache_visited=0\nbplus_tree scan_page 翻完整库                 734.9 µs/页    常驻       0.3 MB  峰值 +     0.4 MB  100 页 / 50000 行（页宽 500）\nSCALE_PHASE_BEGIN engine=bplus_tree phase=seek_prev pid=66240 unix_ms=1794724212956\nSCALE_PHASE engine=bplus_tree phase=seek_prev wall_ms=0.034 cpu_ms=Ok(0.0) allocations=23 page_faults_delta=Ok(3) unix_ms=1794724212956\nSCALE_BPLUS engine=bplus_tree phase=seek_prev node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree seek_prev 中间键                   32.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=reverse_scan pid=66240 unix_ms=1794724212956\nSCALE_PHASE engine=bplus_tree phase=reverse_scan wall_ms=0.587 cpu_ms=Ok(0.0) allocations=2604 page_faults_delta=Ok(0) unix_ms=1794724212957\nSCALE_BPLUS engine=bplus_tree phase=reverse_scan node_parses=0 internal_packs=0 owned_promotions=0 page_reads=30 cache_hits=25 cache_misses=5 cache_sweeps=0 cache_visited=0\nbplus_tree reverse_scan 1% 窗口               1.2 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=bplus_tree phase=search_first pid=66240 unix_ms=1794724212957\nSCALE_PHASE engine=bplus_tree phase=search_first wall_ms=50.427 cpu_ms=Ok(46.875) allocations=257532 page_faults_delta=Ok(138) unix_ms=1794724213007\nSCALE_BPLUS engine=bplus_tree phase=search_first node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2951 cache_hits=1967 cache_misses=984 cache_sweeps=0 cache_visited=0\nbplus_tree search 首页                    50426.2 µs/次    常驻      -0.1 MB  峰值 +     0.6 MB  命中 50000\nSCALE_PHASE_BEGIN engine=bplus_tree phase=search_first_no_total pid=66240 unix_ms=1794724213008\nSCALE_PHASE engine=bplus_tree phase=search_first_no_total wall_ms=3.333 cpu_ms=Ok(0.0) allocations=17046 page_faults_delta=Ok(1) unix_ms=1794724213011\nSCALE_BPLUS engine=bplus_tree phase=search_first_no_total node_parses=0 internal_packs=0 owned_promotions=0 page_reads=238 cache_hits=178 cache_misses=60 cache_sweeps=0 cache_visited=0\nbplus_tree search 首页(免 total)            3331.6 µs/次    常驻       0.0 MB  峰值 +     0.6 MB  拿了 100 条, has_next=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=search_last pid=66240 unix_ms=1794724213011\nSCALE_PHASE engine=bplus_tree phase=search_last wall_ms=49.818 cpu_ms=Ok(46.875) allocations=257530 page_faults_delta=Ok(2) unix_ms=1794724213061\nSCALE_BPLUS engine=bplus_tree phase=search_last node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2951 cache_hits=1967 cache_misses=984 cache_sweeps=0 cache_visited=0\nbplus_tree search 末页(深翻)                49816.3 µs/次    常驻       0.0 MB  峰值 +     0.7 MB  命中 50000，末页 100 条（已逐值验收）\nSCALE_PHASE_BEGIN engine=bplus_tree phase=search_last_no_total pid=66240 unix_ms=1794724213061\nSCALE_PHASE engine=bplus_tree phase=search_last_no_total wall_ms=0.601 cpu_ms=Ok(0.0) allocations=1491 page_faults_delta=Ok(3) unix_ms=1794724213062\nSCALE_BPLUS engine=bplus_tree phase=search_last_no_total node_parses=0 internal_packs=0 owned_promotions=0 page_reads=210 cache_hits=204 cache_misses=6 cache_sweeps=0 cache_visited=0\nbplus_tree search 末页(免 total)             599.1 µs/次    常驻      -0.2 MB  峰值 +     0.0 MB  拿了 100 条, total=None\nSCALE_PHASE_BEGIN engine=bplus_tree phase=key_count pid=66240 unix_ms=1794724213062\nSCALE_PHASE engine=bplus_tree phase=key_count wall_ms=48.292 cpu_ms=Ok(46.875) allocations=257661 page_faults_delta=Ok(31) unix_ms=1794724213111\nSCALE_BPLUS engine=bplus_tree phase=key_count node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2951 cache_hits=1908 cache_misses=1043 cache_sweeps=0 cache_visited=0\nbplus_tree key_count 2B前缀               48290.4 µs/次    常驻       0.2 MB  峰值 +     0.9 MB  50000 键\nSCALE_PHASE_BEGIN engine=bplus_tree phase=set_ttl pid=66240 unix_ms=1794724213111\nSCALE_PHASE engine=bplus_tree phase=set_ttl wall_ms=25.167 cpu_ms=Ok(15.625) allocations=74736 page_faults_delta=Ok(47) unix_ms=1794724213136\nSCALE_BPLUS engine=bplus_tree phase=set_ttl node_parses=1 internal_packs=0 owned_promotions=0 page_reads=2 cache_hits=2 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree set_with_ttl×1000               25.2 µs/次    常驻       0.3 MB  峰值 +     0.4 MB  \nSCALE_PHASE_BEGIN engine=bplus_tree phase=get_ttl pid=66240 unix_ms=1794724213136\nSCALE_PHASE engine=bplus_tree phase=get_ttl wall_ms=1.627 cpu_ms=Ok(0.0) allocations=10001 page_faults_delta=Ok(0) unix_ms=1794724213138\nSCALE_BPLUS engine=bplus_tree phase=get_ttl node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree get_ttl×1000                     1.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL\nbplus_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状\nSCALE_PHASE_BEGIN engine=bplus_tree phase=incr pid=66240 unix_ms=1794724213170\nSCALE_PHASE engine=bplus_tree phase=incr wall_ms=20.157 cpu_ms=Ok(31.25) allocations=67102 page_faults_delta=Ok(0) unix_ms=1794724213191\nSCALE_BPLUS engine=bplus_tree phase=incr node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree incr×1000                       20.2 µs/次    常驻       0.0 MB  峰值 +     0.1 MB  \nSCALE_PHASE_BEGIN engine=bplus_tree phase=update pid=66240 unix_ms=1794724213191\nSCALE_PHASE engine=bplus_tree phase=update wall_ms=151.153 cpu_ms=Ok(93.75) allocations=397576 page_faults_delta=Ok(295) unix_ms=1794724213342\nSCALE_BPLUS engine=bplus_tree phase=update node_parses=279 internal_packs=0 owned_promotions=0 page_reads=558 cache_hits=281 cache_misses=277 cache_sweeps=0 cache_visited=0\nbplus_tree 更新 5000 键                       30.2 µs/次    常驻       1.8 MB  峰值 +     2.0 MB  \nSCALE_UPDATE_STAGES engine=bplus_tree doors=MaintenanceMs { checkpoint: (0, 0.0), commit: (10, 21.03), auto_vacuum: (0, 0.0), vacuum_scan: (0, 0.0), vacuum_delete: (0, 0.0), vacuum_sync: (0, 0.0), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (1, 0.6009), dblwr_data: (1, 1.5839), dblwr_publish: (1, 0.5766), dblwr_clear: (1, 0.4968), page_pack: (1, 0.0153), page_write: (1, 0.0805), page_sync: (1, 1.6542), freelist: (0, 0.0), vacuum_scan_max_ms: 0.0, vacuum_scan_allocations: 0, vacuum_scan_histogram: [0, 0, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 0, bplus_backtrack_reuses: 0, bplus_maintenance_pages: 0, bplus_maintenance_rows: 0, lsm_known_deletes: 0 }\nSCALE_MAINT engine=bplus_tree phase=update auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 7001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=health pid=66240 unix_ms=1794724213343\nSCALE_PHASE engine=bplus_tree phase=health wall_ms=39.852 cpu_ms=Ok(31.25) allocations=121405 page_faults_delta=Ok(13) unix_ms=1794724213383\nSCALE_BPLUS engine=bplus_tree phase=health node_parses=0 internal_packs=0 owned_promotions=0 page_reads=3058 cache_hits=1918 cache_misses=1140 cache_sweeps=0 cache_visited=0\nbplus_tree health()                     39849.7 µs/次    常驻       0.2 MB  峰值 +     0.2 MB  rows=57001 max_chain=2\nSCALE_MEMORY engine=bplus_tree phase=before_vacuum heap_bytes=12432568 rss_bytes=22335488 private_bytes=19136512 page_faults=46131\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum pid=66240 unix_ms=1794724213383\nSCALE_PHASE engine=bplus_tree phase=vacuum wall_ms=128.743 cpu_ms=Ok(62.5) allocations=142128 page_faults_delta=Ok(241) unix_ms=1794724213512\nSCALE_BPLUS engine=bplus_tree phase=vacuum node_parses=0 internal_packs=0 owned_promotions=0 page_reads=7633 cache_hits=6524 cache_misses=1102 cache_sweeps=0 cache_visited=0\nSCALE_MEMORY engine=bplus_tree phase=after_vacuum heap_bytes=12030256 rss_bytes=23322624 private_bytes=19415040 page_faults=46372\nbplus_tree vacuum() 全库                 128741.4 µs/次    常驻      -0.4 MB  峰值 +     1.3 MB  裁掉 6000 行\nSCALE_VACUUM_STAGES engine=bplus_tree doors=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 21.5578), vacuum_delete: (3, 35.0179), vacuum_sync: (1, 71.9387), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (0, 0.0), dblwr_data: (6, 15.5378), dblwr_publish: (6, 7.3914), dblwr_clear: (6, 10.5331), page_pack: (1, 1.3004), page_write: (6, 3.3184), page_sync: (6, 30.3664), freelist: (1, 3.2217), vacuum_scan_max_ms: 4.3363, vacuum_scan_allocations: 6033, vacuum_scan_histogram: [0, 7, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 1, bplus_backtrack_reuses: 33, bplus_maintenance_pages: 3060, bplus_maintenance_rows: 57109, lsm_known_deletes: 0 }\nSCALE_VACUUM engine=bplus_tree rows_scanned=57001 versions_removed=6000 skipped=false\nSCALE_MAINT engine=bplus_tree phase=vacuum auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 7001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=vacuum_bounded pid=66240 unix_ms=1794724213515\nSCALE_PHASE engine=bplus_tree phase=vacuum_bounded wall_ms=1.132 cpu_ms=Ok(0.0) allocations=3 page_faults_delta=Ok(0) unix_ms=1794724213516\nSCALE_BPLUS engine=bplus_tree phase=vacuum_bounded node_parses=0 internal_packs=0 owned_promotions=0 page_reads=96 cache_hits=96 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree vacuum_bounded 一片             1129.0 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）\nSCALE_PHASE_BEGIN engine=bplus_tree phase=flush pid=66240 unix_ms=1794724213517\nSCALE_PHASE engine=bplus_tree phase=flush wall_ms=0.032 cpu_ms=Ok(0.0) allocations=0 page_faults_delta=Ok(0) unix_ms=1794724213517\nSCALE_BPLUS engine=bplus_tree phase=flush node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree flush                           26.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 12.9 MB\nSCALE_PHASE_BEGIN engine=bplus_tree phase=merge pid=66240 unix_ms=1794724213518\nSCALE_PHASE engine=bplus_tree phase=merge wall_ms=0.002 cpu_ms=Ok(0.0) allocations=0 page_faults_delta=Ok(0) unix_ms=1794724213518\nSCALE_BPLUS engine=bplus_tree phase=merge node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree merge                            0.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  （本引擎无 merge）\nSCALE_PHASE_BEGIN engine=bplus_tree phase=export_owned pid=66240 unix_ms=1794724213520\nSCALE_PHASE engine=bplus_tree phase=export_owned wall_ms=55.077 cpu_ms=Ok(46.875) allocations=263033 page_faults_delta=Ok(2669) unix_ms=1794724213575\nSCALE_BPLUS engine=bplus_tree phase=export_owned node_parses=5 internal_packs=0 owned_promotions=0 page_reads=2983 cache_hits=1879 cache_misses=1104 cache_sweeps=0 cache_visited=0\nbplus_tree export 全库(物化)                    1.1 µs/行    常驻       9.2 MB  峰值 +    10.3 MB  51001 行进 Vec\nSCALE_PHASE_BEGIN engine=bplus_tree phase=export_stream pid=66240 unix_ms=1794724213580\nSCALE_PHASE engine=bplus_tree phase=export_stream wall_ms=61.706 cpu_ms=Ok(62.5) allocations=262617 page_faults_delta=Ok(158) unix_ms=1794724213642\nSCALE_BPLUS engine=bplus_tree phase=export_stream node_parses=0 internal_packs=0 owned_promotions=0 page_reads=2978 cache_hits=1966 cache_misses=1012 cache_sweeps=0 cache_visited=0\nbplus_tree export 流式(逐行落地)                  1.2 µs/行    常驻       0.0 MB  峰值 +     0.6 MB  51001 行 → 磁盘 5.0 MB，内存里一行都不攒\nSCALE_PHASE_BEGIN engine=bplus_tree phase=migrate pid=66240 unix_ms=1794724213643\nSCALE_PHASE engine=bplus_tree phase=migrate wall_ms=256.771 cpu_ms=Ok(250.0) allocations=943917 page_faults_delta=Ok(2669) unix_ms=1794724213900\nSCALE_BPLUS engine=bplus_tree phase=migrate node_parses=14 internal_packs=0 owned_promotions=0 page_reads=52230 cache_hits=48543 cache_misses=3687 cache_sweeps=0 cache_visited=0\nbplus_tree migrate → memory                 5.1 µs/行    常驻       9.7 MB  峰值 +     9.9 MB  搬 51001 行 / 52 页 / 2644894 B\nbplus_tree: migrate 验收通过(不计时) 51001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0\nSCALE_MEMORY engine=bplus_tree phase=migration_before_release heap_bytes=22161531 rss_bytes=34070528 private_bytes=29597696 page_faults=52059\nSCALE_MIGRATION_RELEASE engine=bplus_tree released_heap_bytes=9783227\nSCALE_MEMORY engine=bplus_tree phase=migration_after_release heap_bytes=12378304 rss_bytes=23891968 private_bytes=19525632 page_faults=52062\nSCALE_PHASE_BEGIN engine=bplus_tree phase=bulk pid=66240 unix_ms=1794724213958\nSCALE_PHASE engine=bplus_tree phase=bulk wall_ms=71.588 cpu_ms=Ok(62.5) allocations=337825 page_faults_delta=Ok(349) unix_ms=1794724214030\nSCALE_BPLUS engine=bplus_tree phase=bulk node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nbplus_tree bulk 灌 5000 行                   14.3 µs/行    常驻       1.0 MB  峰值 +     2.2 MB  \nSCALE_MEMORY engine=bplus_tree phase=bulk_before_stop heap_bytes=13354983 rss_bytes=25042944 private_bytes=21291008 page_faults=52411\nSCALE_PHASE_BEGIN engine=bplus_tree phase=bulk_stop pid=66240 unix_ms=1794724214030\nSCALE_PHASE engine=bplus_tree phase=bulk_stop wall_ms=6.423 cpu_ms=Ok(0.0) allocations=4 page_faults_delta=Ok(0) unix_ms=1794724214036\nSCALE_BPLUS engine=bplus_tree phase=bulk_stop node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nSCALE_MEMORY engine=bplus_tree phase=bulk_before_reopen heap_bytes=815984 rss_bytes=10346496 private_bytes=5570560 page_faults=52411\nSCALE_PHASE_BEGIN engine=bplus_tree phase=bulk_reopen pid=66240 unix_ms=1794724214037\nSCALE_PHASE engine=bplus_tree phase=bulk_reopen wall_ms=2.298 cpu_ms=Ok(0.0) allocations=65 page_faults_delta=Ok(0) unix_ms=1794724214039\nSCALE_BPLUS engine=bplus_tree phase=bulk_reopen node_parses=0 internal_packs=0 owned_promotions=0 page_reads=0 cache_hits=0 cache_misses=0 cache_sweeps=0 cache_visited=0\nSCALE_MEMORY engine=bplus_tree phase=bulk_after_reopen heap_bytes=818233 rss_bytes=10346496 private_bytes=5570560 page_faults=52411\nbplus_tree 再冷重开                          2297.0 µs      常驻       0.0 MB  峰值 +     0.0 MB  常驻 0.0 MB\nbplus_tree: bulk 重开验收通过(不计时) 56001 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符\nSCALE_ENGINE_DONE rows=50000 engine=bplus_tree\n\nlsm_tree: scratch=C:/Users/Administrator/.codex/test-data/storage-engines\\se_engine_66240_scale_lsm_tree_1794724214152272200_2\nSCALE_PHASE_BEGIN engine=lsm_tree phase=open pid=66240 unix_ms=1794724214152\nSCALE_PHASE engine=lsm_tree phase=open wall_ms=5.652 cpu_ms=Ok(0.0) allocations=58 page_faults_delta=Ok(10) unix_ms=1794724214158\nlsm_tree   open 空库                       5649.3 µs      常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=lsm_tree phase=insert pid=66240 unix_ms=1794724214158\nSCALE_PHASE engine=lsm_tree phase=insert wall_ms=736.973 cpu_ms=Ok(609.375) allocations=992365 page_faults_delta=Ok(7693) unix_ms=1794724214895\nlsm_tree   灌 50000 行(事务)                   14.7 µs/行    常驻      28.0 MB  峰值 +    28.3 MB  \nSCALE_MAINT engine=lsm_tree phase=insert auto=Some(ReclamationStatus { pending_rows: 17232, committed_rows: 50000, completed_slices: 2, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: true, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_LSM_MOVES phase=insert files=0 bytes=0\nSCALE_LSM_STAGES phase=insert merge_ms=0.000 repair_ms=0.000 manifest_ms=0.000 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=0.000 sst_sync_ms=0.000\nSCALE_PHASE_BEGIN engine=lsm_tree phase=checkpoint pid=66240 unix_ms=1794724214896\nSCALE_PHASE engine=lsm_tree phase=checkpoint wall_ms=113.318 cpu_ms=Ok(78.125) allocations=358748 page_faults_delta=Ok(643) unix_ms=1794724215009\nlsm_tree   flush+checkpoint            113315.8 µs      常驻     -27.9 MB  峰值 +     1.0 MB  磁盘 5.9 MB\nSCALE_MEMORY engine=lsm_tree phase=first_before_stop heap_bytes=140382 rss_bytes=9728000 private_bytes=4861952 page_faults=62917\nSCALE_PHASE_BEGIN engine=lsm_tree phase=first_stop pid=66240 unix_ms=1794724215010\nSCALE_PHASE engine=lsm_tree phase=first_stop wall_ms=0.829 cpu_ms=Ok(0.0) allocations=4 page_faults_delta=Ok(0) unix_ms=1794724215011\nSCALE_MEMORY engine=lsm_tree phase=first_before_reopen heap_bytes=7057 rss_bytes=9388032 private_bytes=4870144 page_faults=62917\nSCALE_PHASE_BEGIN engine=lsm_tree phase=first_reopen pid=66240 unix_ms=1794724215011\nSCALE_PHASE engine=lsm_tree phase=first_reopen wall_ms=3.167 cpu_ms=Ok(0.0) allocations=876 page_faults_delta=Ok(45) unix_ms=1794724215014\nSCALE_MEMORY engine=lsm_tree phase=first_after_reopen heap_bytes=140004 rss_bytes=9572352 private_bytes=5038080 page_faults=62962\nlsm_tree   冷重开(恢复)                       3164.1 µs      常驻       0.1 MB  峰值 +     0.3 MB  常驻 0.1 MB\nSCALE_PHASE_BEGIN engine=lsm_tree phase=random_read pid=66240 unix_ms=1794724215015\nSCALE_PHASE engine=lsm_tree phase=random_read wall_ms=168.548 cpu_ms=Ok(171.875) allocations=602374 page_faults_delta=Ok(1662) unix_ms=1794724215183\nlsm_tree   点读×N 乱序                          3.4 µs/次    常驻       7.5 MB  峰值 +     7.5 MB  \nSCALE_PHASE_BEGIN engine=lsm_tree phase=ordered_read pid=66240 unix_ms=1794724215184\nSCALE_PHASE engine=lsm_tree phase=ordered_read wall_ms=128.132 cpu_ms=Ok(125.0) allocations=600001 page_faults_delta=Ok(0) unix_ms=1794724215312\nlsm_tree   点读×N 有序                          2.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=lsm_tree phase=multi_get pid=66240 unix_ms=1794724215312\nSCALE_PHASE engine=lsm_tree phase=multi_get wall_ms=2.976 cpu_ms=Ok(0.0) allocations=11002 page_faults_delta=Ok(6) unix_ms=1794724215315\nlsm_tree   multi_get×1000                   3.0 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条\nSCALE_PHASE_BEGIN engine=lsm_tree phase=multi_miss pid=66240 unix_ms=1794724215315\nSCALE_PHASE engine=lsm_tree phase=multi_miss wall_ms=0.723 cpu_ms=Ok(0.0) allocations=4002 page_faults_delta=Ok(5) unix_ms=1794724215316\nlsm_tree   multi_get×1000 全miss             0.7 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)\nSCALE_PHASE_BEGIN engine=lsm_tree phase=scan pid=66240 unix_ms=1794724215316\nSCALE_PHASE engine=lsm_tree phase=scan wall_ms=32.629 cpu_ms=Ok(31.25) allocations=200371 page_faults_delta=Ok(3135) unix_ms=1794724215349\nlsm_tree   一次全量 scan                        0.7 µs/行    常驻       8.7 MB  峰值 +     9.7 MB  50000 行\nSCALE_PHASE_BEGIN engine=lsm_tree phase=window_scan pid=66240 unix_ms=1794724215354\nSCALE_PHASE engine=lsm_tree phase=window_scan wall_ms=0.629 cpu_ms=Ok(0.0) allocations=2027 page_faults_delta=Ok(20) unix_ms=1794724215355\nlsm_tree   窗口 scan(1%)                      1.3 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=lsm_tree phase=prefix_scan pid=66240 unix_ms=1794724215355\nSCALE_PHASE engine=lsm_tree phase=prefix_scan wall_ms=38.744 cpu_ms=Ok(46.875) allocations=200397 page_faults_delta=Ok(2905) unix_ms=1794724215394\nlsm_tree   prefix_scan 2B前缀                 0.8 µs/行    常驻       8.7 MB  峰值 +     9.7 MB  50000 行\nSCALE_PHASE_BEGIN engine=lsm_tree phase=scan_page pid=66240 unix_ms=1794724215403\nSCALE_PHASE engine=lsm_tree phase=scan_page wall_ms=34.688 cpu_ms=Ok(46.875) allocations=204586 page_faults_delta=Ok(40) unix_ms=1794724215438\nlsm_tree   scan_page 翻完整库                 346.9 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  100 页 / 50000 行（页宽 500）\nSCALE_PHASE_BEGIN engine=lsm_tree phase=seek_prev pid=66240 unix_ms=1794724215438\nSCALE_PHASE engine=lsm_tree phase=seek_prev wall_ms=0.041 cpu_ms=Ok(0.0) allocations=44 page_faults_delta=Ok(3) unix_ms=1794724215438\nlsm_tree   seek_prev 中间键                   39.2 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true\nSCALE_PHASE_BEGIN engine=lsm_tree phase=reverse_scan pid=66240 unix_ms=1794724215438\nSCALE_PHASE engine=lsm_tree phase=reverse_scan wall_ms=0.456 cpu_ms=Ok(0.0) allocations=2027 page_faults_delta=Ok(0) unix_ms=1794724215439\nlsm_tree   reverse_scan 1% 窗口               0.9 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=lsm_tree phase=search_first pid=66240 unix_ms=1794724215439\nSCALE_PHASE engine=lsm_tree phase=search_first wall_ms=33.735 cpu_ms=Ok(31.25) allocations=200354 page_faults_delta=Ok(166) unix_ms=1794724215473\nlsm_tree   search 首页                    33733.5 µs/次    常驻       0.0 MB  峰值 +     0.5 MB  命中 50000\nSCALE_PHASE_BEGIN engine=lsm_tree phase=search_first_no_total pid=66240 unix_ms=1794724215473\nSCALE_PHASE engine=lsm_tree phase=search_first_no_total wall_ms=2.399 cpu_ms=Ok(0.0) allocations=12415 page_faults_delta=Ok(0) unix_ms=1794724215475\nlsm_tree   search 首页(免 total)            2395.7 µs/次    常驻       0.0 MB  峰值 +     0.5 MB  拿了 100 条, has_next=true\nSCALE_PHASE_BEGIN engine=lsm_tree phase=search_last pid=66240 unix_ms=1794724215476\nSCALE_PHASE engine=lsm_tree phase=search_last wall_ms=37.962 cpu_ms=Ok(31.25) allocations=200354 page_faults_delta=Ok(2) unix_ms=1794724215514\nlsm_tree   search 末页(深翻)                37959.6 µs/次    常驻       0.0 MB  峰值 +     0.5 MB  命中 50000，末页 100 条（已逐值验收）\nSCALE_PHASE_BEGIN engine=lsm_tree phase=search_last_no_total pid=66240 unix_ms=1794724215514\nSCALE_PHASE engine=lsm_tree phase=search_last_no_total wall_ms=0.946 cpu_ms=Ok(15.625) allocations=2913 page_faults_delta=Ok(1) unix_ms=1794724215515\nlsm_tree   search 末页(免 total)             939.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  拿了 100 条, total=None\nSCALE_PHASE_BEGIN engine=lsm_tree phase=key_count pid=66240 unix_ms=1794724215515\nSCALE_PHASE engine=lsm_tree phase=key_count wall_ms=31.087 cpu_ms=Ok(31.25) allocations=200382 page_faults_delta=Ok(24) unix_ms=1794724215546\nlsm_tree   key_count 2B前缀               31084.8 µs/次    常驻       0.0 MB  峰值 +     0.5 MB  50000 键\nSCALE_PHASE_BEGIN engine=lsm_tree phase=set_ttl pid=66240 unix_ms=1794724215546\nSCALE_PHASE engine=lsm_tree phase=set_ttl wall_ms=13.812 cpu_ms=Ok(0.0) allocations=18181 page_faults_delta=Ok(0) unix_ms=1794724215560\nlsm_tree   set_with_ttl×1000               13.8 µs/次    常驻       0.6 MB  峰值 +     0.7 MB  \nSCALE_PHASE_BEGIN engine=lsm_tree phase=get_ttl pid=66240 unix_ms=1794724215561\nSCALE_PHASE engine=lsm_tree phase=get_ttl wall_ms=1.785 cpu_ms=Ok(15.625) allocations=10001 page_faults_delta=Ok(0) unix_ms=1794724215562\nlsm_tree   get_ttl×1000                     1.8 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL\nlsm_tree: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状\nSCALE_PHASE_BEGIN engine=lsm_tree phase=incr pid=66240 unix_ms=1794724215587\nSCALE_PHASE engine=lsm_tree phase=incr wall_ms=15.082 cpu_ms=Ok(15.625) allocations=28163 page_faults_delta=Ok(1) unix_ms=1794724215602\nlsm_tree   incr×1000                       15.1 µs/次    常驻       0.1 MB  峰值 +     0.1 MB  \nSCALE_PHASE_BEGIN engine=lsm_tree phase=update pid=66240 unix_ms=1794724215602\nSCALE_PHASE engine=lsm_tree phase=update wall_ms=95.720 cpu_ms=Ok(78.125) allocations=136053 page_faults_delta=Ok(709) unix_ms=1794724215698\nlsm_tree   更新 5000 键                       19.1 µs/次    常驻       2.8 MB  峰值 +     3.0 MB  \nSCALE_UPDATE_STAGES engine=lsm_tree doors=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (0, 0.0), vacuum_delete: (0, 0.0), vacuum_sync: (0, 0.0), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (0, 0.0), dblwr_data: (0, 0.0), dblwr_publish: (0, 0.0), dblwr_clear: (0, 0.0), page_pack: (0, 0.0), page_write: (0, 0.0), page_sync: (0, 0.0), freelist: (0, 0.0), vacuum_scan_max_ms: 0.0, vacuum_scan_allocations: 0, vacuum_scan_histogram: [0, 0, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 0, bplus_backtrack_reuses: 0, bplus_maintenance_pages: 0, bplus_maintenance_rows: 0, lsm_known_deletes: 0 }\nSCALE_MAINT engine=lsm_tree phase=update auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 7001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=1 lsm_flush_ms=102.241 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_LSM_MOVES phase=update files=0 bytes=0\nSCALE_LSM_STAGES phase=update merge_ms=0.000 repair_ms=0.000 manifest_ms=9.521 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=24.993 sst_sync_ms=20.187\nSCALE_PHASE_BEGIN engine=lsm_tree phase=health pid=66240 unix_ms=1794724215699\nSCALE_PHASE engine=lsm_tree phase=health wall_ms=20.934 cpu_ms=Ok(31.25) allocations=114012 page_faults_delta=Ok(5) unix_ms=1794724215720\nlsm_tree   health()                     20931.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=57001 max_chain=2\nSCALE_MEMORY engine=lsm_tree phase=before_vacuum heap_bytes=12476730 rss_bytes=21979136 private_bytes=18989056 page_faults=71818\nSCALE_PHASE_BEGIN engine=lsm_tree phase=vacuum pid=66240 unix_ms=1794724215720\nSCALE_PHASE engine=lsm_tree phase=vacuum wall_ms=60.495 cpu_ms=Ok(46.875) allocations=214929 page_faults_delta=Ok(908) unix_ms=1794724215781\nSCALE_MEMORY engine=lsm_tree phase=after_vacuum heap_bytes=8521668 rss_bytes=18956288 private_bytes=15904768 page_faults=72726\nlsm_tree   vacuum() 全库                  60492.1 µs/次    常驻      -4.0 MB  峰值 +     3.7 MB  裁掉 6000 行\nSCALE_VACUUM_STAGES engine=lsm_tree doors=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 27.256), vacuum_delete: (7, 2.2467), vacuum_sync: (1, 30.8389), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (0, 0.0), dblwr_data: (0, 0.0), dblwr_publish: (0, 0.0), dblwr_clear: (0, 0.0), page_pack: (0, 0.0), page_write: (0, 0.0), page_sync: (0, 0.0), freelist: (0, 0.0), vacuum_scan_max_ms: 4.5181, vacuum_scan_allocations: 115549, vacuum_scan_histogram: [0, 7, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 50012, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 789, bplus_pack_buffers: 0, bplus_backtrack_reuses: 0, bplus_maintenance_pages: 0, bplus_maintenance_rows: 0, lsm_known_deletes: 6000 }\nSCALE_VACUUM engine=lsm_tree rows_scanned=57001 versions_removed=6000 skipped=false\nSCALE_MAINT engine=lsm_tree phase=vacuum auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 7001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=2 lsm_flush_ms=127.366 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_LSM_MOVES phase=vacuum files=0 bytes=0\nSCALE_LSM_STAGES phase=vacuum merge_ms=0.000 repair_ms=0.000 manifest_ms=15.230 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=33.769 sst_sync_ms=26.899\nSCALE_PHASE_BEGIN engine=lsm_tree phase=vacuum_bounded pid=66240 unix_ms=1794724215782\nSCALE_PHASE engine=lsm_tree phase=vacuum_bounded wall_ms=2.066 cpu_ms=Ok(0.0) allocations=5455 page_faults_delta=Ok(1) unix_ms=1794724215784\nlsm_tree   vacuum_bounded 一片             2063.6 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）\nSCALE_PHASE_BEGIN engine=lsm_tree phase=flush pid=66240 unix_ms=1794724215784\nSCALE_PHASE engine=lsm_tree phase=flush wall_ms=3.069 cpu_ms=Ok(0.0) allocations=18 page_faults_delta=Ok(0) unix_ms=1794724215787\nlsm_tree   flush                         3067.3 µs/次    常驻       0.0 MB  峰值 +     0.1 MB  磁盘 8.2 MB\nSCALE_PHASE_BEGIN engine=lsm_tree phase=merge pid=66240 unix_ms=1794724215788\nSCALE_PHASE engine=lsm_tree phase=merge wall_ms=0.002 cpu_ms=Ok(0.0) allocations=0 page_faults_delta=Ok(0) unix_ms=1794724215788\nlsm_tree   merge                            0.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  （本引擎无 merge）\nSCALE_PHASE_BEGIN engine=lsm_tree phase=export_owned pid=66240 unix_ms=1794724215789\nSCALE_PHASE engine=lsm_tree phase=export_owned wall_ms=44.200 cpu_ms=Ok(46.875) allocations=253085 page_faults_delta=Ok(3317) unix_ms=1794724215833\nlsm_tree   export 全库(物化)                    0.9 µs/行    常驻      10.7 MB  峰值 +    11.1 MB  51001 行进 Vec\nSCALE_PHASE_BEGIN engine=lsm_tree phase=export_stream pid=66240 unix_ms=1794724215838\nSCALE_PHASE engine=lsm_tree phase=export_stream wall_ms=49.169 cpu_ms=Ok(46.875) allocations=230414 page_faults_delta=Ok(140) unix_ms=1794724215887\nlsm_tree   export 流式(逐行落地)                  1.0 µs/行    常驻       0.0 MB  峰值 +     0.5 MB  51001 行 → 磁盘 5.0 MB，内存里一行都不攒\nSCALE_PHASE_BEGIN engine=lsm_tree phase=migrate pid=66240 unix_ms=1794724215889\nSCALE_PHASE engine=lsm_tree phase=migrate wall_ms=263.835 cpu_ms=Ok(265.625) allocations=1164921 page_faults_delta=Ok(2232) unix_ms=1794724216152\nlsm_tree   migrate → memory                 5.3 µs/行    常驻       9.8 MB  峰值 +     9.9 MB  搬 51001 行 / 52 页 / 2644894 B\nlsm_tree: migrate 验收通过(不计时) 51001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0\nSCALE_MEMORY engine=lsm_tree phase=migration_before_release heap_bytes=20128398 rss_bytes=32555008 private_bytes=27799552 page_faults=78580\nSCALE_MIGRATION_RELEASE engine=lsm_tree released_heap_bytes=9783227\nSCALE_MEMORY engine=lsm_tree phase=migration_after_release heap_bytes=10345171 rss_bytes=22228992 private_bytes=17289216 page_faults=78580\nSCALE_PHASE_BEGIN engine=lsm_tree phase=bulk pid=66240 unix_ms=1794724216206\nSCALE_PHASE engine=lsm_tree phase=bulk wall_ms=12.993 cpu_ms=Ok(0.0) allocations=50368 page_faults_delta=Ok(392) unix_ms=1794724216219\nlsm_tree   bulk 灌 5000 行                    2.6 µs/行    常驻       0.0 MB  峰值 +     1.9 MB  \nSCALE_MEMORY engine=lsm_tree phase=bulk_before_stop heap_bytes=10347108 rss_bytes=21622784 private_bytes=16629760 page_faults=78972\nSCALE_PHASE_BEGIN engine=lsm_tree phase=bulk_stop pid=66240 unix_ms=1794724216220\nSCALE_PHASE engine=lsm_tree phase=bulk_stop wall_ms=3.018 cpu_ms=Ok(0.0) allocations=4 page_faults_delta=Ok(0) unix_ms=1794724216223\nSCALE_MEMORY engine=lsm_tree phase=bulk_before_reopen heap_bytes=816154 rss_bytes=10289152 private_bytes=7053312 page_faults=78972\nSCALE_PHASE_BEGIN engine=lsm_tree phase=bulk_reopen pid=66240 unix_ms=1794724216223\nSCALE_PHASE engine=lsm_tree phase=bulk_reopen wall_ms=3.571 cpu_ms=Ok(0.0) allocations=1149 page_faults_delta=Ok(56) unix_ms=1794724216226\nSCALE_MEMORY engine=lsm_tree phase=bulk_after_reopen heap_bytes=987173 rss_bytes=10518528 private_bytes=7286784 page_faults=79028\nlsm_tree   再冷重开                          3568.6 µs      常驻       0.2 MB  峰值 +     0.3 MB  常驻 0.2 MB\nlsm_tree: bulk 重开验收通过(不计时) 56001 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符\nSCALE_ENGINE_DONE rows=50000 engine=lsm_tree\n\nmemory: scratch=C:/Users/Administrator/.codex/test-data/storage-engines\\se_engine_66240_scale_memory_1794724216334405600_3\nSCALE_PHASE_BEGIN engine=memory phase=open pid=66240 unix_ms=1794724216334\nSCALE_PHASE engine=memory phase=open wall_ms=0.051 cpu_ms=Ok(0.0) allocations=15 page_faults_delta=Ok(0) unix_ms=1794724216334\nmemory     open 空库                         48.5 µs      常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=memory phase=insert pid=66240 unix_ms=1794724216334\nSCALE_PHASE engine=memory phase=insert wall_ms=89.225 cpu_ms=Ok(93.75) allocations=359398 page_faults_delta=Ok(2994) unix_ms=1794724216424\nmemory     灌 50000 行(事务)                    1.8 µs/行    常驻       9.6 MB  峰值 +     9.9 MB  \nSCALE_MAINT engine=memory phase=insert auto=Some(ReclamationStatus { pending_rows: 17232, committed_rows: 50000, completed_slices: 2, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: true, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=memory phase=checkpoint pid=66240 unix_ms=1794724216424\nSCALE_PHASE engine=memory phase=checkpoint wall_ms=0.003 cpu_ms=Ok(0.0) allocations=0 page_faults_delta=Ok(0) unix_ms=1794724216424\nmemory     flush+checkpoint                 0.3 µs      常驻       0.0 MB  峰值 +     0.0 MB  磁盘 0.0 MB\nSCALE_MEMORY engine=memory phase=first_before_stop heap_bytes=9594083 rss_bytes=20090880 private_bytes=15896576 page_faults=84994\nSCALE_PHASE_BEGIN engine=memory phase=first_stop pid=66240 unix_ms=1794724216425\nmemory     停止落盘                           46.5 ms   （Drop 内写出整库快照，不进性能格）\nSCALE_SNAPSHOT engine=memory release_ms=2.411 stages=Stats { body_ns: 23795400, write_ns: 2542000, crc_ns: 3649000, sync_ns: 19285700, publish_ns: 526700, total_ns: 44120400, crc_calls: 12, write_calls: 12, stop_mode: \"exclusive\", visited_rows: 50000, consumed_rows: 50000, pull_ns: 2740900, fold_emit_ns: 20991200, input_batches: 7, input_buffer_bytes: 393216, fold_direct_rows: 49993, fold_window_rows: 7, input_release_ns: 0, release_rows: 0, record_buffer_bytes: 524288, record_flushes: 11, record_buffered_rows: 50000, record_flush_ns: 6148200, record_direct_large_rows: 0, record_direct_large_ns: 0, record_reference_rows: 0 }\nSCALE_PHASE engine=memory phase=first_stop wall_ms=46.908 cpu_ms=Ok(15.625) allocations=26 page_faults_delta=Ok(247) unix_ms=1794724216472\nSCALE_MEMORY engine=memory phase=first_before_reopen heap_bytes=7493 rss_bytes=9814016 private_bytes=4489216 page_faults=85241\nSCALE_PHASE_BEGIN engine=memory phase=first_reopen pid=66240 unix_ms=1794724216472\nSCALE_PHASE engine=memory phase=first_reopen wall_ms=62.441 cpu_ms=Ok(62.5) allocations=158403 page_faults_delta=Ok(2589) unix_ms=1794724216535\nSCALE_RECOVERY phase=first stages=Stats { total_ns: 62425300, verify_ns: 4887600, decode_ns: 17479800, replay_ns: 39667000, replay_setup_ns: 39900, replay_encode_ns: 1786400, replay_apply_ns: 35194100, replay_commit_ns: 2576800, replay_legacy_ns: 0, replay_pages: 50, replay_input_rows: 50000, replay_registry_lookups: 50, replay_tail_reads: 0, reads: 43 }\nSCALE_MEMORY engine=memory phase=first_after_reopen heap_bytes=9594101 rss_bytes=20422656 private_bytes=16998400 page_faults=87831\nmemory     冷重开(恢复)                      62438.0 µs      常驻       9.6 MB  峰值 +    10.0 MB  常驻 9.6 MB\nSCALE_PHASE_BEGIN engine=memory phase=random_read pid=66240 unix_ms=1794724216536\nSCALE_PHASE engine=memory phase=random_read wall_ms=95.132 cpu_ms=Ok(93.75) allocations=350003 page_faults_delta=Ok(2) unix_ms=1794724216631\nmemory     点读×N 乱序                          1.9 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=memory phase=ordered_read pid=66240 unix_ms=1794724216631\nSCALE_PHASE engine=memory phase=ordered_read wall_ms=103.064 cpu_ms=Ok(109.375) allocations=350001 page_faults_delta=Ok(0) unix_ms=1794724216734\nmemory     点读×N 有序                          2.1 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=memory phase=multi_get pid=66240 unix_ms=1794724216735\nSCALE_PHASE engine=memory phase=multi_get wall_ms=3.444 cpu_ms=Ok(0.0) allocations=6002 page_faults_delta=Ok(39) unix_ms=1794724216738\nmemory     multi_get×1000                   3.4 µs/键    常驻       0.1 MB  峰值 +     0.1 MB  读到 1000 条\nSCALE_PHASE_BEGIN engine=memory phase=multi_miss pid=66240 unix_ms=1794724216739\nSCALE_PHASE engine=memory phase=multi_miss wall_ms=1.140 cpu_ms=Ok(0.0) allocations=2002 page_faults_delta=Ok(5) unix_ms=1794724216740\nmemory     multi_get×1000 全miss             1.1 µs/键    常驻       0.0 MB  峰值 +     0.0 MB  读到 0 条(应为 0)\nSCALE_PHASE_BEGIN engine=memory phase=scan pid=66240 unix_ms=1794724216741\nSCALE_PHASE engine=memory phase=scan wall_ms=22.669 cpu_ms=Ok(15.625) allocations=100182 page_faults_delta=Ok(3065) unix_ms=1794724216764\nmemory     一次全量 scan                        0.5 µs/行    常驻       8.7 MB  峰值 +     9.9 MB  50000 行\nSCALE_PHASE_BEGIN engine=memory phase=window_scan pid=66240 unix_ms=1794724216771\nSCALE_PHASE engine=memory phase=window_scan wall_ms=0.237 cpu_ms=Ok(0.0) allocations=1019 page_faults_delta=Ok(22) unix_ms=1794724216771\nmemory     窗口 scan(1%)                      0.5 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=memory phase=prefix_scan pid=66240 unix_ms=1794724216772\nSCALE_PHASE engine=memory phase=prefix_scan wall_ms=20.337 cpu_ms=Ok(15.625) allocations=100197 page_faults_delta=Ok(2406) unix_ms=1794724216792\nmemory     prefix_scan 2B前缀                 0.4 µs/行    常驻       8.7 MB  峰值 +     9.9 MB  50000 行\nSCALE_PHASE_BEGIN engine=memory phase=scan_page pid=66240 unix_ms=1794724216798\nSCALE_PHASE engine=memory phase=scan_page wall_ms=30.125 cpu_ms=Ok(31.25) allocations=102897 page_faults_delta=Ok(42) unix_ms=1794724216828\nmemory     scan_page 翻完整库                 301.2 µs/页    常驻       0.0 MB  峰值 +     0.1 MB  100 页 / 50000 行（页宽 500）\nSCALE_PHASE_BEGIN engine=memory phase=seek_prev pid=66240 unix_ms=1794724216828\nSCALE_PHASE engine=memory phase=seek_prev wall_ms=0.031 cpu_ms=Ok(0.0) allocations=17 page_faults_delta=Ok(1) unix_ms=1794724216828\nmemory     seek_prev 中间键                   28.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  命中 true\nSCALE_PHASE_BEGIN engine=memory phase=reverse_scan pid=66240 unix_ms=1794724216828\nSCALE_PHASE engine=memory phase=reverse_scan wall_ms=0.190 cpu_ms=Ok(0.0) allocations=1019 page_faults_delta=Ok(0) unix_ms=1794724216829\nmemory     reverse_scan 1% 窗口               0.4 µs/行    常驻       0.1 MB  峰值 +     0.1 MB  500 行\nSCALE_PHASE_BEGIN engine=memory phase=search_first pid=66240 unix_ms=1794724216829\nSCALE_PHASE engine=memory phase=search_first wall_ms=22.824 cpu_ms=Ok(15.625) allocations=100168 page_faults_delta=Ok(153) unix_ms=1794724216852\nmemory     search 首页                    22822.7 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  命中 50000\nSCALE_PHASE_BEGIN engine=memory phase=search_first_no_total pid=66240 unix_ms=1794724216852\nSCALE_PHASE engine=memory phase=search_first_no_total wall_ms=1.641 cpu_ms=Ok(0.0) allocations=8206 page_faults_delta=Ok(1) unix_ms=1794724216854\nmemory     search 首页(免 total)            1638.3 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  拿了 100 条, has_next=true\nSCALE_PHASE_BEGIN engine=memory phase=search_last pid=66240 unix_ms=1794724216854\nSCALE_PHASE engine=memory phase=search_last wall_ms=19.334 cpu_ms=Ok(15.625) allocations=100168 page_faults_delta=Ok(0) unix_ms=1794724216873\nmemory     search 末页(深翻)                19331.4 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  命中 50000，末页 100 条（已逐值验收）\nSCALE_PHASE_BEGIN engine=memory phase=search_last_no_total pid=66240 unix_ms=1794724216874\nSCALE_PHASE engine=memory phase=search_last_no_total wall_ms=0.311 cpu_ms=Ok(15.625) allocations=907 page_faults_delta=Ok(2) unix_ms=1794724216874\nmemory     search 末页(免 total)             308.5 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  拿了 100 条, total=None\nSCALE_PHASE_BEGIN engine=memory phase=key_count pid=66240 unix_ms=1794724216874\nSCALE_PHASE engine=memory phase=key_count wall_ms=19.356 cpu_ms=Ok(15.625) allocations=100182 page_faults_delta=Ok(6) unix_ms=1794724216894\nmemory     key_count 2B前缀               19354.2 µs/次    常驻       0.0 MB  峰值 +     0.8 MB  50000 键\nSCALE_PHASE_BEGIN engine=memory phase=set_ttl pid=66240 unix_ms=1794724216894\nSCALE_PHASE engine=memory phase=set_ttl wall_ms=1.497 cpu_ms=Ok(0.0) allocations=6179 page_faults_delta=Ok(3) unix_ms=1794724216895\nmemory     set_with_ttl×1000                1.5 µs/次    常驻       0.2 MB  峰值 +     0.3 MB  \nSCALE_PHASE_BEGIN engine=memory phase=get_ttl pid=66240 unix_ms=1794724216896\nSCALE_PHASE engine=memory phase=get_ttl wall_ms=1.677 cpu_ms=Ok(0.0) allocations=8001 page_faults_delta=Ok(0) unix_ms=1794724216897\nmemory     get_ttl×1000                     1.7 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  1000/1000 有 TTL\nmemory: 验收准备(不计时) persist 1000 辅助键，新增 1000 个版本；后续辅助键永久化、最新信封少8B，非历史TTL同形状\nSCALE_PHASE_BEGIN engine=memory phase=incr pid=66240 unix_ms=1794724216908\nSCALE_PHASE engine=memory phase=incr wall_ms=3.335 cpu_ms=Ok(0.0) allocations=10998 page_faults_delta=Ok(1) unix_ms=1794724216912\nmemory     incr×1000                        3.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  \nSCALE_PHASE_BEGIN engine=memory phase=update pid=66240 unix_ms=1794724216912\nSCALE_PHASE engine=memory phase=update wall_ms=15.365 cpu_ms=Ok(15.625) allocations=36022 page_faults_delta=Ok(6) unix_ms=1794724216927\nmemory     更新 5000 键                        3.1 µs/次    常驻       1.0 MB  峰值 +     1.1 MB  \nSCALE_UPDATE_STAGES engine=memory doors=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (0, 0.0), vacuum_delete: (0, 0.0), vacuum_sync: (0, 0.0), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (0, 0.0), dblwr_data: (0, 0.0), dblwr_publish: (0, 0.0), dblwr_clear: (0, 0.0), page_pack: (0, 0.0), page_write: (0, 0.0), page_sync: (0, 0.0), freelist: (0, 0.0), vacuum_scan_max_ms: 0.0, vacuum_scan_allocations: 0, vacuum_scan_histogram: [0, 0, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 0, bplus_backtrack_reuses: 0, bplus_maintenance_pages: 0, bplus_maintenance_rows: 0, lsm_known_deletes: 0 }\nSCALE_MAINT engine=memory phase=update auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 57001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=memory phase=health pid=66240 unix_ms=1794724216929\nSCALE_PHASE engine=memory phase=health wall_ms=6.193 cpu_ms=Ok(0.0) allocations=1 page_faults_delta=Ok(0) unix_ms=1794724216935\nmemory     health()                      6183.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  rows=57001 max_chain=2\nSCALE_MEMORY engine=memory phase=before_vacuum heap_bytes=11749281 rss_bytes=24760320 private_bytes=19992576 page_faults=93712\nSCALE_PHASE_BEGIN engine=memory phase=vacuum pid=66240 unix_ms=1794724216936\nSCALE_PHASE engine=memory phase=vacuum wall_ms=10.360 cpu_ms=Ok(15.625) allocations=6025 page_faults_delta=Ok(4) unix_ms=1794724216946\nSCALE_MEMORY engine=memory phase=after_vacuum heap_bytes=10532269 rss_bytes=24776704 private_bytes=19992576 page_faults=93716\nmemory     vacuum() 全库                  10357.1 µs/次    常驻      -1.2 MB  峰值 +     0.3 MB  裁掉 6000 行\nSCALE_VACUUM_STAGES engine=memory doors=MaintenanceMs { checkpoint: (0, 0.0), commit: (0, 0.0), auto_vacuum: (0, 0.0), vacuum_scan: (7, 7.9612), vacuum_delete: (7, 2.3865), vacuum_sync: (0, 0.0), vacuum_blob_refs: (0, 0.0), vacuum_blob_gc: (0, 0.0), dblwr_reset: (0, 0.0), dblwr_data: (0, 0.0), dblwr_publish: (0, 0.0), dblwr_clear: (0, 0.0), page_pack: (0, 0.0), page_write: (0, 0.0), page_sync: (0, 0.0), freelist: (0, 0.0), vacuum_scan_max_ms: 2.0678, vacuum_scan_allocations: 6025, vacuum_scan_histogram: [3, 4, 0, 0, 0, 0], blob_point_reads: 0, bitcask_empty_sweeps: 0, bitcask_reference_sweeps: 0, bitcask_value_reads: 0, lsm_vacuum_owned_rows: 0, lsm_vacuum_legacy_key_copies: 0, lsm_vacuum_blocks: 0, bplus_pack_buffers: 0, bplus_backtrack_reuses: 0, bplus_maintenance_pages: 0, bplus_maintenance_rows: 0, lsm_known_deletes: 0 }\nSCALE_VACUUM engine=memory rows_scanned=57001 versions_removed=6000 skipped=false\nSCALE_MAINT engine=memory phase=vacuum auto=Some(ReclamationStatus { pending_rows: 7001, committed_rows: 57001, completed_slices: 0, skipped_active: 0, failed_slices: 0, versions_removed: 0, running: false, sweep_in_progress: false, active_txns: 0, oldest_active_version: None }) lsm_flushes=0 lsm_flush_ms=0.000 lsm_compactions=0 lsm_compact_ms=0.000 lsm_input_files=0 lsm_input_bytes=0 owned_input_rows=0 legacy_input_clones=0 reference_input_clones=0 compaction_blocks=0\nSCALE_PHASE_BEGIN engine=memory phase=vacuum_bounded pid=66240 unix_ms=1794724216947\nSCALE_PHASE engine=memory phase=vacuum_bounded wall_ms=0.269 cpu_ms=Ok(0.0) allocations=2 page_faults_delta=Ok(0) unix_ms=1794724216948\nmemory     vacuum_bounded 一片              266.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  扫 2048 行、裁 0 行（预算 2048）\nSCALE_PHASE_BEGIN engine=memory phase=flush pid=66240 unix_ms=1794724216948\nSCALE_PHASE engine=memory phase=flush wall_ms=0.001 cpu_ms=Ok(0.0) allocations=0 page_faults_delta=Ok(0) unix_ms=1794724216948\nmemory     flush                            0.3 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  磁盘 5.3 MB\nSCALE_PHASE_BEGIN engine=memory phase=merge pid=66240 unix_ms=1794724216949\nSCALE_PHASE engine=memory phase=merge wall_ms=0.002 cpu_ms=Ok(0.0) allocations=0 page_faults_delta=Ok(0) unix_ms=1794724216949\nmemory     merge                            0.4 µs/次    常驻       0.0 MB  峰值 +     0.0 MB  （本引擎无 merge）\nSCALE_PHASE_BEGIN engine=memory phase=export_owned pid=66240 unix_ms=1794724216949\nSCALE_PHASE engine=memory phase=export_owned wall_ms=23.792 cpu_ms=Ok(31.25) allocations=102184 page_faults_delta=Ok(2440) unix_ms=1794724216973\nmemory     export 全库(物化)                    0.5 µs/行    常驻       8.8 MB  峰值 +     9.9 MB  51001 行进 Vec\nSCALE_PHASE_BEGIN engine=memory phase=export_stream pid=66240 unix_ms=1794724216984\nSCALE_PHASE engine=memory phase=export_stream wall_ms=87.727 cpu_ms=Ok(46.875) allocations=102171 page_faults_delta=Ok(72) unix_ms=1794724217072\nmemory     export 流式(逐行落地)                  1.7 µs/行    常驻       0.0 MB  峰值 +     0.8 MB  51001 行 → 磁盘 5.0 MB，内存里一行都不攒\nSCALE_PHASE_BEGIN engine=memory phase=migrate pid=66240 unix_ms=1794724217073\nSCALE_PHASE engine=memory phase=migrate wall_ms=155.926 cpu_ms=Ok(156.25) allocations=673787 page_faults_delta=Ok(2026) unix_ms=1794724217229\nmemory     migrate → memory                 3.1 µs/行    常驻       9.8 MB  峰值 +     9.9 MB  搬 51001 行 / 52 页 / 2644894 B\nmemory: migrate 验收通过(不计时) 51001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0\nSCALE_MEMORY engine=memory phase=migration_before_release heap_bytes=20315770 rss_bytes=33959936 private_bytes=29454336 page_faults=98483\nSCALE_MIGRATION_RELEASE engine=memory released_heap_bytes=9783227\nSCALE_MEMORY engine=memory phase=migration_after_release heap_bytes=10532543 rss_bytes=26193920 private_bytes=21225472 page_faults=98485\nSCALE_PHASE_BEGIN engine=memory phase=bulk pid=66240 unix_ms=1794724217295\nSCALE_PHASE engine=memory phase=bulk wall_ms=5.420 cpu_ms=Ok(15.625) allocations=25834 page_faults_delta=Ok(134) unix_ms=1794724217300\nmemory     bulk 灌 5000 行                    1.1 µs/行    常驻       1.1 MB  峰值 +     1.3 MB  \nSCALE_MEMORY engine=memory phase=bulk_before_stop heap_bytes=11606479 rss_bytes=26742784 private_bytes=21782528 page_faults=98619\nSCALE_PHASE_BEGIN engine=memory phase=bulk_stop pid=66240 unix_ms=1794724217300\nSCALE_SNAPSHOT phase=bulk total_ms=45.140 release_ms=0.317 stages=Stats { body_ns: 20679400, write_ns: 2412500, crc_ns: 4475600, sync_ns: 22123600, publish_ns: 1166300, total_ns: 44822500, crc_calls: 13, write_calls: 13, stop_mode: \"exclusive\", visited_rows: 56001, consumed_rows: 56001, pull_ns: 3125100, fold_emit_ns: 17507100, input_batches: 7, input_buffer_bytes: 393216, fold_direct_rows: 55994, fold_window_rows: 7, input_release_ns: 0, release_rows: 0, record_buffer_bytes: 524288, record_flushes: 12, record_buffered_rows: 56001, record_flush_ns: 6791400, record_direct_large_rows: 0, record_direct_large_ns: 0, record_reference_rows: 0 }\nSCALE_PHASE engine=memory phase=bulk_stop wall_ms=45.491 cpu_ms=Ok(15.625) allocations=13 page_faults_delta=Ok(265) unix_ms=1794724217346\nSCALE_MEMORY engine=memory phase=bulk_before_reopen heap_bytes=816474 rss_bytes=10735616 private_bytes=5459968 page_faults=98884\nSCALE_PHASE_BEGIN engine=memory phase=bulk_reopen pid=66240 unix_ms=1794724217346\nSCALE_PHASE engine=memory phase=bulk_reopen wall_ms=57.584 cpu_ms=Ok(46.875) allocations=177412 page_faults_delta=Ok(2861) unix_ms=1794724217404\nSCALE_RECOVERY phase=bulk stages=Stats { total_ns: 57570600, verify_ns: 6683000, decode_ns: 16064100, replay_ns: 34467800, replay_setup_ns: 27900, replay_encode_ns: 1749000, replay_apply_ns: 30342700, replay_commit_ns: 2293000, replay_legacy_ns: 0, replay_pages: 57, replay_input_rows: 56001, replay_registry_lookups: 57, replay_tail_reads: 0, reads: 47 }\nSCALE_MEMORY engine=memory phase=bulk_after_reopen heap_bytes=11553341 rss_bytes=22454272 private_bytes=18595840 page_faults=101745\nmemory     再冷重开                         57581.2 µs      常驻      10.7 MB  峰值 +    11.2 MB  常驻 10.7 MB\nmemory: bulk 重开验收通过(不计时) 56001 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符\nSCALE_ENGINE_DONE rows=50000 engine=memory\n\nSCALE_DONE rows=50000 engines=4\nSCALE_LOCK_RELEASE name=scale_rows_50000 pid=66240 unix_ms=1794724217504 active_ms=15172.439\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 589 filtered out; finished in 15.17s\n\n",
+  "summary": [
+    {
+      "rows": 600000,
+      "wall_ms_abba": [
+        2992.269,
+        1900.513,
+        1881.784,
+        2399.34
+      ],
+      "mean_change_percent": -29.8484552570485,
+      "page_reads_old": 106137,
+      "page_reads_new": 78105,
+      "allocations_old": 2463741,
+      "allocations_new": 1284064
+    },
+    {
+      "rows": 1000000,
+      "wall_ms_abba": [
+        3604.037,
+        3578.59,
+        3342.157,
+        3571.029
+      ],
+      "mean_change_percent": -3.5444830751382606,
+      "page_reads_old": 176477,
+      "page_reads_new": 129913,
+      "allocations_old": 4096677,
+      "allocations_new": 2135928
+    },
+    {
+      "rows": 5000000,
+      "wall_ms_abba": [
+        22183.193,
+        25935.346,
+        23893.682,
+        27478.478
+      ],
+      "mean_change_percent": 0.3369942988829422,
+      "page_reads_old": 880956,
+      "page_reads_new": 649000,
+      "allocations_old": 20411318,
+      "allocations_new": 10637049
+    },
+    {
+      "rows": 10000000,
+      "wall_ms_abba": [
+        46974.231,
+        42968.053,
+        44920.004,
+        54896.576
+      ],
+      "mean_change_percent": -13.725963710094103,
+      "page_reads_old": 1761546,
+      "page_reads_new": 1297766,
+      "allocations_old": 40819155,
+      "allocations_new": 21274853
+    },
+    {
+      "rows": 20000000,
+      "wall_ms_abba": [
+        118200.588,
+        96977.928,
+        100725.844,
+        105497.412
+      ],
+      "mean_change_percent": -11.620232635070494,
+      "page_reads_old": 4014954,
+      "page_reads_new": 2923974,
+      "allocations_old": 94165605,
+      "allocations_new": 49079649
+    }
+  ],
+  "delivery": {
+    "json_roundtrip": "Passed: Python json import/export/reimport equality; 20 verified arms; SCALE_DONE confirmed",
+    "source_files": [
+      "src/bplus_tree/bplus_tree.rs",
+      "src/engine.rs"
+    ]
+  }
+}

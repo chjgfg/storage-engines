@@ -6173,6 +6173,87 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ordinary-transaction B+ vacuum node reuse ABBA at 5M/10M/20M; release single thread"]
+    fn bplus_rebalance_read_cost() {
+        use crate::bplus_tree::bplus_tree::{rebalance_read_reference, rebalance_counts, reorg_stats};
+        use crate::common::maintenance_probe::{Scope, Stage};
+        let _run = crate::scale_probe::RunGuard::acquire("bplus_rebalance_read_cost");
+        crate::scale_probe::fingerprint();
+        let sizes: Vec<usize> = std::env::var("BPLUS_REBALANCE_ROWS")
+            .unwrap_or_else(|_| "5000000,10000000,20000000".into())
+            .split(',').map(|s| s.trim().parse().unwrap()).collect();
+        assert!(!sizes.is_empty() && sizes[0] >= 100 && sizes.windows(2).all(|w| w[0] < w[1]));
+        fn copy_seed(from: &Path, to: &Path) {
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap(); assert!(entry.file_type().unwrap().is_file());
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+        let base = ScaleScratch::new("bplus_rebalance_base");
+        let mut built = 0;
+        for rows in sizes {
+            // Grow the unmodified seed with normal transactions and automatic
+            // maintenance. Update a separate copy so earlier scale vacuums do
+            // not change the physical seed or history of subsequent arms.
+            let db = open_engine(EngineKind::BPlusTree, Some(&base.0.join("bplus.db"))).unwrap();
+            for start in (built..rows).step_by(1000) {
+                let end = (start + 1000).min(rows);
+                let items: Vec<_> = (start..end).map(|i| (scale_key(i), scale_val(i))).collect();
+                let tx = db.begin(); tx.batch_set(&items).unwrap(); tx.commit();
+                if end % 1_000_000 == 0 || end == rows { eprintln!("BPLUS_REBALANCE_BUILD rows={rows} completed={end}"); }
+            }
+            db.flush().unwrap(); db.checkpoint().unwrap(); drop(db); built = rows;
+            let seed = ScaleScratch::new("bplus_rebalance_updated"); copy_seed(&base.0, &seed.0);
+            let db = crate::bplus_tree::MVCC::open(seed.0.join("bplus.db"), 64, 1024);
+            db.set_vacuum_auto_slice(0); // Retain exactly 10% history for every arm.
+            for start in (0..rows / 10).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in start..(start + 1000).min(rows / 10) { assert!(tx.set_raw(&scale_key(i), scale_val(i + rows))); }
+                tx.try_commit().unwrap();
+            }
+            db.try_checkpoint().unwrap(); drop(db);
+            let mut outcomes = Vec::new();
+            for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+                let dir = ScaleScratch::new("bplus_rebalance_arm"); copy_seed(&seed.0, &dir.0);
+                let path = dir.0.join("bplus.db");
+                let db = crate::bplus_tree::MVCC::open(&path, 64, 1024); db.set_vacuum_auto_slice(0);
+                let mode = reference.then(rebalance_read_reference::Scope::start);
+                let scope = Scope::start();
+                let counts = rebalance_counts(); let reorg = reorg_stats();
+                let reads = crate::bplus_tree::page::page_reads();
+                eprintln!("BPLUS_REBALANCE_ARM rows={rows} round={round} reference={reference}");
+                let phase = crate::scale_probe::Phase::begin("bplus_tree", "vacuum_abba");
+                let result = db.vacuum().unwrap();
+                phase.finish("bplus_tree", "vacuum_abba");
+                let stats = scope.stats(); let after = rebalance_counts(); let now = reorg_stats();
+                let reused = after.0 - counts.0; let reloads = after.1 - counts.1;
+                let reorg = (now.0 - reorg.0, now.1 - reorg.1, now.2 - reorg.2);
+                let reads = crate::bplus_tree::page::page_reads() - reads;
+                assert_eq!(result.versions_removed, rows / 10);
+                assert_eq!(result.rows_scanned, (rows + rows / 10) as u64);
+                assert_eq!(reused > 0, !reference); assert!(reorg.1 + reorg.2 > 0);
+                eprintln!("BPLUS_REBALANCE_COST rows={rows} round={round} reused={reused} reloads={reloads} page_reads={reads} reorg={reorg:?} stages={stats:?}");
+                outcomes.push((reads, stats.allocations[Stage::VacuumDelete as usize], reorg));
+                drop(scope); drop(mode); drop(db);
+                let db = crate::bplus_tree::MVCC::open(&path, 64, 1024);
+                let mut seen = 0;
+                db.export_latest_visible_for_each(false, |r| {
+                    assert_eq!(r.key, scale_key(seen));
+                    assert_eq!(r.value, Some(scale_val(if seen < rows / 10 { seen + rows } else { seen })));
+                    seen += 1; true
+                });
+                assert_eq!(seen, rows);
+                eprintln!("BPLUS_REBALANCE_VERIFIED rows={rows} round={round}");
+            }
+            for new in [1, 2] { for old in [0, 3] {
+                assert!(outcomes[new].0 < outcomes[old].0);
+                assert!(outcomes[new].1 < outcomes[old].1);
+                assert_eq!(outcomes[new].2, outcomes[old].2);
+            } }
+        }
+    }
+
+    #[test]
     #[ignore = "B+ vacuum redundant blob sync ABBA; release single thread"]
     fn bplus_vacuum_sync_cost() {
         bplus_delete_cost(false, false, true);

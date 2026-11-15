@@ -338,6 +338,49 @@ enum PairReorg {
     Nothing,
 }
 
+/// Nodes read under the tree's exclusive borrow remain valid until a write.
+/// A rejected borrow changes only its local copies; rebalancing must then
+/// reload the unchanged pages rather than reuse those speculative copies.
+enum RebalanceInput {
+    Fresh { first: BTreeNode, second: BTreeNode, parent: BTreeNode },
+    Reload,
+}
+
+impl RebalanceInput {
+    fn load(self, tree: &mut BPlusTree, first: PageId, second: PageId, parent: PageId)
+        -> (BTreeNode, BTreeNode, BTreeNode) {
+        match self {
+            Self::Fresh { first, second, parent } => {
+                #[cfg(test)]
+                REBALANCE_REUSES.with(|c| c.set(c.get() + 1));
+                (first, second, parent)
+            }
+            Self::Reload => {
+                #[cfg(test)]
+                REBALANCE_RELOADS.with(|c| c.set(c.get() + 1));
+                (tree.read_node(first), tree.read_node(second), tree.read_node(parent))
+            }
+        }
+    }
+
+    fn swap(self) -> Self {
+        match self {
+            Self::Fresh { first, second, parent } => Self::Fresh { first: second, second: first, parent },
+            Self::Reload => Self::Reload,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REBALANCE_REUSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static REBALANCE_RELOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn rebalance_counts() -> (u64, u64) {
+    (REBALANCE_REUSES.with(|c| c.get()), REBALANCE_RELOADS.with(|c| c.get()))
+}
+
 /// 一趟下降插入的结果：`writes` 是**还没落盘**的一串（页号, 内容），`alloc` 是途中占下的页
 /// （整条路径作废时由 [`BPlusTree::insert`] 回收）。为什么要攒着一起写，见 `insert` 的注释。
 struct InsertStep {
@@ -1558,6 +1601,7 @@ impl BPlusTree {
     }
 
     /// 在父节点中查找 child 的下标
+    #[cfg(test)]
     fn get_parent_index(&mut self, parent_page_id: PageId, child_page_id: PageId) -> Option<usize> {
         match self.read_node(parent_page_id) {
             BTreeNode::Internal { children, .. } => {
@@ -1568,6 +1612,7 @@ impl BPlusTree {
     }
 
     /// 优先右兄弟，否则左兄弟；返回 (sibling_id, is_left_sibling)
+    #[cfg(test)]
     fn get_sibling(&mut self, parent_page_id: PageId, child_idx: usize) -> (Option<PageId>, bool) {
         match self.read_node(parent_page_id) {
             BTreeNode::Internal { children, .. } => {
@@ -1614,10 +1659,9 @@ impl BPlusTree {
         is_left_sibling: bool,
         parent_page_id: PageId,
         child_idx: usize,
+        input: RebalanceInput,
     )  -> bool {
-        let mut node = self.read_node(node_page_id);
-        let mut sibling = self.read_node(sibling_page_id);
-        let mut parent = self.read_node(parent_page_id);
+        let (mut node, mut sibling, mut parent) = input.load(self, node_page_id, sibling_page_id, parent_page_id);
 
         match (&mut node, &mut sibling, &mut parent) {
             (
@@ -1676,9 +1720,11 @@ impl BPlusTree {
         right_page: PageId,
         parent_page_id: PageId,
         sep_idx: usize,
+        input: RebalanceInput,
     ) -> PairReorg {
+        let (left, right, parent) = input.load(self, left_page, right_page, parent_page_id);
         let (left_entries, left_next, right_entries, right_next) =
-            match (self.read_node(left_page), self.read_node(right_page)) {
+            match (left, right) {
                 (
                     BTreeNode::Leaf {
                         entries: a,
@@ -1691,7 +1737,7 @@ impl BPlusTree {
                 ) => (a, l, b, r),
                 _ => return PairReorg::Nothing,
             };
-        let (mut parent_keys, parent_children) = match self.read_node(parent_page_id) {
+        let (mut parent_keys, parent_children) = match parent {
             BTreeNode::Internal { keys, children } => (keys, children),
             _ => return PairReorg::Nothing,
         };
@@ -1796,10 +1842,9 @@ impl BPlusTree {
         is_left_sibling: bool,
         parent_page_id: PageId,
         child_idx: usize,
+        input: RebalanceInput,
     )  -> bool {
-        let mut node = self.read_node(node_page_id);
-        let mut sibling = self.read_node(sibling_page_id);
-        let mut parent = self.read_node(parent_page_id);
+        let (mut node, mut sibling, mut parent) = input.load(self, node_page_id, sibling_page_id, parent_page_id);
 
         match (&mut node, &mut sibling, &mut parent) {
             (
@@ -1865,16 +1910,18 @@ impl BPlusTree {
         right_page: PageId,
         parent_page_id: PageId,
         sep_idx: usize,
+        input: RebalanceInput,
     ) -> PairReorg {
-        let (left_keys, left_children) = match self.read_node(left_page) {
+        let (left, right, parent) = input.load(self, left_page, right_page, parent_page_id);
+        let (left_keys, left_children) = match left {
             BTreeNode::Internal { keys, children } => (keys, children),
             _ => return PairReorg::Nothing,
         };
-        let (right_keys, right_children) = match self.read_node(right_page) {
+        let (right_keys, right_children) = match right {
             BTreeNode::Internal { keys, children } => (keys, children),
             _ => return PairReorg::Nothing,
         };
-        let (mut parent_keys, parent_children) = match self.read_node(parent_page_id) {
+        let (mut parent_keys, parent_children) = match parent {
             BTreeNode::Internal { keys, children } => (keys, children),
             _ => return PairReorg::Nothing,
         };
@@ -1983,7 +2030,8 @@ impl BPlusTree {
     /// - 而那是冗余的：合并只让"**这一层的父节点**"少一个孩子，而那个父节点正是 `delete_recursive`
     ///   回溯栈上的下一帧 —— 它紧接着就做自己那一层的下溢检查（`is_underflow(&cur)`），
     ///   一路到根；根降层由 `delete()` 收尾。⇒ DFS 归零，`真下溢/借位/合并` 三个计数一字不差。
-    fn handle_underflow(&mut self, node_page_id: PageId, parent_page_id: PageId) -> bool {
+    #[cfg(test)]
+    fn handle_underflow_reference(&mut self, node_page_id: PageId, parent_page_id: PageId) -> bool {
         if node_page_id == self.root {
             return false;
         }
@@ -2018,6 +2066,7 @@ impl BPlusTree {
                     is_left_sibling,
                     parent_page_id,
                     child_idx,
+                    RebalanceInput::Reload,
                 )
             } else {
                 self.internal_borrow_key(
@@ -2026,6 +2075,7 @@ impl BPlusTree {
                     is_left_sibling,
                     parent_page_id,
                     child_idx,
+                    RebalanceInput::Reload,
                 )
             };
             // 借不释放页 ⇒ 父节点的子数不变 ⇒ 不会连锁下溢
@@ -2043,9 +2093,96 @@ impl BPlusTree {
             (node_page_id, sibling_page_id, child_idx)
         };
         let reorg = if is_leaf {
-            self.rebalance_leaf_pair(left_page, right_page, parent_page_id, sep_idx)
+            self.rebalance_leaf_pair(left_page, right_page, parent_page_id, sep_idx, RebalanceInput::Reload)
         } else {
-            self.rebalance_internal_pair(left_page, right_page, parent_page_id, sep_idx)
+            self.rebalance_internal_pair(left_page, right_page, parent_page_id, sep_idx, RebalanceInput::Reload)
+        };
+        let merged = reorg == PairReorg::Merged;
+        #[cfg(test)]
+        if merged {
+            note_merge!();
+        }
+        // 合并过 ⇒ 父节点少了一个孩子：往上**报告**，由父节点自己那一帧去查下溢、由 `delete()` 收尾降根
+        merged
+    }
+
+    fn handle_underflow(&mut self, node_page_id: PageId, parent_page_id: PageId) -> bool {
+        #[cfg(test)]
+        if rebalance_read_reference::enabled() {
+            return self.handle_underflow_reference(node_page_id, parent_page_id);
+        }
+        if node_page_id == self.root {
+            return false;
+        }
+
+        let node = self.read_node(node_page_id);
+        if !self.is_underflow(&node) {
+            return false;
+        }
+        // 走到这里才是"真的要做一次重组"（M56 的数：每行删除都会问一句下溢，但只有这里动手）
+        #[cfg(test)]
+        note_underflow!();
+
+        let parent = self.read_node(parent_page_id);
+        let BTreeNode::Internal { children, .. } = &parent else {
+            return false;
+        };
+        let Some(child_idx) = children.iter().position(|&id| id == node_page_id) else {
+            return false;
+        };
+        let (sibling_page_id, is_left_sibling) = if let Some(&right) = children.get(child_idx + 1) {
+            (right, false)
+        } else if child_idx > 0 {
+            (children[child_idx - 1], true)
+        } else { return false; };
+
+        let sibling = self.read_node(sibling_page_id);
+        let sibling_has_extra = Self::node_key_count(&sibling) > self.min_entries();
+
+        // 先试最便宜的一招：只动两页 + 一把分隔键。借不动（兄弟条数不够）或**借完装不下**，
+        // 都退到整对重排 —— 原先借完装不下就整次作废，等于"宁可一直下溢也不重排"。
+        let is_leaf = matches!(&node, BTreeNode::Leaf { .. });
+        let mut input = RebalanceInput::Fresh { first: node, second: sibling, parent };
+        if sibling_has_extra {
+            let borrow_input = std::mem::replace(&mut input, RebalanceInput::Reload);
+            let borrowed = if is_leaf {
+                self.leaf_borrow_key(
+                    node_page_id,
+                    sibling_page_id,
+                    is_left_sibling,
+                    parent_page_id,
+                    child_idx,
+                    borrow_input,
+                )
+            } else {
+                self.internal_borrow_key(
+                    node_page_id,
+                    sibling_page_id,
+                    is_left_sibling,
+                    parent_page_id,
+                    child_idx,
+                    borrow_input,
+                )
+            };
+            // 借不释放页 ⇒ 父节点的子数不变 ⇒ 不会连锁下溢
+            if borrowed {
+                #[cfg(test)]
+                note_borrow!();
+                return false;
+            }
+        }
+
+        // 相邻两页按 key 顺序是「左在右之前」，重排只需要这一对页号 + 它们之间那把分隔键
+        let (left_page, right_page, sep_idx) = if is_left_sibling {
+            input = input.swap();
+            (sibling_page_id, node_page_id, child_idx - 1)
+        } else {
+            (node_page_id, sibling_page_id, child_idx)
+        };
+        let reorg = if is_leaf {
+            self.rebalance_leaf_pair(left_page, right_page, parent_page_id, sep_idx, input)
+        } else {
+            self.rebalance_internal_pair(left_page, right_page, parent_page_id, sep_idx, input)
         };
         let merged = reorg == PairReorg::Merged;
         #[cfg(test)]
@@ -3190,6 +3327,79 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_reuses_nodes_and_preserves_tree_bytes() {
+        let mut outcomes = Vec::new();
+        for old in [true, false] {
+            let (_scratch, mut tree) = anon(8, 64);
+            for i in 0..1200_u64 {
+                assert!(tree.insert(i.to_be_bytes().to_vec(), RowId(Some(vec![i as u8; 24]))));
+            }
+            let mode = old.then(rebalance_read_reference::Scope::start);
+            let before = crate::bplus_tree::page::page_reads();
+            let counts = rebalance_counts();
+            let stats = reorg_stats();
+            let victims: Vec<_> = (0..1000_u64).map(|i| i.to_be_bytes().to_vec()).collect();
+            assert_eq!(tree.delete_batch(&victims), 1000);
+            let reads = crate::bplus_tree::page::page_reads() - before;
+            let now = rebalance_counts();
+            let after = reorg_stats();
+            let stats = (after.0 - stats.0, after.1 - stats.1, after.2 - stats.2);
+            assert!(stats.1 + stats.2 > 0);
+            if old { assert_eq!(now.0, counts.0); assert!(now.1 > counts.1); }
+            else { assert!(now.0 > counts.0); }
+            drop(mode);
+            let mut pages = Vec::new();
+            for id in 1..tree.page_manager.next_page_id() {
+                pages.push(tree.page_manager.read_page(PageId(id)));
+            }
+            outcomes.push((reads, stats, tree.root, pages));
+            tree.try_flush_all().unwrap();
+            let path = tree.page_manager.path().to_path_buf(); drop(tree);
+            let mut tree = BPlusTree::open(&path, 8, 64);
+            for i in 0..1200_u64 {
+                assert_eq!(tree.get(i.to_be_bytes().to_vec()),
+                    (i >= 1000).then(|| RowId(Some(vec![i as u8; 24]))));
+            }
+        }
+        assert!(outcomes[1].0 < outcomes[0].0, "reusing nodes must actually remove page reads");
+        assert_eq!((&outcomes[0].1, &outcomes[0].2, &outcomes[0].3),
+            (&outcomes[1].1, &outcomes[1].2, &outcomes[1].3));
+    }
+
+    #[test]
+    fn rebalance_failed_borrow_reloads_unmodified_pages() {
+        let mut outcomes = Vec::new();
+        for old in [true, false] {
+            let (_scratch, mut tree) = anon(8, 8);
+            let left = tree.root;
+            let right = tree.page_manager.allocate_page();
+            let parent = tree.page_manager.allocate_page();
+            let left_node = BTreeNode::Leaf { entries: vec![(vec![0], RowId(Some(vec![9; 3700])))], next_leaf: Some(right) };
+            let right_node = BTreeNode::Leaf { entries: (1..=4).map(|i| (vec![i], RowId(Some(vec![i; 500])))).collect(), next_leaf: None };
+            let parent_node = BTreeNode::Internal { keys: vec![vec![1]], children: vec![left, right] };
+            assert!(tree.write_node(left, &left_node)); assert!(tree.write_node(right, &right_node));
+            assert!(tree.write_node(parent, &parent_node)); tree.set_root(parent);
+            let mode = old.then(rebalance_read_reference::Scope::start);
+            let before = rebalance_counts();
+            assert!(!tree.handle_underflow(left, parent));
+            let after = rebalance_counts();
+            // 3700+500 bytes cannot be borrowed into one page. The fallback
+            // must reread originals, never the locally mutated failed attempt.
+            assert_eq!(after.1 - before.1, if old { 2 } else { 1 });
+            assert_eq!(after.0 - before.0, u64::from(!old));
+            drop(mode);
+            outcomes.push([left, right, parent].map(|p| tree.page_manager.read_page(p)));
+            tree.try_flush_all().unwrap();
+            let path = tree.page_manager.path().to_path_buf(); drop(tree);
+            let mut tree = BPlusTree::open(&path, 8, 8);
+            for i in 0..=4 {
+                assert_eq!(tree.get(vec![i]), Some(RowId(Some(vec![if i == 0 { 9 } else { i }; if i == 0 { 3700 } else { 500 }]))));
+            }
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[test]
     fn delete_page_projection_preserves_dirty_reads_and_restructure() {
         let mut costs = Vec::new();
         for old in [true, false] {
@@ -4197,6 +4407,16 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod delete_read_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
+}
+
+#[cfg(test)]
+pub(crate) mod rebalance_read_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
