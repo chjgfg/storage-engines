@@ -1,0 +1,660 @@
+{
+  "schema_version": 1,
+  "milestone": "M141",
+  "date": "2026-11-15",
+  "base_commit": "4d02648412985338a5c0cccfee6e62e65b133199",
+  "decision": "Rejected production change: single-pass leaf validation/indexing did not demonstrate stable performance across scales. Production remains M140.",
+  "experiment_executable_sha256": "e524a6f412faa792f9c9bae76cde73710d4c4b0dd6102f9d4903d351128cfb50",
+  "scope": "Ordinary 1000-row transactions, default cache and automatic maintenance. One database grows 600k/1M/5M/10M/20M, each scale ABBA reopens identical physical database; random/ordered min(rows,1M) reads, pagination every row.",
+  "limitations": [
+    "Shared host load; ABBA is not proof that wall-time differences are caused solely by this change.",
+    "No full four-engine five-scale run; no A/B for build, update, vacuum.",
+    "Results belong to discarded experiment, not final production code."
+  ],
+  "validation": [
+    {
+      "name": "debug differential",
+      "result": "1 passed, 0 failed; 0.13s"
+    },
+    {
+      "name": "negative control",
+      "mutation": "omit record_leaf_offset(index, offset)?",
+      "result": "0 passed, 1 failed; 0.02s; callback trace differs: once vs six times; exit 1; mutation restored"
+    },
+    {
+      "name": "release suite experiment",
+      "result": "515 passed, 0 failed, 74 ignored, 147.86s"
+    },
+    {
+      "name": "cross checks",
+      "result": "Windows all-targets all-features 43.27s; Linux GNU cross-check 22.79s. Linux not executed."
+    },
+    {
+      "name": "five-scale ABBA",
+      "result": "20 arms verified, 60 phase samples, 1 passed exit 0, 2049.14s"
+    }
+  ],
+  "measurements": [
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 0,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 11549.967,
+      "cpu_ms": 11031.25,
+      "allocations": 7824902
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 0,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 3116.912,
+      "cpu_ms": 3015.625,
+      "allocations": 6672055
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 0,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 1612.447,
+      "cpu_ms": 1453.125,
+      "allocations": 5066703
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 1,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 10416.884,
+      "cpu_ms": 10250,
+      "allocations": 7824900
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 1,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 3324.783,
+      "cpu_ms": 3046.875,
+      "allocations": 6672055
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 1,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 1553.703,
+      "cpu_ms": 1546.875,
+      "allocations": 5066698
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 2,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 10331.776,
+      "cpu_ms": 10093.75,
+      "allocations": 7824900
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 2,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 3147.375,
+      "cpu_ms": 2968.75,
+      "allocations": 6672055
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 2,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 1287.99,
+      "cpu_ms": 1265.625,
+      "allocations": 5066698
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 3,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 10479.321,
+      "cpu_ms": 10343.75,
+      "allocations": 7824900
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 3,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 2597.365,
+      "cpu_ms": 2562.5,
+      "allocations": 6672055
+    },
+    {
+      "rows": 600000,
+      "reads": 600000,
+      "round": 3,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 1264.774,
+      "cpu_ms": 1265.625,
+      "allocations": 5066698
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 17393.265,
+      "cpu_ms": 16968.75,
+      "allocations": 13041246
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 5863.112,
+      "cpu_ms": 5531.25,
+      "allocations": 11120114
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 3748.985,
+      "cpu_ms": 3468.75,
+      "allocations": 8469844
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 18828.322,
+      "cpu_ms": 18250,
+      "allocations": 13041246
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 5567.155,
+      "cpu_ms": 5015.625,
+      "allocations": 11120114
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 2550.082,
+      "cpu_ms": 2500,
+      "allocations": 8469844
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 19599.091,
+      "cpu_ms": 18796.875,
+      "allocations": 13041246
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 4715.241,
+      "cpu_ms": 4609.375,
+      "allocations": 11120114
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 2866.196,
+      "cpu_ms": 2640.625,
+      "allocations": 8469844
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 21353.781,
+      "cpu_ms": 20093.75,
+      "allocations": 13041246
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 5579.254,
+      "cpu_ms": 5171.875,
+      "allocations": 11120114
+    },
+    {
+      "rows": 1000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 2672.655,
+      "cpu_ms": 2609.375,
+      "allocations": 8469844
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 30321.008,
+      "cpu_ms": 29078.125,
+      "allocations": 17392298
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 5514.884,
+      "cpu_ms": 5109.375,
+      "allocations": 11128296
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 13046.938,
+      "cpu_ms": 12187.5,
+      "allocations": 42502151
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 30927.115,
+      "cpu_ms": 29765.625,
+      "allocations": 17392298
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 4984.794,
+      "cpu_ms": 4671.875,
+      "allocations": 11128296
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 12177.883,
+      "cpu_ms": 11828.125,
+      "allocations": 42502151
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 37861.608,
+      "cpu_ms": 35281.25,
+      "allocations": 17392298
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 4961.244,
+      "cpu_ms": 4796.875,
+      "allocations": 11128296
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 14336.511,
+      "cpu_ms": 13531.25,
+      "allocations": 42502151
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 31311.129,
+      "cpu_ms": 30000,
+      "allocations": 17392298
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 4838.106,
+      "cpu_ms": 4640.625,
+      "allocations": 11128296
+    },
+    {
+      "rows": 5000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 12363.878,
+      "cpu_ms": 11765.625,
+      "allocations": 42502151
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 37536.601,
+      "cpu_ms": 36281.25,
+      "allocations": 18468538
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 4889.334,
+      "cpu_ms": 4781.25,
+      "allocations": 11128856
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 23749.426,
+      "cpu_ms": 23062.5,
+      "allocations": 85042222
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 28429.288,
+      "cpu_ms": 27937.5,
+      "allocations": 18468538
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 4106.696,
+      "cpu_ms": 4062.5,
+      "allocations": 11128856
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 22435.104,
+      "cpu_ms": 21937.5,
+      "allocations": 85042222
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 29160.489,
+      "cpu_ms": 28828.125,
+      "allocations": 18468538
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 3988.41,
+      "cpu_ms": 3921.875,
+      "allocations": 11128856
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 21165.754,
+      "cpu_ms": 20750,
+      "allocations": 85042222
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 44540.415,
+      "cpu_ms": 36609.375,
+      "allocations": 18468538
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 4212.011,
+      "cpu_ms": 4156.25,
+      "allocations": 11128856
+    },
+    {
+      "rows": 10000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 21339.83,
+      "cpu_ms": 20765.625,
+      "allocations": 85042222
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 50404.482,
+      "cpu_ms": 45593.75,
+      "allocations": 20082621
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 7906.704,
+      "cpu_ms": 6953.125,
+      "allocations": 11129124
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 0,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 67333.412,
+      "cpu_ms": 63375,
+      "allocations": 170123355
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 48004.003,
+      "cpu_ms": 45390.625,
+      "allocations": 20082621
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 9137.248,
+      "cpu_ms": 7562.5,
+      "allocations": 11129124
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 1,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 73105.815,
+      "cpu_ms": 64828.125,
+      "allocations": 170123355
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "random_read",
+      "wall_ms": 49057.374,
+      "cpu_ms": 45218.75,
+      "allocations": 20082621
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "ordered_read",
+      "wall_ms": 4429.279,
+      "cpu_ms": 4406.25,
+      "allocations": 11129124
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 2,
+      "reference": false,
+      "phase": "scan_page",
+      "wall_ms": 52092.482,
+      "cpu_ms": 49171.875,
+      "allocations": 170123355
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "random_read",
+      "wall_ms": 73926.346,
+      "cpu_ms": 54218.75,
+      "allocations": 20082621
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "ordered_read",
+      "wall_ms": 10499.512,
+      "cpu_ms": 8859.375,
+      "allocations": 11129124
+    },
+    {
+      "rows": 20000000,
+      "reads": 1000000,
+      "round": 3,
+      "reference": true,
+      "phase": "scan_page",
+      "wall_ms": 78284.193,
+      "cpu_ms": 67875,
+      "allocations": 170123355
+    }
+  ],
+  "raw_output": "    Finished `release` profile [optimized] target(s) in 0.57s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 1 test\ntest engine::tests::bplus_leaf_index_cost ... SCALE_LOCK_WAIT name=bplus_LEAF_INDEX_cost pid=13872 unix_ms=1794718719154 path=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target/scale-bench.lock\nSCALE_LOCK_ACQUIRED name=bplus_LEAF_INDEX_cost pid=13872 unix_ms=1794718719155 wait_ms=0.053\nSCALE_BUILD harness=2 executable_sha256=\"e524a6f412faa792f9c9bae76cde73710d4c4b0dd6102f9d4903d351128cfb50\" runtime_git=\"4d02648412985338a5c0cccfee6e62e65b133199\" tracked_dirty=Ok(true)\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=13872 unix_ms=1794718721554\nBPLUS_LEAF_INDEX_BUILD rows=600000 completed=600000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=26944.480 cpu_ms=Ok(20062.5) allocations=46692266 page_faults_delta=Ok(68694) unix_ms=1794718748499\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=27 internal_packs=1 owned_promotions=1 page_reads=35283 cache_hits=34252 cache_misses=1031 cache_sweeps=25 cache_visited=50125\nBPLUS_LEAF_INDEX_ARM rows=600000 reads=600000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718748509\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=11549.967 cpu_ms=Ok(11031.25) allocations=7824902 page_faults_delta=Ok(2972) unix_ms=1794718760059\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=78 owned_promotions=0 page_reads=601102 cache_hits=15836 cache_misses=585266 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718760059\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3116.912 cpu_ms=Ok(3015.625) allocations=6672055 page_faults_delta=Ok(100) unix_ms=1794718763176\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=600000 cache_hits=564720 cache_misses=35280 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718763177\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=1612.447 cpu_ms=Ok(1453.125) allocations=5066703 page_faults_delta=Ok(910) unix_ms=1794718764789\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1278 internal_packs=0 owned_promotions=62 page_reads=37917 cache_hits=2142 cache_misses=35775 cache_sweeps=1 cache_visited=2048\nBPLUS_LEAF_INDEX_VERIFIED rows=600000 round=0\nBPLUS_LEAF_INDEX_ARM rows=600000 reads=600000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718764806\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=10416.884 cpu_ms=Ok(10250.0) allocations=7824900 page_faults_delta=Ok(2996) unix_ms=1794718775223\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=78 owned_promotions=0 page_reads=601102 cache_hits=15836 cache_misses=585266 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718775223\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3324.783 cpu_ms=Ok(3046.875) allocations=6672055 page_faults_delta=Ok(36) unix_ms=1794718778548\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=600000 cache_hits=564720 cache_misses=35280 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718778548\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=1553.703 cpu_ms=Ok(1546.875) allocations=5066698 page_faults_delta=Ok(937) unix_ms=1794718780102\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1278 internal_packs=0 owned_promotions=62 page_reads=37917 cache_hits=2142 cache_misses=35775 cache_sweeps=1 cache_visited=2048\nBPLUS_LEAF_INDEX_VERIFIED rows=600000 round=1\nBPLUS_LEAF_INDEX_ARM rows=600000 reads=600000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718780118\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=10331.776 cpu_ms=Ok(10093.75) allocations=7824900 page_faults_delta=Ok(2915) unix_ms=1794718790449\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=78 owned_promotions=0 page_reads=601102 cache_hits=15836 cache_misses=585266 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718790450\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3147.375 cpu_ms=Ok(2968.75) allocations=6672055 page_faults_delta=Ok(28) unix_ms=1794718793597\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=600000 cache_hits=564720 cache_misses=35280 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718793597\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=1287.990 cpu_ms=Ok(1265.625) allocations=5066698 page_faults_delta=Ok(810) unix_ms=1794718794885\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1278 internal_packs=0 owned_promotions=62 page_reads=37917 cache_hits=2142 cache_misses=35775 cache_sweeps=1 cache_visited=2048\nBPLUS_LEAF_INDEX_VERIFIED rows=600000 round=2\nBPLUS_LEAF_INDEX_ARM rows=600000 reads=600000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718794904\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=10479.321 cpu_ms=Ok(10343.75) allocations=7824900 page_faults_delta=Ok(2914) unix_ms=1794718805383\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=78 owned_promotions=0 page_reads=601102 cache_hits=15836 cache_misses=585266 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718805383\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=2597.365 cpu_ms=Ok(2562.5) allocations=6672055 page_faults_delta=Ok(44) unix_ms=1794718807981\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=600000 cache_hits=564720 cache_misses=35280 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718807981\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=1264.774 cpu_ms=Ok(1265.625) allocations=5066698 page_faults_delta=Ok(733) unix_ms=1794718809246\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=1278 internal_packs=0 owned_promotions=62 page_reads=37917 cache_hits=2142 cache_misses=35775 cache_sweeps=1 cache_visited=2048\nBPLUS_LEAF_INDEX_VERIFIED rows=600000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=13872 unix_ms=1794718809263\nBPLUS_LEAF_INDEX_BUILD rows=1000000 completed=1000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=18006.222 cpu_ms=Ok(12000.0) allocations=31118516 page_faults_delta=Ok(42974) unix_ms=1794718827269\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=18 internal_packs=0 owned_promotions=0 page_reads=23523 cache_hits=101 cache_misses=23422 cache_sweeps=14 cache_visited=28672\nBPLUS_LEAF_INDEX_ARM rows=1000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718827282\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=17393.265 cpu_ms=Ok(16968.75) allocations=13041246 page_faults_delta=Ok(3208) unix_ms=1794718844675\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=813 owned_promotions=0 page_reads=1001837 cache_hits=15769 cache_misses=986068 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718844675\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=5863.112 cpu_ms=Ok(5531.25) allocations=11120114 page_faults_delta=Ok(123) unix_ms=1794718850538\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1000000 cache_hits=941189 cache_misses=58811 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718850539\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=3748.985 cpu_ms=Ok(3468.75) allocations=8469844 page_faults_delta=Ok(1493) unix_ms=1794718854288\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=2813 internal_packs=0 owned_promotions=81 page_reads=63904 cache_hits=3568 cache_misses=60336 cache_sweeps=3 cache_visited=6144\nBPLUS_LEAF_INDEX_VERIFIED rows=1000000 round=0\nBPLUS_LEAF_INDEX_ARM rows=1000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718854306\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=18828.322 cpu_ms=Ok(18250.0) allocations=13041246 page_faults_delta=Ok(3340) unix_ms=1794718873134\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=813 owned_promotions=0 page_reads=1001837 cache_hits=15769 cache_misses=986068 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718873134\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=5567.155 cpu_ms=Ok(5015.625) allocations=11120114 page_faults_delta=Ok(85) unix_ms=1794718878702\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1000000 cache_hits=941189 cache_misses=58811 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718878702\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=2550.082 cpu_ms=Ok(2500.0) allocations=8469844 page_faults_delta=Ok(1509) unix_ms=1794718881252\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=2813 internal_packs=0 owned_promotions=81 page_reads=63904 cache_hits=3568 cache_misses=60336 cache_sweeps=3 cache_visited=6144\nBPLUS_LEAF_INDEX_VERIFIED rows=1000000 round=1\nBPLUS_LEAF_INDEX_ARM rows=1000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718881274\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=19599.091 cpu_ms=Ok(18796.875) allocations=13041246 page_faults_delta=Ok(3329) unix_ms=1794718900873\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=813 owned_promotions=0 page_reads=1001837 cache_hits=15769 cache_misses=986068 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718900873\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4715.241 cpu_ms=Ok(4609.375) allocations=11120114 page_faults_delta=Ok(106) unix_ms=1794718905588\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1000000 cache_hits=941189 cache_misses=58811 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718905589\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=2866.196 cpu_ms=Ok(2640.625) allocations=8469844 page_faults_delta=Ok(1602) unix_ms=1794718908455\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=2813 internal_packs=0 owned_promotions=81 page_reads=63904 cache_hits=3568 cache_misses=60336 cache_sweeps=3 cache_visited=6144\nBPLUS_LEAF_INDEX_VERIFIED rows=1000000 round=2\nBPLUS_LEAF_INDEX_ARM rows=1000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794718908476\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=21353.781 cpu_ms=Ok(20093.75) allocations=13041246 page_faults_delta=Ok(3364) unix_ms=1794718929830\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=813 owned_promotions=0 page_reads=1001837 cache_hits=15769 cache_misses=986068 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794718929830\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=5579.254 cpu_ms=Ok(5171.875) allocations=11120114 page_faults_delta=Ok(95) unix_ms=1794718935409\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=0 owned_promotions=0 page_reads=1000000 cache_hits=941189 cache_misses=58811 cache_sweeps=0 cache_visited=0\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794718935409\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=2672.655 cpu_ms=Ok(2609.375) allocations=8469844 page_faults_delta=Ok(1610) unix_ms=1794718938082\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=2813 internal_packs=0 owned_promotions=81 page_reads=63904 cache_hits=3568 cache_misses=60336 cache_sweeps=3 cache_visited=6144\nBPLUS_LEAF_INDEX_VERIFIED rows=1000000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=13872 unix_ms=1794718938099\nBPLUS_LEAF_INDEX_BUILD rows=5000000 completed=2000000\nBPLUS_LEAF_INDEX_BUILD rows=5000000 completed=3000000\nBPLUS_LEAF_INDEX_BUILD rows=5000000 completed=4000000\nBPLUS_LEAF_INDEX_BUILD rows=5000000 completed=5000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=186785.851 cpu_ms=Ok(133468.75) allocations=311207585 page_faults_delta=Ok(225112) unix_ms=1794719124885\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=620 internal_packs=389 owned_promotions=389 page_reads=240388 cache_hits=2127 cache_misses=238261 cache_sweeps=227 cache_visited=464896\nBPLUS_LEAF_INDEX_ARM rows=5000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719124980\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=30321.008 cpu_ms=Ok(29078.125) allocations=17392298 page_faults_delta=Ok(3483) unix_ms=1794719155301\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=864410 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719155302\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=5514.884 cpu_ms=Ok(5109.375) allocations=11128296 page_faults_delta=Ok(72) unix_ms=1794719160817\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1623 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719160817\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=13046.938 cpu_ms=Ok(12187.5) allocations=42502151 page_faults_delta=Ok(7302) unix_ms=1794719173864\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_LEAF_INDEX_VERIFIED rows=5000000 round=0\nBPLUS_LEAF_INDEX_ARM rows=5000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719173882\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=30927.115 cpu_ms=Ok(29765.625) allocations=17392298 page_faults_delta=Ok(3526) unix_ms=1794719204809\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=864410 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719204809\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4984.794 cpu_ms=Ok(4671.875) allocations=11128296 page_faults_delta=Ok(75) unix_ms=1794719209794\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1623 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719209794\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=12177.883 cpu_ms=Ok(11828.125) allocations=42502151 page_faults_delta=Ok(6958) unix_ms=1794719221972\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_LEAF_INDEX_VERIFIED rows=5000000 round=1\nBPLUS_LEAF_INDEX_ARM rows=5000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719221990\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=37861.608 cpu_ms=Ok(35281.25) allocations=17392298 page_faults_delta=Ok(3398) unix_ms=1794719259852\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=864410 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719259852\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4961.244 cpu_ms=Ok(4796.875) allocations=11128296 page_faults_delta=Ok(58) unix_ms=1794719264813\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1623 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719264813\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=14336.511 cpu_ms=Ok(13531.25) allocations=42502151 page_faults_delta=Ok(1795) unix_ms=1794719279150\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_LEAF_INDEX_VERIFIED rows=5000000 round=2\nBPLUS_LEAF_INDEX_ARM rows=5000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719279171\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=31311.129 cpu_ms=Ok(30000.0) allocations=17392298 page_faults_delta=Ok(3365) unix_ms=1794719310482\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=864410 owned_promotions=0 page_reads=1865434 cache_hits=12751 cache_misses=1852683 cache_sweeps=844 cache_visited=1728512\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719310482\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4838.106 cpu_ms=Ok(4640.625) allocations=11128296 page_faults_delta=Ok(82) unix_ms=1794719315320\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1623 owned_promotions=0 page_reads=1001623 cache_hits=941179 cache_misses=60444 cache_sweeps=1 cache_visited=2048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719315320\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=12363.878 cpu_ms=Ok(11765.625) allocations=42502151 page_faults_delta=Ok(2913) unix_ms=1794719327684\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=18172 internal_packs=0 owned_promotions=0 page_reads=324050 cache_hits=17848 cache_misses=306202 cache_sweeps=18 cache_visited=36864\nBPLUS_LEAF_INDEX_VERIFIED rows=5000000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=13872 unix_ms=1794719327707\nBPLUS_LEAF_INDEX_BUILD rows=10000000 completed=6000000\nBPLUS_LEAF_INDEX_BUILD rows=10000000 completed=7000000\nBPLUS_LEAF_INDEX_BUILD rows=10000000 completed=8000000\nBPLUS_LEAF_INDEX_BUILD rows=10000000 completed=9000000\nBPLUS_LEAF_INDEX_BUILD rows=10000000 completed=10000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=228141.708 cpu_ms=Ok(164296.875) allocations=389009950 page_faults_delta=Ok(34210) unix_ms=1794719555849\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=780 internal_packs=489 owned_promotions=489 page_reads=300537 cache_hits=2052 cache_misses=298485 cache_sweeps=286 cache_visited=585728\nBPLUS_LEAF_INDEX_ARM rows=10000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719556051\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=37536.601 cpu_ms=Ok(36281.25) allocations=18468538 page_faults_delta=Ok(3419) unix_ms=1794719593588\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719593588\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4889.334 cpu_ms=Ok(4781.25) allocations=11128856 page_faults_delta=Ok(54) unix_ms=1794719598477\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719598478\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=23749.426 cpu_ms=Ok(23062.5) allocations=85042222 page_faults_delta=Ok(6779) unix_ms=1794719622227\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_LEAF_INDEX_VERIFIED rows=10000000 round=0\nBPLUS_LEAF_INDEX_ARM rows=10000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719622246\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=28429.288 cpu_ms=Ok(27937.5) allocations=18468538 page_faults_delta=Ok(3509) unix_ms=1794719650676\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719650676\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4106.696 cpu_ms=Ok(4062.5) allocations=11128856 page_faults_delta=Ok(67) unix_ms=1794719654782\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719654782\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=22435.104 cpu_ms=Ok(21937.5) allocations=85042222 page_faults_delta=Ok(6272) unix_ms=1794719677218\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_LEAF_INDEX_VERIFIED rows=10000000 round=1\nBPLUS_LEAF_INDEX_ARM rows=10000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719677234\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=29160.489 cpu_ms=Ok(28828.125) allocations=18468538 page_faults_delta=Ok(3482) unix_ms=1794719706394\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719706394\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=3988.410 cpu_ms=Ok(3921.875) allocations=11128856 page_faults_delta=Ok(13) unix_ms=1794719710383\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719710383\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=21165.754 cpu_ms=Ok(20750.0) allocations=85042222 page_faults_delta=Ok(6152) unix_ms=1794719731549\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_LEAF_INDEX_VERIFIED rows=10000000 round=2\nBPLUS_LEAF_INDEX_ARM rows=10000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794719731566\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=44540.415 cpu_ms=Ok(36609.375) allocations=18468538 page_faults_delta=Ok(3440) unix_ms=1794719776107\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1081208 owned_promotions=0 page_reads=2082232 cache_hits=19909 cache_misses=2062323 cache_sweeps=1055 cache_visited=2160640\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794719776107\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4212.011 cpu_ms=Ok(4156.25) allocations=11128856 page_faults_delta=Ok(31) unix_ms=1794719780319\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1734 owned_promotions=0 page_reads=1001734 cache_hits=941179 cache_misses=60555 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794719780319\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=21339.830 cpu_ms=Ok(20765.625) allocations=85042222 page_faults_delta=Ok(3231) unix_ms=1794719801659\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=37370 internal_packs=0 owned_promotions=0 page_reads=649129 cache_hits=35697 cache_misses=613432 cache_sweeps=37 cache_visited=75776\nBPLUS_LEAF_INDEX_VERIFIED rows=10000000 round=3\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordinary_build pid=13872 unix_ms=1794719801681\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=11000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=12000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=13000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=14000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=15000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=16000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=17000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=18000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=19000000\nBPLUS_LEAF_INDEX_BUILD rows=20000000 completed=20000000\nSCALE_PHASE engine=bplus_tree phase=ordinary_build wall_ms=440824.714 cpu_ms=Ok(306921.875) allocations=758024869 page_faults_delta=Ok(67473) unix_ms=1794720242506\nSCALE_BPLUS engine=bplus_tree phase=ordinary_build node_parses=1667 internal_packs=1078 owned_promotions=1078 page_reads=601197 cache_hits=4082 cache_misses=597115 cache_sweeps=584 cache_visited=1196032\nBPLUS_LEAF_INDEX_ARM rows=20000000 reads=1000000 round=0 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794720242950\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=50404.482 cpu_ms=Ok(45593.75) allocations=20082621 page_faults_delta=Ok(3505) unix_ms=1794720293354\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1409440 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794720293354\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=7906.704 cpu_ms=Ok(6953.125) allocations=11129124 page_faults_delta=Ok(67) unix_ms=1794720301261\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1788 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794720301262\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=67333.412 cpu_ms=Ok(63375.0) allocations=170123355 page_faults_delta=Ok(16683) unix_ms=1794720368596\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_LEAF_INDEX_VERIFIED rows=20000000 round=0\nBPLUS_LEAF_INDEX_ARM rows=20000000 reads=1000000 round=1 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794720368612\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=48004.003 cpu_ms=Ok(45390.625) allocations=20082621 page_faults_delta=Ok(3546) unix_ms=1794720416616\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1409440 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794720416616\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=9137.248 cpu_ms=Ok(7562.5) allocations=11129124 page_faults_delta=Ok(18) unix_ms=1794720425753\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1788 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794720425753\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=73105.815 cpu_ms=Ok(64828.125) allocations=170123355 page_faults_delta=Ok(17403) unix_ms=1794720498859\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_LEAF_INDEX_VERIFIED rows=20000000 round=1\nBPLUS_LEAF_INDEX_ARM rows=20000000 reads=1000000 round=2 reference=false\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794720498904\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=49057.374 cpu_ms=Ok(45218.75) allocations=20082621 page_faults_delta=Ok(3444) unix_ms=1794720547961\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1409440 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794720547961\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=4429.279 cpu_ms=Ok(4406.25) allocations=11129124 page_faults_delta=Ok(32) unix_ms=1794720552391\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1788 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794720552391\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=52092.482 cpu_ms=Ok(49171.875) allocations=170123355 page_faults_delta=Ok(14204) unix_ms=1794720604483\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_LEAF_INDEX_VERIFIED rows=20000000 round=2\nBPLUS_LEAF_INDEX_ARM rows=20000000 reads=1000000 round=3 reference=true\nSCALE_PHASE_BEGIN engine=bplus_tree phase=random_read pid=13872 unix_ms=1794720604598\nSCALE_PHASE engine=bplus_tree phase=random_read wall_ms=73926.346 cpu_ms=Ok(54218.75) allocations=20082621 page_faults_delta=Ok(3496) unix_ms=1794720678524\nSCALE_BPLUS engine=bplus_tree phase=random_read node_parses=1024 internal_packs=1409440 owned_promotions=0 page_reads=2410464 cache_hits=38305 cache_misses=2372159 cache_sweeps=1376 cache_visited=2818048\nSCALE_PHASE_BEGIN engine=bplus_tree phase=ordered_read pid=13872 unix_ms=1794720678524\nSCALE_PHASE engine=bplus_tree phase=ordered_read wall_ms=10499.512 cpu_ms=Ok(8859.375) allocations=11129124 page_faults_delta=Ok(36) unix_ms=1794720689024\nSCALE_BPLUS engine=bplus_tree phase=ordered_read node_parses=0 internal_packs=1788 owned_promotions=0 page_reads=1001788 cache_hits=941181 cache_misses=60607 cache_sweeps=2 cache_visited=4096\nSCALE_PHASE_BEGIN engine=bplus_tree phase=scan_page pid=13872 unix_ms=1794720689025\nSCALE_PHASE engine=bplus_tree phase=scan_page wall_ms=78284.193 cpu_ms=Ok(67875.0) allocations=170123355 page_faults_delta=Ok(16071) unix_ms=1794720767309\nSCALE_BPLUS engine=bplus_tree phase=scan_page node_parses=75790 internal_packs=0 owned_promotions=0 page_reads=1299315 cache_hits=71423 cache_misses=1227892 cache_sweeps=74 cache_visited=151552\nBPLUS_LEAF_INDEX_VERIFIED rows=20000000 round=3\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 588 filtered out; finished in 2049.14s\n\nSCALE_LOCK_RELEASE name=bplus_LEAF_INDEX_cost pid=13872 unix_ms=1794720768280 active_ms=2049125.736\n",
+  "release_suite_output": "    Blocking waiting for file lock on package cache\n    Blocking waiting for file lock on package cache\n    Blocking waiting for file lock on package cache\n    Finished `release` profile [optimized] target(s) in 0.59s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 589 tests\ni.i......................iii...............i...................i..............i........ 87/589\n..............iiii.......i............................................................. 174/589\n..............................................i...............i........................ 261/589\n....i.....iiiiiiiiiii.i.i....ii...........i.iiiiii..iii.i...iiiiiiii..iiiiiii.....i.... 348/589\n...ii....i.....................iii...................................i......i.iiii..... 435/589\n...............i.......................i............................i.................. 522/589\n..................................i................................\ntest result: ok. 515 passed; 0 failed; 74 ignored; 0 measured; 0 filtered out; finished in 147.86s\n\n",
+  "reproduction": {
+    "environment": {
+      "BPLUS_LEAF_ROWS": "600000,1000000,5000000,10000000,20000000",
+      "POINT_READS": "1000000",
+      "CARGO_HOME": "D:/develop/rust/.cargo",
+      "TEMP": "C:/Users/Administrator/.codex/test-data/storage-engines",
+      "TMP": "C:/Users/Administrator/.codex/test-data/storage-engines",
+      "SCALE_SCRATCH_DIR": "C:/Users/Administrator/.codex/test-data/storage-engines"
+    },
+    "command": "cargo test --offline --release --lib engine::tests::bplus_leaf_index_cost -- --exact --ignored --nocapture --test-threads=1",
+    "patch": "diff --git a/src/bplus_tree/bplus_tree.rs b/src/bplus_tree/bplus_tree.rs\nindex d912b4c..fd03a7c 100644\n--- a/src/bplus_tree/bplus_tree.rs\n+++ b/src/bplus_tree/bplus_tree.rs\n@@ -201,6 +201,7 @@ enum MaintenanceNode<'a> {\n     Internal { keys: &'a [u8], count: usize, children: &'a [u8] },\n }\n \n+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]\n enum PointStep {\n     Child(PageId),\n     Hit(Key, RowId),\n@@ -260,6 +261,35 @@ impl PointStep {\n     }\n \n     fn borrowed(payload: &[u8], low: &[u8], high: &[u8],\n+        accept: &mut impl FnMut(&[u8]) -> bool) -> std::io::Result<Self> {\n+        #[cfg(test)]\n+        if point_leaf_index_reference::enabled() {\n+            return Self::borrowed_reference(payload, low, high, accept);\n+        }\n+        // Record row offsets during the existing complete-node validation.\n+        // Only this local index is touched before validation finishes: even a\n+        // hit in the first row must not call `accept` on a malformed tail.\n+        let mut offsets = [0_u16; MAX_PAYLOAD / 9];\n+        let node = MaintenanceNode::decode_recording(payload, |index, offset| {\n+            *offsets.get_mut(index).ok_or_else(NodeBytes::invalid)? =\n+                u16::try_from(offset).map_err(|_| NodeBytes::invalid())?;\n+            Ok(())\n+        })?;\n+        let MaintenanceNode::Leaf { rows, count, .. } = node else {\n+            return Err(NodeBytes::invalid());\n+        };\n+        let end = offsets[..count].partition_point(|offset|\n+            NodeBytes(&rows[*offset as usize..]).row().unwrap().0 <= high);\n+        if end == 0 {\n+            return Ok(if count == 0 { Self::Missing }\n+                else { Self::Previous(NodeBytes(rows).row()?.0.to_vec()) });\n+        }\n+        Ok(Self::leaf(offsets[..end].iter().map(|offset|\n+            NodeBytes(&rows[*offset as usize..]).row().unwrap()), low, high, accept))\n+    }\n+\n+    #[cfg(test)]\n+    fn borrowed_reference(payload: &[u8], low: &[u8], high: &[u8],\n         accept: &mut impl FnMut(&[u8]) -> bool) -> std::io::Result<Self> {\n         let MaintenanceNode::Leaf { rows, count, .. } = MaintenanceNode::decode(payload)? else {\n             return Err(NodeBytes::invalid());\n@@ -285,6 +315,11 @@ impl PointStep {\n }\n impl<'a> MaintenanceNode<'a> {\n     fn decode(payload: &'a [u8]) -> std::io::Result<Self> {\n+        Self::decode_recording(payload, |_, _| Ok(()))\n+    }\n+\n+    fn decode_recording(payload: &'a [u8],\n+        mut record_leaf_offset: impl FnMut(usize, usize) -> std::io::Result<()>) -> std::io::Result<Self> {\n         let mut bytes = NodeBytes(payload);\n         let tag = u32::from_le_bytes(bytes.take(4)?.try_into().unwrap());\n         let count = bytes.len()?;\n@@ -293,10 +328,12 @@ impl<'a> MaintenanceNode<'a> {\n         if count > bytes.0.len() / 8 { return Err(NodeBytes::invalid()); }\n         let node = match tag {\n             0 => {\n-                for _ in 0..count {\n+                for index in 0..count {\n+                    let offset = begin.len() - bytes.0.len();\n                     let (key, _) = bytes.row()?;\n                     if previous.is_some_and(|old| old >= key) { return Err(NodeBytes::invalid()); }\n                     previous = Some(key);\n+                    record_leaf_offset(index, offset)?;\n                 }\n                 let rows = &begin[..begin.len() - bytes.0.len()];\n                 let next = if bytes.option()? { Some(PageId(bytes.u64()?)) } else { None };\n@@ -3146,6 +3183,66 @@ mod tests {\n         }\n     }\n \n+    #[test]\n+    fn point_leaf_index_matches_reference_and_validates_before_accept() {\n+        fn compare(payload: &[u8], low: &[u8], high: &[u8], reject: bool) {\n+            let mut results = Vec::new();\n+            for old in [true, false] {\n+                let _scope = old.then(point_leaf_index_reference::Scope::start);\n+                let mut calls = Vec::new();\n+                let step = PointStep::borrowed(payload, low, high, &mut |key| {\n+                    calls.push(key.to_vec());\n+                    !reject || key.last().is_some_and(|b| b % 3 == 0)\n+                }).map_err(|e| e.kind());\n+                if step.is_err() { assert!(calls.is_empty(), \"invalid tail reached accept\"); }\n+                results.push((step, calls));\n+            }\n+            assert_eq!(results[0], results[1]);\n+        }\n+        let keys = vec![vec![], vec![0], vec![0, 0], vec![0, 255], vec![1], vec![255; 257]];\n+        let entries: Vec<_> = keys.iter().enumerate().map(|(i, k)|\n+            (k.clone(), RowId(if i % 3 == 0 { None } else { Some(vec![i as u8; i * 7]) }))).collect();\n+        for next_leaf in [None, Some(PageId(42))] {\n+            for entries in [Vec::new(), entries.clone()] {\n+                let payload = bincode::serialize(&BTreeNode::Leaf { entries, next_leaf }).unwrap();\n+                for low in &keys {\n+                    for high in &keys { for reject in [false, true] { compare(&payload, low, high, reject); } }\n+                }\n+                // Truncation at every byte, malformed lengths/tags/order/tails,\n+                // and zero padding must agree with the pre-change decoder.\n+                for end in 0..payload.len() { compare(&payload[..end], &[], &[255; 300], false); }\n+                for at in 0..payload.len() {\n+                    for value in [0, 1, 255] {\n+                        let mut bad = payload.clone(); bad[at] = value;\n+                        compare(&bad, &[], &[255; 300], false);\n+                    }\n+                }\n+                let mut padded = payload; padded.resize(MAX_PAYLOAD, 0);\n+                compare(&padded, &[], &[255; 300], false);\n+                *padded.last_mut().unwrap() = 1;\n+                compare(&padded, &[], &[255; 300], false);\n+            }\n+        }\n+        for bad in [\n+            BTreeNode::Leaf { entries: vec![(vec![1], RowId(None)), (vec![1], RowId(None))], next_leaf: None },\n+            BTreeNode::Leaf { entries: vec![(vec![2], RowId(None)), (vec![1], RowId(None))], next_leaf: None },\n+            BTreeNode::Internal { keys: vec![], children: vec![PageId(1)] },\n+        ] { compare(&bincode::serialize(&bad).unwrap(), &[], &[255], false); }\n+        // Independently check the index and accepted row, so two decoders\n+        // agreeing on an accidentally shared error cannot pass this guard.\n+        let payload = bincode::serialize(&BTreeNode::Leaf { entries: entries.clone(), next_leaf: None }).unwrap();\n+        let mut offsets = Vec::new();\n+        let MaintenanceNode::Leaf { rows, count, .. } = MaintenanceNode::decode_recording(&payload,\n+            |index, offset| { assert_eq!(index, offsets.len()); offsets.push(offset); Ok(()) }).unwrap() else { panic!() };\n+        assert_eq!(count, entries.len());\n+        assert_eq!(offsets.len(), count);\n+        for ((key, value), at) in entries.iter().zip(offsets) {\n+            assert_eq!(NodeBytes(&rows[at..]).row().unwrap(), (key.as_slice(), value.0.as_deref()));\n+            assert_eq!(PointStep::borrowed(&payload, key, key, &mut |_| true).unwrap(),\n+                PointStep::Hit(key.clone(), value.clone()));\n+        }\n+    }\n+\n     #[test]\n     fn point_projection_matches_reference_and_avoids_leaf_materialization() {\n         let (_scratch, mut tree) = anon(64, 64);\n@@ -4205,6 +4302,16 @@ pub(crate) mod delete_read_reference {\n     impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }\n }\n \n+#[cfg(test)]\n+pub(crate) mod point_leaf_index_reference {\n+    use std::{assert, cell::Cell, thread_local};\n+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }\n+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }\n+    pub(crate) struct Scope;\n+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }\n+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }\n+}\n+\n #[cfg(test)]\n pub(crate) mod point_internal_reference {\n     use std::{assert, cell::Cell, thread_local};\ndiff --git a/src/engine.rs b/src/engine.rs\nindex cb749f1..08cf55b 100644\n--- a/src/engine.rs\n+++ b/src/engine.rs\n@@ -6401,10 +6401,21 @@ mod tests {\n     #[test]\n     #[ignore = \"ordinary-transaction B+ internal-node ABBA at 5M/10M/20M; release single thread\"]\n     fn bplus_internal_projection_cost() {\n-        use crate::bplus_tree::bplus_tree::point_internal_reference;\n-        let _run = crate::scale_probe::RunGuard::acquire(\"bplus_internal_projection_cost\");\n+        bplus_read_projection_cost(\"INTERNAL\", \"BPLUS_INTERNAL_ROWS\", ||\n+            crate::bplus_tree::bplus_tree::point_internal_reference::Scope::start());\n+    }\n+\n+    #[test]\n+    #[ignore = \"ordinary-transaction B+ leaf index ABBA at 5M/10M/20M; release single thread\"]\n+    fn bplus_leaf_index_cost() {\n+        bplus_read_projection_cost(\"LEAF_INDEX\", \"BPLUS_LEAF_ROWS\", ||\n+            crate::bplus_tree::bplus_tree::point_leaf_index_reference::Scope::start());\n+    }\n+\n+    fn bplus_read_projection_cost<S>(label: &str, sizes_env: &str, reference_scope: impl Fn() -> S) {\n+        let _run = crate::scale_probe::RunGuard::acquire(&format!(\"bplus_{label}_cost\"));\n         crate::scale_probe::fingerprint();\n-        let sizes: Vec<usize> = std::env::var(\"BPLUS_INTERNAL_ROWS\")\n+        let sizes: Vec<usize> = std::env::var(sizes_env)\n             .unwrap_or_else(|_| \"5000000,10000000,20000000\".into())\n             .split(',').map(|s| s.trim().parse().unwrap()).collect();\n         assert!(!sizes.is_empty() && sizes[0] > 0 && sizes.windows(2).all(|w| w[0] < w[1]));\n@@ -6425,7 +6436,7 @@ mod tests {\n                 let items: Vec<_> = (base..end).map(|i| (scale_key(i), scale_val(i))).collect();\n                 let tx = db.begin(); tx.batch_set(&items).unwrap(); tx.commit();\n                 if end % 1_000_000 == 0 || end == rows {\n-                    eprintln!(\"BPLUS_INTERNAL_BUILD rows={rows} completed={end}\");\n+                    eprintln!(\"BPLUS_{label}_BUILD rows={rows} completed={end}\");\n                 }\n             }\n             db.flush().unwrap(); db.checkpoint().unwrap(); drop(db);\n@@ -6435,8 +6446,8 @@ mod tests {\n             let reads = reads.min(rows);\n             for (round, reference) in [true, false, false, true].into_iter().enumerate() {\n                 let db = open_engine(EngineKind::BPlusTree, Some(&path)).unwrap();\n-                let mode = reference.then(point_internal_reference::Scope::start);\n-                eprintln!(\"BPLUS_INTERNAL_ARM rows={rows} reads={reads} round={round} reference={reference}\");\n+                let mode = reference.then(&reference_scope);\n+                eprintln!(\"BPLUS_{label}_ARM rows={rows} reads={reads} round={round} reference={reference}\");\n                 let tx = db.begin();\n                 let phase = crate::scale_probe::Phase::begin(\"bplus_tree\", \"random_read\");\n                 for &i in &order[..reads] { assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i))); }\n@@ -6459,7 +6470,7 @@ mod tests {\n                 assert_eq!(seen, rows);\n                 phase.finish(\"bplus_tree\", \"scan_page\");\n                 tx.commit(); drop(tx); drop(mode); drop(db);\n-                eprintln!(\"BPLUS_INTERNAL_VERIFIED rows={rows} round={round}\");\n+                eprintln!(\"BPLUS_{label}_VERIFIED rows={rows} round={round}\");\n             }\n         }\n     }\n"
+  },
+  "delivery_validation": {
+    "json_round_trip": true,
+    "samples": 60,
+    "verified_arms": 20,
+    "git_apply_check": true,
+    "production_source_matches_M140": true
+  }
+}

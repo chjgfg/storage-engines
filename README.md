@@ -1,5 +1,8 @@
 # storage-engines
 
+M141 对叶子单遍解析进行了完整五档 ABBA，因收益不稳定已撤回生产改动；生产实现仍为 M140。
+实验原始输出与可重放补丁见 [performance-m141.json](docs/performance-m141.json)，决策见 [CHANGELOG](CHANGELOG.md)。
+
 test14 后首项优化见 [CHANGELOG](CHANGELOG.md) M140：B+ 超出钉住预算的内部节点使用紧凑缓存。
 普通事务 5M/10M/20M 库各 1M 随机点读，ABBA 均值耗时下降 13.93%/21.01%/25.94%；顺序读、分页仍有不利读数，不能解释为全流程提速。
 原始与结构化证据见 [performance-m140.json](docs/performance-m140.json)，复现方式见 [压测手册](docs/大规模压测手册.md)。
@@ -9,7 +12,7 @@ test13 后四项改动见 [CHANGELOG](CHANGELOG.md) M134–M139：压测进程�
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M140 为未发布改动**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M141 为未发布记录**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - M127 将 LSM 内存表/旧格式的值复制延迟到逻辑版本胜者确定，100 版本守卫只复制最终 1 行。
 - M126 的 memory 停机快照直接编码已证完整的组，批尾/二进制重叠保留窗口折叠；memory debug 49 项通过。test11 四步代码已落实，最终 release 库回归通过，大档验收见 M128。
 - M128 已完成 LSM 20M 复用、B+ 20M 回收后重开、memory 20M/22M 停机专项及 50k 四引擎台架；memory 22M 最后一轮末尾验收两行未从终端取回，账本保留该证据边界。
