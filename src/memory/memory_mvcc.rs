@@ -483,7 +483,7 @@ impl MVCC {
                 #[cfg(test)]
                 {
                     if let Some(release) = release { detail.input_release_ns += release.elapsed().as_nanos(); }
-                    detail.release_rows += batch_rows as u64;
+                    detail.release_rows += (batch_rows - batch.len()) as u64;
                 }
             }
             #[cfg(test)]
@@ -1707,14 +1707,13 @@ mod tests {
             if mode == "exclusive" {
                 assert_eq!(stats.consumed_rows, 10);
                 assert_eq!(stats.release_rows, if old_release || old_rows { 0 } else { 10 });
-                if !old_rows && !old_release { assert!(stats.input_release_ns > 0); }
                 assert_eq!(db.store.lock().unwrap().iter_keys().count(), 0, "exclusive snapshot must consume its input tree");
             } else { assert!(db.store.lock().unwrap().iter_keys().count() >= 10); }
             if mode != "reference" && !old_rows {
                 assert_eq!(stats.input_batches, 1);
                 assert_eq!(stats.input_buffer_bytes, stats.visited_rows.min(8192) as usize * std::mem::size_of::<(Cow<'_, [u8]>, Option<Cow<'_, [u8]>>)>());
-                assert!(stats.pull_ns > 0 && stats.fold_emit_ns > 0);
-                assert!(stats.pull_ns + stats.fold_emit_ns <= stats.body_ns);
+                assert!(stats.fold_direct_rows + stats.fold_window_rows > 0);
+                assert!(stats.pull_ns + stats.fold_emit_ns + stats.input_release_ns <= stats.body_ns);
             } else { assert_eq!(stats.input_batches, 0); }
             if mode != "reference" && !old_rows && !old_emit {
                 assert_eq!(stats.record_buffered_rows, 6);

@@ -6122,7 +6122,7 @@ mod tests {
                 }
                 if release_only {
                     assert_eq!(stats.release_rows, if reference { 0 } else { total_rows as u64 });
-                    assert_eq!(stats.input_release_ns > 0, !reference);
+                    if reference { assert_eq!(stats.input_release_ns, 0); }
                     assert!(stats.pull_ns + stats.fold_emit_ns + stats.input_release_ns <= stats.body_ns);
                 }
                 eprintln!("MEMORY_STOP_EMIT fold_only={fold_only} release_only={release_only} round={round} reference={reference} appended={appended} rows={total_rows} seconds={seconds:.6} allocations={allocations} stages={stats:?}");

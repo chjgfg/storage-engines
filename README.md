@@ -1,5 +1,8 @@
 # storage-engines
 
+M143 修复 memory 停机测试的零纳秒误报，按实际释放行数验收；生产快照和同步策略不变。
+证据见 [validation-m143.json](docs/validation-m143.json)，不作为停机提速结论。
+
 M142 复用 B+ 回收时已解析的节点，借位失败显式重读原页；五档 20 轮关闭重开逐值通过。
 10M/20M 回收 ABBA 均值下降 13.73%/11.62%，5M 慢 0.34%，不宣称每档提速。证据见 [performance-m142.json](docs/performance-m142.json)。
 
@@ -15,7 +18,7 @@ test13 后四项改动见 [CHANGELOG](CHANGELOG.md) M134–M139：压测进程�
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M142 为未发布记录**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M143 为未发布记录**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - M127 将 LSM 内存表/旧格式的值复制延迟到逻辑版本胜者确定，100 版本守卫只复制最终 1 行。
 - M126 的 memory 停机快照直接编码已证完整的组，批尾/二进制重叠保留窗口折叠；memory debug 49 项通过。test11 四步代码已落实，最终 release 库回归通过，大档验收见 M128。
 - M128 已完成 LSM 20M 复用、B+ 20M 回收后重开、memory 20M/22M 停机专项及 50k 四引擎台架；memory 22M 最后一轮末尾验收两行未从终端取回，账本保留该证据边界。

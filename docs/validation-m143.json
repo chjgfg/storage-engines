@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "milestone": "M143",
+  "date": "2026-11-15",
+  "base_commit": "62c40d7be3504dda358a52fbb21cdaacee3960fa",
+  "scope": "Test-only memory batch-release accounting and guards. Production eager snapshot and durability unchanged.",
+  "cause": "Existing 10-row batch clear can measure zero nanoseconds. Wall clock positivity is not proof of route execution.",
+  "change": "Count actual input length removed; assert released rows, folded rows and inclusive time bounds. Remove positive elapsed-time requirements in stop-mode and release-only benchmark guards.",
+  "validation": {
+    "initial_release": "517 passed,1 failed,75 ignored;108.13s; input_release_ns > 0 failed",
+    "negative_control": {
+      "chunk_id": "c30332",
+      "wall_time_seconds": 0.0000206,
+      "exit_code": 1,
+      "original_token_count": 207,
+      "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.50s\n     Running unittests src\\lib.rs (target\\debug\\deps\\storage_engines-841d71bdec02be97.exe)\n\nrunning 1 test\ntest memory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions ... \nthread 'memory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions' (63756) panicked at src\\memory\\memory_mvcc.rs:1709:17:\nassertion `left == right` failed\n  left: 0\n right: 10\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nFAILED\n\nfailures:\n\nfailures:\n    memory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 592 filtered out; finished in 0.05s\n\nerror: test failed, to rerun pass `--lib`\n"
+    },
+    "final_release": "518 passed,0 failed,75 ignored;127.29s",
+    "windows": "all-targets/all-features passed18.88s",
+    "linux": "GNU cross-check all-targets/all-features passed8.07s,not executed",
+    "final_executable_sha256": "7e026f247834531552aa35e70b861a30adc6f696755663594611de2e2941ca41",
+    "scope_caveat": "Final suite binary also contains pending LSM ownership change/tests, excluded from this commit; 518 includes those tests."
+  },
+  "raw_failed_suite": "    Finished `release` profile [optimized] target(s) in 0.31s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 593 tests\ni.i......................iii...............i...................i..............i........ 87/593\n...............iiii.......i............................................................ 174/593\n...............................................i...............i....................... 261/593\n.....i.....iiiiiiiiiii.i.i....ii...........i.iiiiiii..iii.i...iiiiiiii..iiiiiii.....i.. 348/593\n.....ii....i.....................iii.....................................i......i.iiii. 435/593\n...................i.......................i............................i.............. 522/593\n............... 537/593\nmemory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions --- FAILED\n......................i................................\nfailures:\n\n---- memory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions stdout ----\n\nthread 'memory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions' (56980) panicked at src\\memory\\memory_mvcc.rs:1710:48:\nassertion failed: stats.input_release_ns > 0\n\n\nfailures:\n    memory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions\n\ntest result: FAILED. 517 passed; 1 failed; 75 ignored; 0 measured; 0 filtered out; finished in 108.13s\n\nerror: test failed, to rerun pass `--lib`\n",
+  "raw_final_suite": "    Finished `release` profile [optimized] target(s) in 0.38s\n     Running unittests src\\lib.rs (target\\release\\deps\\storage_engines-7533728b253b9a38.exe)\n\nrunning 593 tests\ni.i......................iii...............i...................i..............i........ 87/593\n...............iiii.......i............................................................ 174/593\n...............................................i...............i....................... 261/593\n.....i.....iiiiiiiiiii.i.i....ii...........i.iiiiiii..iii.i...iiiiiiii..iiiiiii.....i.. 348/593\n.....ii....i.....................iii.....................................i......i.iiii. 435/593\n...................i.......................i............................i.............. 522/593\n......................................i................................\ntest result: ok. 518 passed; 0 failed; 75 ignored; 0 measured; 0 filtered out; finished in 127.29s\n\n",
+  "delivery": {
+    "roundtrip": "Passed Python JSON import/export/reimport equality"
+  }
+}
