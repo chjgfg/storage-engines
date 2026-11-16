@@ -2529,6 +2529,8 @@ pub(crate) fn merge_to_ssts_with_action(
             out.0.push(b.finish()?);
         }
     }
+    #[cfg(test)]
+    crate::lsm_tree::lsm_tree::maintenance_probe::outputs(out.0.len(), out.0.iter().map(|f| f.size_bytes).sum());
     Ok(std::mem::take(&mut out.0))
 }
 

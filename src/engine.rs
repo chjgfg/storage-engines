@@ -7216,6 +7216,8 @@ mod tests {
             eprintln!("SCALE_LSM_MOVES phase={phase} files={} bytes={}", s.trivial_moves, s.moved_bytes);
             eprintln!("SCALE_LSM_REWRITE_INPUTS phase={phase} cumulative=true files={} bytes={} excludes_trivial_moves=true",
                 s.input_files - s.trivial_moves, s.input_bytes - s.moved_bytes);
+            eprintln!("SCALE_LSM_REWRITE_OUTPUTS phase={phase} cumulative=true files={} bytes={} includes_overlap_repair=true scope=merge_generated_sst",
+                s.output_files, s.output_bytes);
             eprintln!("SCALE_LSM_STAGES phase={phase} merge_ms={:.3} repair_ms={:.3} manifest_ms={:.3} guard_ms={:.3} cleanup_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3}",
                 s.merge_ns as f64 / 1e6, s.repair_ns as f64 / 1e6, s.manifest_ns as f64 / 1e6,
                 s.guard_ns as f64 / 1e6, s.cleanup_ns as f64 / 1e6, s.sst_finish_ns as f64 / 1e6, s.sst_sync_ns as f64 / 1e6);

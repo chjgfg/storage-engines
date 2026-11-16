@@ -450,6 +450,8 @@ pub(crate) mod maintenance_probe {
         pub input_bytes: u64,
         pub trivial_moves: u64,
         pub moved_bytes: u64,
+        pub output_files: u64,
+        pub output_bytes: u64,
         pub owned_input_rows: u64,
         pub legacy_input_clones: u64,
         pub reference_input_clones: u64,
@@ -514,6 +516,11 @@ pub(crate) mod maintenance_probe {
     pub(crate) fn inputs(files: u64, bytes: u64) {
         ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
             stats.input_files += files; stats.input_bytes += bytes;
+        });
+    }
+    pub(crate) fn outputs(files: usize, bytes: u64) {
+        ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+            stats.output_files += files as u64; stats.output_bytes += bytes;
         });
     }
 }
@@ -3383,6 +3390,11 @@ mod tests {
             let stats = scope.stats();
             assert_eq!(stats.trivial_moves, if reference { 0 } else { 3 });
             assert_eq!(stats.owned_input_rows, if reference { 4 } else { 0 });
+            // Count generated SST files, not reused files or their input bytes.
+            assert_eq!(stats.output_files, if reference { db.levels[1].len() as u64 } else { 0 });
+            assert_eq!(stats.output_bytes, if reference {
+                db.levels[1].iter().map(|file| fs::metadata(&file.path).unwrap().len()).sum()
+            } else { 0 });
             if !reference {
                 assert_eq!(stats.merge_ns, 0);
                 assert_eq!(stats.sst_sync_ns, 0);
