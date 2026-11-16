@@ -5652,6 +5652,75 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "LSM disjoint L0 movement ABBA, fill/read/update/vacuum/reopen; release single thread"]
+    fn lsm_disjoint_move_cost() {
+        use crate::lsm_tree::lsm_tree::{disjoint_move_reference, maintenance_probe};
+        let _run = crate::scale_probe::RunGuard::acquire("lsm_disjoint_move_cost");
+        let rows: usize = std::env::var("LSM_MOVE_ROWS").map(|v| v.parse().unwrap()).unwrap_or(600_000);
+        assert!(rows >= 1000 && rows.checked_mul(16).is_some());
+        crate::scale_probe::fingerprint();
+        for (round, reference) in [true, false, false, true].into_iter().enumerate() {
+            let scratch = ScaleScratch::new("lsm_disjoint_move");
+            let mode = reference.then(disjoint_move_reference::Scope::start);
+            let mut db = open_engine(EngineKind::LsmTree, Some(&scratch.0)).unwrap();
+            for phase in ["insert", "reopen", "read_sample", "update", "vacuum", "final_reopen"] {
+                let maint = maintenance_probe::Scope::start();
+                let clock = std::time::Instant::now();
+                let cpu = crate::scale_probe::Phase::begin("lsm_tree", phase);
+                let before = crate::mem_probe::allocations();
+                match phase {
+                    "insert" | "update" => {
+                        let count = if phase == "insert" { rows } else { rows / 10 };
+                        let batch = if phase == "insert" { 1000 } else { 500 };
+                        for base in (0..count).step_by(batch) {
+                            let items: Vec<_> = (base..(base + batch).min(count))
+                                .map(|i| (scale_key(i), scale_val(if phase == "insert" { i } else { i + rows }))).collect();
+                            let tx = db.begin();
+                            tx.batch_set(&items).unwrap();
+                            tx.commit();
+                            if (base + batch) % 1_000_000 == 0 {
+                                eprintln!("LSM_DISJOINT_PROGRESS rows={rows} round={round} reference={reference} phase={phase} completed={}", base + batch);
+                            }
+                        }
+                    }
+                    "reopen" | "final_reopen" => {
+                        db.flush().unwrap(); db.checkpoint().unwrap(); drop(db);
+                        db = open_engine(EngineKind::LsmTree, Some(&scratch.0)).unwrap();
+                    }
+                    "read_sample" => {
+                        let tx = db.begin();
+                        for n in 0..rows.min(20_000) {
+                            let i = ((n as u64 * 104729) % rows as u64) as usize;
+                            assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i)));
+                        }
+                        tx.commit();
+                    }
+                    "vacuum" => { assert!(!db.vacuum().unwrap().skipped_active_txn); }
+                    _ => unreachable!(),
+                }
+                let seconds = clock.elapsed().as_secs_f64();
+                let allocations = crate::mem_probe::allocations() - before;
+                cpu.finish("lsm_tree", phase);
+                let stats = maint.stats();
+                eprintln!("LSM_DISJOINT rows={rows} round={round} reference={reference} phase={phase} seconds={seconds:.6} allocations={allocations} rewrite_input_files={} rewrite_input_bytes={} stages={stats:?}",
+                    stats.input_files - stats.trivial_moves, stats.input_bytes - stats.moved_bytes);
+            }
+            // Independent seed, final persisted state, every key and value.
+            let tx = db.begin();
+            let mut seen = 0;
+            tx.export_latest_visible_for_each(false, &mut |record| {
+                assert_eq!(record.key, scale_key(seen));
+                assert_eq!(record.value, Some(scale_val(if seen < rows / 10 { seen + rows } else { seen })));
+                seen += 1;
+                true
+            });
+            assert_eq!(seen, rows);
+            drop(tx); drop(db); drop(mode);
+            eprintln!("LSM_DISJOINT_VERIFIED rows={rows} round={round} reference={reference} unique_keys={seen}");
+        }
+    }
+
+    #[test]
     #[ignore = "LSM ordinary fill/get/update ABBA; release single thread"]
     fn lsm_ordinary_rw_cost() {
         use crate::lsm_tree::sst::{point_read_reference, block_reads, block_misses, sst_entry_walks, entry_value_clones};
@@ -7145,6 +7214,8 @@ mod tests {
             s.owned_input_rows, s.legacy_input_clones, s.reference_input_clones, s.compaction_blocks);
         if db.name() == "lsm_tree" {
             eprintln!("SCALE_LSM_MOVES phase={phase} files={} bytes={}", s.trivial_moves, s.moved_bytes);
+            eprintln!("SCALE_LSM_REWRITE_INPUTS phase={phase} cumulative=true files={} bytes={} excludes_trivial_moves=true",
+                s.input_files - s.trivial_moves, s.input_bytes - s.moved_bytes);
             eprintln!("SCALE_LSM_STAGES phase={phase} merge_ms={:.3} repair_ms={:.3} manifest_ms={:.3} guard_ms={:.3} cleanup_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3}",
                 s.merge_ns as f64 / 1e6, s.repair_ns as f64 / 1e6, s.manifest_ns as f64 / 1e6,
                 s.guard_ns as f64 / 1e6, s.cleanup_ns as f64 / 1e6, s.sst_finish_ns as f64 / 1e6, s.sst_sync_ns as f64 / 1e6);

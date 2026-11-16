@@ -2280,9 +2280,11 @@ impl LSMTree {
     fn try_trivial_move(&mut self, level: usize, next: usize) -> std::io::Result<MoveOutcome> {
         #[cfg(test)]
         if trivial_move_probe::reference() { return Ok(MoveOutcome::Rewrite); }
-        if self.bulk_mode || self.compaction_filter.is_some() || self.levels[level].is_empty()
-            || (level == 0 && self.levels[0].len() != 1) {
+        if self.bulk_mode || self.compaction_filter.is_some() || self.levels[level].is_empty() {
             return Ok(MoveOutcome::Rewrite);
+        }
+        if level == 0 && self.levels[0].len() > 1 {
+            return self.try_disjoint_l0_move(next);
         }
         let idx = if level == 0 { 0 } else {
             self.levels[level].iter().enumerate().max_by_key(|(_, s)| s.size_bytes).unwrap().0
@@ -2329,6 +2331,69 @@ impl LSMTree {
         }
         #[cfg(not(test))]
         let _ = (id, bytes);
+        self.notify_bg();
+        Ok(MoveOutcome::Moved)
+    }
+
+    /// Publish a disjoint L0 run in one manifest edit. L0's insertion order must
+    /// survive a failed publication; never sort or drain it before certification.
+    fn try_disjoint_l0_move(&mut self, next: usize) -> std::io::Result<MoveOutcome> {
+        #[cfg(test)]
+        if disjoint_move_reference::enabled() { return Ok(MoveOutcome::Rewrite); }
+        let mut source: Vec<_> = self.levels[0].iter().collect();
+        source.sort_unstable_by(|a, b| a.min_key.cmp(&b.min_key));
+        if source.windows(2).any(|p| p[0].max_key >= p[1].min_key)
+            || self.levels[next].windows(2).any(|p| p[0].max_key >= p[1].min_key) {
+            return Ok(MoveOutcome::Rewrite);
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let mut target = 0;
+        for file in &source {
+            if file.move_eligibility() != crate::lsm_tree::sst::MoveEligibility::Ready
+                || self.ttl_meta.range(file.min_key.clone()..=file.max_key.clone()).any(|(_, exp)| now > *exp) {
+                return Ok(MoveOutcome::Rewrite);
+            }
+            while target < self.levels[next].len() && self.levels[next][target].max_key < file.min_key {
+                target += 1;
+            }
+            if target < self.levels[next].len() && self.levels[next][target].min_key <= file.max_key {
+                return Ok(MoveOutcome::Rewrite);
+            }
+        }
+        // Record only moved files. The target's original sorted order is retained
+        // by filtering; source indices restore its original (old -> new) order.
+        let positions: HashMap<_, _> = self.levels[0].iter().enumerate()
+            .map(|(position, file)| (file.id, position)).collect();
+        #[cfg(test)]
+        let bytes: u64 = source.iter().map(|file| file.size_bytes).sum();
+        drop(source);
+        #[cfg(test)]
+        let _probe = maintenance_probe::Timer::start(maintenance_probe::Kind::Compact);
+        let source = std::mem::take(&mut self.levels[0]);
+        self.levels[next].extend(source);
+        self.levels[next].sort_unstable_by(|a, b| a.min_key.cmp(&b.min_key));
+        if let Err(error) = self.write_manifest() {
+            let (mut source, target): (Vec<_>, Vec<_>) = std::mem::take(&mut self.levels[next])
+                .into_iter().partition(|file| positions.contains_key(&file.id));
+            source.sort_unstable_by_key(|file| positions[&file.id]);
+            self.levels[0] = source;
+            self.levels[next] = target;
+            self.refresh_level_ranges(0);
+            self.refresh_level_ranges(next);
+            return Err(error);
+        }
+        self.refresh_level_ranges(0);
+        self.refresh_level_ranges(next);
+        self.stats_dirty = true;
+        #[cfg(test)] {
+            maintenance_probe::inputs(positions.len() as u64, bytes);
+            for file in &self.levels[next] {
+                if positions.contains_key(&file.id) { maintenance_probe::moved(file.size_bytes); }
+            }
+            let text = fs::read_to_string(self.manifest_path())?;
+            assert!(manifest_publishes(&text, next, &positions.keys().copied().collect::<Vec<_>>()));
+        }
         self.notify_bg();
         Ok(MoveOutcome::Moved)
     }
@@ -3297,6 +3362,101 @@ mod tests {
         for id in [17, 18, 19, 20, 22] {
             assert!(manifest_publishes_reference(text, &[id]));
             assert!(!manifest_publishes(text, 1, &[id]), "unpublished id {id} passed the guard");
+        }
+    }
+
+    #[test]
+    fn disjoint_l0_move_preserves_files_and_reopen_with_reference_control() {
+        for reference in [true, false] {
+            let dir = tmp_dir("disjoint_l0");
+            let mut db = LSMTree::open(&dir).unwrap();
+            // L0 insertion order differs from key order. Target lies in a gap.
+            for key in [b"e", b"a", b"c"] {
+                db.inject_sst_for_test(0, vec![(key.to_vec(), StoredEntry::put(1, Some(key.to_vec())))]).unwrap();
+            }
+            db.inject_sst_for_test(1, vec![(b"b".to_vec(), StoredEntry::put(1, None))]).unwrap();
+            db.write_manifest().unwrap();
+            let originals: Vec<_> = db.levels.iter().flatten().map(|f| (f.id, f.path.clone(), fs::read(&f.path).unwrap())).collect();
+            let mode = reference.then(disjoint_move_reference::Scope::start);
+            let scope = maintenance_probe::Scope::start();
+            db.compact_level(0).unwrap();
+            let stats = scope.stats();
+            assert_eq!(stats.trivial_moves, if reference { 0 } else { 3 });
+            assert_eq!(stats.owned_input_rows, if reference { 4 } else { 0 });
+            if !reference {
+                assert_eq!(stats.merge_ns, 0);
+                assert_eq!(stats.sst_sync_ns, 0);
+                for (id, path, bytes) in &originals {
+                    assert!(db.levels[1].iter().any(|f| f.id == *id));
+                    assert_eq!(fs::read(path).unwrap(), *bytes);
+                }
+            }
+            drop(scope); drop(mode); drop(db);
+            let db = LSMTree::open(&dir).unwrap();
+            for key in [b"a", b"c", b"e"] { assert_eq!(db.get(key), Some(key.to_vec())); }
+            assert_eq!(db.get(b"b"), None);
+            assert!(db.levels[0].is_empty());
+        }
+    }
+
+    #[test]
+    fn disjoint_l0_move_failure_restores_source_order_and_target() {
+        let dir = tmp_dir("disjoint_publish_failure");
+        let mut db = LSMTree::open(&dir).unwrap();
+        for key in [b"e", b"a", b"c"] {
+            db.inject_sst_for_test(0, vec![(key.to_vec(), StoredEntry::put(1, Some(key.to_vec())))]).unwrap();
+        }
+        db.inject_sst_for_test(1, vec![(b"b".to_vec(), StoredEntry::put(1, Some(b"b".to_vec())))]).unwrap();
+        db.write_manifest().unwrap();
+        let ids = |db: &LSMTree| db.levels.iter().map(|l| l.iter().map(|f| f.id).collect::<Vec<_>>()).collect::<Vec<_>>();
+        let before = ids(&db);
+        let manifest = fs::read(db.manifest_path()).unwrap();
+        fs::create_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+        assert!(db.compact_level(0).is_err());
+        assert_eq!(ids(&db), before);
+        assert_eq!(fs::read(db.manifest_path()).unwrap(), manifest);
+        for key in [b"a", b"b", b"c", b"e"] { assert_eq!(db.get(key), Some(key.to_vec())); }
+        fs::remove_dir(db.dir.join("MANIFEST.tmp")).unwrap();
+        db.compact_level(0).unwrap();
+        drop(db);
+        let db = LSMTree::open(&dir).unwrap();
+        for key in [b"a", b"b", b"c", b"e"] { assert_eq!(db.get(key), Some(key.to_vec())); }
+    }
+
+    #[test]
+    fn disjoint_l0_move_fallbacks_match_reference() {
+        for mode in 0..9 {
+            let mut answers = Vec::new();
+            for reference in [true, false] {
+                let dir = tmp_dir("disjoint_fallback");
+                let mut db = LSMTree::open(&dir).unwrap();
+                let first = if mode == 2 { StoredEntry::drop_at(3) } else { StoredEntry::put(3, Some(b"new".to_vec())) };
+                let mut entries = vec![(b"a".to_vec(), first)];
+                if mode == 3 { entries.insert(0, (b"a".to_vec(), StoredEntry::put(1, Some(b"old".to_vec())))); }
+                db.inject_sst_for_test(0, entries).unwrap();
+                db.inject_sst_for_test(0, vec![(if mode == 0 { b"a".to_vec() } else { b"z".to_vec() }, StoredEntry::put(4, None))]).unwrap();
+                if mode == 1 { db.set_compaction_filter(Some(Arc::new(|_, _| false))); }
+                if mode == 2 { db.inject_sst_for_test(3, vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"old".to_vec())))]).unwrap(); }
+                if mode == 4 { db.ttl_meta.insert(b"a".to_vec(), 1); }
+                if mode == 5 { db.inject_sst_for_test(1, vec![(b"a".to_vec(), StoredEntry::put(1, Some(b"old".to_vec())))]).unwrap(); }
+                if mode == 6 { let f = &db.levels[0][0]; db.levels[0][0] = SstFile::open(f.id, &f.path).unwrap(); }
+                if mode == 7 {
+                    for seq in [1, 2] { db.inject_sst_for_test(1, vec![(b"m".to_vec(), StoredEntry::put(seq, Some(vec![seq as u8])))]).unwrap(); }
+                }
+                if mode == 8 { db.bulk_mode = true; }
+                let control = reference.then(disjoint_move_reference::Scope::start);
+                let scope = maintenance_probe::Scope::start();
+                db.compact_level(0).unwrap();
+                assert_eq!(scope.stats().trivial_moves, 0, "mode={mode}");
+                assert!(scope.stats().owned_input_rows > 0, "mode={mode}");
+                drop(scope); drop(control);
+                db.bulk_mode = false;
+                drop(db);
+                let db = LSMTree::open(&dir).unwrap();
+                answers.push([db.get(b"a"), db.get(b"m"), db.get(b"z")]);
+            }
+            assert_eq!(answers[0], answers[1], "mode={mode}");
+            if mode == 2 { assert_eq!(answers[1][0], None, "deleted value resurrected"); }
         }
     }
 
@@ -5438,6 +5598,16 @@ impl<R: MergeRow> Iterator for LightMerge<'_, R> {
         // 走到这里 = 堆空**且**等待队列空 ⇒ 所有源都收干净了，最后一个待定键可以吐
         self.pending.take()
     }
+}
+
+#[cfg(test)]
+pub(crate) mod disjoint_move_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub struct Scope;
+    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
 }
 
 #[cfg(test)]

@@ -1,0 +1,48 @@
+{
+  "milestone": "M145",
+  "date": "2026-11-16",
+  "change": "disjoint L0 files move to the next level in one manifest publication; rewrite input is reported separately from trivial moves",
+  "correctness": {
+    "release_lib": "519 passed / 0 failed / 75 ignored",
+    "lsm_targeted": "132 passed / 0 failed / 11 ignored",
+    "guards": [
+      "same-build reference=true/false",
+      "source file bytes and IDs preserved",
+      "manifest publication failure restores source order and target",
+      "nine fallback cases match the rewrite path",
+      "reopen and full key/value verification"
+    ]
+  },
+  "benchmark": {
+    "command": "LSM_MOVE_ROWS=<rows> cargo test --release --lib engine::tests::lsm_disjoint_move_cost -- --exact --ignored --nocapture --test-threads=1",
+    "completed_scales": [600000, 1000000, 5000000],
+    "aborted_scales": [10000000],
+    "note": "10M was stopped during the first reference insert phase; 20M was not started.",
+    "observations": {
+      "600000": {
+        "reference_insert_rewrite_bytes": [55385402, 55385402],
+        "candidate_insert_rewrite_bytes": [0, 0],
+        "candidate_verified_rounds": 2
+      },
+      "1000000": {
+        "reference_insert_rewrite_bytes": [110762614, 110762614],
+        "candidate_insert_rewrite_bytes": [0, 0],
+        "candidate_verified_rounds": 2
+      },
+      "5000000": {
+        "reference_insert_rewrite_bytes": [553689809, 553689809],
+        "candidate_insert_rewrite_bytes": [0, 0],
+        "reference_update_rewrite_bytes": [474913255, 474913255],
+        "candidate_update_rewrite_bytes": [303726697, 303726697],
+        "reference_vacuum_rewrite_bytes": [260043910, 260043910],
+        "candidate_vacuum_rewrite_bytes": [153910617, 153910617],
+        "candidate_verified_rounds": 2
+      }
+    }
+  },
+  "limits": [
+    "wall-clock insert speed is not claimed as a stable improvement",
+    "rewrite_input_bytes is cumulative input to merge, not output bytes or a write-amplification ratio",
+    "full five-scale benchmark remains for the user's next run"
+  ]
+}
