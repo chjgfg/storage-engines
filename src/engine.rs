@@ -7195,6 +7195,7 @@ mod tests {
 
     // 固定规模的 IDE / cargo test 入口；共享下面的同一套台架，不复制五份负载。
     include!("scale_bench.rs");
+    include!("lsm_allocation_bench.rs");
 
     #[test]
     #[ignore = "大库基线，手动 release 单线程跑：SCALE_ROWS=50000 cargo test --release --lib -- --ignored --nocapture --test-threads=1 scale_baseline"]
@@ -7414,18 +7415,27 @@ mod tests {
             line(label, "open 空库", d.as_secs_f64() * 1e6, "µs", live, peak, "");
 
             // ---- 写入：每 1000 行一个事务（commit 带 fsync） ----
+            let mut insert_stages = [0_u128; 3];
             let (d, live, peak, ()) = timed_phase(label, "insert", || {
                 for base in (0..rows).step_by(1000) {
                     let end = (base + 1000).min(rows);
+                    let stage = std::time::Instant::now();
                     let items: Vec<(Vec<u8>, Vec<u8>)> =
                         (base..end).map(|i| (key(i), val(i))).collect();
+                    insert_stages[0] += stage.elapsed().as_nanos();
                     let tx = db.begin();
+                    let stage = std::time::Instant::now();
                     if let Err(bad) = tx.batch_set(&items) {
                         panic!("{label}: batch_set 冲突 {}", String::from_utf8_lossy(&bad));
                     }
+                    insert_stages[1] += stage.elapsed().as_nanos();
+                    let stage = std::time::Instant::now();
                     tx.commit();
+                    insert_stages[2] += stage.elapsed().as_nanos();
                 }
             });
+            eprintln!("SCALE_INSERT_STAGES engine={label} prepare_ms={:.3} batch_set_ms={:.3} commit_ms={:.3} scope=disjoint_substages",
+                insert_stages[0] as f64 / 1e6, insert_stages[1] as f64 / 1e6, insert_stages[2] as f64 / 1e6);
             line(label, &format!("灌 {rows} 行(事务)"), d.as_secs_f64() * 1e6 / rows as f64, "µs/行", live, peak, "");
             scale_note_maintenance(&*db, "insert", &maintenance);
 
@@ -7434,6 +7444,7 @@ mod tests {
                 db.checkpoint().unwrap();
             });
             let disk = disk_bytes(arg.unwrap());
+            if label == "lsm_tree" { scale_note_maintenance(&*db, "checkpoint", &maintenance); }
             line(label, "flush+checkpoint", d.as_secs_f64() * 1e6, "µs", live, peak, &format!("磁盘 {:.1} MB", disk as f64 / 1e6));
 
             // ---- 冷重开：恢复要多久、恢复完常驻多少 ----
@@ -7703,6 +7714,7 @@ mod tests {
             // 而 bplus 同格 18.5µs ⇒ flush 那一半在 bitcask 上是零头）。拆格本身一秒不省，
             // 它的作用是让"merge 已从 vacuum 拆出去"那笔省下的时间在下一格露出来。
             let (d, live, peak, ()) = timed_phase(label, "flush", || db.flush().unwrap());
+            if label == "lsm_tree" { scale_note_maintenance(&*db, "flush", &maintenance); }
             let disk_after_flush = disk_bytes(arg.unwrap());
             line(label, "flush", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("磁盘 {:.1} MB", disk_after_flush as f64 / 1e6));
@@ -7777,6 +7789,7 @@ mod tests {
                 bulk.finish();
             });
             line(label, &format!("bulk 灌 {bulk_rows} 行"), d.as_secs_f64() * 1e6 / bulk_rows as f64, "µs/行", live, peak, "");
+            if label == "lsm_tree" { scale_note_maintenance(&*db, "bulk", &maintenance); }
 
             // ---- 再冷重开一次：bulk 之后的恢复代价 ----
             // （M81 第 6 项：memory 走同一条路了 —— 这一次 drop 会把它连 bulk 一起写进快照。
@@ -7798,6 +7811,7 @@ mod tests {
                 crate::scale_probe::memory(label, "bulk_before_reopen");
                 let recovery = (kind == EngineKind::Memory).then(crate::common::kv_snapshot::recovery_probe::Scope::start);
                 let (d, live, peak, db) = timed_phase(label, "bulk_reopen", || open_engine(kind, arg).unwrap());
+                if label == "lsm_tree" { scale_note_maintenance(&*db, "bulk_reopen", &maintenance); }
                 if let Some(scope) = recovery { eprintln!("SCALE_RECOVERY phase=bulk stages={:?}", scope.stats()); }
                 crate::scale_probe::memory(label, "bulk_after_reopen");
                 line(

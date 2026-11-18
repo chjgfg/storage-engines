@@ -20,6 +20,17 @@ use std::{
 };
 
 use crate::lsm_tree::mem_wal::{MemWal, MemWalRecord};
+
+/// Test-only pre-M147 allocation paths; never switches durability or visibility.
+#[cfg(test)]
+pub(crate) mod allocation_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|c| c.set(false)); } }
+}
 use crate::lsm_tree::sst::{
     merge_latest_streaming, merge_streaming, merge_to_ssts_with_action, CompactionAction, TryMergeInput, UnpublishedSsts, vec_inputs, BlockCache, EntryValue,
     LightEntry, MergeInput, SstBuilder, SstFile, StoredEntry, SourceRow, MergeRow,
@@ -1849,15 +1860,23 @@ impl LSMTree {
                     .rev()
                     .find(|(k, v)| accept(k.as_slice(), v));
             }
-            excluded.insert(key.clone());
+            #[cfg(test)]
+            if allocation_reference::enabled() { excluded.insert(key.clone()); }
 
             // 跨源定论：Drop / 不存在 ⇒ 该 key 整体不可见，继续找下一个更小的键
             let Some(val) = self.get_value_at(&key, snap_seq) else {
+                // The reference already excluded this key before lookup.
+                #[cfg(test)]
+                if allocation_reference::enabled() { continue; }
+                excluded.insert(key);
                 continue;
             };
             if accept(&key, &val) {
                 return Some((key, val));
             }
+            #[cfg(test)]
+            if allocation_reference::enabled() { continue; }
+            excluded.insert(key);
         }
     }
 
@@ -1899,7 +1918,14 @@ impl LSMTree {
         snap_seq: u64,
         excluded: &std::collections::HashSet<Vec<u8>>,
     ) -> Option<Vec<u8>> {
-        map.range(low.to_vec()..=high.to_vec())
+        #[cfg(test)]
+        if allocation_reference::enabled() {
+            return map.range(low.to_vec()..=high.to_vec()).rev()
+                .filter(|(k, _)| !excluded.contains(k.as_slice()))
+                .find(|(_, vers)| vers.iter().rev().any(|(s, _)| *s <= snap_seq))
+                .map(|(k, _)| k.clone());
+        }
+        map.range::<[u8], _>((std::ops::Bound::Included(low), std::ops::Bound::Included(high)))
             .rev()
             .filter(|(k, _)| !excluded.contains(k.as_slice()))
             .find(|(_, vers)| vers.iter().rev().any(|(s, _)| *s <= snap_seq))
@@ -1928,9 +1954,13 @@ impl LSMTree {
                 }
                 return KeyBackResult::FullScan(found);
             }
-            excluded.insert(key.clone());
+            #[cfg(test)]
+            if allocation_reference::enabled() { excluded.insert(key.clone()); }
             if self.get_light_entry_at(&key, snap_seq).is_some_and(|row| row.kind != 2)
                 && accept(&key) { return KeyBackResult::Indexed(Some(key)); }
+            #[cfg(test)]
+            if allocation_reference::enabled() { continue; }
+            excluded.insert(key);
         }
     }
 
@@ -4140,7 +4170,15 @@ mod tests {
             let accept = |k: &[u8], _: &Option<Vec<u8>>| k == b"k0000";
             let want = db.range_scan_at_seq(b"k0000", b"k9999", 1).into_iter().rev().find(|(k, v)| accept(k, v));
             assert!(want.is_some());
-            assert_eq!(db.find_back(b"k0000", b"k9999", 1, accept), want);
+            for reference in [true, false] {
+                let mode = reference.then(allocation_reference::Scope::start);
+                assert_eq!(db.find_back(b"k0000", b"k9999", 1, accept), want);
+                assert!(matches!(db.find_key_back(b"k0000", b"k9999", 1, |k| k == b"k0000"),
+                    KeyBackResult::FullScan(Some(key)) if key == b"k0000"));
+                assert!(matches!(db.find_key_back(b"k0000", b"k9999", 10, |k| k == b"k0000"),
+                    KeyBackResult::FullScan(None)));
+                drop(mode);
+            }
             db.mem.clear();
         }
         let _ = fs::remove_dir_all(&dir);

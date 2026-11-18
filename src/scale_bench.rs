@@ -10,6 +10,15 @@
 // 中 scratch= 指向的本次精确目录，不要通配删除其它测试库。
 
 mod scale_bench {
+    /// One entry point fixes scale order even when invoked from an IDE.
+    #[test]
+    #[ignore = "完整五档串行压测；release + exact + 单测试线程"]
+    fn all_scales_serial() {
+        for rows in [600_000, 1_000_000, 5_000_000, 10_000_000, 20_000_000] {
+            super::run_scale_baseline(rows);
+        }
+    }
+
     macro_rules! scale_case {
         ($name:ident, $rows:expr) => {
             #[test]

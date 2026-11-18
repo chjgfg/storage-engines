@@ -51,6 +51,24 @@ impl Transaction {
     /// 共用**当前事务**版本；全部成功返回 Ok，任一条冲突则回滚本批写入并
     /// `Err(failed_key)`。调用方成功后自行 `commit()`。
     pub fn batch_set(&self, items: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Vec<u8>> {
+        #[cfg(test)]
+        if super::lsm_tree::allocation_reference::enabled() {
+            return self.batch_set_reference(items);
+        }
+        for (i, (k, v)) in items.iter().enumerate() {
+            if !self.set(k, pack_plain(v)) {
+                // The input already owns the successful prefix. Copy keys only
+                // on failure, preserving the existing partial-undo contract.
+                let written: Vec<_> = items[..i].iter().map(|(key, _)| key.clone()).collect();
+                self.rollback_keys(&written);
+                return Err(k.clone());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn batch_set_reference(&self, items: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Vec<u8>> {
         let mut written: Vec<Vec<u8>> = Vec::new();
         for (k, v) in items {
             let packed = pack_plain(v);
@@ -70,13 +88,11 @@ impl Transaction {
 
     /// 批量删除；全部成功返回 Ok，否则 Err(首个失败 key) 并回滚本批删除
     pub fn batch_delete(&self, keys: &[Vec<u8>]) -> Result<(), Vec<u8>> {
-        let mut written: Vec<Vec<u8>> = Vec::new();
-        for k in keys {
+        for (i, k) in keys.iter().enumerate() {
             if !self.delete(k) {
-                self.rollback_keys(&written);
+                self.rollback_keys(&keys[..i]);
                 return Err(k.clone());
             }
-            written.push(k.clone());
         }
         Ok(())
     }
@@ -497,6 +513,55 @@ mod tests {
             tx.commit();
         }
         cleanup(&path);
+    }
+
+    #[test]
+    fn batch_failure_undoes_only_successful_prefix_and_survives_reopen() {
+        for reference in [true, false] {
+            let mode = reference.then(super::super::lsm_tree::allocation_reference::Scope::start);
+            let path = tmp("batch_failure_prefix");
+            {
+                let mvcc = MVCC::open(&path);
+                let seed = mvcc.begin_transaction();
+                seed.batch_set(&[(b"a".to_vec(), b"old".to_vec()),
+                    (b"hot".to_vec(), b"original".to_vec())]).unwrap();
+                seed.commit();
+                let holder = mvcc.begin_transaction();
+                assert!(holder.set(b"hot", pack_plain(b"locked")));
+                let tx = mvcc.begin_transaction();
+                assert!(tx.batch_set(&[]).is_ok());
+                assert!(tx.batch_delete(&[]).is_ok());
+                assert!(tx.set(b"outside", pack_plain(b"keep")));
+                let items = [(b"new".to_vec(), b"one".to_vec()),
+                    (b"new".to_vec(), b"two".to_vec()),
+                    (b"hot".to_vec(), b"rejected".to_vec()),
+                    (b"untouched".to_vec(), b"never".to_vec())];
+                assert_eq!(tx.batch_set(&items), Err(b"hot".to_vec()));
+                assert_eq!(tx.get(b"new"), None);
+                assert_eq!(tx.get(b"untouched"), None);
+                assert_eq!(tx.batch_delete(&[b"a".to_vec(), b"a".to_vec(), b"hot".to_vec()]),
+                    Err(b"hot".to_vec()));
+                assert_eq!(tx.get(b"a"), Some(b"old".to_vec()));
+                assert_eq!(tx.batch_delete(&[b"hot".to_vec(), b"outside".to_vec()]),
+                    Err(b"hot".to_vec()));
+                assert_eq!(tx.get(b"outside"), Some(b"keep".to_vec()));
+                // KvTxn's failure contract requires aborting the whole txn;
+                // partial undo is not a durable savepoint that can be committed.
+                tx.rollback();
+                holder.rollback();
+            }
+            {
+                let mvcc = MVCC::open(&path);
+                let tx = mvcc.begin_transaction();
+                assert_eq!(tx.get(b"a"), Some(b"old".to_vec()));
+                assert_eq!(tx.get(b"hot"), Some(b"original".to_vec()));
+                assert_eq!(tx.get(b"outside"), None);
+                assert_eq!(tx.get(b"new"), None);
+                assert_eq!(tx.get(b"untouched"), None);
+                tx.commit();
+            }
+            drop(mode);
+        }
     }
 
     #[test]

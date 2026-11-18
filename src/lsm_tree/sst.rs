@@ -780,7 +780,7 @@ impl SstFile {
             })));
         }
         VacuumLightInput::OwnedBlocks(VacuumLightRows { sst: self, block: from.and_then(|f| self.find_block(f)).unwrap_or(0),
-            rows: Vec::new().into_iter(), from, to, snap_seq, done: false })
+            rows: VacuumBlockRows::Metadata(Vec::new().into_iter()), from, to, snap_seq, done: false })
     }
 
     pub(crate) fn move_eligibility(&self) -> MoveEligibility { self.move_eligibility }
@@ -1800,6 +1800,13 @@ fn read_entry_from_slice(
     off: &mut usize,
     with_seq: bool,
 ) -> std::io::Result<(Vec<u8>, StoredEntry)> {
+    read_entry_project(data, off, with_seq, |seq, kind, value| StoredEntry {
+        seq, value: EntryValue::from_parts(kind, value.map(<[u8]>::to_vec)).expect("validated kind"),
+    })
+}
+
+fn read_entry_project<R>(data: &[u8], off: &mut usize, with_seq: bool,
+    project: impl Fn(u64, u8, Option<&[u8]>) -> R) -> std::io::Result<(Vec<u8>, R)> {
     if *off + 4 > data.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -1846,16 +1853,14 @@ fn read_entry_from_slice(
                 "val",
             ));
         }
-        let v = data[*off..*off + vl].to_vec();
+        let v = &data[*off..*off + vl];
         *off += vl;
         Some(v)
     } else {
         None
     };
-    let value = EntryValue::from_parts(kind, val).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "未知 kind")
-    })?;
-    Ok((key, StoredEntry { seq, value }))
+    if kind > 2 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "未知 kind")); }
+    Ok((key, project(seq, kind, val)))
 }
 
 fn read_entry_v1(f: &mut File) -> std::io::Result<(Vec<u8>, EntryValue)> {
@@ -1881,6 +1886,18 @@ fn read_entry_v1(f: &mut File) -> std::io::Result<(Vec<u8>, EntryValue)> {
 }
 
 fn decode_block(raw: &[u8], with_seq: bool) -> std::io::Result<DataBlock> {
+    decode_block_project(raw, with_seq, read_entry_from_slice).map(|entries| DataBlock { entries })
+}
+
+fn decode_light_block(raw: &[u8], with_seq: bool) -> std::io::Result<Vec<(Vec<u8>, LightEntry)>> {
+    decode_block_project(raw, with_seq, |data, off, seq| {
+        read_entry_project(data, off, seq, |seq, kind, _| LightEntry { seq, kind })
+    })
+}
+
+fn decode_block_project<R>(raw: &[u8], with_seq: bool,
+    read: impl Fn(&[u8], &mut usize, bool) -> std::io::Result<(Vec<u8>, R)>)
+    -> std::io::Result<Vec<(Vec<u8>, R)>> {
     if raw.len() < 8 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1899,9 +1916,9 @@ fn decode_block(raw: &[u8], with_seq: bool) -> std::io::Result<DataBlock> {
     let mut off = 0usize;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        entries.push(read_entry_from_slice(body, &mut off, with_seq)?);
+        entries.push(read(body, &mut off, with_seq)?);
     }
-    Ok(DataBlock { entries })
+    Ok(entries)
 }
 
 fn encode_block(entries: &[(Vec<u8>, StoredEntry)], with_seq: bool) -> Vec<u8> {
@@ -2564,6 +2581,36 @@ mod tests {
         assert!(rows.next().is_none());
     }
     use super::*;
+
+    #[test]
+    fn light_decode_matches_full_and_rejects_the_same_bad_frames() {
+        let entries = vec![
+            (b"a".to_vec(), StoredEntry::put(2, Some(vec![7; 8192]))),
+            (b"b".to_vec(), StoredEntry::put(3, Some(Vec::new()))),
+            (b"c".to_vec(), StoredEntry::put(4, None)),
+            (b"d".to_vec(), StoredEntry { seq: 5, value: EntryValue::Drop }),
+        ];
+        for with_seq in [false, true] {
+            let raw = encode_block(&entries, with_seq);
+            let expected: Vec<_> = decode_block(&raw, with_seq).unwrap().entries.into_iter()
+                .map(|(key, value)| (key, LightEntry::of(&value))).collect();
+            assert_eq!(decode_light_block(&raw, with_seq).unwrap(), expected);
+            for len in 0..raw.len() {
+                assert!(decode_light_block(&raw[..len], with_seq).is_err());
+            }
+            // Recompute CRC so malformed lengths/kinds reach the field parser.
+            for (at, byte) in [(9, 255), (4, 255), (0, 5)] {
+                let mut bad = raw.clone(); bad[at] = byte;
+                let end = bad.len() - 4;
+                let checksum = crc32(&bad[4..end]);
+                bad[end..].copy_from_slice(&checksum.to_le_bytes());
+                let full = decode_block(&bad, with_seq).err().map(|e| e.kind());
+                let light = decode_light_block(&bad, with_seq).err().map(|e| e.kind());
+                assert!(full.is_some(), "malformed fixture must fail the original parser");
+                assert_eq!(light, full);
+            }
+        }
+    }
     use std::assert;
     use std::assert_eq;
     use std::panic;
@@ -3401,11 +3448,34 @@ impl Iterator for VacuumLightInput<'_> {
 pub(crate) struct VacuumLightRows<'a> {
     sst: &'a SstFile,
     block: usize,
-    rows: std::vec::IntoIter<(Vec<u8>, StoredEntry)>,
+    rows: VacuumBlockRows,
     from: Option<&'a [u8]>,
     to: Option<&'a [u8]>,
     snap_seq: u64,
     done: bool,
+}
+
+/// Both branches own keys; only the reference branch materializes payloads.
+enum VacuumBlockRows {
+    Metadata(std::vec::IntoIter<(Vec<u8>, LightEntry)>),
+    #[cfg(test)]
+    Payload(std::vec::IntoIter<(Vec<u8>, StoredEntry)>),
+}
+impl VacuumBlockRows {
+    fn next(&mut self) -> Option<(Vec<u8>, LightEntry)> {
+        match self {
+            Self::Metadata(rows) => rows.next(),
+            #[cfg(test)]
+            Self::Payload(rows) => rows.next().map(|(key, entry)| (key, LightEntry::of(&entry))),
+        }
+    }
+    fn decode(raw: &[u8], with_seq: bool) -> std::io::Result<Self> {
+        #[cfg(test)]
+        if super::lsm_tree::allocation_reference::enabled() {
+            return decode_block(raw, with_seq).map(|b| Self::Payload(b.entries.into_iter()));
+        }
+        decode_light_block(raw, with_seq).map(|rows| Self::Metadata(rows.into_iter()))
+    }
 }
 
 impl Iterator for VacuumLightRows<'_> {
@@ -3415,17 +3485,17 @@ impl Iterator for VacuumLightRows<'_> {
         loop {
             if let Some((key, entry)) = self.rows.next() {
                 if self.to.is_some_and(|to| key.as_slice() >= to) { self.done = true; return None; }
-                if self.from.is_some_and(|from| key.as_slice() < from) || !entry.visible_at(self.snap_seq) { continue; }
+                if self.from.is_some_and(|from| key.as_slice() < from) || entry.seq > self.snap_seq { continue; }
                 #[cfg(test)]
                 crate::common::maintenance_probe::note_lsm_vacuum_row(true);
-                return Some(Ok((key, LightEntry::of(&entry))));
+                return Some(Ok((key, entry)));
             }
             let index = self.sst.index.get(self.block)?;
             self.block += 1;
             #[cfg(test)]
             crate::common::maintenance_probe::note_lsm_vacuum_block();
-            match self.sst.read_slice(index.offset, index.len as usize).and_then(|raw| decode_block(&raw, self.sst.has_seq)) {
-                Ok(block) => self.rows = block.entries.into_iter(),
+            match self.sst.read_slice(index.offset, index.len as usize).and_then(|raw| VacuumBlockRows::decode(&raw, self.sst.has_seq)) {
+                Ok(rows) => self.rows = rows,
                 Err(error) => { self.done = true; return Some(Err(error)); }
             }
         }

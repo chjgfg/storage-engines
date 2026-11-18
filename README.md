@@ -1,5 +1,10 @@
 # storage-engines
 
+M147 减少 LSM 批写、点读和 vacuum 的重复分配；同一 Release 构建的五档 20 臂、240 条阶段记录与全量重开核验已完成。
+20M 插入分配约 5.666 亿→4.879 亿次，vacuum 均值下降 24.68%；但 10M/20M 插入均值仍慢 4.83%/1.29%，不宣称稳定写吞吐提速。
+完整库回归 521 passed / 0 failed / 77 ignored，50k 四引擎完整台架通过；专项随机读最多抽样 20 万次，不代替五档四引擎完整压测。
+原始输出、指纹、完整有利/不利结果与修订记录见 [performance-m147.json](docs/performance-m147.json)，复现入口见 [压测手册](docs/大规模压测手册.md)。
+
 M146 完成 LSM 分组压实五档 20 轮对照并撤回实验：5M/10M 未减少重写，20M 两轮均多读 10,610,865 B、多生成 6 个 SST。
 保留 M145 压实行为，压测新增归并输出文件/字节统计；完整结果、边界与可重放补丁见 [performance-m146.json](docs/performance-m146.json)。本轮不宣称吞吐提速。
 
@@ -26,7 +31,7 @@ test13 后四项改动见 [CHANGELOG](CHANGELOG.md) M134–M139：压测进程�
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M146 为未发布记录**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M147 为未发布记录**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - M127 将 LSM 内存表/旧格式的值复制延迟到逻辑版本胜者确定，100 版本守卫只复制最终 1 行。
 - M126 的 memory 停机快照直接编码已证完整的组，批尾/二进制重叠保留窗口折叠；memory debug 49 项通过。test11 四步代码已落实，最终 release 库回归通过，大档验收见 M128。
 - M128 已完成 LSM 20M 复用、B+ 20M 回收后重开、memory 20M/22M 停机专项及 50k 四引擎台架；memory 22M 最后一轮末尾验收两行未从终端取回，账本保留该证据边界。
