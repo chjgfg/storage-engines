@@ -115,10 +115,10 @@ function Invoke-LoggedProcess {
     }
 }
 
-# 一个仓库一次只允许一个台架脚本（不同 OutputRoot 也不能绕过这把锁）。
+# 脚本持有自己的锁，实际压测由 Rust 子进程持有运行锁。
 $targetDir = Join-Path $Repo 'target'
 [void][IO.Directory]::CreateDirectory($targetDir)
-$gate = [IO.File]::Open((Join-Path $targetDir 'scale-bench.lock'), [IO.FileMode]::OpenOrCreate,
+$gate = [IO.File]::Open((Join-Path $targetDir 'scale-bench-runner.lock'), [IO.FileMode]::OpenOrCreate,
     [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 $runDir = $null
 $summary = New-Object 'Collections.Generic.List[object]'
@@ -130,7 +130,12 @@ try {
         if ($manifest.tool -ne 'storage-engines-scale-v1' -or $manifest.repo -ne $Repo) {
             throw '不是本仓库的台架清理清单'
         }
-        foreach ($row in @($manifest.cases)) { Remove-OwnedScratch $row.scratch $row.token }
+        $runLock = [IO.File]::Open((Join-Path $targetDir 'scale-bench.lock'), [IO.FileMode]::OpenOrCreate,
+            [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            # Rust 打开文件期间 Windows 会拒绝独占共享，防止清理正在写入的 scratch。
+            foreach ($row in @($manifest.cases)) { Remove-OwnedScratch $row.scratch $row.token }
+        } finally { $runLock.Dispose() }
         [Console]::WriteLine('本次清单的 scratch 已清理；日志未删除。')
         return
     }
@@ -145,7 +150,7 @@ try {
             try { Remove-OwnedScratch $path 'wrong-token' } catch { $denied = $true }
             if (-not $denied -or -not (Test-Path -LiteralPath $path)) { throw 'ownership guard 自检失败' }
             $state = @{ lines = (New-Object 'Collections.Generic.List[string]') }
-            $exit = Invoke-LoggedProcess -Exe (Join-Path $PSHOME 'powershell.exe') `
+            $exit = Invoke-LoggedProcess -Exe ((Get-Process -Id $PID).Path) `
                 -Arguments '-NoProfile -NonInteractive -Command "[Console]::Out.WriteLine(''probe-out''); [Console]::Error.WriteLine(''probe-err''); exit 7"' `
                 -Log (Join-Path $path 'probe.log') -State $state -OnLine { param($Line, $State) $State.lines.Add($Line) }
             if ($exit -ne 7 -or -not $state.lines.Contains('probe-out') -or -not $state.lines.Contains('probe-err')) {

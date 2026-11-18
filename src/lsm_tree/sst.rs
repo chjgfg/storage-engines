@@ -3174,11 +3174,13 @@ mod tests {
             sst.set_block_cache(cache.clone());
             assert!(sst.get_at(b"k050", 1).is_some());
             let mode = reference.then(packed_scan_reference::Scope::start);
-            let before = crate::mem_probe::allocations();
             let promotions = packed_promotions();
-            let rows: Vec<_> = sst.row_iter(None, None, 1)
-                .map(|(key, row)| { let frozen = row.freeze(|| key.clone()); (key, frozen) }).collect();
-            costs.push(crate::mem_probe::allocations() - before);
+            let (rows, allocations) = crate::mem_probe::count_thread_allocations(|| {
+                sst.row_iter(None, None, 1)
+                    .map(|(key, row)| { let frozen = row.freeze(|| key.clone()); (key, frozen) })
+                    .collect::<Vec<_>>()
+            });
+            costs.push(allocations);
             assert_eq!(packed_promotions() - promotions, u64::from(reference));
             assert_eq!(rows.len(), 100);
             cache.lock().unwrap().evict_lru();
@@ -3222,9 +3224,8 @@ mod tests {
             let cache = Arc::new(Mutex::new(BlockCache::new(1)));
             sst.set_block_cache(cache.clone());
             let _mode = old.then(packed_point_reference::Scope::start);
-            let before = crate::mem_probe::allocations();
-            let got = sst.get_at(b"k050", 1).unwrap();
-            costs.push(crate::mem_probe::allocations() - before);
+            let (got, allocations) = crate::mem_probe::count_thread_allocations(|| sst.get_at(b"k050", 1).unwrap());
+            costs.push(allocations);
             assert_eq!(got, StoredEntry::put(1, Some(vec![50; 64])));
             let block = cache.lock().unwrap().get(0, 1, sst.index[0].offset).unwrap();
             assert_eq!(matches!(block, CachedBlock::Decoded(_)), old);
@@ -3458,19 +3459,19 @@ pub(crate) struct VacuumLightRows<'a> {
 /// Both branches own keys; only the reference branch materializes payloads.
 enum VacuumBlockRows {
     Metadata(std::vec::IntoIter<(Vec<u8>, LightEntry)>),
-    #[cfg(test)]
+    #[cfg(all(test, feature = "lsm-allocation-reference"))]
     Payload(std::vec::IntoIter<(Vec<u8>, StoredEntry)>),
 }
 impl VacuumBlockRows {
     fn next(&mut self) -> Option<(Vec<u8>, LightEntry)> {
         match self {
             Self::Metadata(rows) => rows.next(),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "lsm-allocation-reference"))]
             Self::Payload(rows) => rows.next().map(|(key, entry)| (key, LightEntry::of(&entry))),
         }
     }
     fn decode(raw: &[u8], with_seq: bool) -> std::io::Result<Self> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "lsm-allocation-reference"))]
         if super::lsm_tree::allocation_reference::enabled() {
             return decode_block(raw, with_seq).map(|b| Self::Payload(b.entries.into_iter()));
         }

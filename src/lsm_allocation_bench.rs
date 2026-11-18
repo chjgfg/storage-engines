@@ -1,6 +1,7 @@
 // Included in engine::tests. Same ordinary transaction seed as the full scale
 // harness; reference switches only M147, leaving the M145 compaction unchanged.
 #[test]
+#[cfg(feature = "lsm-allocation-reference")]
 #[ignore = "five-scale LSM allocation ABBA; release, one test thread"]
 fn lsm_allocation_cost() {
     let _run = crate::scale_probe::RunGuard::acquire("lsm_allocation_cost");

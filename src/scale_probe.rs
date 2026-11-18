@@ -121,12 +121,18 @@ pub(crate) struct Phase {
     allocations: u64,
     process: io::Result<ProcessMemory>,
     bplus: [u64; 8],
+    lsm: [u64; 7],
 }
 fn bplus_counts() -> [u64; 8] {
     use crate::bplus_tree::{bplus_tree as tree, page};
     [tree::node_parses(), tree::point_internal_packs(), tree::point_internal_promotions(),
         page::page_reads(), page::cache_hits(), page::cache_misses(),
         tree::node_cache_sweeps(), tree::node_cache_visited()]
+}
+fn lsm_counts() -> [u64; 7] {
+    use crate::lsm_tree::sst;
+    [sst::block_reads(), sst::block_misses(), sst::sst_probes(), sst::index_probes(),
+        sst::sst_entry_walks(), sst::packed_promotions(), sst::entry_value_clones()]
 }
 impl Phase {
     pub(crate) fn begin(engine: &str, phase: &str) -> Self {
@@ -136,7 +142,8 @@ impl Phase {
     pub(crate) fn start() -> Self {
         let process = read_memory();
         let cpu = cpu_ns();
-        Self { wall: std::time::Instant::now(), cpu, process, allocations: crate::mem_probe::allocations(), bplus: bplus_counts() }
+        Self { wall: std::time::Instant::now(), cpu, process, allocations: crate::mem_probe::allocations(),
+            bplus: bplus_counts(), lsm: lsm_counts() }
     }
     pub(crate) fn finish(self, engine: &str, phase: &str) {
         let wall_ms = self.wall.elapsed().as_secs_f64() * 1e3;
@@ -152,6 +159,12 @@ impl Phase {
             let [parses, packs, promotions, reads, hits, misses, sweeps, visited] =
                 std::array::from_fn(|i| now[i].saturating_sub(self.bplus[i]));
             eprintln!("SCALE_BPLUS engine={engine} phase={phase} node_parses={parses} internal_packs={packs} owned_promotions={promotions} page_reads={reads} cache_hits={hits} cache_misses={misses} cache_sweeps={sweeps} cache_visited={visited}");
+        }
+        if engine == "lsm_tree" {
+            let now = lsm_counts();
+            let [accesses, misses, probes, index_comparisons, entry_comparisons, promotions, value_clones] =
+                std::array::from_fn(|i| now[i].saturating_sub(self.lsm[i]));
+            eprintln!("SCALE_LSM_READ engine={engine} phase={phase} block_accesses={accesses} block_cache_misses={misses} sst_probes={probes} index_comparisons={index_comparisons} entry_comparisons={entry_comparisons} packed_promotions={promotions} value_clones={value_clones}");
         }
     }
 }

@@ -3223,12 +3223,12 @@ mod tests {
             }
             let mut bad = payload.clone(); bad.push(1);
             assert!(PointInternal::decode(&bad).is_err());
-            let before = crate::mem_probe::allocations();
-            let owned: BTreeNode = bincode::deserialize(&payload).unwrap();
-            let owned_cost = crate::mem_probe::allocations() - before;
-            let before = crate::mem_probe::allocations();
-            let compact = PointInternal::decode(&payload).unwrap();
-            let compact_cost = crate::mem_probe::allocations() - before;
+            let (owned, owned_cost) = crate::mem_probe::count_thread_allocations(|| {
+                bincode::deserialize::<BTreeNode>(&payload).unwrap()
+            });
+            let (compact, compact_cost) = crate::mem_probe::count_thread_allocations(|| {
+                PointInternal::decode(&payload).unwrap()
+            });
             if count > 1 { assert!(owned_cost >= compact_cost + count as u64); }
             drop((owned, compact));
         }
@@ -3291,10 +3291,11 @@ mod tests {
         for old in [true, false] {
             tree.node_cache.clear();
             let _mode = old.then(point_projection_reference::Scope::start);
-            let before = crate::mem_probe::allocations();
             let parses = node_parses();
-            let hit = tree.find_back(&0_u64.to_be_bytes(), &4_u64.to_be_bytes(), |_| true);
-            costs.push(crate::mem_probe::allocations() - before);
+            let (hit, allocations) = crate::mem_probe::count_thread_allocations(|| {
+                tree.find_back(&0_u64.to_be_bytes(), &4_u64.to_be_bytes(), |_| true)
+            });
+            costs.push(allocations);
             assert_eq!(hit, Some((4_u64.to_be_bytes().to_vec(), RowId(Some(vec![4; 32])))));
             assert_eq!(node_parses() - parses, u64::from(old));
         }
@@ -3406,14 +3407,12 @@ mod tests {
             let (_scratch, mut tree) = anon(8, 4096);
             for i in 0..2000 { assert!(tree.insert(format!("{i:08}").into_bytes(), RowId(Some(vec![7; 16])))); }
             let mode = old.then(delete_read_reference::Scope::start);
-            let before = crate::mem_probe::allocations();
-            let read = tree.read_node(tree.root);
-            let allocations = crate::mem_probe::allocations() - before;
+            let (read, allocations) = crate::mem_probe::count_thread_allocations(|| tree.read_node(tree.root));
             costs.push(allocations);
             assert!(matches!(read, BTreeNode::Internal { .. }));
-            let before = crate::mem_probe::allocations();
-            assert_eq!(tree.subtree_min_key(tree.root), Some(b"00000000".to_vec()));
-            let min_allocations = crate::mem_probe::allocations() - before;
+            let ((), min_allocations) = crate::mem_probe::count_thread_allocations(|| {
+                assert_eq!(tree.subtree_min_key(tree.root), Some(b"00000000".to_vec()));
+            });
             if !old { assert_eq!(min_allocations, 2, "one copied min key plus expected test key; no owned intermediate nodes"); }
             let victims: Vec<_> = (0..1900).map(|i| format!("{i:08}").into_bytes()).collect();
             assert_eq!(tree.delete_batch(&victims), victims.len());
@@ -3436,9 +3435,10 @@ mod tests {
             let keys: Vec<_> = victims.iter().map(|i| (*i as u64).to_be_bytes().to_vec()).collect();
             let payload = bincode::serialize(&BTreeNode::Leaf { entries: entries.clone(), next_leaf: Some(PageId(77)) }).unwrap();
             let mut out = Vec::with_capacity(MAX_PAYLOAD);
-            let before = crate::mem_probe::allocations();
-            let got = DeleteRead::project(&payload, &keys, &mut out).unwrap();
-            assert_eq!(crate::mem_probe::allocations() - before, 0);
+            let (got, allocations) = crate::mem_probe::count_thread_allocations(|| {
+                DeleteRead::project(&payload, &keys, &mut out).unwrap()
+            });
+            assert_eq!(allocations, 0);
             let expected: Vec<_> = entries.iter().filter(|(k, _)| !keys.contains(k)).cloned().collect();
             assert!(matches!(got, DeleteRead::PackedLeaf { remaining, removed, min_changed }
                 if remaining == expected.len() && removed == entries.len() - expected.len() && min_changed == victims.contains(&0)));
@@ -3450,9 +3450,9 @@ mod tests {
             for (k, v) in entries.clone() { assert!(tree.insert(k, v)); }
             let victims = vec![4_u64.to_be_bytes().to_vec()];
             let mode = old.then(delete_leaf_reference::Scope::start);
-            let before = crate::mem_probe::allocations();
-            assert_eq!(tree.delete_batch(&victims), 1);
-            costs.push(crate::mem_probe::allocations() - before);
+            let (deleted, allocations) = crate::mem_probe::count_thread_allocations(|| tree.delete_batch(&victims));
+            assert_eq!(deleted, 1);
+            costs.push(allocations);
             drop(mode);
         }
         assert!(costs[0] >= costs[1] + 30, "owned reference must allocate surviving rows");

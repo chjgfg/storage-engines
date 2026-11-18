@@ -59,11 +59,47 @@ pub use lsm_tree::LSMTreeOptions;
 #[cfg(test)]
 pub(crate) mod mem_probe {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::{Relaxed, SeqCst}};
 
     static LIVE: AtomicU64 = AtomicU64::new(0);
     static PEAK: AtomicU64 = AtomicU64::new(0);
     static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    // Rust TLS initialization can allocate on Windows. The allocator must not
+    // initialize TLS on a foreign thread while a measurement is active.
+    // Ordinary scale phases take only this atomic-load fast path (zero scopes).
+    static ACTIVE_SCOPES: AtomicUsize = AtomicUsize::new(0);
+    const LOCAL_SCOPE_SLOTS: usize = 64;
+    struct LocalScope {
+        thread_id: AtomicU64,
+        depth: AtomicUsize,
+        allocations: AtomicU64,
+    }
+    static LOCAL_SCOPES: [LocalScope; LOCAL_SCOPE_SLOTS] = [const {
+        LocalScope { thread_id: AtomicU64::new(0), depth: AtomicUsize::new(0), allocations: AtomicU64::new(0) }
+    }; LOCAL_SCOPE_SLOTS];
+
+    #[cfg(windows)]
+    fn current_thread_id() -> u64 {
+        #[link(name = "kernel32")]
+        unsafe extern "system" { fn GetCurrentThreadId() -> u32; }
+        // SAFETY: GetCurrentThreadId has no preconditions and does not access Rust TLS.
+        unsafe { GetCurrentThreadId() as u64 }
+    }
+
+    #[cfg(unix)]
+    fn current_thread_id() -> u64 {
+        unsafe extern "C" { fn pthread_self() -> usize; }
+        // SAFETY: pthread_self has no preconditions and returns the caller's pthread id.
+        unsafe { pthread_self() as u64 }
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn current_thread_id() -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut hash);
+        hash.finish().max(1)
+    }
 
     pub struct Tracking;
 
@@ -73,6 +109,15 @@ pub(crate) mod mem_probe {
             let p = unsafe { System.alloc(l) };
             if !p.is_null() {
                 ALLOCATIONS.fetch_add(1, Relaxed);
+                if ACTIVE_SCOPES.load(Relaxed) != 0 {
+                    let thread_id = current_thread_id();
+                    for scope in &LOCAL_SCOPES {
+                        if scope.thread_id.load(Relaxed) == thread_id {
+                            scope.allocations.fetch_add(1, Relaxed);
+                            break;
+                        }
+                    }
+                }
                 let now = LIVE.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
                 PEAK.fetch_max(now, Relaxed);
             }
@@ -95,6 +140,75 @@ pub(crate) mod mem_probe {
 
     /// Allocation calls, for isolated resource-shape comparisons (not RSS).
     pub(crate) fn allocations() -> u64 { ALLOCATIONS.load(Relaxed) }
+
+    /// Measure synchronous work on this thread while other tests run in parallel.
+    /// Scale phases still use the process-wide counters above.
+    pub(crate) fn count_thread_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        struct Scope(&'static LocalScope);
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                if self.0.depth.fetch_sub(1, Relaxed) == 1 {
+                    self.0.thread_id.store(0, SeqCst);
+                    ACTIVE_SCOPES.fetch_sub(1, SeqCst);
+                }
+            }
+        }
+
+        let thread_id = current_thread_id();
+        let existing = LOCAL_SCOPES.iter().find(|scope| scope.thread_id.load(Relaxed) == thread_id);
+        let (scope, fresh) = if let Some(scope) = existing {
+            (scope, false)
+        } else {
+            let claimed = LOCAL_SCOPES.iter().find(|scope| {
+                scope.thread_id.compare_exchange(0, u64::MAX, SeqCst, Relaxed).is_ok()
+            });
+            (claimed.expect("too many concurrent allocation measurements"), true)
+        };
+        if fresh {
+            scope.allocations.store(0, Relaxed);
+            scope.depth.store(1, Relaxed);
+            scope.thread_id.store(thread_id, SeqCst);
+            ACTIVE_SCOPES.fetch_add(1, SeqCst);
+        } else {
+            scope.depth.fetch_add(1, Relaxed);
+        }
+        let before = scope.allocations.load(Relaxed);
+        let _scope = Scope(scope);
+        let value = f();
+        let after = scope.allocations.load(Relaxed);
+        (value, after - before)
+    }
+
+    #[test]
+    fn thread_allocation_scope_excludes_concurrent_allocations() {
+        use std::hint::black_box;
+        use std::sync::atomic::{AtomicU8, Ordering::{Acquire, Release}};
+
+        let state = AtomicU8::new(0);
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                while state.load(Acquire) != 1 { std::thread::yield_now(); }
+                drop(black_box(Box::new(black_box(42_u64))));
+                state.store(2, Release);
+            });
+            let before = allocations();
+            let ((), foreign) = count_thread_allocations(|| {
+                state.store(1, Release);
+                while state.load(Acquire) != 2 { std::thread::yield_now(); }
+            });
+            assert!(allocations() > before, "process counter sees the other thread");
+            assert_eq!(foreign, 0, "parallel work must not change this thread's count");
+            let ((value, inner), total) = count_thread_allocations(|| {
+                count_thread_allocations(|| black_box(Box::new(black_box(7_u64))))
+            });
+            assert_eq!((*value, inner, total), (7, 1, 1));
+        });
+        // Freed slots must be reusable across a long parallel regression run.
+        for _ in 0..LOCAL_SCOPE_SLOTS * 2 {
+            let (value, allocations) = count_thread_allocations(|| black_box(Box::new(black_box(9_u64))));
+            assert_eq!((*value, allocations), (9, 1));
+        }
+    }
 
     /// 开机到此刻的高水位
     pub(crate) fn peak() -> u64 {

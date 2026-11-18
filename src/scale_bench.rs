@@ -14,8 +14,9 @@ mod scale_bench {
     #[test]
     #[ignore = "完整五档串行压测；release + exact + 单测试线程"]
     fn all_scales_serial() {
+        let run = crate::scale_probe::RunGuard::acquire("scale_all_scales_serial");
         for rows in [600_000, 1_000_000, 5_000_000, 10_000_000, 20_000_000] {
-            super::run_scale_baseline(rows);
+            super::run_scale_baseline_locked(rows, &run);
         }
     }
 

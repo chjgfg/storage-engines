@@ -1,0 +1,287 @@
+{
+  "schema_version": 1,
+  "milestone": "M148",
+  "date": "2026-11-19",
+  "status": "verified_harness_and_regression_repairs",
+  "base_commit": "68dceae9ad022600fd95347e11f469f20097d1d8",
+  "scope": "修复已证实的压测启动、分配回归计数和阶段测量问题；不以减少分配等同于大档吞吐改善",
+  "changes": [
+    "Move M147-only allocation reference switches behind explicit lsm-allocation-reference test feature.",
+    "Keep a checkout-wide Rust run lock across all_scales_serial; retain single-scale wrapper.",
+    "Separate PowerShell runner ownership lock from Rust runtime lock; keep explicit cleanup exclusive to inactive runs.",
+    "Use scoped per-thread allocation counters for exact B+ and SST allocation guards without changing process-wide scale accounting or assertion thresholds.",
+    "Append existing thread-local LSM read counter deltas to full scale phases without adding per-operation instrumentation."
+  ],
+  "validation": [
+    {
+      "kind": "debug_feature_library_suite",
+      "command": "cargo test --lib --features lsm-allocation-reference -- --format terse --color never",
+      "passed": 522,
+      "failed": 0,
+      "ignored": 77,
+      "seconds": 116.35,
+      "diagnostic_revision": "在追加 SCALE_LSM_READ 日志前完成；核心分配器、feature 门控、运行锁代码相同"
+    },
+    {
+      "kind": "debug_feature_abba_smoke",
+      "environment": {
+        "LSM_ALLOCATION_ROWS": "2000"
+      },
+      "command": "target/debug/deps/storage_engines-41f50526535011dd.exe --exact engine::tests::lsm_allocation_cost --ignored --nocapture --test-threads=1",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 5.27,
+      "arms": 4,
+      "verified_keys_per_arm": 2200,
+      "conclusion": "仅验证对照路径及正确性，不证明大规模提速"
+    },
+    {
+      "kind": "production_library_check",
+      "command": "cargo check --lib --offline",
+      "exit_code": 0,
+      "seconds": 2.33
+    },
+    {
+      "kind": "powershell_self_test",
+      "hosts": [
+        "Windows PowerShell 5.1",
+        "PowerShell 7.6.9"
+      ],
+      "exit_code": 0,
+      "output": "SELFTEST PASS: exit=7 captured, stdout+stderr captured, ownership checked, scratch removed."
+    },
+    {
+      "kind": "release_default_library_suite",
+      "command": "cargo test --release --lib -- --format terse --color never",
+      "passed": 522,
+      "failed": 0,
+      "ignored": 76,
+      "seconds": 65.59,
+      "build_seconds": 344
+    },
+    {
+      "kind": "default_binary_reference_gate",
+      "command": "target/release/deps/storage_engines-7533728b253b9a38.exe --list engine::tests::lsm_allocation_cost",
+      "output": "0 tests, 0 benchmarks",
+      "exit_code": 0
+    },
+    {
+      "kind": "runner_gate_and_cleanup_controls",
+      "results": [
+        "Rust cross-process lock test passed while scale-bench-runner.lock was held exclusively.",
+        "CleanRun exited 1 while scale-bench.lock was held open with an exclusive byte lock; no scratch deleted.",
+        "CleanRun exited 0 after releasing that lock."
+      ]
+    }
+  ],
+  "source_sha256": {
+    "Cargo.toml": "2a55091d1fd2c82443525a5c4f168c75afcfbdf4cc8d462c5773acfeeb65be66",
+    "scripts/run-scale-bench.ps1": "abed8b4a6c769e11e360723b837cc9a529900a5df1fbb327d1856d4d3d1f626a",
+    "src/lib.rs": "f96acc7de93f98575b085c66a375984f42e00d81c114e0af68b3cd9910023f25",
+    "src/bplus_tree/bplus_tree.rs": "2901834270198adb86813d588466c31b15dbe57f6bf1b46fcf4954af02d2c2e0",
+    "src/engine.rs": "aab1fa9807f07e33bf95c230fc786ffcfdc03f48195bb05d10e5038e5f14f22e",
+    "src/lsm_allocation_bench.rs": "b460abf4769abec9b3e4ba9f58f03ffda1ce0d05ebaa63cabdefc0abab130be9",
+    "src/lsm_tree/kv_ops.rs": "6ff9aed17392fdee4d4d52209388ded876ce23d28d15bdaeb664f469851017fa",
+    "src/lsm_tree/lsm_tree.rs": "b023e7b9edef864971644994e7c5be251308f6501a50fab893938c5c2c47412e",
+    "src/lsm_tree/sst.rs": "6f194f023f3e8fe8c6094f7a8cbcfaba5552a0f948f9aeba9159e6ac2b94140b",
+    "src/scale_bench.rs": "79ef1b792971228b573b1e485313bc15f52a9d8e02557d02a6853c13413a2ea8",
+    "src/scale_probe.rs": "d95dd62681b631aa3fbb0106c17c38b969bff8e06834981de146aafece98708e"
+  },
+  "executable_sha256": "3125e2d5b2d352ecaec6dc36cf5918317904e4abedf61b93f5c50fd762f17ae8",
+  "runner_smoke": {
+    "relative_path": "data/bench-results/20261119-034010-6efea57ecdff428ba0d07fd81b644005",
+    "manifest": {
+      "tool": "storage-engines-scale-v1",
+      "repo": "D:\\develop\\workspace\\rust_workspace\\storage-engines",
+      "started_utc": "2026-11-18T19:40:13.8590019Z",
+      "head": "68dceae9ad022600fd95347e11f469f20097d1d8",
+      "git_status": [
+        " M CHANGELOG.md",
+        " M Cargo.toml",
+        " M \"docs/\\345\\244\\247\\350\\247\\204\\346\\250\\241\\345\\216\\213\\346\\265\\213\\346\\211\\213\\345\\206\\214.md\"",
+        " M scripts/run-scale-bench.ps1",
+        " M src/bplus_tree/bplus_tree.rs",
+        " M src/engine.rs",
+        " M src/lib.rs",
+        " M src/lsm_allocation_bench.rs",
+        " M src/lsm_tree/kv_ops.rs",
+        " M src/lsm_tree/lsm_tree.rs",
+        " M src/lsm_tree/sst.rs",
+        " M src/scale_bench.rs",
+        " M src/scale_probe.rs",
+        "?? docs/test10.txt",
+        "?? docs/test11.txt",
+        "?? docs/test12.txt",
+        "?? docs/test13.txt",
+        "?? docs/test14.txt",
+        "?? docs/test15.txt",
+        "?? docs/test16.txt",
+        "?? docs/test17.txt",
+        "?? docs/test18.txt",
+        "?? docs/test4.txt",
+        "?? docs/test5.txt",
+        "?? docs/test6.txt",
+        "?? docs/test7.txt",
+        "?? docs/test8.txt",
+        "?? docs/test9.txt"
+      ],
+      "source_sha256": "715c3d88459055e4c516564d49c0492702d069ec1a931ccec9b87191c88ff630",
+      "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+      "powershell": "5.1.19041.6456",
+      "cpu": [
+        {
+          "Name": "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
+          "NumberOfCores": 4,
+          "NumberOfLogicalProcessors": 8
+        }
+      ],
+      "memory_total_bytes": 68596707328,
+      "memory_free_bytes": 35555459072,
+      "scratch_root": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data",
+      "output_root": "D:\\develop\\workspace\\rust_workspace\\storage-engines\\data\\bench-results",
+      "cases": [
+        {
+          "rows": 2000,
+          "pass": 1,
+          "token": "293c71b9ade7416483a20304757e8a43",
+          "scratch": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data\\scale-293c71b9ade7416483a20304757e8a43"
+        },
+        {
+          "rows": 3000,
+          "pass": 1,
+          "token": "f31ca98794f74c608b1679fa55890504",
+          "scratch": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data\\scale-f31ca98794f74c608b1679fa55890504"
+        }
+      ],
+      "memory_metric": "Rust allocator live/peak delta, decimal MB; NOT process RSS",
+      "public_contract": "same API/parameters/transaction+TTL semantics/disk format; verify internal changes",
+      "benchmark_policy": "TTL read/write measured; then auxiliary keys persisted outside timing; independent migration manifest",
+      "executable_sha256": "3125e2d5b2d352ecaec6dc36cf5918317904e4abedf61b93f5c50fd762f17ae8",
+      "cargo_lock_sha256": "06a642091be8fcaa23f7e46dc42abe41d174ec29509cc79fcfcb22325d639dfd"
+    },
+    "summary": [
+      {
+        "rows": 2000,
+        "pass": 1,
+        "status": "PASS",
+        "exit_code": 0,
+        "elapsed_seconds": 3.834,
+        "metrics": 132,
+        "cleanup": "OK",
+        "error": null,
+        "log": "rows_2000_pass_1.log"
+      },
+      {
+        "rows": 3000,
+        "pass": 1,
+        "status": "PASS",
+        "exit_code": 0,
+        "elapsed_seconds": 4.594,
+        "metrics": 132,
+        "cleanup": "OK",
+        "error": null,
+        "log": "rows_3000_pass_1.log"
+      }
+    ],
+    "artifact_sha256": {
+      "build.log": "cb3a0f5b285b840d9a7cae557b93e054ca8b0ec817712ef560032319d460bab7",
+      "rows_2000_pass_1.csv": "40c9ba060ad04b631f778408d07e69b3061fa30d568dfb70afa1238739c58c66",
+      "rows_2000_pass_1.log": "0968d5ec9b5d369d79888b2f840ddbbb711d038cfb259531d53fdea36aff6bc0",
+      "rows_3000_pass_1.csv": "f3972c6a5fa9cf8d88708d0014bc3daaae2904c5c9d1c9a0dfcf3fe812926bfa",
+      "rows_3000_pass_1.log": "826e06c654f0b26670c45f407a415ee2c87bf469b779df4296086b2490b73050",
+      "run.json": "a17a2b7c2c4c695405b580a79a6dd086a3b17fbb7cb1e926608cf04df7c33802",
+      "source.json": "5e85e75889b66eb3b406bb477ba4e30fbd9647d17a8238cbe2cfc9760bd0dcac",
+      "summary.json": "ccb1f71dc27face22af0b7be301d0c4e12ae3dcaae66ab23598fd1f6d7aad575"
+    },
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -Rows \"2000,3000\" -ScratchRoot \"C:/Users/Administrator/.cache/storage-engines/test-data\"",
+    "csv_roundtrip": "Imported both generated CSV files: 132 records each. Both scratch directories confirmed absent.",
+    "lsm_read_records": [
+      {
+        "rows": 2000,
+        "engine": "lsm_tree",
+        "phase": "random_read",
+        "block_accesses": 4062,
+        "block_cache_misses": 32,
+        "sst_probes": 2000,
+        "index_comparisons": 20128,
+        "entry_comparisons": 2000,
+        "packed_promotions": 0,
+        "value_clones": 2000
+      },
+      {
+        "rows": 2000,
+        "engine": "lsm_tree",
+        "phase": "ordered_read",
+        "block_accesses": 4062,
+        "block_cache_misses": 0,
+        "sst_probes": 2000,
+        "index_comparisons": 20128,
+        "entry_comparisons": 2000,
+        "packed_promotions": 0,
+        "value_clones": 2000
+      },
+      {
+        "rows": 3000,
+        "engine": "lsm_tree",
+        "phase": "random_read",
+        "block_accesses": 6092,
+        "block_cache_misses": 47,
+        "sst_probes": 3000,
+        "index_comparisons": 33968,
+        "entry_comparisons": 3000,
+        "packed_promotions": 0,
+        "value_clones": 3000
+      },
+      {
+        "rows": 3000,
+        "engine": "lsm_tree",
+        "phase": "ordered_read",
+        "block_accesses": 6092,
+        "block_cache_misses": 0,
+        "sst_probes": 3000,
+        "index_comparisons": 33968,
+        "entry_comparisons": 3000,
+        "packed_promotions": 0,
+        "value_clones": 3000
+      }
+    ]
+  },
+  "diagnosis": {
+    "input": "docs/test18.txt",
+    "lsm_20m": {
+      "insert_seconds": 508.874762,
+      "random_N_read_seconds": 799.307125,
+      "compactions": 702,
+      "input_files": 1003,
+      "input_bytes": 6978424444,
+      "trivial_move_files": 1003,
+      "trivial_move_bytes": 6978424444,
+      "owned_input_rows": 0,
+      "compaction_seconds": 3.340702
+    },
+    "conclusions": [
+      "插入阶段归并输入全部为迁层，不能把累计输入字节当成重写字节。",
+      "其他引擎也有跨轮变慢，尚未证明 LSM 墙钟退化的因果根源。",
+      "M147 既有 ABBA 随机读最多 200000 次，不等于完整 N 次乱序读。"
+    ],
+    "input_sha256": "ac68c235f57f4be670a4831d9b5609a0894d6baf307b81041e2fdcfc39c9e2aa"
+  },
+  "rejected_attempts": [
+    {
+      "kind": "tls_allocator_counter",
+      "reason": "Windows 外部线程首次触碰 Rust TLS 时在分配器内递归，默认并行、4 线程及增大栈后都出现 STATUS_STACK_OVERFLOW；移除分配器内 Rust TLS 调用，改用预分配原子槽和 OS 线程 ID。"
+    },
+    {
+      "kind": "release_link",
+      "reason": "失败测试的 4 个已终止进程仍占用旧测试二进制；只处理本轮已识别进程并在 target 内改名保留旧二进制，未触碰源码或其他进程。"
+    }
+  ],
+  "limitations": [
+    "This milestone repairs measurement and regression infrastructure; production LSM algorithms, durability and file format are unchanged.",
+    "No new complete 600k/1M/5M/10M/20M four-engine benchmark was run in this milestone. The 2k/3k runner smoke does not prove large-scale throughput.",
+    "No throughput gain or resolution of the test18 10M/20M wall-clock regression is claimed.",
+    "Validation ran on Windows; Linux execution was not performed.",
+    "The debug feature suite and 2k ABBA ran before the additive SCALE_LSM_READ log change; the final default Release suite and runner smoke include it.",
+    "Raw runner logs and manifests are local final verification artifacts under the recorded data/bench-results directory. User-provided test18.txt remains untracked."
+  ]
+}

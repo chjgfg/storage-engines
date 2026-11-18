@@ -26,6 +26,7 @@ exclude = [
 [features]
 default = []
 web = ["dep:serde_json", "dep:tokio", "dep:axum"]
+lsm-allocation-reference = []
 
 [dependencies]
 log = "0.4.21"

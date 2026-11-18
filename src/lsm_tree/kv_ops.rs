@@ -51,7 +51,7 @@ impl Transaction {
     /// 共用**当前事务**版本；全部成功返回 Ok，任一条冲突则回滚本批写入并
     /// `Err(failed_key)`。调用方成功后自行 `commit()`。
     pub fn batch_set(&self, items: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Vec<u8>> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "lsm-allocation-reference"))]
         if super::lsm_tree::allocation_reference::enabled() {
             return self.batch_set_reference(items);
         }
@@ -67,7 +67,7 @@ impl Transaction {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "lsm-allocation-reference"))]
     fn batch_set_reference(&self, items: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Vec<u8>> {
         let mut written: Vec<Vec<u8>> = Vec::new();
         for (k, v) in items {
@@ -517,8 +517,13 @@ mod tests {
 
     #[test]
     fn batch_failure_undoes_only_successful_prefix_and_survives_reopen() {
-        for reference in [true, false] {
-            let mode = reference.then(super::super::lsm_tree::allocation_reference::Scope::start);
+        #[cfg(feature = "lsm-allocation-reference")]
+        let references = [true, false];
+        #[cfg(not(feature = "lsm-allocation-reference"))]
+        let references = [false];
+        for _reference in references {
+            #[cfg(feature = "lsm-allocation-reference")]
+            let mode = _reference.then(super::super::lsm_tree::allocation_reference::Scope::start);
             let path = tmp("batch_failure_prefix");
             {
                 let mvcc = MVCC::open(&path);
@@ -560,6 +565,7 @@ mod tests {
                 assert_eq!(tx.get(b"untouched"), None);
                 tx.commit();
             }
+            #[cfg(feature = "lsm-allocation-reference")]
             drop(mode);
         }
     }

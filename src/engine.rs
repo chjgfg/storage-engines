@@ -7380,7 +7380,11 @@ mod tests {
     }
 
     fn run_scale_baseline(rows: usize) {
-        let _run = crate::scale_probe::RunGuard::acquire(&format!("scale_rows_{rows}"));
+        let run = crate::scale_probe::RunGuard::acquire(&format!("scale_rows_{rows}"));
+        run_scale_baseline_locked(rows, &run);
+    }
+
+    fn run_scale_baseline_locked(rows: usize, _run: &crate::scale_probe::RunGuard) {
         assert!(rows > 0 && rows.checked_mul(16).is_some(), "SCALE_ROWS 必须为非零且不溢出的行数");
         // 键 ≈ 35 字节、值 ≈ 60 字节：照下游真实形状（也都远小于任何 blob 阈值）
         use self::{scale_key as key, scale_val as val};
