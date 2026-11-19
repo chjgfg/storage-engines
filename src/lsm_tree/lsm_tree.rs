@@ -1715,12 +1715,17 @@ impl LSMTree {
     /// 正常 L1+ 的 min/max 都单调，可二分两头；端点相等要保留所有相邻文件。
     /// L0 及恢复得到的乱序/重叠层不能二分，仍交全片段给调用方逐篇检查。
     fn sst_candidates(&self, level: usize, low: &[u8], high: &[u8]) -> &[SstFile] {
+        let range = self.sst_candidate_range(level, low, high);
+        &self.levels[level][range]
+    }
+
+    fn sst_candidate_range(&self, level: usize, low: &[u8], high: &[u8]) -> std::ops::Range<usize> {
         let files = &self.levels[level];
         if low > high {
-            return &files[..0];
+            return 0..0;
         }
         if level == 0 || !self.level_ranges_ordered[level] {
-            return files;
+            return 0..files.len();
         }
         let end = files.partition_point(|sst| {
             #[cfg(test)]
@@ -1732,7 +1737,7 @@ impl LSMTree {
             LEVEL_RANGE_PROBES.with(|c| c.set(c.get() + 1));
             sst.max_key.as_slice() < low
         });
-        &files[start..end]
+        start..end
     }
 
     /// 跨源点查：**每个可能含键的源都要比较，取最大可见 seq**，不能在第一层命中就收手。
@@ -1848,10 +1853,18 @@ impl LSMTree {
         if low > high {
             return None;
         }
+        #[cfg(all(test, feature = "lsm-allocation-reference"))]
+        if allocation_reference::enabled() {
+            return self.find_back_reference(low, high, snap_seq, accept);
+        }
+        #[cfg(all(test, feature = "lsm-allocation-reference"))]
+        if crate::lsm_tree::sst::point_read_reference::enabled() {
+            return self.find_back_reference(low, high, snap_seq, accept);
+        }
 
         let mut excluded: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         loop {
-            let Some(key) = self.max_key_excluding(low, high, snap_seq, &excluded) else { return None };
+            let Some((key, entry)) = self.max_entry_excluding(low, high, snap_seq, &excluded) else { return None };
             if excluded.len() >= BACK_SCAN_FALLBACK {
                 // 退化形状：回退成一次正向全扫再反向挑（代价与旧实现同阶）
                 return self
@@ -1860,22 +1873,45 @@ impl LSMTree {
                     .rev()
                     .find(|(k, v)| accept(k.as_slice(), v));
             }
-            #[cfg(all(test, feature = "lsm-allocation-reference"))]
-            if allocation_reference::enabled() { excluded.insert(key.clone()); }
-
-            // 跨源定论：Drop / 不存在 ⇒ 该 key 整体不可见，继续找下一个更小的键
-            let Some(val) = self.get_value_at(&key, snap_seq) else {
-                // The reference already excluded this key before lookup.
-                #[cfg(all(test, feature = "lsm-allocation-reference"))]
-                if allocation_reference::enabled() { continue; }
-                excluded.insert(key);
-                continue;
+            // 候选定位时已按 seq 合并所有源，直接用胜出值，省掉一次完整跨 SST 点查。
+            let val = match entry.value {
+                EntryValue::Put(value) => self.deref_value(value),
+                EntryValue::Drop => {
+                    excluded.insert(key);
+                    continue;
+                }
             };
             if accept(&key, &val) {
                 return Some((key, val));
             }
-            #[cfg(all(test, feature = "lsm-allocation-reference"))]
-            if allocation_reference::enabled() { continue; }
+            excluded.insert(key);
+        }
+    }
+
+    #[cfg(all(test, feature = "lsm-allocation-reference"))]
+    fn find_back_reference(
+        &self,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        accept: impl Fn(&[u8], &Option<Vec<u8>>) -> bool,
+    ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        const BACK_SCAN_FALLBACK: usize = 4096;
+        let mut excluded = HashSet::new();
+        loop {
+            let Some(key) = self.max_key_excluding(low, high, snap_seq, &excluded) else { return None };
+            if excluded.len() >= BACK_SCAN_FALLBACK {
+                return self.range_scan_at_seq(low, high, snap_seq)
+                    .into_iter().rev().find(|(key, value)| accept(key, value));
+            }
+            excluded.insert(key.clone());
+            let Some(value) = self.get_value_at(&key, snap_seq) else {
+                excluded.insert(key);
+                continue;
+            };
+            if accept(&key, &value) {
+                return Some((key, value));
+            }
             excluded.insert(key);
         }
     }
@@ -1930,6 +1966,121 @@ impl LSMTree {
             .filter(|(k, _)| !excluded.contains(k.as_slice()))
             .find(|(_, vers)| vers.iter().rev().any(|(s, _)| *s <= snap_seq))
             .map(|(k, _)| k.clone())
+    }
+
+    fn mem_max_entry(
+        map: &MemMap,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        excluded: &HashSet<Vec<u8>>,
+    ) -> Option<(Vec<u8>, StoredEntry)> {
+        map.range::<[u8], _>((std::ops::Bound::Included(low), std::ops::Bound::Included(high)))
+            .rev()
+            .filter(|(key, _)| !excluded.contains(key.as_slice()))
+            .find_map(|(key, versions)| {
+                versions.range(..=snap_seq).next_back().map(|(seq, value)| {
+                    (key.clone(), StoredEntry { seq: *seq, value: value.clone() })
+                })
+            })
+    }
+
+    fn consider_back_entry(
+        best: &mut Option<(Vec<u8>, StoredEntry, usize)>,
+        key: Vec<u8>,
+        entry: StoredEntry,
+        source_order: usize,
+    ) {
+        let replace = best.as_ref().is_none_or(|(old_key, old_entry, old_order)| {
+            match key.as_slice().cmp(old_key.as_slice()) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => {
+                    entry.seq > old_entry.seq
+                        || (entry.seq == old_entry.seq && source_order >= *old_order)
+                }
+            }
+        });
+        if replace {
+            *best = Some((key, entry, source_order));
+        }
+    }
+
+    fn consider_sst_back_entry(
+        sst: &SstFile,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        excluded: &HashSet<Vec<u8>>,
+        source_order: usize,
+        best: &mut Option<(Vec<u8>, StoredEntry, usize)>,
+    ) {
+        if let Some((key, entry)) = sst.find_back(low, high, snap_seq, |key, _| !excluded.contains(key)) {
+            Self::consider_back_entry(best, key, entry, source_order);
+        }
+    }
+
+    /// 逐源比较反向候选，并保留候选 SST 已读出的胜出 value，省掉二次跨源点查。
+    fn max_entry_excluding(
+        &self,
+        low: &[u8],
+        high: &[u8],
+        snap_seq: u64,
+        excluded: &HashSet<Vec<u8>>,
+    ) -> Option<(Vec<u8>, StoredEntry)> {
+        let mut best: Option<(Vec<u8>, StoredEntry, usize)> = None;
+        let mut source_order = 0usize;
+        for map in std::iter::once(&self.mem).chain(self.immutables.iter()) {
+            if let Some((key, entry)) = Self::mem_max_entry(map, low, high, snap_seq, excluded) {
+                Self::consider_back_entry(&mut best, key, entry, source_order);
+            }
+            source_order += 1;
+        }
+
+        if let Some(l0) = self.levels.first() {
+            let mut by_max: Vec<_> = l0.iter().enumerate().collect();
+            by_max.sort_unstable_by(|(ai, a), (bi, b)| {
+                b.max_key.cmp(&a.max_key).then_with(|| bi.cmp(ai))
+            });
+            for (index, sst) in by_max {
+                if sst.may_overlap(low, high)
+                    && best.as_ref().is_none_or(|(key, _, _)| sst.max_key.as_slice() >= key.as_slice())
+                {
+                    Self::consider_sst_back_entry(
+                        sst, low, high, snap_seq, excluded, source_order + l0.len() - 1 - index, &mut best,
+                    );
+                } else if best.as_ref().is_some_and(|(key, _, _)| sst.max_key.as_slice() < key.as_slice()) {
+                    break;
+                }
+            }
+            source_order += l0.len();
+        }
+
+        for level in 1..self.levels.len() {
+            let range = self.sst_candidate_range(level, low, high);
+            if level < self.level_ranges_ordered.len() && self.level_ranges_ordered[level] {
+                for index in range.rev() {
+                    let sst = &self.levels[level][index];
+                    if best.as_ref().is_some_and(|(key, _, _)| sst.max_key.as_slice() < key.as_slice()) {
+                        break;
+                    }
+                    Self::consider_sst_back_entry(sst, low, high, snap_seq, excluded, source_order + index, &mut best);
+                }
+            } else {
+                let mut indexes: Vec<usize> = range.collect();
+                indexes.sort_unstable_by(|a, b| self.levels[level][*b].max_key.cmp(&self.levels[level][*a].max_key));
+                for index in indexes {
+                    let sst = &self.levels[level][index];
+                    if best.as_ref().is_some_and(|(key, _, _)| sst.max_key.as_slice() < key.as_slice()) {
+                        break;
+                    }
+                    Self::consider_sst_back_entry(sst, low, high, snap_seq, excluded, source_order + index, &mut best);
+                }
+            }
+            source_order += self.levels[level].len();
+        }
+        let (key, entry, _) = best?;
+        Some((key, entry))
     }
 
     /// Conflict checks require an existing Put's key and seq, never its payload.
@@ -3853,6 +4004,15 @@ mod tests {
                         };
                         let want = rows.iter().rev().find(|(k, v)| accept(k, v)).cloned();
                         assert_eq!(db.find_back(lo, hi, snap, accept), want, "snap={snap}, mode={mode}, abnormal={abnormal}");
+                        #[cfg(feature = "lsm-allocation-reference")]
+                        {
+                            let _reference = crate::lsm_tree::sst::point_read_reference::Scope::start();
+                            assert_eq!(
+                                db.find_back(lo, hi, snap, |key, value| accept(key, value)),
+                                want,
+                                "reference snap={snap}, mode={mode}, abnormal={abnormal}"
+                            );
+                        }
                         if mode != 2 {
                             let key_accept = |key: &[u8]| accept(key, &None);
                             assert_eq!(db.find_key_back(lo, hi, snap, key_accept).into_key(), want.as_ref().map(|(k, _)| k.clone()),
@@ -3872,6 +4032,7 @@ mod tests {
     #[test]
     fn test_sst_pruning_l0_descending_files_and_light_bounds() {
         use crate::lsm_tree::sst::block_reads;
+        use crate::lsm_tree::sst::entry_value_clones;
         let dir = tmp_dir("sst_pruning_l0_bounds");
         {
             let mut db = LSMTree::open_with_config(&dir, pruning_options()).unwrap();
@@ -3880,8 +4041,21 @@ mod tests {
                 db.inject_sst_for_test(0, vec![(version_key(n), StoredEntry::put(1, Some(vec![1])))]).unwrap();
             }
             let before = block_reads();
-            assert_eq!(db.find_back(&version_key(0), &version_key(u64::MAX), 1, |_, _| true).unwrap().0, version_key(63));
-            assert_eq!(block_reads() - before, 2, "乱序 L0 也只需候选+取值两块");
+            let clones_before = entry_value_clones();
+            let range_low = version_key(0);
+            let range_high = version_key(u64::MAX);
+            let hit = db.find_back(&range_low, &range_high, 1, |_, _| true).unwrap();
+            assert_eq!(hit.0, version_key(63));
+            assert_eq!(block_reads() - before, 1, "候选块已包含胜者，不应再做第二次点查");
+            assert_eq!(entry_value_clones() - clones_before, 1, "新路径只拥有化胜出 value 一次");
+            #[cfg(feature = "lsm-allocation-reference")]
+            {
+                let _reference = crate::lsm_tree::sst::point_read_reference::Scope::start();
+                let clones_before = entry_value_clones();
+                let reference = db.find_back(&range_low, &range_high, 1, |_, _| true).unwrap();
+                assert_eq!(reference, hit);
+                assert_eq!(entry_value_clones() - clones_before, 2, "旧式反向候选再点查会复制胜出 value 两次");
+            }
 
             let from = version_key(10);
             let to = version_key(11);
@@ -3909,6 +4083,7 @@ mod tests {
         assert_eq!(key, b"k");
         assert!(matches!(row.freeze(|| key.clone()), ScanRow::AmbiguousLookup(_)));
         assert_eq!(db.get_value_at(&key, 4), Some(Some(vec![1])));
+        assert_eq!(db.find_back(b"k", b"k", 4, |_, _| true), Some((b"k".to_vec(), Some(vec![1]))));
         let clones = crate::lsm_tree::sst::entry_value_clones();
         assert_eq!(db.row_iter_range(None, None, 4).count(), 1);
         assert_eq!(crate::lsm_tree::sst::entry_value_clones(), clones);

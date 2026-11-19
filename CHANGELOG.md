@@ -2,6 +2,18 @@
 
 ## 未发布（2026-11-19）
 
+### M149：LSM 反向点读复用候选值
+
+- `find_back` 在反向扫描各来源时直接携带各源候选 `StoredEntry`，依照键、可见 `seq` 和既有来源优先级选出胜者；
+  命中后不再对胜出键重新调用跨源 `get_value_at`。保留 Drop 遮蔽、snapshot、前缀交错、blob 解引用与 FullScan 回退语义。
+- Release 全库回归 **522 passed / 0 failed / 76 ignored**；LSM Release 专项 **134 passed / 0 failed / 11 ignored**；
+  `cargo check --lib --offline` 通过。带 `lsm-allocation-reference` 的反向查找对照覆盖快照、Drop、前缀交错、层重叠及回退。
+- 完整四引擎压测台架 2k/3k 各 132 格通过，重开逐值验收与 scratch 清理通过。LSM 完整 N 次随机/有序点读的
+  块访问数分别从基线 4,062→2,031、6,092→3,046，索引比较数正好减半；随机读块缓存 miss 仍分别为 32、47，
+  每键值复制仍为 1 次。该小档证实重复查找已消除，不代表 60 万至 2000 万规模的吞吐结论。
+- 完整读数、基线对照、运行清单、哈希及范围限制见 [performance-m149.json](docs/performance-m149.json)。
+  `docs/test18.txt` 中 20M LSM 随机 N 次读约 799.31 s 的大档复测仍需本轮代码的用户压测确认。
+
 ### M148：修正压测进程互斥和并行回归分配计数
 
 - Windows 脚本和 Rust 子进程分开持锁，解决旧脚本启动子进程时的 Windows 错误 32；显式清理仍与活动台架互斥。

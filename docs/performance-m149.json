@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "milestone": "M149",
+  "date": "2026-11-19",
+  "status": "verified_reverse_read_reuse_small_scale",
+  "base_commit": "8998d09a98cf25c4eafe51803b3f6b4f2562850f",
+  "scope": "LSM find_back reuses the winning candidate value and avoids a second cross-source get_value_at lookup; no on-disk format or public API changes.",
+  "changes": [
+    "Find the maximum visible candidate across memtables and SSTs while preserving sequence ordering and the existing source-priority tie rule.",
+    "Return the candidate value directly, retain Drop masking, snapshot visibility, accepted-prefix behavior, blob dereferencing, and the 4096-rejection FullScan fallback.",
+    "Keep the pre-change lookup available only in test builds for differential semantic checks."
+  ],
+  "validation": [
+    {
+      "kind": "release_default_library_suite",
+      "command": "cargo test --release --lib -- --format terse --color never",
+      "passed": 522,
+      "failed": 0,
+      "ignored": 76,
+      "exit_code": 0,
+      "seconds": 55.81
+    },
+    {
+      "kind": "release_lsm_suite",
+      "command": "cargo test --release --lib lsm_tree:: -- --test-threads=1",
+      "passed": 134,
+      "failed": 0,
+      "ignored": 11,
+      "exit_code": 0,
+      "seconds": 29.17
+    },
+    {
+      "kind": "debug_reference_semantics",
+      "command": "cargo test --lib test_sst_pruning --features lsm-allocation-reference -- --nocapture --test-threads=1",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "exit_code": 0,
+      "seconds": 44.85,
+      "coverage": "Snapshots, Drop masking, byte-prefix interleaving, overlapping/abnormal levels, source-sequence ties, and rejection fallback compared with the old lookup."
+    },
+    {
+      "kind": "production_library_check",
+      "command": "cargo check --lib --offline",
+      "exit_code": 0,
+      "seconds": 2.13
+    },
+    {
+      "kind": "four_engine_harness_smoke",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -Rows \"2000,3000\" -ScratchRoot \"C:/Users/Administrator/.cache/storage-engines/test-data\"",
+      "rows": [2000, 3000],
+      "engines": 4,
+      "metrics_per_row": 132,
+      "exit_code": 0,
+      "cleanup": "OK",
+      "summary": "data/bench-results/20261119-141116-48dda1817f2c4553831e682b862c8798/summary.json"
+    }
+  ],
+  "lsm_read_comparison": [
+    {
+      "rows": 2000,
+      "phase": "random_read",
+      "baseline_block_accesses": 4062,
+      "current_block_accesses": 2031,
+      "baseline_index_comparisons": 20128,
+      "current_index_comparisons": 10064,
+      "current_block_cache_misses": 32,
+      "current_value_clones": 2000,
+      "wall_ms": 7.843
+    },
+    {
+      "rows": 2000,
+      "phase": "ordered_read",
+      "baseline_block_accesses": 4062,
+      "current_block_accesses": 2031,
+      "baseline_index_comparisons": 20128,
+      "current_index_comparisons": 10064,
+      "current_block_cache_misses": 0,
+      "current_value_clones": 2000,
+      "wall_ms": 6.939
+    },
+    {
+      "rows": 3000,
+      "phase": "random_read",
+      "baseline_block_accesses": 6092,
+      "current_block_accesses": 3046,
+      "baseline_index_comparisons": 33968,
+      "current_index_comparisons": 16984,
+      "current_block_cache_misses": 47,
+      "current_value_clones": 3000,
+      "wall_ms": 7.231
+    },
+    {
+      "rows": 3000,
+      "phase": "ordered_read",
+      "baseline_block_accesses": 6092,
+      "current_block_accesses": 3046,
+      "baseline_index_comparisons": 33968,
+      "current_index_comparisons": 16984,
+      "current_block_cache_misses": 0,
+      "current_value_clones": 3000,
+      "wall_ms": 5.129
+    }
+  ],
+  "source_sha256": {
+    "src/lsm_tree/lsm_tree.rs": "dc3e71222b6f77d293ee608ba84ea7c395a58ad13bf27606ce0e00401e4278d7"
+  },
+  "benchmark_artifact_sha256": {
+    "summary.json": "c3bc61678fc3e6e633c452f1b843dd55bc2d5487eb0f5c5d0c3f7d53d40400d8",
+    "rows_2000_pass_1.csv": "f8113eb3d5e0726277f8aa0181272ec09b0757020e8c46a7c13018591a004f2d",
+    "rows_2000_pass_1.log": "4d4ddd4dd31a8cbb10160f20a51bd5574e75465d63b3d084c1110301c380ea47",
+    "rows_3000_pass_1.csv": "8620c1f4dd730a9dfddae902251a82763eeb6ce161d4e0072fc62982f079a77f",
+    "rows_3000_pass_1.log": "fc65c7bfc2e4e93c1498c9a6f5bf5bee21c1dcc310cb772e26a1245e2220d306",
+    "run.json": "3337a111b7b2e72f79754c9297f9bbb55935a661daad9440e89f03d398f9ac30",
+    "source.json": "32797f16d01fe551477c0eef986a3b7176cf2ed610ba91e98907c046bfab83eb"
+  },
+  "limitations": [
+    "The four-engine smoke covers 2k and 3k only; it is a path/correctness check, not evidence of throughput at 600k, 1M, 5M, 10M, or 20M.",
+    "No complete five-scale run was executed in this milestone. Re-run the user's full workload before claiming large-scale improvement or resolution of test18's 20M random-read time.",
+    "Validation ran on Windows; Linux was not tested."
+  ]
+}
