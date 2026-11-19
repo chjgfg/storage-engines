@@ -1549,14 +1549,34 @@ impl Transaction {
         key: &[u8],
         accept: impl Fn(u64) -> bool,
     ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        let low = encode_key(key, 0);
-        let high = encode_key(key, u64::MAX);
-        kv.find_back(&low, &high, u64::MAX, |enc, _val| {
+        // 两个边界只有尾部版本不同；合并成一次分配，避免每次点读多分配一块。
+        let bound_len = key.len() + 8;
+        let mut bounds = Vec::with_capacity(bound_len * 2);
+        bounds.extend_from_slice(key);
+        bounds.extend_from_slice(&0_u64.to_be_bytes());
+        bounds.extend_from_slice(key);
+        bounds.extend_from_slice(&u64::MAX.to_be_bytes());
+        let (low, high) = bounds.split_at(bound_len);
+        kv.find_back(low, high, u64::MAX, |enc, _val| {
             #[cfg(test)]
             if crate::lsm_tree::sst::point_read_reference::enabled() {
                 return decode_key(enc).is_some_and(|vk| vk.raw_key.as_slice() == key && accept(vk.version));
             }
             crate::common::version::decode_key_ref(enc).is_some_and(|(raw, version)| raw == key && accept(version))
+        })
+    }
+
+    #[cfg(test)]
+    fn find_version_back_reference(
+        kv: &LSMTree,
+        key: &[u8],
+        accept: impl Fn(u64) -> bool,
+    ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let low = encode_key(key, 0);
+        let high = encode_key(key, u64::MAX);
+        kv.find_back(&low, &high, u64::MAX, |enc, _val| {
+            crate::common::version::decode_key_ref(enc)
+                .is_some_and(|(raw, version)| raw == key && accept(version))
         })
     }
 
@@ -1764,6 +1784,62 @@ mod tests {
     /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
     fn tmp_db(tag: &str) -> crate::common::ScratchPath {
         crate::common::ScratchPath::new("lsm_mvcc", tag, "")
+    }
+
+    #[test]
+    fn version_point_bounds_save_one_allocation_per_lookup() {
+        const READS: usize = 32;
+        let path = tmp_db("point_bound_allocations");
+        let db = MVCC::open(&path);
+        db.set_vacuum_auto_slice(0);
+        let writer = db.begin_transaction();
+        assert!(writer.set_raw(b"k", b"exact".to_vec()));
+        assert!(writer.set_raw(b"k\0suffix", b"prefix-extension".to_vec()));
+        let keys: Vec<Vec<u8>> = (0..READS)
+            .map(|i| (i as u64).to_be_bytes().to_vec())
+            .collect();
+        for key in &keys {
+            assert!(writer.set_raw(key, b"value".to_vec()));
+        }
+        writer.commit();
+
+        let reader = db.begin_transaction();
+        let kv = reader.kv.lock().unwrap();
+        let old_prefix = Transaction::find_version_back_reference(&kv, b"k", |_| true);
+        let new_prefix = Transaction::find_version_back(&kv, b"k", |_| true);
+        let (old, old_allocations) = crate::mem_probe::count_thread_allocations(|| {
+            let mut last = None;
+            for key in &keys {
+                last = Transaction::find_version_back_reference(
+                    &kv,
+                    std::hint::black_box(key.as_slice()),
+                    |_| true,
+                );
+                std::hint::black_box(&last);
+            }
+            last
+        });
+        let (new, new_allocations) = crate::mem_probe::count_thread_allocations(|| {
+            let mut last = None;
+            for key in &keys {
+                last = Transaction::find_version_back(
+                    &kv,
+                    std::hint::black_box(key.as_slice()),
+                    |_| true,
+                );
+                std::hint::black_box(&last);
+            }
+            last
+        });
+        drop(kv);
+        reader.commit();
+        assert_eq!(old_prefix, new_prefix, "prefix-interleaved lookup must be preserved");
+        assert_eq!(new, old, "combined bounds must preserve lookup results");
+        assert_eq!(
+            old_allocations,
+            new_allocations + READS as u64,
+            "one old bound allocation must disappear for each lookup"
+        );
     }
 
     fn cleanup(path: &Path) {

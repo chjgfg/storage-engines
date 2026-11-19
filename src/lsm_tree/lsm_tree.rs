@@ -323,6 +323,52 @@ type MemMap = BTreeMap<Vec<u8>, BTreeMap<u64, EntryValue>>;
 /// 不会反过来低估；② 键更长时开销也涨（节点装得更少），那部分由载荷项顶着，同样是保守方向。
 const MEM_ENTRY_OVERHEAD: usize = 451;
 
+// 常规 MVCC 点查的 L0 文件数通常低于此值；恢复或批量写入产生更大 L0 时走堆分配兜底。
+const INLINE_L0_ORDER: usize = 128;
+
+enum L0CandidateOrder {
+    Inline {
+        indexes: [usize; INLINE_L0_ORDER],
+        len: usize,
+    },
+    Heap(Vec<usize>),
+}
+
+impl L0CandidateOrder {
+    fn by_max_key(files: &[SstFile]) -> Self {
+        let sort = |indexes: &mut [usize]| {
+            indexes.sort_unstable_by(|a, b| {
+                files[*b]
+                    .max_key
+                    .cmp(&files[*a].max_key)
+                    .then_with(|| b.cmp(a))
+            });
+        };
+        if files.len() <= INLINE_L0_ORDER {
+            let mut indexes = [0; INLINE_L0_ORDER];
+            for (index, slot) in indexes[..files.len()].iter_mut().enumerate() {
+                *slot = index;
+            }
+            sort(&mut indexes[..files.len()]);
+            Self::Inline {
+                indexes,
+                len: files.len(),
+            }
+        } else {
+            let mut indexes: Vec<_> = (0..files.len()).collect();
+            sort(&mut indexes);
+            Self::Heap(indexes)
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Inline { indexes, len } => &indexes[..*len],
+            Self::Heap(indexes) => indexes,
+        }
+    }
+}
+
 // 测试专用：本线程「为了数 memtable 条目而走过的条目数」。
 //
 // M19 的复杂度尺子。它数的不是" flush 判定的结果对不对"，而是**判定本身花了多少步**：
@@ -2038,11 +2084,9 @@ impl LSMTree {
         }
 
         if let Some(l0) = self.levels.first() {
-            let mut by_max: Vec<_> = l0.iter().enumerate().collect();
-            by_max.sort_unstable_by(|(ai, a), (bi, b)| {
-                b.max_key.cmp(&a.max_key).then_with(|| bi.cmp(ai))
-            });
-            for (index, sst) in by_max {
+            let by_max = L0CandidateOrder::by_max_key(l0);
+            for &index in by_max.as_slice() {
+                let sst = &l0[index];
                 if sst.may_overlap(low, high)
                     && best.as_ref().is_none_or(|(key, _, _)| sst.max_key.as_slice() >= key.as_slice())
                 {
@@ -3539,6 +3583,25 @@ mod tests {
     use std::panic;
     use std::println;
     use std::eprintln;
+
+    #[test]
+    fn l0_candidate_order_uses_stack_and_keeps_source_tie_order() {
+        let dir = tmp_dir("l0_candidate_order");
+        let mut db = LSMTree::open(&dir).unwrap();
+        for key in [b"c".as_slice(), b"a", b"b", b"b"] {
+            db.inject_sst_for_test(
+                0,
+                vec![(key.to_vec(), StoredEntry::put(1, Some(key.to_vec())))],
+            )
+                .unwrap();
+        }
+        let files = db.l0_for_test();
+        let (order, allocations) = crate::mem_probe::count_thread_allocations(|| {
+            L0CandidateOrder::by_max_key(files)
+        });
+        assert_eq!(allocations, 0, "ordinary L0 candidate ordering must not allocate");
+        assert_eq!(order.as_slice(), &[0, 3, 2, 1], "same-key source priority must be unchanged");
+    }
 
     #[test]
     fn manifest_publication_guard_requires_target_level() {
