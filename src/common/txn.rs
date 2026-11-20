@@ -369,6 +369,33 @@ impl TxnCore {
         Ok(())
     }
 
+    /// Apply borrowed-key rows while retaining the caller's input for
+    /// batch-local rollback. Returns the first failed row index.
+    pub(crate) fn try_write_borrowed_page<'a, S: WriteSide>(
+        &self,
+        reg: &mut Registry,
+        side: &mut S,
+        first_index: usize,
+        rows: impl ExactSizeIterator<Item = (usize, &'a [u8], Option<Vec<u8>>)>,
+    ) -> Result<(), (usize, WriteError)> {
+        if self.state.get() != TxnState::Active {
+            return Err((first_index, WriteError::TransactionClosed));
+        }
+        if let Some(error) = self.write_error.get() {
+            return Err((first_index, error));
+        }
+        #[cfg(test)]
+        WRITE_REG_LOOKUPS.with(|s| s.set(s.get() + 1));
+        let writes = reg.entry(self.version).or_default();
+        writes.reserve(rows.len());
+        for (index, key, value) in rows {
+            if let Err(error) = self.try_write_row(side, Cow::Borrowed(key), value, || &mut *writes) {
+                return Err((index, error));
+            }
+        }
+        Ok(())
+    }
+
     /// Latch an engine failure without changing an already completed outcome.
     pub(crate) fn mark_storage_failed(&self) {
         if self.state.get() == TxnState::Active {

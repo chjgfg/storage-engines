@@ -31,6 +31,8 @@ use std::time::Duration;
 use crate::common::codec::parse_i64_user;
 use crate::lsm_tree::lsm_tree_mvcc::{MVCC, Transaction, TxnSide};
 
+const BATCH_SET_PAGE_ROWS: usize = 1024;
+
 /// 公共类型与编解码工具现由 [`crate::common`] 统一定义。
 ///
 /// 这里按原路径重导出，保证 `lsm_tree::kv_ops::pack_plain` 等既有调用点不变。
@@ -55,13 +57,37 @@ impl Transaction {
         if super::lsm_tree::allocation_reference::enabled() {
             return self.batch_set_reference(items);
         }
-        for (i, (k, v)) in items.iter().enumerate() {
-            if !self.set(k, pack_plain(v)) {
-                // The input already owns the successful prefix. Copy keys only
-                // on failure, preserving the existing partial-undo contract.
-                let written: Vec<_> = items[..i].iter().map(|(key, _)| key.clone()).collect();
-                self.rollback_keys(&written);
-                return Err(k.clone());
+        for (page_index, page) in items.chunks(BATCH_SET_PAGE_ROWS).enumerate() {
+            // Bound the time spent holding shared engine locks even when a
+            // caller passes a very large slice. The input remains borrowed.
+            let mut reg = self.core.lock_registry();
+            let mut wal = self.wal.lock().unwrap();
+            let mut kv = self.kv.lock().unwrap();
+            let mut side = TxnSide {
+                wal: &mut wal,
+                kv: &mut kv,
+            };
+            let page_start = page_index * BATCH_SET_PAGE_ROWS;
+            let result = self.core.try_write_borrowed_page(
+                &mut reg,
+                &mut side,
+                page_start,
+                page.iter().enumerate().map(|(i, (key, value))| {
+                    (
+                        page_start + i,
+                        key.as_slice(),
+                        Some(pack_plain(value)),
+                    )
+                }),
+            );
+            if let Err((failed_at, _error)) = result {
+                let failed_key = items[failed_at].0.clone();
+                let written: Vec<_> = items[..failed_at]
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                self.core.undo(&mut reg, &mut side, &written);
+                return Err(failed_key);
             }
         }
         Ok(())
@@ -541,7 +567,11 @@ mod tests {
                     (b"new".to_vec(), b"two".to_vec()),
                     (b"hot".to_vec(), b"rejected".to_vec()),
                     (b"untouched".to_vec(), b"never".to_vec())];
+                let lookups_before = crate::common::txn::write_registry_lookups();
                 assert_eq!(tx.batch_set(&items), Err(b"hot".to_vec()));
+                assert_eq!(crate::common::txn::write_registry_lookups() - lookups_before,
+                    if _reference { 2 } else { 1 },
+                    "the reference resolves the write registry for each successful row; the batch path resolves it once");
                 assert_eq!(tx.get(b"new"), None);
                 assert_eq!(tx.get(b"untouched"), None);
                 assert_eq!(tx.batch_delete(&[b"a".to_vec(), b"a".to_vec(), b"hot".to_vec()]),
@@ -568,6 +598,49 @@ mod tests {
             #[cfg(feature = "lsm-allocation-reference")]
             drop(mode);
         }
+    }
+
+    #[test]
+    fn batch_set_rolls_back_prefix_across_lock_pages() {
+        let path = tmp("batch_set_lock_pages");
+        let mvcc = MVCC::open(&path);
+        let holder = mvcc.begin_transaction();
+        assert!(holder.set(b"locked", pack_plain(b"held")));
+        let tx = mvcc.begin_transaction();
+        let items: Vec<_> = (0..BATCH_SET_PAGE_ROWS + 2)
+            .map(|index| {
+                if index == BATCH_SET_PAGE_ROWS {
+                    (b"locked".to_vec(), b"rejected".to_vec())
+                } else {
+                    (index.to_be_bytes().to_vec(), b"value".to_vec())
+                }
+            })
+            .collect();
+
+        let lookups_before = crate::common::txn::write_registry_lookups();
+        assert_eq!(tx.batch_set(&items), Err(b"locked".to_vec()));
+        assert_eq!(
+            crate::common::txn::write_registry_lookups() - lookups_before,
+            2,
+            "the write registry is resolved once for each attempted lock page"
+        );
+        assert_eq!(tx.get(&0usize.to_be_bytes()), None);
+        assert_eq!(tx.get(&1023usize.to_be_bytes()), None);
+        assert_eq!(tx.get(&1025usize.to_be_bytes()), None);
+
+        tx.rollback();
+        holder.rollback();
+        drop(tx);
+        drop(holder);
+        drop(mvcc);
+
+        let reopened = MVCC::open(&path);
+        let check = reopened.begin_transaction();
+        assert_eq!(check.get(&0usize.to_be_bytes()), None);
+        assert_eq!(check.get(&1023usize.to_be_bytes()), None);
+        assert_eq!(check.get(&1025usize.to_be_bytes()), None);
+        check.commit();
+        cleanup(&path);
     }
 
     #[test]
