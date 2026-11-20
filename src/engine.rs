@@ -8264,18 +8264,16 @@ pub fn migrate(
     let mut stats = MigrateStats::default();
     let mut cursor: Option<Vec<u8>> = None;
     loop {
-        // 读侧一页：`scan_page` + 每行一次 `get_meta`。**TTL 必须在源侧读** ——
-        // 目标侧此刻还没有这把 key，拿目标事务问 meta 会一律得到"永久"，于是 TTL 静默丢
-        // （这条是 migrate_walks_a_ring_of_engines 第一版就抓出来的错）。
+        // `scan_page` already returns the source-side absolute expiry. Keep it
+        // with the value so each source row is visited only once.
         let (rows, next) = {
             let tx = from.begin();
             let (page, next) = tx.scan_page(cursor.as_deref(), page_rows);
             let page: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = page
                 .into_iter()
                 .filter_map(|rec| {
-                    let value = rec.value?;
-                    let expire = tx.get_meta(&rec.key).and_then(|m| m.expire_unix_secs);
-                    Some((rec.key, value, expire))
+                    rec.value
+                        .map(|value| (rec.key, value, rec.expire_unix_secs))
                 })
                 .collect();
             tx.commit();
