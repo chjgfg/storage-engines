@@ -20,6 +20,77 @@ use memmap2::Mmap;
 use crate::lsm_tree::bloom::Bloom;
 use crate::lsm_tree::storage::crc32;
 
+// Windows seek_read accepts an explicit offset but does not change the file cursor.
+// Keep the handle lock there so its lifetime and platform behavior stay uniform.
+fn read_sst_exact(file: &mut File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if positioned_read_reference::enabled() {
+        positioned_read_reference::note_seek();
+        file.seek(SeekFrom::Start(offset))?;
+        return file.read_exact(buf);
+    }
+    #[cfg(any(unix, windows))]
+    {
+        read_exact_positioned(offset, buf, |buf, offset| {
+            #[cfg(unix)]
+            { std::os::unix::fs::FileExt::read_at(file, buf, offset) }
+            #[cfg(windows)]
+            { std::os::windows::fs::FileExt::seek_read(file, buf, offset) }
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buf)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn read_exact_positioned(
+    mut offset: u64,
+    mut buf: &mut [u8],
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match read(buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                if !buf.is_empty() {
+                    offset = offset
+                        .checked_add(n as u64)
+                        .ok_or(std::io::ErrorKind::InvalidInput)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod positioned_read_reference {
+    use std::{cell::Cell, thread_local};
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static SEEKS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) fn seeks() -> u64 { SEEKS.with(Cell::get) }
+    pub(super) fn note_seek() { SEEKS.with(|count| count.set(count.get() + 1)); }
+
+    pub(crate) struct Scope(bool);
+    impl Scope {
+        pub(crate) fn start() -> Self { Self(ENABLED.with(|enabled| enabled.replace(true))) }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) { ENABLED.with(|enabled| enabled.set(self.0)); }
+    }
+}
+
 const SST_MAGIC_V1: &[u8; 8] = b"LSMSST01";
 const SST_MAGIC_V2: &[u8; 8] = b"LSMSST02";
 
@@ -1423,16 +1494,14 @@ impl SstFile {
         }
         #[cfg(test)]
         BLOCK_MISSES.with(|c| c.set(c.get() + 1));
-        // 常驻句柄：懒开一次，之后只 seek + read。这里省掉的正是那次与读字节同量级、
-        // 却贵一个数量级的 File::open。
+        // Reuse one handle and supply the offset in the read itself.
         let mut guard = self.handle.lock().unwrap();
         if guard.is_none() {
             *guard = Some(File::open(&self.path)?);
         }
         let f = guard.as_mut().unwrap();
-        f.seek(SeekFrom::Start(offset))?;
         let mut raw: Vec<u8> = vec![0u8; len];
-        f.read_exact(&mut raw)?;
+        read_sst_exact(f, offset, &mut raw)?;
         Ok(raw)
     }
 
@@ -2554,6 +2623,72 @@ pub(crate) fn merge_to_ssts_with_action(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn positioned_sst_read_retries_short_reads_and_interrupts() {
+        let data = b"0123456789";
+        let mut output = [0; 5];
+        let mut calls = 0;
+        read_exact_positioned(3, &mut output, |buffer, offset| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let count = buffer.len().min(2);
+            buffer[..count]
+                .copy_from_slice(&data[offset as usize..offset as usize + count]);
+            Ok(count)
+        })
+        .unwrap();
+        assert_eq!(&output, b"34567");
+        assert_eq!(calls, 4);
+        assert_eq!(
+            read_exact_positioned(0, &mut output, |_, _| Ok(0))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_exact_positioned(u64::MAX, &mut output, |_, _| Ok(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn positioned_sst_point_reads_match_seek_reads() {
+        let path = tmp("positioned_sst");
+        let mut builder = SstBuilder::with_options(1, &path, 64, false);
+        for key in 0..64_u64 {
+            builder.add(
+                key.to_be_bytes().to_vec(),
+                StoredEntry::put(key, Some(vec![key as u8; 16])),
+            );
+        }
+        let sst = builder.finish().unwrap();
+        for reference in [true, false] {
+            let _mode = reference.then(positioned_read_reference::Scope::start);
+            let before = positioned_read_reference::seeks();
+            for key in 0..64_u64 {
+                assert_eq!(
+                    sst.get_at(&key.to_be_bytes(), u64::MAX),
+                    Some(StoredEntry::put(key, Some(vec![key as u8; 16])))
+                );
+            }
+            let seeks = positioned_read_reference::seeks() - before;
+            assert!(if reference { seeks > 0 } else { seeks == 0 });
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[sst.index[0].offset as usize + 4] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            sst.load_point_block(0).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn vacuum_light_owned_blocks_match_cached_ranges_and_surface_bad_blocks() {
         let path = tmp("vacuum_owned");
