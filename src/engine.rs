@@ -7420,6 +7420,7 @@ mod tests {
 
             // ---- 写入：每 1000 行一个事务（commit 带 fsync） ----
             let mut insert_stages = [0_u128; 3];
+            let wal_commit_probe = crate::common::wal::commit_probe::Scope::start();
             let (d, live, peak, ()) = timed_phase(label, "insert", || {
                 for base in (0..rows).step_by(1000) {
                     let end = (base + 1000).min(rows);
@@ -7440,6 +7441,16 @@ mod tests {
             });
             eprintln!("SCALE_INSERT_STAGES engine={label} prepare_ms={:.3} batch_set_ms={:.3} commit_ms={:.3} scope=disjoint_substages",
                 insert_stages[0] as f64 / 1e6, insert_stages[1] as f64 / 1e6, insert_stages[2] as f64 / 1e6);
+            let wal = wal_commit_probe.stats();
+            let sync_avg_us = if wal.sync_calls == 0 { 0.0 } else {
+                wal.sync_ns as f64 / wal.sync_calls as f64 / 1e3
+            };
+            eprintln!("SCALE_WAL_COMMIT engine={label} attempts={} append_calls={} append_total_ms={:.3} append_max_us={:.3} commit_sync_calls={} commit_sync_total_ms={:.3} commit_sync_avg_us={:.3} commit_sync_max_ms={:.3} commit_sync_hist_le1ms_1to5ms_5to10ms_10to25ms_25to50ms_50to100ms_100to250ms_gt250ms={:?} fsync_calls={} fsync_total_ms={:.3} fsync_max_ms={:.3}",
+                wal.attempts, wal.append_calls, wal.append_ns as f64 / 1e6,
+                wal.append_max_ns as f64 / 1e3, wal.sync_calls, wal.sync_ns as f64 / 1e6,
+                sync_avg_us, wal.sync_max_ns as f64 / 1e6, wal.sync_histogram,
+                wal.fsync_calls, wal.fsync_ns as f64 / 1e6, wal.fsync_max_ns as f64 / 1e6);
+            drop(wal_commit_probe);
             line(label, &format!("灌 {rows} 行(事务)"), d.as_secs_f64() * 1e6 / rows as f64, "µs/行", live, peak, "");
             scale_note_maintenance(&*db, "insert", &maintenance);
 

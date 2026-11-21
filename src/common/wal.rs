@@ -24,6 +24,124 @@ const WAL_MAGIC: &[u8; 8] = b"WAL00001";
 const WAL_HEADER_SIZE: usize = 32;
 // header: magic(8) + next_lsn(8) + reserved(16)
 
+/// Opt-in WAL commit timing for scale benchmarks. Disabled outside a scope and
+/// compiled out of non-test builds.
+#[cfg(test)]
+pub(crate) mod commit_probe {
+    use std::{assert, cell::RefCell, time::Instant};
+
+    const SYNC_LIMITS_NS: [u128; 7] = [
+        1_000_000,
+        5_000_000,
+        10_000_000,
+        25_000_000,
+        50_000_000,
+        100_000_000,
+        250_000_000,
+    ];
+
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Stats {
+        pub(crate) attempts: u64,
+        pub(crate) append_calls: u64,
+        pub(crate) append_ns: u128,
+        pub(crate) append_max_ns: u128,
+        pub(crate) sync_calls: u64,
+        pub(crate) sync_ns: u128,
+        pub(crate) sync_max_ns: u128,
+        /// Buckets: <=1, 1-5, 5-10, 10-25, 25-50, 50-100, 100-250, >250 ms.
+        pub(crate) sync_histogram: [u64; 8],
+        pub(crate) fsync_calls: u64,
+        pub(crate) fsync_ns: u128,
+        pub(crate) fsync_max_ns: u128,
+    }
+
+    std::thread_local! {
+        static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Scope;
+
+    impl Scope {
+        pub(crate) fn start() -> Self {
+            ACTIVE.with(|active| {
+                assert!(active.borrow().is_none(), "nested WAL commit probe scope");
+                *active.borrow_mut() = Some(Stats::default());
+            });
+            Self
+        }
+
+        pub(crate) fn stats(&self) -> Stats {
+            ACTIVE.with(|active| active.borrow().as_ref().unwrap().clone())
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| *active.borrow_mut() = None);
+        }
+    }
+
+    pub(super) enum Stage {
+        Append,
+        Sync,
+        Fsync,
+    }
+
+    pub(super) struct Timer {
+        stage: Stage,
+        start: Instant,
+    }
+
+    impl Timer {
+        pub(super) fn start(stage: Stage) -> Option<Self> {
+            ACTIVE.with(|active| {
+                active.borrow().is_some().then(|| Self {
+                    stage,
+                    start: Instant::now(),
+                })
+            })
+        }
+    }
+
+    pub(super) fn note_attempt() {
+        ACTIVE.with(|active| {
+            if let Some(stats) = active.borrow_mut().as_mut() {
+                stats.attempts += 1;
+            }
+        });
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            let elapsed = self.start.elapsed().as_nanos();
+            ACTIVE.with(|active| {
+                if let Some(stats) = active.borrow_mut().as_mut() {
+                    match self.stage {
+                        Stage::Append => {
+                            stats.append_calls += 1;
+                            stats.append_ns += elapsed;
+                            stats.append_max_ns = stats.append_max_ns.max(elapsed);
+                        }
+                        Stage::Sync => {
+                            stats.sync_calls += 1;
+                            stats.sync_ns += elapsed;
+                            stats.sync_max_ns = stats.sync_max_ns.max(elapsed);
+                            let bucket = SYNC_LIMITS_NS.partition_point(|limit| elapsed > *limit);
+                            stats.sync_histogram[bucket] += 1;
+                        }
+                        Stage::Fsync => {
+                            stats.fsync_calls += 1;
+                            stats.fsync_ns += elapsed;
+                            stats.fsync_max_ns = stats.fsync_max_ns.max(elapsed);
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// 记录帧：len(u32) + crc(u32) + body
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WalRecord {
@@ -158,7 +276,12 @@ impl Wal {
         hdr[0..8].copy_from_slice(WAL_MAGIC);
         hdr[8..16].copy_from_slice(&self.next_lsn.to_le_bytes());
         self.file.write_all_at(0, &hdr)?;
-        self.file.sync_at(SITE_WAL_SYNC)?;
+        #[cfg(test)]
+        let fsync_timer = commit_probe::Timer::start(commit_probe::Stage::Fsync);
+        let result = self.file.sync_at(SITE_WAL_SYNC);
+        #[cfg(test)]
+        drop(fsync_timer);
+        result?;
         Ok(())
     }
 
@@ -249,19 +372,30 @@ impl Wal {
     pub fn commit_transaction(&mut self, xid: u64) -> std::io::Result<()> {
         self.ensure_healthy()?;
         #[cfg(test)]
+        commit_probe::note_attempt();
+        #[cfg(test)]
         let fail = FAIL_COMMIT.with(|f| f.replace(0));
         #[cfg(test)]
         if fail == 1 {
             self.poisoned = true;
             return Err(std::io::Error::other("injected Commit append failure"));
         }
+        #[cfg(test)]
+        let append_timer = commit_probe::Timer::start(commit_probe::Stage::Append);
         self.append(WalRecord::Commit { xid })?;
+        #[cfg(test)]
+        drop(append_timer);
         #[cfg(test)]
         if fail == 2 {
             self.poisoned = true;
             return Err(std::io::Error::other("injected Commit fsync failure"));
         }
-        self.sync()
+        #[cfg(test)]
+        let sync_timer = commit_probe::Timer::start(commit_probe::Stage::Sync);
+        let result = self.sync();
+        #[cfg(test)]
+        drop(sync_timer);
+        result
     }
 }
 
@@ -350,6 +484,23 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn commit_probe_separates_wal_append_and_sync() {
+        let path = tmp_wal("commit_probe");
+        let mut wal = Wal::open(&path).unwrap();
+        let probe = commit_probe::Scope::start();
+        wal.commit_transaction(1).unwrap();
+        let stats = probe.stats();
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.append_calls, 1);
+        assert_eq!(stats.sync_calls, 1);
+        assert_eq!(stats.fsync_calls, 1);
+        assert_eq!(stats.sync_histogram.iter().sum::<u64>(), 1);
+        drop(probe);
+        drop(wal);
+        std::fs::remove_file(path).unwrap();
     }
 
     /// M53 的守卫：**一次收口只许付一次 fsync**。
