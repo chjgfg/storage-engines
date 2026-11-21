@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::disk::{SITE_BPLUS_DBLWR, SITE_BPLUS_META, SITE_BPLUS_PAGE_FLUSH};
 use crate::bplus_tree::storage::{
-    dblwr_path, freelist_path, lock_path, pack_page, read_freelist, unpack_page, write_freelist, DiskFile,
+    dblwr_path, freelist_path, lock_path, pack_page, read_freelist, unpack_page, DiskFile, FreelistWriter,
     PAGE_SIZE,
     DoubleWriteBuffer, FileLock, PAGE_PAYLOAD_SIZE,
 };
@@ -105,8 +105,11 @@ pub struct PageManager {
     meta_dirty: bool,
     /// freelist sidecar 是否有未落盘变更
     freelist_dirty: bool,
+    freelist_writer: Option<FreelistWriter>,
     /// bulk 模式：换出/刷盘跳过双写与频繁 fsync，只在 flush_all 末尾 sync 一次
     bulk_mode: bool,
+    /// Bulk eviction can leave no dirty cache pages while disk writes still need sync.
+    bulk_pending_sync: bool,
     io_state: PageIoState,
     /// 每页被写入过几次（`write_page` / `allocate_page` 各算一次）。
     ///
@@ -421,7 +424,9 @@ impl PageManager {
             clock: 0,
             meta_dirty: false,
             freelist_dirty: false,
+            freelist_writer: None,
             bulk_mode: false,
+            bulk_pending_sync: false,
             io_state: PageIoState::Healthy,
             page_writes: HashMap::new(),
             pinned: HashSet::new(),
@@ -613,8 +618,10 @@ impl PageManager {
         }
         #[cfg(test)]
         let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::Freelist);
-        let ids: Vec<u64> = self.free_page_ids.iter().map(|p| p.0).collect();
-        write_freelist(&freelist_path(&self.path), &ids)?;
+        if self.freelist_writer.is_none() {
+            self.freelist_writer = Some(FreelistWriter::open(&freelist_path(&self.path))?);
+        }
+        self.freelist_writer.as_mut().unwrap().write(self.free_page_ids.iter().map(|p| p.0))?;
         self.freelist_dirty = false;
         Ok(())
     }
@@ -691,7 +698,7 @@ impl PageManager {
     }
 
     fn flush_pages_batch_inner(&mut self, page_ids: &[PageId], do_sync: bool) -> std::io::Result<()> {
-        if page_ids.is_empty() && !self.meta_dirty && !self.freelist_dirty {
+        if page_ids.is_empty() && !self.meta_dirty && !self.freelist_dirty && !self.bulk_pending_sync {
             return Ok(());
         }
 
@@ -711,23 +718,17 @@ impl PageManager {
         }
         #[cfg(test)]
         drop(pack_timer);
-        if batch.is_empty() {
-            // 可能只有 freelist 变更
-            self.persist_freelist()?;
-            return Ok(());
-        }
-
         if self.bulk_mode {
             // 快速路径：直接写主文件，不做双写；sync 可选
-            #[cfg(test)]
-            crate::bplus_tree::storage::dblwr_probe::fail_at(4)?;
-            for (pid, raw) in &batch {
-                self.file.write_page(*pid, raw)?;
-            }
-            if do_sync {
+            if !batch.is_empty() {
+                self.bulk_pending_sync = true;
                 #[cfg(test)]
-                crate::bplus_tree::storage::dblwr_probe::fail_at(5)?;
-                self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
+                let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::PageWrite);
+                #[cfg(test)]
+                crate::bplus_tree::storage::dblwr_probe::fail_at(4)?;
+                for (pid, raw) in &batch {
+                    self.file.write_page(*pid, raw)?;
+                }
             }
         } else {
             for chunk in batch.chunks(crate::bplus_tree::storage::DBLWR_MAX_PAGES) {
@@ -745,13 +746,24 @@ impl PageManager {
                     #[cfg(test)]
                     crate::bplus_tree::storage::dblwr_probe::fail_at(5)?;
                     self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
+                    self.bulk_pending_sync = false;
                 }
                 self.dblwr.clear()?;
             }
         }
+        // Also covers a bulk batch whose dirty pages were all evicted, and a
+        // caller switching out of bulk mode before the explicit final flush.
+        if do_sync && self.bulk_pending_sync {
+            #[cfg(test)]
+            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::PageSync);
+            #[cfg(test)]
+            crate::bplus_tree::storage::dblwr_probe::fail_at(5)?;
+            self.file.sync_at(SITE_BPLUS_PAGE_FLUSH)?;
+            self.bulk_pending_sync = false;
+        }
 
         // Mark clean only after the entire publication succeeds.
-        self.persist_freelist()?;
+        if !self.bulk_mode || do_sync { self.persist_freelist()?; }
         for &pid in page_ids {
             if let Some(entry) = self.cache.get_mut(&pid) {
                 if entry.state == PageState::Dirty {
@@ -1209,6 +1221,92 @@ mod tests {
     use super::*;
     use std::assert;
     use std::assert_eq;
+
+    #[test]
+    fn bulk_eviction_defers_freelist_sync_until_finish() {
+        use crate::common::disk::{fsync_counts, SITE_BPLUS_FREELIST};
+        let path = crate::common::ScratchPath::new("page", "bulk_freelist", ".db");
+        {
+            let mut pm = PageManager::open(&path, 64).unwrap();
+            for _ in 0..256 { pm.allocate_page(); }
+            pm.try_flush_all().unwrap();
+            for i in 1..=256 { pm.free_page(PageId(i)); }
+            pm.try_flush_all().unwrap();
+            pm.set_bulk_mode(true);
+            let before = fsync_counts()[SITE_BPLUS_FREELIST];
+            for i in 1..=256_u64 {
+                let pid = pm.allocate_page();
+                assert_eq!(pid, PageId(i));
+                assert!(pm.write_page(pid, &i.to_le_bytes()));
+            }
+            assert_eq!(fsync_counts()[SITE_BPLUS_FREELIST] - before, 0);
+            pm.try_flush_all().unwrap();
+            assert_eq!(fsync_counts()[SITE_BPLUS_FREELIST] - before, 1);
+        }
+        let mut pm = PageManager::open(&path, 64).unwrap();
+        for i in 1..=256_u64 {
+            assert_eq!(&pm.read_page(PageId(i)).unwrap()[..8], &i.to_le_bytes());
+        }
+        assert_eq!(pm.allocate_page(), PageId(257));
+    }
+
+    #[test]
+    fn bulk_finish_syncs_evicted_clean_pages_and_latches_failure() {
+        use crate::common::disk::{fsync_counts, SITE_BPLUS_PAGE_FLUSH};
+        for (switch_mode, fault) in [(false, false), (true, false), (false, true)] {
+            let path = crate::common::ScratchPath::new("page", "bulk_pending_sync", ".db");
+            {
+                let mut pm = PageManager::open(&path, 64).unwrap();
+                pm.set_bulk_mode(true);
+                let pid = pm.allocate_page();
+                assert!(pm.write_page(pid, b"bulk"));
+                let before = fsync_counts()[SITE_BPLUS_PAGE_FLUSH];
+                pm.flush_pages_batch(&[pid], false).unwrap();
+                assert_eq!(pm.get_page_state(pid), Some(PageState::Clean));
+                assert!(!pm.meta_dirty);
+                pm.cache.clear(); // all remaining cached pages have already been published
+                if switch_mode { pm.set_bulk_mode(false); }
+                let injection = fault.then(|| crate::bplus_tree::storage::dblwr_probe::Scope::fault(5));
+                let result = pm.try_flush_all();
+                assert_eq!(result.is_err(), fault);
+                if fault {
+                    assert!(pm.bulk_pending_sync);
+                    assert!(pm.ensure_healthy().is_err());
+                    assert!(pm.try_flush_all().is_err());
+                } else {
+                    assert!(!pm.bulk_pending_sync);
+                    assert_eq!(fsync_counts()[SITE_BPLUS_PAGE_FLUSH] - before, 1);
+                    pm.try_flush_all().unwrap();
+                    assert_eq!(fsync_counts()[SITE_BPLUS_PAGE_FLUSH] - before, 1);
+                }
+                drop(injection);
+            }
+            if !fault {
+                let mut pm = PageManager::open(&path, 64).unwrap();
+                assert_eq!(&pm.read_page(PageId(1)).unwrap()[..4], b"bulk");
+            }
+        }
+    }
+
+    #[test]
+    fn freelist_publication_failure_keeps_dirty_state_and_refuses_retry() {
+        for bulk in [false, true] {
+            for fault in [6, 7] {
+                let path = crate::common::ScratchPath::new("page", "freelist_failure", ".db");
+                let mut pm = PageManager::open(&path, 64).unwrap();
+                let pid = pm.allocate_page();
+                pm.try_flush_all().unwrap();
+                assert!(pm.free_page(pid));
+                pm.set_bulk_mode(bulk);
+                let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(fault);
+                assert!(pm.try_flush_all().is_err());
+                assert!(pm.freelist_dirty);
+                assert!(pm.meta_dirty);
+                assert!(pm.ensure_healthy().is_err());
+                assert!(pm.try_flush_all().is_err());
+            }
+        }
+    }
 
     #[test]
     fn eviction_reserves_metadata_and_preserves_every_page() {

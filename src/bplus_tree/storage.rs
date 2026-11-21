@@ -134,6 +134,7 @@ pub(crate) mod dblwr_probe {
     pub fn reference() -> bool { REFERENCE.with(|c| c.get()) }
     pub fn writes() -> u64 { PAYLOAD_WRITES.with(|c| c.get()) }
     pub fn note_write() { PAYLOAD_WRITES.with(|c| c.set(c.get() + 1)); }
+    // 1..3 double-write, 4 main write, 5 main sync, 6 freelist write, 7 freelist sync.
     pub fn fail_at(at: u8) -> std::io::Result<()> {
         if FAULT.with(|c| c.get() == at && c.replace(0) == at) {
             return Err(std::io::Error::other("injected double-write interruption"));
@@ -582,24 +583,58 @@ const FREELIST_MAGIC: &[u8; 8] = b"FREE0001";
 
 /// 把全部空闲页号写入 sidecar 文件并 fsync
 pub fn write_freelist(path: &Path, free_ids: &[u64]) -> std::io::Result<()> {
-    let mut body = Vec::with_capacity(free_ids.len() * 8);
-    for id in free_ids {
-        body.extend_from_slice(&id.to_le_bytes());
+    FreelistWriter::open(path)?.write(free_ids.iter().copied())
+}
+
+/// Reuse the sidecar handle; each publication still ends with fsync. The on-disk
+/// FREE0001 format and its CRC remain compatible with write_freelist/read_freelist.
+pub(crate) struct FreelistWriter {
+    file: DiskFile,
+    len: u64,
+}
+
+impl FreelistWriter {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        #[cfg(test)]
+        let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistOpen);
+        let file = DiskFile::open(path)?;
+        let len = file.len()?;
+        Ok(Self { file, len })
     }
-    let checksum = crc32(&body);
 
-    let mut buf = Vec::with_capacity(20 + body.len());
-    buf.extend_from_slice(FREELIST_MAGIC);
-    buf.extend_from_slice(&(free_ids.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&checksum.to_le_bytes());
-    buf.extend_from_slice(&body);
-
-    let mut file = DiskFile::open(path)?;
-    // 先截断再写，避免旧文件更长时残留垃圾
-    file.set_len(0)?;
-    file.write_all_at(0, &buf)?;
-    file.sync_at(SITE_BPLUS_FREELIST)?;
-    Ok(())
+    pub(crate) fn write(&mut self, ids: impl ExactSizeIterator<Item = u64>) -> std::io::Result<()> {
+        #[cfg(test)]
+        let encode = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistEncode);
+        let count = ids.len();
+        let mut buf = Vec::with_capacity(20 + count * 8);
+        buf.extend_from_slice(FREELIST_MAGIC);
+        buf.extend_from_slice(&(count as u64).to_le_bytes());
+        buf.extend_from_slice(&[0; 4]);
+        for id in ids { buf.extend_from_slice(&id.to_le_bytes()); }
+        let checksum = crc32(&buf[20..]);
+        buf[16..20].copy_from_slice(&checksum.to_le_bytes());
+        #[cfg(test)]
+        drop(encode);
+        let new_len = buf.len() as u64;
+        {
+            #[cfg(test)]
+            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistWrite);
+            #[cfg(test)]
+            dblwr_probe::fail_at(6)?;
+            self.file.write_all_at(0, &buf)?;
+            // Overwrite first; truncate only a shrinking tail, never to zero.
+            if new_len < self.len { self.file.set_len(new_len)?; }
+        }
+        {
+            #[cfg(test)]
+            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistSync);
+            #[cfg(test)]
+            dblwr_probe::fail_at(7)?;
+            self.file.sync_at(SITE_BPLUS_FREELIST)?;
+        }
+        self.len = new_len;
+        Ok(())
+    }
 }
 
 /// 读取 sidecar 空闲页列表；文件不存在返回 Ok(None)
@@ -787,6 +822,40 @@ mod tests {
                 assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - syncs, if reference { 3 } else { 2 });
             }
         }
+    }
+
+    #[test]
+    fn freelist_writer_reuses_handle_and_preserves_exact_layout() {
+        use crate::common::disk::{file_opens, fsync_counts};
+        use crate::common::maintenance_probe::{Scope, Stage};
+        let path = crate::common::ScratchPath::new("storage", "freelist_writer", ".bin");
+        let before = file_opens();
+        let probe = Scope::start();
+        let mut writer = FreelistWriter::open(&path).unwrap();
+        for count in [256_u64, 3, 0, 129, 1] {
+            let ids: Vec<u64> = (1..count + 1).collect();
+            let syncs = fsync_counts()[SITE_BPLUS_FREELIST];
+            let opens = file_opens();
+            writer.write(ids.iter().copied()).unwrap();
+            assert_eq!(file_opens(), opens);
+            assert_eq!(fsync_counts()[SITE_BPLUS_FREELIST] - syncs, 1);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 20 + count * 8);
+            assert_eq!(read_freelist(&path).unwrap().unwrap(), ids);
+            let bytes = std::fs::read(&path).unwrap();
+            let body: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            let mut expected = b"FREE0001".to_vec();
+            expected.extend_from_slice(&count.to_le_bytes());
+            expected.extend_from_slice(&crc32(&body).to_le_bytes());
+            expected.extend_from_slice(&body);
+            assert_eq!(bytes, expected);
+        }
+        assert_eq!(file_opens() - before, 6); // one writer, five independent readers
+        let stats = probe.stats();
+        assert_eq!(stats.calls[Stage::FreelistOpen as usize], 1);
+        assert_eq!(stats.calls[Stage::FreelistSync as usize], 5);
+        drop(probe); drop(writer);
+        write_freelist(&path, &[9, 5]).unwrap();
+        assert_eq!(read_freelist(&path).unwrap().unwrap(), vec![9, 5]);
     }
 
     #[test]

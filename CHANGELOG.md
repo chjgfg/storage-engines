@@ -1,6 +1,35 @@
 # 更新日志
 
-## 未发布（2026-11-19）
+## 未发布（2026-11-21）
+
+### M151：B+ 回收空扫免刷页、bulk 收尾统一同步与 freelist 写入优化
+
+- 依据 `data/bench-results/20261121-130854-4c5e8acb76a14157aea63d10cac3eefd` 的五档完整结果定位：
+  五档各 132 格通过；20M B+ insert 8730.447 s，旧 prepare/batch_set/commit 合计仅 2899.111 s，
+  另 5831.336 s 尚未归因；vacuum 532.324 s，其中 freelist 301.029 s（545 次）。这些是修复前读数。
+- 自动回收没有删除版本时不再更新 meta 或刷出前序事务脏页；有删除仍刷页与 freelist。
+  WAL 提交、checkpoint、回收调度和版本可见性合同保持原样，测试保留旧空扫同步对照门。
+- bulk 换页不再持久化 freelist，finish 同步主文件与 freelist 后才能封 WAL。新增未同步主文件状态，
+  即使所有脏页已换出或先退出 bulk 模式，显式 flush 仍必须同步；失败锁存且不清恢复 WAL。
+- freelist 复用句柄，直接从队列单缓冲编码；覆盖写后仅在文件缩短时截尾，保留逐次 fsync 和 FREE0001 磁盘格式。
+  普通事务和 vacuum 不延迟其 freelist 同步；新增编码/打开/写入（含截尾）/同步分段，均嵌在 freelist 总耗时内。
+- insert 新增 begin/release/residual，bulk 新增 begin/prepare/put/finish/residual 及内部维护明细。
+  子阶段互不嵌套并用 checked_sub 校验，CSV 仍为每档 132 格，逐值迁移与重开验收保持不变。
+- 负向对照：旧实现的两个新守卫如预期失败，256 个复用页在 finish 前 freelist 同步 12 次（要求 0），
+  一次无删除自动回收触发主文件同步 1 次（要求 0）。编译错误不计入负向对照结果。
+- 守卫修订：新增的 freelist 故障测试最初错误要求失败 bulk 也能完整重开，实际触发失败。
+  依据既有 `begin_bulk` 的 finish 前崩溃不安全合同，改为核验错误锁存与 WAL 不封口；
+  没有放宽旧守卫或同步次数阈值。保留的 WAL 不代表部分发布的 bulk 树一定可恢复；成功 finish 后仍须逐值重开验收。
+- 最终 `cargo test --release --lib --offline`：**534 passed / 0 failed / 76 ignored**，54.84 s；
+  6 个新增守卫均通过。`cargo check --lib --offline` 与 `cargo check --all-targets --offline` 通过。
+  此回归使用本会话 C 盘 SSD 的独立 `target/test-data`；此前 D 盘串行 Debug/Release 回归中止，不计通过、不用于性能比较。
+- 正式脚本 `scripts/run-scale-bench.ps1 -Rows "2000,3000"` 使用原默认 D 盘路径，
+  两档分别 11.398/10.931 s，各 132 格，退出 0、cleanup=OK，8 次迁移和 8 次 bulk 重开逐值验收通过。
+  每档新增四类诊断日志各 4 条；B+ bulk 主文件同步 1 次、freelist 同步 1 次。
+  本地产物入口：`data/bench-results/20261121-234740-8c2138991af548c9a2f28539b320d002/summary.json`，
+  同目录含 run/source/build、CSV 和完整日志；61 个源码文件哈希逐项匹配。
+  测试二进制 SHA256：`9afb7686484e1a6adce42a4bc8c47c03101b34f596210a83a2eb28060aa873cd`。
+- 本轮大档性能收益待用户运行完整五档确认，不能将小数据同步次数变化等同于 20M 吞吐提升。
 
 ### M149：LSM 反向点读复用候选值
 

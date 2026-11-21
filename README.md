@@ -1,5 +1,10 @@
 # storage-engines
 
+M151 修复 B+ 自动回收空扫时的额外刷页，以及 bulk 复用空闲页时的提前 freelist 同步。
+普通事务与有删除的回收保留同步，freelist 复用文件句柄、单缓冲编码并仅在缩短时截尾；磁盘格式不变。
+本轮新增 insert/bulk 分段及 freelist I/O 计量；验证结果和大档复测边界见 [更新日志](CHANGELOG.md)。
+Release 库回归 534 passed / 0 failed / 76 ignored；正式脚本 2k/3k 各 132 格、迁移和 bulk 重开逐值验收通过。
+
 M147 减少 LSM 批写、点读和 vacuum 的重复分配；同一 Release 构建的五档 20 臂、240 条阶段记录与全量重开核验已完成。
 20M 插入分配约 5.666 亿→4.879 亿次，vacuum 均值下降 24.68%；但 10M/20M 插入均值仍慢 4.83%/1.29%，不宣称稳定写吞吐提速。
 完整库回归 521 passed / 0 failed / 77 ignored，50k 四引擎完整台架通过；专项随机读最多抽样 20 万次，不代替五档四引擎完整压测。
@@ -210,6 +215,10 @@ tx.try_commit()?;
 - `rows_<规模>_pass_<轮次>.csv`：原始操作名、归一化操作名、单位耗时、堆常驻/峰值增量、额外计数。
 - 同名 `.log`：完整 stdout/stderr，含独立迁移验收和四引擎结束标记；错误不会过滤掉。
 - `run.json` / `source.json` / `build.log`：环境、版本指纹、计划档位、编译记录；失败另有 `failure.txt`。
+
+`SCALE_INSERT_STAGES` 的 prepare/batch_set/commit/begin/release 互不嵌套，连同 residual 覆盖 insert 总时间；
+`SCALE_BULK_STAGES` 同样拆出 begin/prepare/put/finish/residual。两者的 `*_MAINT` 是内部维护明细，不能与外层重复相加。
+freelist 总时间内含 encode/open/write/sync；普通事务和 vacuum 仍同步，bulk 换页不提前同步，finish 必须先同步主文件及 freelist 再封 WAL。
 
 **返回给我：先给 `summary.json`、CSV 和 `run.json`；有 FAIL/异常时再附对应完整日志。**
 MB 是分段 Rust 堆增量，不是 RSS。跨构建的时间差只是线索，不能把数据形状/工作量不同当算法进步。

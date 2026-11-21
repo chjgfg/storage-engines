@@ -566,7 +566,7 @@ impl MVCC {
     /// 所以一行的预算偏差 = 那一条链的长度。
     ///
     /// blob 回收只在**全库轮次**（`budget_rows == u64::MAX`）做：它要看到全部存活行才能判断
-    /// 「还有没有人引用 blob」。中间轮次照样 `flush_all`，裁掉的行不能悬着。
+    /// 「还有没有人引用 blob」。有删除的轮次必须 `flush_all`；空扫不代替 checkpoint。
     ///
     /// 为什么要切片：`kv` 挂在 `Mutex` 后面，[`MVCC::vacuum`] 会把这把锁按到整库叶子链
     /// 走完，期间点读点写全部排队。自动回收要能在单核机器上跑，就得一轮只按一小段。
@@ -741,12 +741,18 @@ impl MVCC {
             false
         };
 
-        // 把当前 next_version 一并写入 meta，避免下次 open 因 meta 过旧依赖大 WAL
-        let next_ver = self.next_version.load(Ordering::SeqCst);
-        kv.set_next_version(next_ver);
+        // A read-only sweep must not flush unrelated committed transaction pages.
+        // WAL + checkpoint retain their durability responsibilities. A deletion
+        // still publishes pages and freelist before reporting reclamation.
+        let flush_pages = removed > 0;
         #[cfg(test)]
-        let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
-        kv.try_flush_all()?;
+        let flush_pages = flush_pages || vacuum_sync_reference::enabled();
+        if flush_pages {
+            kv.set_next_version(self.next_version.load(Ordering::SeqCst));
+            #[cfg(test)]
+            let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumSync);
+            kv.try_flush_all()?;
+        }
         // vacuum never appends blobs; clear_in_place already syncs when a full
         // blob rewrite was actually required. Avoid an unconditional blob fsync
         // on every bounded round.
@@ -1576,6 +1582,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_auto_vacuum_leaves_page_sync_to_checkpoint() {
+        use crate::common::disk::{fsync_counts, SITE_BPLUS_PAGE_FLUSH};
+        use crate::common::maintenance_probe::{Scope, Stage};
+        let path = tmp_db("empty_auto_vacuum");
+        {
+            let db = MVCC::open(&path, 64, 128);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin_transaction();
+            assert!(tx.set_raw(b"key", b"value".to_vec()));
+            tx.try_commit().unwrap(); drop(tx);
+            db.set_vacuum_auto_slice(1);
+            let before = fsync_counts()[SITE_BPLUS_PAGE_FLUSH];
+            let scope = Scope::start();
+            let tx = db.begin_transaction();
+            assert_eq!(tx.get(b"key"), Some(b"value".to_vec()));
+            tx.try_commit().unwrap(); drop(tx);
+            let stats = scope.stats();
+            assert_eq!(stats.calls[Stage::AutoVacuum as usize], 1);
+            assert!(stats.bplus_maintenance_rows > 0);
+            assert_eq!(fsync_counts()[SITE_BPLUS_PAGE_FLUSH] - before, 0);
+            drop(scope);
+            db.try_checkpoint().unwrap();
+            assert!(fsync_counts()[SITE_BPLUS_PAGE_FLUSH] > before);
+        }
+        let db = MVCC::open(&path, 64, 128);
+        let tx = db.begin_transaction();
+        assert_eq!(tx.get(b"key"), Some(b"value".to_vec()));
+        tx.try_commit().unwrap();
+    }
+
+    #[test]
     fn vacuum_sync_skips_unchanged_blobs_but_persists_reclamation() {
         use crate::common::disk::{fsync_counts, SITE_BLOB};
         for reference in [true, false] {
@@ -1774,6 +1811,39 @@ mod tests {
         let tx = db.begin_transaction();
         assert_eq!(tx.get(b"committed"), Some(b"keep".to_vec()));
         tx.try_commit().unwrap();
+    }
+
+    #[test]
+    fn bulk_finish_freelist_failure_does_not_seal_wal() {
+        for fault in [6, 7] {
+            let path = tmp_db("bulk_freelist_failure");
+            let db = MVCC::open(&path, 4, 128);
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin_transaction();
+            for i in 0..32_u32 { assert!(tx.set_raw(&i.to_be_bytes(), vec![1; 16])); }
+            tx.try_commit().unwrap(); drop(tx);
+            let tx = db.begin_transaction();
+            for i in 0..32_u32 { assert!(tx.delete(&i.to_be_bytes())); }
+            tx.try_commit().unwrap(); drop(tx);
+            assert!(db.vacuum().unwrap().versions_removed > 0);
+            db.try_checkpoint().unwrap();
+            let tx = db.begin_transaction();
+            assert!(tx.set_raw(b"committed", b"keep".to_vec()));
+            tx.try_commit().unwrap(); drop(tx);
+            let mut bulk = db.begin_bulk();
+            for i in 32..64_u32 { bulk.put(&i.to_be_bytes(), crate::common::pack_plain(b"bulk")); }
+            let before = std::fs::read(wal_path(&path)).unwrap();
+            let injection = crate::bplus_tree::storage::dblwr_probe::Scope::fault(fault);
+            assert!(bulk.try_finish().is_err(), "must reach freelist fault {fault}");
+            assert!(db.try_checkpoint().is_err());
+            assert!(db.vacuum().is_err());
+            assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before);
+            drop(db); drop(injection);
+            assert_eq!(std::fs::read(wal_path(&path)).unwrap(), before);
+            // begin_bulk explicitly provides no crash recovery guarantee before
+            // successful finish. Do not treat retained WAL as proof that a
+            // partially published bulk tree can reopen after a sidecar failure.
+        }
     }
 
     #[test]

@@ -7419,7 +7419,8 @@ mod tests {
             line(label, "open 空库", d.as_secs_f64() * 1e6, "µs", live, peak, "");
 
             // ---- 写入：每 1000 行一个事务（commit 带 fsync） ----
-            let mut insert_stages = [0_u128; 3];
+            let mut insert_stages = [0_u128; 5];
+            let insert_doors = crate::common::maintenance_probe::Scope::start();
             let wal_commit_probe = crate::common::wal::commit_probe::Scope::start();
             let (d, live, peak, ()) = timed_phase(label, "insert", || {
                 for base in (0..rows).step_by(1000) {
@@ -7428,7 +7429,9 @@ mod tests {
                     let items: Vec<(Vec<u8>, Vec<u8>)> =
                         (base..end).map(|i| (key(i), val(i))).collect();
                     insert_stages[0] += stage.elapsed().as_nanos();
+                    let stage = std::time::Instant::now();
                     let tx = db.begin();
+                    insert_stages[3] += stage.elapsed().as_nanos();
                     let stage = std::time::Instant::now();
                     if let Err(bad) = tx.batch_set(&items) {
                         panic!("{label}: batch_set 冲突 {}", String::from_utf8_lossy(&bad));
@@ -7437,10 +7440,18 @@ mod tests {
                     let stage = std::time::Instant::now();
                     tx.commit();
                     insert_stages[2] += stage.elapsed().as_nanos();
+                    let stage = std::time::Instant::now();
+                    drop(tx);
+                    drop(items);
+                    insert_stages[4] += stage.elapsed().as_nanos();
                 }
             });
-            eprintln!("SCALE_INSERT_STAGES engine={label} prepare_ms={:.3} batch_set_ms={:.3} commit_ms={:.3} scope=disjoint_substages",
-                insert_stages[0] as f64 / 1e6, insert_stages[1] as f64 / 1e6, insert_stages[2] as f64 / 1e6);
+            let residual = d.as_nanos().checked_sub(insert_stages.iter().sum()).expect("insert substages overlap");
+            eprintln!("SCALE_INSERT_STAGES engine={label} prepare_ms={:.3} batch_set_ms={:.3} commit_ms={:.3} begin_ms={:.3} release_ms={:.3} residual_ms={:.3} scope=disjoint_substages",
+                insert_stages[0] as f64 / 1e6, insert_stages[1] as f64 / 1e6, insert_stages[2] as f64 / 1e6,
+                insert_stages[3] as f64 / 1e6, insert_stages[4] as f64 / 1e6, residual as f64 / 1e6);
+            eprintln!("SCALE_INSERT_MAINT engine={label} doors={:?}", insert_doors.stats());
+            drop(insert_doors);
             let wal = wal_commit_probe.stats();
             let sync_avg_us = if wal.sync_calls == 0 { 0.0 } else {
                 wal.sync_ns as f64 / wal.sync_calls as f64 / 1e3
@@ -7796,13 +7807,29 @@ mod tests {
                 heap_before_release.saturating_sub(heap_after_release));
             crate::scale_probe::memory(label, "migration_after_release");
             let bulk_rows = (rows / 10).max(1);
+            let mut bulk_stages = [0_u128; 4];
+            let bulk_doors = crate::common::maintenance_probe::Scope::start();
             let (d, live, peak, ()) = timed_phase(label, "bulk", || {
+                let stage = std::time::Instant::now();
                 let mut bulk = db.begin_bulk();
+                bulk_stages[0] += stage.elapsed().as_nanos();
+                let stage = std::time::Instant::now();
                 let items: Vec<(Vec<u8>, Vec<u8>)> =
                     (0..bulk_rows).map(|i| (key(rows + i), val(i))).collect();
+                bulk_stages[1] += stage.elapsed().as_nanos();
+                let stage = std::time::Instant::now();
                 bulk.put_batch_owned(items);
+                bulk_stages[2] += stage.elapsed().as_nanos();
+                let stage = std::time::Instant::now();
                 bulk.finish();
+                bulk_stages[3] += stage.elapsed().as_nanos();
             });
+            let residual = d.as_nanos().checked_sub(bulk_stages.iter().sum()).expect("bulk substages overlap");
+            eprintln!("SCALE_BULK_STAGES engine={label} begin_ms={:.3} prepare_ms={:.3} put_ms={:.3} finish_ms={:.3} residual_ms={:.3} scope=disjoint_substages",
+                bulk_stages[0] as f64 / 1e6, bulk_stages[1] as f64 / 1e6, bulk_stages[2] as f64 / 1e6,
+                bulk_stages[3] as f64 / 1e6, residual as f64 / 1e6);
+            eprintln!("SCALE_BULK_MAINT engine={label} doors={:?}", bulk_doors.stats());
+            drop(bulk_doors);
             line(label, &format!("bulk 灌 {bulk_rows} 行"), d.as_secs_f64() * 1e6 / bulk_rows as f64, "µs/行", live, peak, "");
             if label == "lsm_tree" { scale_note_maintenance(&*db, "bulk", &maintenance); }
 
