@@ -12,7 +12,7 @@
 
 #[cfg(test)]
 use std::thread_local;
-use std::matches;
+use std::{matches, unreachable};
 use crate::common::codec::{
     key_matches, logical_to_user, now_unix_secs, prefix_upper_bound, visible_owned_value, VisibleOwnedValue,
 };
@@ -29,6 +29,72 @@ pub enum RowValue {
     Tombstone,
     /// 这一行根本读不到：与墓碑不同，它**不该出现在结果里**
     Missing,
+}
+
+
+/// Search keeps rejected candidates for cursor progress and counts page-external rows.
+pub enum SearchRow {
+    Excluded,
+    Counted,
+    Retained(Option<Vec<u8>>),
+}
+
+pub(crate) enum SearchSelection { Excluded, Counted, Value, Deleted }
+
+pub struct SearchRetention {
+    include_deleted: bool,
+    skip: usize,
+    take: usize,
+}
+
+impl SearchRetention {
+    pub fn new(include_deleted: bool, skip: usize, take: usize) -> Self {
+        Self { include_deleted, skip, take }
+    }
+
+    pub(crate) fn select(&mut self, logical: Option<&[u8]>) -> SearchSelection {
+        let live = logical.is_some_and(crate::common::codec::logical_is_live);
+        if !live && !self.include_deleted { return SearchSelection::Excluded; }
+        if self.skip > 0 {
+            self.skip -= 1;
+            return SearchSelection::Counted;
+        }
+        if self.take == 0 { return SearchSelection::Counted; }
+        self.take -= 1;
+        if live { SearchSelection::Value } else { SearchSelection::Deleted }
+    }
+}
+
+pub(crate) fn retain_search_row(
+    selection: SearchSelection,
+    owned: impl FnOnce() -> Option<Vec<u8>>,
+) -> SearchRow {
+    match selection {
+        SearchSelection::Excluded => SearchRow::Excluded,
+        SearchSelection::Counted => SearchRow::Counted,
+        SearchSelection::Value => SearchRow::Retained(owned()),
+        SearchSelection::Deleted => SearchRow::Retained(None),
+    }
+}
+
+/// Default for engines whose candidate credential requires owned materialization.
+pub fn owned_search_candidates<S: VersionedStore + ?Sized>(
+    store: &S,
+    start: Option<&[u8]>, end: Option<&[u8]>,
+    accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+    mut retention: SearchRetention,
+) -> (Vec<WinCandidate<SearchRow>>, bool) {
+    let (rows, complete) = store.scan_candidates(start, end, accept, after, budget);
+    let rows = rows.into_iter().map(|c| {
+        let row = match store.materialize(c.row) {
+            RowValue::Missing => SearchRow::Excluded,
+            RowValue::Tombstone => retain_search_row(retention.select(None), || None),
+            RowValue::Value(bytes) =>
+                retain_search_row(retention.select(Some(&bytes)), || Some(bytes)),
+        };
+        WinCandidate { key: c.key, version: c.version, row }
+    }).collect();
+    (rows, complete)
 }
 
 /// 一把逻辑 key 的**版本行**怎么读。
@@ -67,6 +133,18 @@ pub trait VersionedStore {
     /// （lsm 的轻量视图与值存储不一致时会跳过整行，而墓碑在 `include_deleted` 下要出现在结果里），
     /// 合成一个 `Option` 就会把那两种情况混成一种 —— 折叠统一的前提是不改语义。
     fn materialize(&self, row: Self::Row) -> RowValue;
+
+    /// Classify under the engine's read boundary; copy only retained page values.
+    /// Excluded candidates must remain in the batch so the fold cursor advances.
+    fn scan_search_candidates(
+        &self,
+        start: Option<&[u8]>, end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+        retention: SearchRetention,
+    ) -> (Vec<WinCandidate<SearchRow>>, bool) {
+        owned_search_candidates(self, start, end, accept, after, budget, retention)
+    }
+
 }
 
 /// 界内折叠 + 窗口化：`after` 之后最多 `limit` 组，返回 `(行, 是否还有更多)`。
@@ -381,48 +459,46 @@ pub fn search_page_walk<S: VersionedStore>(
 ) -> (Vec<ExportRecord>, bool, usize) {
     let (lo, hi) = search_bounds(pattern, mode);
     let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
-    let mut items: Vec<ExportRecord> =
-        Vec::with_capacity(page_size.min(crate::common::kernel::FOLD_CHUNK));
-    let mut seen = 0usize;
+    let mut items = Vec::with_capacity(page_size.min(crate::common::kernel::FOLD_CHUNK));
+    let seen = std::cell::Cell::new(0usize);
+    let retained = std::cell::Cell::new(0usize);
     let mut has_more = false;
-    // ⚠️ `wanted` 给 **`None`** 而不是 `skip + page_size + 1`：那才是"每轮固定一片候选"的门
-    // （`fold_window_emit` 里 `budget` 的起点就是 `wanted`，给了它就是把整段前缀的候选
-    // 一次装进 `Vec` ⇒ 省下的留存又被候选买回来）。收手由 `emit` 决定。
     let total = fold_window_emit(
         None,
-        |after, budget| store.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
-        // 这一层只判"算不算一条"，把逻辑字节原样带下去（不拷值）
-        |c| match store.materialize(c.row) {
-            RowValue::Missing => None,
-            RowValue::Tombstone => include_deleted.then_some((c.key, None)),
-            RowValue::Value(logical) => {
-                if crate::common::codec::logical_is_live(&logical) {
-                    Some((c.key, Some(logical)))
-                } else {
-                    // 过期与墓碑同待
-                    include_deleted.then_some((c.key, None))
-                }
-            }
+        |after, budget| store.scan_search_candidates(
+            lo, hi.as_deref(), Some(&accept), after, budget,
+            SearchRetention::new(include_deleted, skip.saturating_sub(seen.get()),
+                page_size.saturating_sub(retained.get()))),
+        |c| match c.row {
+            SearchRow::Excluded => None,
+            row => Some((c.key, row)),
         },
-        |(key, logical)| {
-            seen += 1;
-            if seen <= skip {
-                return true; // 前面的页：**当场丢掉**，一行都不留，更一次都不拷
+        |(key, row)| {
+            let next = seen.get() + 1;
+            seen.set(next);
+            if next <= skip { return true; }
+            match row {
+                SearchRow::Retained(logical) => {
+                    items.push(ExportRecord {
+                        key,
+                        expire_unix_secs: logical.as_ref()
+                            .and_then(|l| crate::common::codec::logical_expiry(l)),
+                        value: logical.and_then(logical_to_user),
+                    });
+                    retained.set(items.len());
+                    true
+                }
+                SearchRow::Counted => {
+                    has_more = true;
+                    want_total
+                }
+                SearchRow::Excluded => unreachable!(),
             }
-            if items.len() < page_size {
-                items.push(ExportRecord {
-                    key,
-                    expire_unix_secs: logical.as_ref().and_then(|l| crate::common::codec::logical_expiry(l)),
-                    value: logical.and_then(logical_to_user),
-                });
-                return true;
-            }
-            has_more = true; // 第 `page_size + 1` 条 = 还有下一页（要 total 时以 total 为准）
-            want_total // emit 返回 `false` 才收手：不要 total 就停，要 total 必须走完全界
         },
     );
     (items, has_more, total)
 }
+
 
 /// 游标式有界扫描：`after`（**不含**）之后最多 `limit` 行可见记录，返回 `(行, 下一页游标)`；
 /// 游标 `None` = 已经到底，调用方该停了。
@@ -596,22 +672,14 @@ pub fn count_window<S: VersionedStore>(
     let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
     fold_window_emit(
         None,
-        |after, budget| store.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
-        |c| match store.materialize(c.row) {
-            RowValue::Missing => None,
-            RowValue::Tombstone => include_deleted.then_some(()),
-            RowValue::Value(logical) => {
-                if crate::common::codec::logical_is_live(&logical) {
-                    Some(())
-                } else {
-                    // 过期与墓碑同待
-                    include_deleted.then_some(())
-                }
-            }
-        },
+        |after, budget| store.scan_search_candidates(
+            lo, hi.as_deref(), Some(&accept), after, budget,
+            SearchRetention::new(include_deleted, 0, 0)),
+        |c| match c.row { SearchRow::Excluded => None, _ => Some(()) },
         |_| true,
     )
 }
+
 
 /// 模式搜索 + 分页的**唯一一份实现**（M35：四家原先各抄一遍同形的 15 行）。
 ///

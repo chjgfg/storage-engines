@@ -1339,6 +1339,23 @@ impl Transaction {
     /// ⚠️ 交出一组只能在**组边界**：一组的胜出行要等看见下一组的第一行才算收齐
     /// （版本大端接在 key 后面 ⇒ 组内升序）。在半截组上收手会把旧版本当成最新行。
     /// 返回的 `bool` = 是否已走到界尾（`false` = 是被 `budget` 拦下的，还能续跑）。
+    fn scan_candidate_refs<'a>(
+        &self, store: &'a MemStore,
+        start: Option<&[u8]>, end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+    ) -> (Vec<crate::common::WinCandidate<&'a Option<Vec<u8>>>>, bool) {
+        let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
+        let lo = crate::common::fold_lower_bound(start, after);
+        let mut fold = crate::common::order::CandidateFold::new(
+            start, end, after, accept, self.core.version, budget);
+        for (enc, value) in store.iter_entries_in(lo, hi.as_deref()) {
+            #[cfg(test)]
+            FOLD_KEYS.with(|c| c.set(c.get() + 1));
+            if fold.push(enc, |v| self.is_visible(v), || value) { break; }
+        }
+        fold.finish()
+    }
+
     pub(crate) fn scan_candidates(
         &self, start: Option<&[u8]>, end: Option<&[u8]>,
         accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
@@ -1347,21 +1364,14 @@ impl Transaction {
         if scan_reference::enabled() {
             return self.scan_candidates_reference(start, end, accept, after, budget);
         }
-        let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
-        let lo = crate::common::fold_lower_bound(start, after);
         let store = self.store.lock().unwrap();
-        let mut fold = crate::common::order::CandidateFold::new(
-            start, end, after, accept, self.core.version, budget);
-        for (enc, value) in store.iter_entries_in(lo, hi.as_deref()) {
-            #[cfg(test)]
-            FOLD_KEYS.with(|c| c.set(c.get() + 1));
-            // Retain a reference while selecting winners. Clone only final
-            // winners under the same store lock; no second tree search.
-            if fold.push(enc, |v| self.is_visible(v), || value) { break; }
-        }
-        let (rows, complete) = fold.finish();
+        let (rows, complete) = self.scan_candidate_refs(&store, start, end, accept, after, budget);
         (rows.into_iter().map(|c| crate::common::WinCandidate {
-            key: c.key, version: c.version, row: c.row.clone(),
+            key: c.key, version: c.version, row: {
+                #[cfg(test)]
+                if c.row.is_some() { search_copy_reference::note_copy(); }
+                c.row.clone()
+            },
         }).collect(), complete)
     }
 
@@ -1559,8 +1569,167 @@ pub(crate) mod replay_reference {
 }
 
 #[cfg(test)]
+
+#[cfg(test)]
+pub(crate) mod search_copy_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; static COPIES: Cell<u64> = const { Cell::new(0) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) fn note_copy() { COPIES.with(|c| c.set(c.get() + 1)); }
+    pub(crate) fn copies() -> u64 { COPIES.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    fn search_seed(rows: usize, bytes: usize) -> MVCC {
+        let db = MVCC::new();
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..rows {
+            assert!(tx.set_raw(&(i as u64).to_be_bytes(), vec![b'v'; bytes]));
+        }
+        tx.commit();
+        db
+    }
+
+    #[test]
+    fn search_count_and_offset_allocate_keys_but_only_page_values() {
+        const ROWS: usize = 16_384;
+        const PAGE: usize = 17;
+        let db = search_seed(ROWS, 1024);
+        let tx = db.begin_transaction();
+        // One allocation per final key, plus bounded fold vectors and cursors.
+        // Restoring the old value clone adds ROWS allocations and must fail.
+        let copies = search_copy_reference::copies();
+        let (count, count_alloc) = crate::mem_probe::count_thread_allocations(|| tx.key_count(b""));
+        assert_eq!(count, ROWS);
+        assert_eq!(search_copy_reference::copies() - copies, 0);
+        assert!(count_alloc < (ROWS + ROWS / 16) as u64,
+            "count allocated {count_alloc}; stored values were copied");
+        let query = crate::common::SearchQuery::contains(b"", ROWS / PAGE - 2, PAGE);
+        let copies = search_copy_reference::copies();
+        let (page, page_alloc) = crate::mem_probe::count_thread_allocations(|| tx.search_keys(&query));
+        assert_eq!(page.total, Some(ROWS));
+        assert_eq!(page.items.len(), PAGE);
+        assert_eq!(search_copy_reference::copies() - copies, PAGE as u64);
+        assert!(page_alloc < (ROWS + ROWS / 16) as u64,
+            "page allocated {page_alloc}; page-external values were copied");
+        let old = search_copy_reference::Scope::start();
+        let copies = search_copy_reference::copies();
+        let (old_count, old_alloc) =
+            crate::mem_probe::count_thread_allocations(|| tx.key_count(b""));
+        assert_eq!(search_copy_reference::copies() - copies, ROWS as u64);
+        let copies = search_copy_reference::copies();
+        let (old_page, old_page_alloc) =
+            crate::mem_probe::count_thread_allocations(|| tx.search_keys(&query));
+        assert_eq!(search_copy_reference::copies() - copies, ROWS as u64);
+        drop(old);
+        assert_eq!(old_count, count);
+        assert_eq!(old_page.items, page.items);
+        assert_eq!(old_page.total, page.total);
+        assert!(old_alloc >= (ROWS + ROWS / 16) as u64);
+        assert!(old_page_alloc >= (ROWS + ROWS / 16) as u64);
+        eprintln!("SEARCH_ALLOCATION_GUARD rows={ROWS} count_new={count_alloc} count_old={old_alloc} page_new={page_alloc} page_old={old_page_alloc} kept={PAGE}");
+    }
+
+    #[test]
+    fn search_retention_preserves_binary_snapshots_ttl_and_rejected_chunk_progress() {
+        let db = MVCC::new();
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        let mut keys: Vec<Vec<u8>> = (0..9000u64).map(|i| i.to_be_bytes().to_vec()).collect();
+        keys.extend([vec![], b"a".to_vec(), b"a\0".to_vec(), b"a\0\0".to_vec(), b"a\xff".to_vec(), vec![255]]);
+        for (i, key) in keys.iter().enumerate() {
+            let value = if i < 5000 { crate::common::codec::pack_ttl(b"expired", 0) }
+                else if i % 3 == 0 { crate::common::codec::pack_ttl(b"future", u64::MAX) }
+                else if i % 3 == 1 { vec![1, 2] } // short TTL tag is a legacy raw value
+                else { crate::common::codec::pack_plain(b"live") };
+            assert!(tx.set(key, value));
+        }
+        tx.commit();
+        let snapshot = db.begin_transaction();
+        let writer = db.begin_transaction();
+        for key in keys.iter().skip(5000).step_by(3) { assert!(writer.delete(key)); }
+        let before_commit = db.begin_transaction();
+        let own = &writer;
+        fn verify(tx: &Transaction) {
+            for mode in [crate::common::KeyMatchMode::Contains, crate::common::KeyMatchMode::Prefix] {
+                for pattern in [b"".as_slice(), b"a".as_slice(), &[0], &[255]] {
+                    for deleted in [false, true] {
+                        let expected = crate::common::search_window(tx, deleted, Some(pattern), mode, None);
+                        assert_eq!(crate::common::count_window(tx, deleted, Some(pattern), mode), expected.len());
+                        for page in [0, 1, 241, 500] {
+                            for total in [false, true] {
+                                let q = crate::common::SearchQuery { pattern: pattern.to_vec(), mode,
+                                    include_deleted: deleted, page, page_size: 17, need_total: total };
+                                let actual = tx.search_keys(&q);
+                                let skip = page * 17;
+                                assert_eq!(actual.items, expected.iter().skip(skip).take(17).cloned().collect::<Vec<_>>());
+                                assert_eq!(actual.total, total.then_some(expected.len()));
+                                assert_eq!(actual.has_next, expected.len() > skip + 17);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        verify(own);
+        verify(&before_commit);
+        writer.commit();
+        verify(&snapshot);
+        verify(&before_commit);
+        let latest = db.begin_transaction();
+        verify(&latest);
+        let page = latest.search_keys(&crate::common::SearchQuery::contains(b"", 0, 0));
+        assert_eq!(page.page_size, 1);
+        assert_eq!(page.items.len(), 1);
+        eprintln!("SEARCH_SEMANTICS_VERIFIED snapshots=5 binary_prefixes=true expired_chunk=5000 zero_page_size=true");
+    }
+
+    #[test]
+    #[ignore = "read-only same-seed ABBA for count and offset search"]
+    fn search_retention_same_seed_abba() {
+        const ROWS: usize = 200_000;
+        let db = search_seed(ROWS, 128);
+        let tx = db.begin_transaction();
+        for task in ["count", "first_total", "deep_total", "first_no_total", "deep_no_total"] {
+            for (arm, improved) in [false, true, true, false].into_iter().enumerate() {
+                let reference = (!improved).then(search_copy_reference::Scope::start);
+                let now = std::time::Instant::now();
+                let (total, allocations) = crate::mem_probe::count_thread_allocations(|| {
+                    if task == "count" { tx.key_count(b"") } else {
+                        let page = if task.starts_with("deep") { ROWS / 100 - 1 } else { 0 };
+                        let mut q = crate::common::SearchQuery::contains(b"", page, 100);
+                        q.need_total = !task.ends_with("no_total");
+                        let result = tx.search_keys(&q);
+                        assert_eq!(result.items.len(), 100);
+                        assert_eq!(result.items[0].key, ((page * 100) as u64).to_be_bytes());
+                        assert_eq!(result.items[99].value, Some(vec![b'v'; 128]));
+                        if q.need_total { assert_eq!(result.total, Some(ROWS)); }
+                        result.items.len()
+                    }
+                });
+                let ms = now.elapsed().as_secs_f64() * 1000.0;
+                drop(reference);
+                assert_eq!(total, if task == "count" { ROWS } else { 100 });
+                eprintln!("SEARCH_RETENTION_ABBA task={task} arm={arm} improved={improved} rows={ROWS} ms={ms:.3} allocations={allocations}");
+            }
+        }
+    }
+
+    #[test]
+    fn search_reference_fails_the_same_allocation_guard() {
+        let reference = search_copy_reference::Scope::start();
+        let rejected = std::panic::catch_unwind(search_count_and_offset_allocate_keys_but_only_page_values);
+        drop(reference);
+        assert!(rejected.is_err(), "old eager value cloning must fail the unchanged guard");
+        eprintln!("SEARCH_NEGATIVE_CONTROL expected_copy_guard_failure=true");
+    }
+
     use std::assert;
     use std::assert_eq;
     use std::assert_ne;
@@ -2561,6 +2730,33 @@ impl crate::common::VersionedStore for Transaction {
     ) -> (Vec<crate::common::WinCandidate<Option<Vec<u8>>>>, bool) {
         // 走本类型上的同名 inherent 方法（inherent 优先于 trait ⇒ 不会自我递归）
         self.scan_candidates(start, end, accept, after, budget)
+    }
+
+
+    fn scan_search_candidates(
+        &self,
+        start: Option<&[u8]>, end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+        mut retention: crate::common::store::SearchRetention,
+    ) -> (Vec<crate::common::WinCandidate<crate::common::store::SearchRow>>, bool) {
+        #[cfg(test)]
+        if search_copy_reference::enabled() || scan_reference::enabled() {
+            return crate::common::store::owned_search_candidates(
+                self, start, end, accept, after, budget, retention);
+        }
+        let store = self.store.lock().unwrap();
+        let (rows, complete) =
+            self.scan_candidate_refs(&store, start, end, accept, after, budget);
+        let rows = rows.into_iter().map(|c| {
+            let selection = retention.select(c.row.as_deref());
+            let row = crate::common::store::retain_search_row(selection, || {
+                #[cfg(test)]
+                if c.row.is_some() { search_copy_reference::note_copy(); }
+                c.row.clone()
+            });
+            crate::common::WinCandidate { key: c.key, version: c.version, row }
+        }).collect();
+        (rows, complete)
     }
 
     fn materialize(&self, row: Option<Vec<u8>>) -> crate::common::RowValue {
