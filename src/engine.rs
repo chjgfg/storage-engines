@@ -4324,7 +4324,7 @@ mod tests {
         let live_mb = live as f64 / 1e6;
         let peak_mb = peak as f64 / 1e6;
         eprintln!(
-            "{engine:<10} {op:<24} {per:>11.1} {unit:<7} 常驻 {live_mb:>9.1} MB  峰值 +{peak_mb:>8.1} MB  {extra}"
+            "{engine:<10} {op:<24} {per:>11.1} {unit:<7} 堆增量 {live_mb:>9.1} MB  堆峰值 +{peak_mb:>8.1} MB  {extra}"
         );
     }
 
@@ -7206,6 +7206,76 @@ mod tests {
         run_scale_baseline(rows);
     }
 
+
+    // Seed old versions of existing keys after full vacuum; latest values are unchanged.
+    fn scale_prepare_bounded_vacuum(db: &dyn KvEngine, rows: usize) -> (u64, usize) {
+        let auto = db.vacuum_auto_slice();
+        db.set_vacuum_auto_slice(0);
+        let keys = rows.min(8);
+        for _ in 0..2 {
+            let tx = db.begin();
+            for i in 0..keys {
+                let key = scale_key(i);
+                let value = tx.get(&key).expect("bounded seed key must already exist");
+                tx.try_set_raw(&key, value).expect("bounded seed write");
+            }
+            tx.try_commit().expect("bounded seed commit");
+        }
+        (auto, keys)
+    }
+
+    #[test]
+    fn scale_bounded_vacuum_seed_is_required_and_preserves_latest_values() {
+        const ROWS: usize = 32;
+        for (name, db, _dir) in open_all() {
+            let auto = db.vacuum_auto_slice();
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin();
+            for i in 0..ROWS { tx.try_set_raw(&scale_key(i), scale_val(i)).unwrap(); }
+            tx.try_commit().unwrap();
+            drop(tx);
+            db.vacuum().unwrap();
+            assert_eq!(db.vacuum_bounded(None, 2048).unwrap().stats.versions_removed, 0,
+                "{name}: control without old versions must be an empty sweep");
+            db.set_vacuum_auto_slice(auto);
+            let (restore, keys) = scale_prepare_bounded_vacuum(&*db, ROWS);
+            let round = db.vacuum_bounded(None, 2048).unwrap();
+            db.set_vacuum_auto_slice(restore);
+            assert_eq!(round.stats.versions_removed, keys * 2,
+                "{name}: removing the seed must fail the non-empty delete guard");
+            assert_eq!(db.vacuum_auto_slice(), auto);
+            let tx = db.begin();
+            for i in 0..ROWS { assert_eq!(tx.get(&scale_key(i)), Some(scale_val(i))); }
+        }
+    }
+
+    #[test]
+    fn vacuum_lock_probe_observes_skip_and_real_storage_holds() {
+        use crate::common::maintenance_probe::{Scope, Stage};
+        for (name, db, _dir) in open_all() {
+            db.set_vacuum_auto_slice(0);
+            let tx = db.begin();
+            tx.try_set_raw(b"key", b"value".to_vec()).unwrap();
+            tx.try_commit().unwrap(); drop(tx);
+            let reader = db.begin();
+            let scope = Scope::start();
+            assert!(db.vacuum_bounded(None, 2048).unwrap().stats.skipped_active_txn);
+            let skipped = scope.stats(); drop(scope);
+            assert_eq!(skipped.calls[Stage::VacuumRegistryWait as usize], 1, "{name}");
+            assert_eq!(skipped.calls[Stage::VacuumRegistryHold as usize], 1, "{name}");
+            assert_eq!(skipped.calls[Stage::VacuumStorageHold as usize], 0, "{name}");
+            drop(reader);
+            let scope = Scope::start();
+            assert!(!db.vacuum_bounded(None, 2048).unwrap().stats.skipped_active_txn);
+            let completed = scope.stats(); drop(scope);
+            assert_eq!(completed.calls[Stage::VacuumRegistryHold as usize], 1, "{name}");
+            assert_eq!(completed.calls[Stage::VacuumStorageWait as usize],
+                completed.calls[Stage::VacuumStorageHold as usize], "{name}");
+            assert_eq!(completed.calls[Stage::VacuumStorageHold as usize],
+                if name == "memory" { 2 } else { 1 }, "{name}");
+        }
+    }
+
     fn scale_note_maintenance(db: &dyn KvEngine, phase: &str,
         scope: &crate::lsm_tree::lsm_tree::maintenance_probe::Scope) {
         let s = scope.stats();
@@ -7395,7 +7465,7 @@ mod tests {
         crate::scale_probe::fingerprint();
         eprintln!("SCALE_BEGIN rows={rows} package={} os={} arch={} optimized={}",
             env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, !cfg!(debug_assertions));
-        eprintln!("=== 大库基线 rows={rows}（µs/次 + 常驻/峰值 MB）===");
+        eprintln!("=== 大库基线 rows={rows}（µs/次 + 堆增量/堆峰值 MB）===");
         eprintln!("验收政策：TTL 两格后计时外 persist 同一批辅助键；迁移期望 rows+min(rows,1000)+1，bulk 重开再加 bulk_rows；逐键逐值验收不计入每引擎33格性能记录。");
         for kind in [
             EngineKind::Bitcask,
@@ -7508,12 +7578,12 @@ mod tests {
                 crate::scale_probe::memory(label, "first_after_reopen");
                 line(
                     label,
-                    "冷重开(恢复)",
+                    "正常关闭后重开(恢复)",
                     d.as_secs_f64() * 1e6,
                     "µs",
                     live,
                     peak,
-                    &format!("常驻 {:.1} MB", live as f64 / 1e6),
+                    &format!("堆增量 {:.1} MB", live as f64 / 1e6),
                 );
                 open_stages_report(label, st_base);
                 db
@@ -7734,7 +7804,14 @@ mod tests {
             eprintln!("SCALE_VACUUM engine={label} rows_scanned={} versions_removed={} skipped={}", v.rows_scanned, v.versions_removed, v.skipped_active_txn);
             scale_note_maintenance(&*db, "vacuum", &maintenance);
 
+            let (_, _, _, (auto, seed_keys)) = timed_phase(label, "bounded_prepare", || scale_prepare_bounded_vacuum(&*db, rows));
+            let bounded_stages = crate::common::maintenance_probe::Scope::start();
             let (d, live, peak, vr) = timed_phase(label, "vacuum_bounded", || db.vacuum_bounded(None, 2048).unwrap());
+            db.set_vacuum_auto_slice(auto);
+            assert!(vr.stats.versions_removed >= seed_keys * 2, "{label}: bounded vacuum must remove seeded history");
+            eprintln!("SCALE_BOUNDED_VACUUM engine={label} seed_keys={seed_keys} added_versions={} rows_scanned={} versions_removed={}", seed_keys * 2, vr.stats.rows_scanned, vr.stats.versions_removed);
+            eprintln!("SCALE_BOUNDED_STAGES engine={label} doors={:?}", bounded_stages.stats());
+            drop(bounded_stages);
             line(label, "vacuum_bounded 一片", d.as_secs_f64() * 1e6, "µs/次", live, peak,
                  &format!("扫 {} 行、裁 {} 行（预算 2048）", vr.stats.rows_scanned, vr.stats.versions_removed));
 
@@ -7836,7 +7913,7 @@ mod tests {
             line(label, &format!("bulk 灌 {bulk_rows} 行"), d.as_secs_f64() * 1e6 / bulk_rows as f64, "µs/行", live, peak, "");
             if label == "lsm_tree" { scale_note_maintenance(&*db, "bulk", &maintenance); }
 
-            // ---- 再冷重开一次：bulk 之后的恢复代价 ----
+            // ---- bulk 正常关闭后重开一次：bulk 之后的恢复代价 ----
             // （M81 第 6 项：memory 走同一条路了 —— 这一次 drop 会把它连 bulk 一起写进快照。
             //   "停止落盘"那行不计时读数只在上面那一处打，免得同一格的两条噪声线混淆。）
             crate::scale_probe::memory(label, "bulk_before_stop");
@@ -7861,12 +7938,12 @@ mod tests {
                 crate::scale_probe::memory(label, "bulk_after_reopen");
                 line(
                     label,
-                    "再冷重开",
+                    "bulk 正常关闭后重开",
                     d.as_secs_f64() * 1e6,
                     "µs",
                     live,
                     peak,
-                    &format!("常驻 {:.1} MB", live as f64 / 1e6),
+                    &format!("堆增量 {:.1} MB", live as f64 / 1e6),
                 );
                 open_stages_report(label, st_base);
                 db

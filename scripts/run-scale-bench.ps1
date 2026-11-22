@@ -11,6 +11,11 @@ param(
     [string]$CleanRun = ''
 )
 
+# A child Windows PowerShell can inherit PowerShell 7 module paths.
+# Prefer this process runtime's bundled modules; do not persist machine/user settings.
+$runtimeModules = Join-Path $PSHOME 'Modules'
+$env:PSModulePath = $runtimeModules + [IO.Path]::PathSeparator + $env:PSModulePath
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -18,6 +23,55 @@ $Utf8 = New-Object Text.UTF8Encoding($false)
 
 function Save-Json($Path, $Value) {
     [IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $Value -Depth 12), $script:Utf8)
+}
+
+
+function Add-ScaleDiagnostic($Line, $State) {
+    if ($Line -match '^(SCALE_[A-Z_]+)(?: |$)') {
+        $kind = $Matches[1]
+        $fields = [ordered]@{}
+        foreach ($field in [regex]::Matches($Line, '([a-z_]+)=([^ ]+)')) {
+            $fields[$field.Groups[1].Value] = $field.Groups[2].Value
+        }
+        $State.diagnostics.Add([pscustomobject][ordered]@{ kind = $kind; fields = $fields; raw = $Line })
+        if ($kind -in @('SCALE_MAINT','SCALE_LSM_MOVES','SCALE_LSM_REWRITE_INPUTS','SCALE_LSM_REWRITE_OUTPUTS','SCALE_LSM_DELETE_STAGES','SCALE_LSM_STAGES')) {
+            if (-not $State.ContainsKey('maintenance_previous')) { $State.maintenance_previous = @{} }
+            $engine = if ($fields.Contains('engine')) { $fields.engine } else { 'lsm_tree' }
+            $key = $kind + ':' + $engine
+            $previous = if ($State.maintenance_previous.ContainsKey($key)) { $State.maintenance_previous[$key] } else { $null }
+            $delta = [ordered]@{ engine = $engine; phase = $fields.phase }
+            foreach ($name in $fields.Keys) {
+                [decimal]$current = 0
+                if (-not [decimal]::TryParse($fields[$name], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$current)) { continue }
+                [decimal]$before = 0
+                if ($null -ne $previous -and $previous.fields.Contains($name)) {
+                    $before = [decimal]::Parse($previous.fields[$name], [Globalization.CultureInfo]::InvariantCulture)
+                }
+                if ($current -lt $before) { throw "cumulative maintenance counter decreased: $key $name" }
+                $delta[$name] = $current - $before
+            }
+            $previousPhase = if ($null -ne $previous) { $previous.fields.phase } else { 'scope_start' }
+            $State.diagnostics.Add([pscustomobject][ordered]@{
+                kind = $kind + '_DELTA'; derived = $true; previous_phase = $previousPhase
+                fields = $delta; source_raw = $Line
+            })
+            $State.maintenance_previous[$key] = @{ fields = $fields }
+        }
+    }
+    if ($Line -match '^SCALE_BOUNDED_VACUUM engine=(\w+) seed_keys=(\d+) added_versions=(\d+) rows_scanned=(\d+) versions_removed=(\d+)$') {
+        $State.bounded[$Matches[1]] = (
+            [long]$Matches[2] -gt 0 -and
+            [long]$Matches[3] -eq 2 * [long]$Matches[2] -and
+            [long]$Matches[4] -gt 0 -and
+            [long]$Matches[5] -ge [long]$Matches[3])
+    }
+}
+
+function Test-BoundedEvidence($State) {
+    foreach ($engine in @('bitcask','bplus_tree','lsm_tree','memory')) {
+        if (-not $State.bounded.ContainsKey($engine) -or -not $State.bounded[$engine]) { return $false }
+    }
+    return $true
 }
 
 function Source-Manifest {
@@ -141,6 +195,10 @@ try {
     }
 
     if ($SelfTest) {
+        $runnerProbe = Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256
+        if ($runnerProbe.Hash.Length -ne 64) { throw 'runner hash probe failed' }
+        [void](Get-Command Get-CimInstance -ErrorAction Stop)
+
         $token = [guid]::NewGuid().ToString('N')
         $path = Join-Path $Repo ('data/scale-runner-selftest-' + $token)
         [void][IO.Directory]::CreateDirectory($path)
@@ -156,6 +214,30 @@ try {
             if ($exit -ne 7 -or -not $state.lines.Contains('probe-out') -or -not $state.lines.Contains('probe-err')) {
                 throw '子进程退出码/两条日志流自检失败'
             }
+
+            $diagnostic = @{ diagnostics = (New-Object 'Collections.Generic.List[object]'); bounded = @{} }
+            if (Test-BoundedEvidence $diagnostic) { throw 'missing bounded evidence accepted' }
+            foreach ($engine in @('bitcask','bplus_tree','lsm_tree','memory')) {
+                Add-ScaleDiagnostic "SCALE_BOUNDED_VACUUM engine=$engine seed_keys=8 added_versions=16 rows_scanned=48 versions_removed=16" $diagnostic
+            }
+            if (-not (Test-BoundedEvidence $diagnostic)) { throw 'valid bounded evidence rejected' }
+            $empty = 'SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=48 versions_removed=0'
+            Add-ScaleDiagnostic $empty $diagnostic
+            if (Test-BoundedEvidence $diagnostic) { throw 'empty bounded sweep accepted' }
+            $json = ConvertTo-Json -InputObject @($diagnostic.diagnostics.ToArray()) -Depth 12
+            $back = [object[]](ConvertFrom-Json -InputObject $json)
+            if ($back.Count -ne 5 -or $back[4].raw -ne $empty) { throw 'diagnostic JSON roundtrip failed' }
+            $maintenance = @{ diagnostics = (New-Object 'Collections.Generic.List[object]'); bounded = @{} }
+            Add-ScaleDiagnostic 'SCALE_LSM_DELETE_STAGES phase=insert cumulative=true delete_calls=10 write_ms=1.500 threshold_flushes=1 threshold_flush_ms=3.500' $maintenance
+            Add-ScaleDiagnostic 'SCALE_LSM_DELETE_STAGES phase=vacuum cumulative=true delete_calls=14 write_ms=2.250 threshold_flushes=2 threshold_flush_ms=5.000' $maintenance
+            $diff = $maintenance.diagnostics[3]
+            if ($diff.kind -ne 'SCALE_LSM_DELETE_STAGES_DELTA' -or $diff.previous_phase -ne 'insert' -or
+                $diff.fields.delete_calls -ne 4 -or $diff.fields.write_ms -ne 0.750 -or $diff.fields.threshold_flush_ms -ne 1.500) {
+                throw 'maintenance phase delta failed'
+            }
+            $decreased = $false
+            try { Add-ScaleDiagnostic 'SCALE_LSM_DELETE_STAGES phase=flush cumulative=true delete_calls=1' $maintenance } catch { $decreased = $true }
+            if (-not $decreased) { throw 'decreasing cumulative counter accepted' }
         } finally { Remove-OwnedScratch $path $token }
         if (Test-Path -LiteralPath $path) { throw '失败子进程后的 cleanup 自检失败' }
         [Console]::WriteLine('SELFTEST PASS: exit=7 captured, stdout+stderr captured, ownership checked, scratch removed.')
@@ -193,13 +275,16 @@ try {
     $commit = (& git -C $Repo rev-parse HEAD) -join ''
     $gitStatus = @(& git -C $Repo status --short)
     $manifest = [ordered]@{
-        tool = 'storage-engines-scale-v1'; repo = $Repo; started_utc = [DateTime]::UtcNow.ToString('o')
+        tool = 'storage-engines-scale-v1'; harness_schema = 3; runner_sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant(); repo = $Repo; started_utc = [DateTime]::UtcNow.ToString('o')
         head = $commit; git_status = $gitStatus; source_sha256 = $source.hash
         rustc = ((& rustc --version) -join ''); powershell = $PSVersionTable.PSVersion.ToString()
         cpu = $cpu; memory_total_bytes = ([long]$os.TotalVisibleMemorySize * 1024)
         memory_free_bytes = ([long]$os.FreePhysicalMemory * 1024)
         scratch_root = $ScratchRoot; output_root = $OutputRoot; cases = @($cases.ToArray())
         memory_metric = 'Rust allocator live/peak delta, decimal MB; NOT process RSS'
+        reopen_policy = 'normal close then reopen; Windows page cache not cleared; not a power-loss test'
+        bounded_policy = 'full vacuum first; seed 2 old versions for up to 8 existing keys outside timing; latest values unchanged'
+        diagnostic_schema = 'SCALE token fields are literal strings; raw preserves the complete line'
         public_contract = 'same API/parameters/transaction+TTL semantics/disk format; verify internal changes'
         benchmark_policy = 'TTL read/write measured; then auxiliary keys persisted outside timing; independent migration manifest'
     }
@@ -228,6 +313,9 @@ try {
 
     foreach ($case in $cases) {
         if ((Source-Manifest).hash -ne $source.hash) { throw '各档之间源码发生变化，停止，避免混合版本结果。' }
+        if ((Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.runner_sha256) {
+            throw '各档之间压测脚本发生变化，拒绝混合口径。'
+        }
         if ((Get-FileHash -LiteralPath $build.executable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.executable_sha256) {
             throw '测试二进制在档位之间被替换，拒绝混用构建。'
         }
@@ -235,9 +323,9 @@ try {
         if (Test-Path -LiteralPath $case.scratch) { throw "scratch 路径已存在，拒绝复用: $($case.scratch)" }
         [void][IO.Directory]::CreateDirectory($case.scratch)
         [IO.File]::WriteAllText((Join-Path $case.scratch '.scale-owner'), $case.token, $Utf8)
-        $state = @{ metrics = (New-Object 'Collections.Generic.List[object]'); engines = @{}; done = $false; rows = $case.rows; pass = $case.pass }
+        $state = @{ metrics = (New-Object 'Collections.Generic.List[object]'); diagnostics = (New-Object 'Collections.Generic.List[object]'); bounded = @{}; engines = @{}; done = $false; rows = $case.rows; pass = $case.pass }
         $record = [ordered]@{ rows = $case.rows; pass = $case.pass; status = 'RUNNING'; exit_code = $null
-            elapsed_seconds = $null; metrics = 0; cleanup = 'PENDING'; error = $null; log = ($name + '.log') }
+            elapsed_seconds = $null; metrics = 0; cleanup = 'PENDING'; error = $null; log = ($name + '.log'); diagnostics = ($name + '.diagnostics.json'); diagnostics_count = 0; bounded_vacuum_verified = $false }
         $summary.Add($record)
         Save-Json (Join-Path $runDir 'summary.json') @($summary.ToArray())
         $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -249,11 +337,12 @@ try {
             $exit = Invoke-LoggedProcess -Exe $build.executable -Arguments '--exact engine::tests::scale_baseline_all_engines --ignored --nocapture --test-threads=1' `
                 -Log (Join-Path $runDir $record.log) -Environment $childEnv -State $state -OnLine {
                     param($Line, $State)
+                    Add-ScaleDiagnostic $Line $State
                     if ($Line -match '^SCALE_ENGINE_DONE rows=(\d+) engine=(\w+)$' -and [long]$Matches[1] -eq $State.rows) {
                         $State.engines[$Matches[2]] = $true
                     }
                     if ($Line -eq "SCALE_DONE rows=$($State.rows) engines=4") { $State.done = $true }
-                    if ($Line -match '^(bitcask|bplus_tree|lsm_tree|memory)\s+(.+?)\s+(-?\d+(?:\.\d+)?)\s+(\S+)\s+常驻\s+(-?\d+(?:\.\d+)?) MB\s+峰值 \+\s*(\d+(?:\.\d+)?) MB\s*(.*)$') {
+                    if ($Line -match '^(bitcask|bplus_tree|lsm_tree|memory)\s+(.+?)\s+(-?\d+(?:\.\d+)?)\s+(\S+)\s+(?:常驻|堆增量)\s+(-?\d+(?:\.\d+)?) MB\s+(?:峰值|堆峰值) \+\s*(\d+(?:\.\d+)?) MB\s*(.*)$') {
                         $State.metrics.Add([pscustomobject][ordered]@{ rows = $State.rows; pass = $State.pass
                             engine = $Matches[1]; operation = $Matches[2].Trim()
                             operation_key = [regex]::Replace($Matches[2].Trim(), '\d+', '#')
@@ -261,6 +350,9 @@ try {
                             heap_peak_delta_mb = $Matches[6]; extra = $Matches[7] })
                     }
                 }
+            Save-Json (Join-Path $runDir $record.diagnostics) @($state.diagnostics.ToArray())
+            $record.diagnostics_count = $state.diagnostics.Count
+            $record.bounded_vacuum_verified = (Test-BoundedEvidence $state)
             $record.exit_code = $exit
             $record.metrics = $state.metrics.Count
             @($state.metrics.ToArray()) | Export-Csv -LiteralPath (Join-Path $runDir ($name + '.csv')) -NoTypeInformation -Encoding UTF8
@@ -269,9 +361,9 @@ try {
             # 一格 ⇒ 126 → 130（34 类）。第 6 项把 memory 冷重开的两处特判拆掉（它有启停快照了）
             # ⇒ 130 → 132（每引擎 33 格）。M97 的逐值验收与维护诊断不增加性能格。
             $expectedMetrics = 132
-            if ($exit -ne 0 -or -not $state.done -or $state.metrics.Count -ne $expectedMetrics -or
+            if ($exit -ne 0 -or -not $record.bounded_vacuum_verified -or -not $state.done -or $state.metrics.Count -ne $expectedMetrics -or
                 @($expected | Where-Object { -not $state.engines.ContainsKey($_) }).Count -ne 0) {
-                throw "验收失败：exit=$exit，完成标记=$($state.done)，性能格=$($state.metrics.Count)/$expectedMetrics"
+                throw "验收失败：exit=$exit，完成标记=$($state.done)，性能格=$($state.metrics.Count)/$expectedMetrics，bounded删除证据=$($record.bounded_vacuum_verified)"
             }
             $record.status = 'PASS'
         } catch {

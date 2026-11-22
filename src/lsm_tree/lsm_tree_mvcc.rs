@@ -611,6 +611,9 @@ impl MVCC {
         #[cfg(test)]
         if vacuum_cost_reference::enabled() { return self.vacuum_bounded_reference(after, budget_rows); }
         use crate::common::version::decode_key_ref;
+        #[cfg(test)]
+        let _active_guard = crate::common::maintenance_probe::lock(&self.active_txn, crate::common::maintenance_probe::LockKind::Registry);
+        #[cfg(not(test))]
         let _active_guard = self.active_txn.lock().unwrap();
         if !_active_guard.is_empty() {
             return Ok(VacuumRound {
@@ -626,6 +629,9 @@ impl MVCC {
         }
         let xmin = self.next_version.load(Ordering::SeqCst);
 
+        #[cfg(test)]
+        let mut kv = crate::common::maintenance_probe::lock(&self.kv, crate::common::maintenance_probe::LockKind::Storage);
+        #[cfg(not(test))]
         let mut kv = self.kv.lock().unwrap();
         #[cfg(test)]
         // M41 的分段标尺（与 bitcask 共用 [`crate::mem_probe`] 那一把）：①走查+删除、

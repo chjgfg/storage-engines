@@ -2,6 +2,23 @@
 
 ## 未发布（2026-11-22）
 
+### M155：真实 bounded 回收、锁与内存诊断、维护差分及压测 JSON
+
+- 全库 vacuum 后在计时外对最多 8 个既有键再写两版本；bounded 实测必须删除至少 16 个版本，
+  最新值不变，自动回收设置恢复。无旧版本的对照删除 0，不能再作为真实删除性能通过证据。
+- 四家正式 bounded 回收增加注册表/存储锁等待与持有计量；计时守卫先结束再释放锁。
+  注册表持有内嵌存储等待/持有，不可相加；新增 active reader 跳过与真实锁门守卫。
+- CSV 改称堆增量/堆峰值，阶段前后另记绝对堆/RSS/private；重开改称正常关闭后重开，
+  Windows 页缓存未清。first_stop/bulk_stop 单独计时，快照子项仍是嵌套成本。
+- 每档新增 diagnostics.json，raw 完整保真；累计维护记录另导出带 previous_phase 的采样区间差分。
+  区间可含未单独采样操作（vacuum→flush 含 bounded 准备/删除），不能当成单操作独占成本。
+- Release 回归 **543 passed / 0 failed / 79 ignored**（120.11 s），all-targets check 通过；
+  PowerShell 5.1/7 自检均通过。修复 5.1 JSON 数组包层和继承 7 版模块路径的问题，未改系统持久配置。
+- 正式脚本 2k/3k 分别 **12.031 / 13.299 s**，各 132 格、cleanup=OK，四家各删 16 个历史版本；
+  8 次迁移与 8 次 bulk 重开逐值验收通过。每档 797 条原始诊断+51 条差分，与日志逐条往返核验，
+  61 个源码指纹和脚本指纹一致。入口及完整证据见 [performance-m155.json](docs/performance-m155.json)。
+- 本项设施验收仅用两小档；最新代码的完整五档性能尚未复测。
+
 ### M154：LSM vacuum 删除与阈值 flush 分段诊断
 
 - 在真实删除写入、阈值 flush 与 mem WAL sync 门增加 cfg(test) 探针；写入计时在 flush 前结束。

@@ -835,6 +835,9 @@ impl MVCC {
         #[cfg(test)]
         if vacuum_cost_reference::enabled() { return self.vacuum_bounded_reference(after, budget_rows); }
         use crate::common::version::decode_key_ref;
+        #[cfg(test)]
+        let _active_guard = crate::common::maintenance_probe::lock(&self.active_txn, crate::common::maintenance_probe::LockKind::Registry);
+        #[cfg(not(test))]
         let _active_guard = self.active_txn.lock().unwrap();
         if !_active_guard.is_empty() {
             return VacuumRound {
@@ -876,7 +879,10 @@ impl MVCC {
             #[cfg(test)]
             let scan_probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumScan);
             {
-                let store = self.store.lock().unwrap();
+                #[cfg(test)]
+        let store = crate::common::maintenance_probe::lock(&self.store, crate::common::maintenance_probe::LockKind::Storage);
+        #[cfg(not(test))]
+        let store = self.store.lock().unwrap();
                 store.scan_entries_from(lower.as_deref(), |enc, val| {
                     let Some((raw_key, version)) = decode_key_ref(enc) else {
                         return false;
@@ -927,7 +933,10 @@ impl MVCC {
             {
                 #[cfg(test)]
                 let _probe = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumDelete);
-                let mut store = self.store.lock().unwrap();
+                #[cfg(test)]
+        let mut store = crate::common::maintenance_probe::lock(&self.store, crate::common::maintenance_probe::LockKind::Storage);
+        #[cfg(not(test))]
+        let mut store = self.store.lock().unwrap();
                 for enc in to_delete.drain(..) {
                     let _ = store.delete(&enc);
                     removed += 1;

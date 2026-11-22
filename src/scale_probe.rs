@@ -137,6 +137,7 @@ fn lsm_counts() -> [u64; 7] {
 impl Phase {
     pub(crate) fn begin(engine: &str, phase: &str) -> Self {
         eprintln!("SCALE_PHASE_BEGIN engine={engine} phase={phase} pid={} unix_ms={}", std::process::id(), unix_ms());
+        memory(engine, &format!("{phase}_before"));
         Self::start()
     }
     pub(crate) fn start() -> Self {
@@ -154,6 +155,7 @@ impl Phase {
         }));
         eprintln!("SCALE_PHASE engine={engine} phase={phase} wall_ms={wall_ms:.3} cpu_ms={cpu_ms:?} allocations={} page_faults_delta={faults:?} unix_ms={}",
             crate::mem_probe::allocations().saturating_sub(self.allocations), unix_ms());
+        memory(engine, &format!("{phase}_after"));
         if engine == "bplus_tree" {
             let now = bplus_counts();
             let [parses, packs, promotions, reads, hits, misses, sweeps, visited] =

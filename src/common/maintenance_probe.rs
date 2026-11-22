@@ -2,14 +2,14 @@
 use std::{assert, cell::RefCell, thread_local, time::Instant};
 
 #[derive(Clone, Copy)]
-pub(crate) enum Stage { Checkpoint, Commit, AutoVacuum, VacuumScan, VacuumDelete, VacuumSync, VacuumBlobRefs, VacuumBlobGc, DblwrReset, DblwrData, DblwrPublish, DblwrClear, PagePack, PageWrite, PageSync, Freelist, FreelistEncode, FreelistOpen, FreelistWrite, FreelistSync }
+pub(crate) enum Stage { Checkpoint, Commit, AutoVacuum, VacuumScan, VacuumDelete, VacuumSync, VacuumBlobRefs, VacuumBlobGc, DblwrReset, DblwrData, DblwrPublish, DblwrClear, PagePack, PageWrite, PageSync, Freelist, FreelistEncode, FreelistOpen, FreelistWrite, FreelistSync, VacuumRegistryWait, VacuumRegistryHold, VacuumStorageWait, VacuumStorageHold }
 
 #[derive(Clone, Default)]
 pub(crate) struct Stats {
-    pub ns: [u128; 20],
-    pub calls: [u64; 20],
-    pub max_ns: [u128; 20],
-    pub allocations: [u64; 20],
+    pub ns: [u128; 24],
+    pub calls: [u64; 24],
+    pub max_ns: [u128; 24],
+    pub allocations: [u64; 24],
     /// Scan calls in <=1, <=5, <=10, <=50, <=100, >100 ms buckets.
     pub scan_histogram: [u64; 6],
     pub blob_point_reads: u64,
@@ -29,7 +29,7 @@ pub(crate) struct Stats {
 impl std::fmt::Debug for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = f.debug_struct("MaintenanceMs");
-        for (i, name) in ["checkpoint", "commit", "auto_vacuum", "vacuum_scan", "vacuum_delete", "vacuum_sync", "vacuum_blob_refs", "vacuum_blob_gc", "dblwr_reset", "dblwr_data", "dblwr_publish", "dblwr_clear", "page_pack", "page_write", "page_sync", "freelist", "freelist_encode", "freelist_open", "freelist_write", "freelist_sync"].into_iter().enumerate() {
+        for (i, name) in ["checkpoint", "commit", "auto_vacuum", "vacuum_scan", "vacuum_delete", "vacuum_sync", "vacuum_blob_refs", "vacuum_blob_gc", "dblwr_reset", "dblwr_data", "dblwr_publish", "dblwr_clear", "page_pack", "page_write", "page_sync", "freelist", "freelist_encode", "freelist_open", "freelist_write", "freelist_sync", "vacuum_registry_wait", "vacuum_registry_hold", "vacuum_storage_wait", "vacuum_storage_hold"].into_iter().enumerate() {
             out.field(name, &(self.calls[i], self.ns[i] as f64 / 1e6));
         }
         out.field("vacuum_scan_max_ms", &(self.max_ns[Stage::VacuumScan as usize] as f64 / 1e6))
@@ -122,4 +122,32 @@ impl Drop for Timer {
             }
         });
     }
+}
+
+pub(crate) enum LockKind { Registry, Storage }
+
+pub(crate) struct MeasuredMutexGuard<'a, T> {
+    _hold: Option<Timer>,
+    guard: std::sync::MutexGuard<'a, T>,
+}
+
+impl<T> std::ops::Deref for MeasuredMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T { &self.guard }
+}
+impl<T> std::ops::DerefMut for MeasuredMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T { &mut self.guard }
+}
+
+pub(crate) fn lock<T>(
+    mutex: &std::sync::Mutex<T>, kind: LockKind,
+) -> MeasuredMutexGuard<'_, T> {
+    let (wait, hold) = match kind {
+        LockKind::Registry => (Stage::VacuumRegistryWait, Stage::VacuumRegistryHold),
+        LockKind::Storage => (Stage::VacuumStorageWait, Stage::VacuumStorageHold),
+    };
+    let waiting = Timer::start(wait);
+    let guard = mutex.lock().unwrap();
+    drop(waiting);
+    MeasuredMutexGuard { _hold: Timer::start(hold), guard }
 }

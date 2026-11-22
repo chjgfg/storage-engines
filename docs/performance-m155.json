@@ -1,0 +1,680 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M155",
+  "date": "2026-11-22",
+  "base_commit": "1f44a26e253650fda30b7b83d63185647c94d0a5",
+  "objective": "压测要求真正 bounded 删除；分开堆/RSS、锁等待/持有、停止、累计维护采样区间差分",
+  "changes": [
+    "src/common/maintenance_probe.rs",
+    "src/bitcask/bitcask_mvcc.rs",
+    "src/bplus_tree/bplus_tree_mvcc.rs",
+    "src/lsm_tree/lsm_tree_mvcc.rs",
+    "src/memory/memory_mvcc.rs",
+    "src/engine.rs",
+    "src/scale_probe.rs",
+    "scripts/run-scale-bench.ps1"
+  ],
+  "commands": [
+    "cargo check --all-targets --offline --quiet",
+    "cargo test --release --lib --offline --quiet -- --test-threads=1",
+    "pwsh -NoProfile -File scripts/run-scale-bench.ps1 -SelfTest",
+    "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -SelfTest",
+    "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -Rows 2000,3000"
+  ],
+  "validation": {
+    "tests": {
+      "passed": 543,
+      "failed": 0,
+      "ignored": 79,
+      "seconds": 120.11
+    },
+    "selftest_powershell_7": "PASS; negative missing/zero-delete evidence; positive four-engine evidence; JSON raw roundtrip; maintenance delta and decreasing-counter rejection",
+    "selftest_powershell_5_1": "PASS; same assertions and actual runtime hashing/CIM commands",
+    "run_path": "data/bench-results/20261122-161100-a17b92c7d97c44c2ac24a36592047206",
+    "run_manifest": {
+      "tool": "storage-engines-scale-v1",
+      "harness_schema": 3,
+      "runner_sha256": "fde062aa9f8fffc04a71ff333906e97caf6956ee306bf002edd10587fa59c3ed",
+      "repo": "D:\\develop\\workspace\\rust_workspace\\storage-engines",
+      "started_utc": "2026-11-22T08:11:03.7940394Z",
+      "head": "1f44a26e253650fda30b7b83d63185647c94d0a5",
+      "git_status": [
+        " M scripts/run-scale-bench.ps1",
+        " M src/bitcask/bitcask_mvcc.rs",
+        " M src/bplus_tree/bplus_tree_mvcc.rs",
+        " M src/common/maintenance_probe.rs",
+        " M src/engine.rs",
+        " M src/lsm_tree/lsm_tree_mvcc.rs",
+        " M src/memory/memory_mvcc.rs",
+        " M src/scale_probe.rs",
+        "?? docs/test10.txt",
+        "?? docs/test11.txt",
+        "?? docs/test12.txt",
+        "?? docs/test13.txt",
+        "?? docs/test14.txt",
+        "?? docs/test15.txt",
+        "?? docs/test16.txt",
+        "?? docs/test17.txt",
+        "?? docs/test18.txt",
+        "?? docs/test19.txt",
+        "?? docs/test20.txt",
+        "?? docs/test21.txt",
+        "?? docs/test4.txt",
+        "?? docs/test5.txt",
+        "?? docs/test6.txt",
+        "?? docs/test7.txt",
+        "?? docs/test8.txt",
+        "?? docs/test9.txt"
+      ],
+      "source_sha256": "9aea6af6f67277306c8a87f98b497f7c91dd7096d1a954e55fe2c412d820998c",
+      "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+      "powershell": "5.1.19041.6456",
+      "cpu": [
+        {
+          "Name": "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
+          "NumberOfCores": 4,
+          "NumberOfLogicalProcessors": 8
+        }
+      ],
+      "memory_total_bytes": 68596707328,
+      "memory_free_bytes": 42218827776,
+      "scratch_root": "D:\\develop\\workspace\\rust_workspace\\storage-engines\\data\\bench-scratch",
+      "output_root": "D:\\develop\\workspace\\rust_workspace\\storage-engines\\data\\bench-results",
+      "cases": [
+        {
+          "rows": 2000,
+          "pass": 1,
+          "token": "271c325128a642178603af87004bbff7",
+          "scratch": "D:\\develop\\workspace\\rust_workspace\\storage-engines\\data\\bench-scratch\\scale-271c325128a642178603af87004bbff7"
+        },
+        {
+          "rows": 3000,
+          "pass": 1,
+          "token": "5685ac53bc9e45e3a986ee6977058bed",
+          "scratch": "D:\\develop\\workspace\\rust_workspace\\storage-engines\\data\\bench-scratch\\scale-5685ac53bc9e45e3a986ee6977058bed"
+        }
+      ],
+      "memory_metric": "Rust allocator live/peak delta, decimal MB; NOT process RSS",
+      "reopen_policy": "normal close then reopen; Windows page cache not cleared; not a power-loss test",
+      "bounded_policy": "full vacuum first; seed 2 old versions for up to 8 existing keys outside timing; latest values unchanged",
+      "diagnostic_schema": "SCALE token fields are literal strings; raw preserves the complete line",
+      "public_contract": "same API/parameters/transaction+TTL semantics/disk format; verify internal changes",
+      "benchmark_policy": "TTL read/write measured; then auxiliary keys persisted outside timing; independent migration manifest",
+      "executable_sha256": "846f463801a5539c6457ea93805cdcd22052f13fcd0f826349026be56c9d9dcd",
+      "cargo_lock_sha256": "06a642091be8fcaa23f7e46dc42abe41d174ec29509cc79fcfcb22325d639dfd"
+    },
+    "cases": [
+      {
+        "summary": {
+          "rows": 2000,
+          "pass": 1,
+          "status": "PASS",
+          "exit_code": 0,
+          "elapsed_seconds": 12.031,
+          "metrics": 132,
+          "cleanup": "OK",
+          "error": null,
+          "log": "rows_2000_pass_1.log",
+          "diagnostics": "rows_2000_pass_1.diagnostics.json",
+          "diagnostics_count": 848,
+          "bounded_vacuum_verified": true
+        },
+        "bounded": [
+          "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+        ],
+        "emitted_diagnostics": 797,
+        "derived_diagnostics": 51,
+        "csv_roundtrip_rows": 132,
+        "raw_roundtrip": true,
+        "maintenance_delete_delta": [
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "scope_start",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "insert",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=insert cumulative=true delete_calls=0 write_ms=0.000 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "insert",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "checkpoint",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=checkpoint cumulative=true delete_calls=0 write_ms=0.000 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "checkpoint",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "update",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=update cumulative=true delete_calls=0 write_ms=0.000 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "update",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "vacuum",
+              "delete_calls": 1200,
+              "write_ms": 0.923,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=vacuum cumulative=true delete_calls=1200 write_ms=0.923 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "vacuum",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "flush",
+              "delete_calls": 16,
+              "write_ms": 0.013,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=flush cumulative=true delete_calls=1216 write_ms=0.936 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "flush",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "bulk",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=bulk cumulative=true delete_calls=1216 write_ms=0.936 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "bulk",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "bulk_reopen",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=bulk_reopen cumulative=true delete_calls=1216 write_ms=0.936 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          }
+        ]
+      },
+      {
+        "summary": {
+          "rows": 3000,
+          "pass": 1,
+          "status": "PASS",
+          "exit_code": 0,
+          "elapsed_seconds": 13.299,
+          "metrics": 132,
+          "cleanup": "OK",
+          "error": null,
+          "log": "rows_3000_pass_1.log",
+          "diagnostics": "rows_3000_pass_1.diagnostics.json",
+          "diagnostics_count": 848,
+          "bounded_vacuum_verified": true
+        },
+        "bounded": [
+          "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+        ],
+        "emitted_diagnostics": 797,
+        "derived_diagnostics": 51,
+        "csv_roundtrip_rows": 132,
+        "raw_roundtrip": true,
+        "maintenance_delete_delta": [
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "scope_start",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "insert",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=insert cumulative=true delete_calls=0 write_ms=0.000 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "insert",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "checkpoint",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=checkpoint cumulative=true delete_calls=0 write_ms=0.000 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "checkpoint",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "update",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=update cumulative=true delete_calls=0 write_ms=0.000 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "update",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "vacuum",
+              "delete_calls": 1300,
+              "write_ms": 0.701,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=vacuum cumulative=true delete_calls=1300 write_ms=0.701 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "vacuum",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "flush",
+              "delete_calls": 16,
+              "write_ms": 0.009,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=flush cumulative=true delete_calls=1316 write_ms=0.710 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "flush",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "bulk",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=bulk cumulative=true delete_calls=1316 write_ms=0.710 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          },
+          {
+            "kind": "SCALE_LSM_DELETE_STAGES_DELTA",
+            "derived": true,
+            "previous_phase": "bulk",
+            "fields": {
+              "engine": "lsm_tree",
+              "phase": "bulk_reopen",
+              "delete_calls": 0,
+              "write_ms": 0.0,
+              "threshold_flushes": 0,
+              "threshold_flush_ms": 0.0,
+              "mem_wal_syncs": 0,
+              "mem_wal_sync_ms": 0.0
+            },
+            "source_raw": "SCALE_LSM_DELETE_STAGES phase=bulk_reopen cumulative=true delete_calls=1316 write_ms=0.710 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000"
+          }
+        ]
+      }
+    ],
+    "source_hashes_verified": 61,
+    "runner_hash_verified": true,
+    "migration_verifications": 8,
+    "bulk_reopen_verifications": 8,
+    "normal_stop_phases_verified": 16
+  },
+  "accounting": {
+    "bounded": "After full vacuum, outside bounded timing prepare two more versions on up to eight existing keys; values unchanged; automatic reclamation temporarily disabled then restored; seed preparation timed separately",
+    "locks": "RegistryHold contains storage wait/hold and other work; storage hold includes nested work. Never add nested timers. Guard timer is dropped before mutex guard release. cfg(test) only.",
+    "memory": "CSV heap_live_delta_mb / heap_peak_delta_mb are allocator deltas in decimal MB; SCALE_MEMORY separates absolute heap_bytes/rss_bytes/private_bytes at phase boundaries",
+    "reopen": "Normal close/reopen; Windows page cache not cleared; not power-loss recovery proof",
+    "stop": "first_stop and bulk_stop already timed independently; SCALE_SNAPSHOT contains nested encoding/CRC/write/sync costs",
+    "maintenance_delta": "Each _DELTA is the interval between previous_phase and fields.phase, using rounded cumulative readings. It is not necessarily one operation: vacuum->flush also includes intervening bounded preparation and deletion. Raw source log remains authoritative.",
+    "diagnostic": "Literal token fields are a convenience index; raw preserves complete emitted lines, including nested Rust Debug values and spaces; derived records include source_raw and previous_phase",
+    "schema": "run.json harness_schema=3 versions runner/export policy; SCALE_BUILD harness=2 retains Rust build-identification schema"
+  },
+  "revisions": [
+    {
+      "issue": "PowerShell 5.1 wraps ConvertFrom-Json arrays as a single pipeline item when enclosed by @(); roundtrip guard failed",
+      "fix": "Use explicit object[] normalization; reproduced wrapped_count=1, direct_count=2; unchanged expected count/raw assertions; both versions pass"
+    },
+    {
+      "issue": "PowerShell 5.1 child inherited PowerShell 7 module paths; Get-FileHash unavailable and CIM auto-loaded v7",
+      "fix": "Prefer current process PSHOME Modules; no persistent system/user configuration change; SelfTest now exercises actual hash and CIM command discovery",
+      "failed_run": "data/bench-results/20261122-160911-bbf68c61ed07471aa5bcf612ceb7d45f"
+    }
+  ],
+  "limits": [
+    "This final run has 2k/3k rows, not the five-scale 20M throughput validation",
+    "No new production synchronization or transaction behavior in this diagnostic milestone"
+  ],
+  "source_manifest": {
+    "hash": "9aea6af6f67277306c8a87f98b497f7c91dd7096d1a954e55fe2c412d820998c",
+    "files": [
+      {
+        "path": "Cargo.toml",
+        "sha256": "2a55091d1fd2c82443525a5c4f168c75afcfbdf4cc8d462c5773acfeeb65be66"
+      },
+      {
+        "path": "src/bin/bitcask-bench-bulk.rs",
+        "sha256": "04a0f01d9087ccffe304eb73173dcf03b86740808f8a854bb72b7326f8f28a92"
+      },
+      {
+        "path": "src/bin/bplus-bench.rs",
+        "sha256": "b03d85f1efd1923aecacd248432de52738be7e26598ace8c458f4537525c236e"
+      },
+      {
+        "path": "src/bin/export-kv.rs",
+        "sha256": "aaf9a4c02c4a1b84ee1071f854bcb1f05eeec822bf01e011c25e509dfceb616f"
+      },
+      {
+        "path": "src/bin/import-kv.rs",
+        "sha256": "36536f3ca44c8a68378e9b715ec57c777afc435240e560cb286ca9fb675e8561"
+      },
+      {
+        "path": "src/bin/lsm-bench-bulk.rs",
+        "sha256": "810ef34a67cbaa69273ceda7943579893fbcd34aadca0fc34feec88f3a15097a"
+      },
+      {
+        "path": "src/bin/memory-bench.rs",
+        "sha256": "3eff085e0ea457ee29328fb6046f852a5aa53bb732ba67898f996aea2f1178b1"
+      },
+      {
+        "path": "src/bin/shell.rs",
+        "sha256": "2becf0668d7808ebfa5236aaa42d92febe77535b6a327014901d667234ef42f0"
+      },
+      {
+        "path": "src/bin/web.rs",
+        "sha256": "6adb352a1d5aea167bddd9efb42fcc61f96a383161e0710bba0096699ab03379"
+      },
+      {
+        "path": "src/bitcask/bitcask.rs",
+        "sha256": "1abe7e4f2a9da69dd320a844847c75b2d24980374fe24c0ea79eae496484d99e"
+      },
+      {
+        "path": "src/bitcask/bitcask_mvcc.rs",
+        "sha256": "72a800c722d17438dcef1ba759b1c467e8646d14719640b49e06f389863aa3bc"
+      },
+      {
+        "path": "src/bitcask/checkpoint_probe.rs",
+        "sha256": "410aae99b6fb620bd3b2339e8adca9c6132ef1b9a15e0b37b7114c8c376c6c09"
+      },
+      {
+        "path": "src/bitcask/error.rs",
+        "sha256": "a75039a5dc999bcc25724160f3a860b49c799aeda6d5ff9283aa8ecc82f333ff"
+      },
+      {
+        "path": "src/bitcask/kv_ops.rs",
+        "sha256": "c565ebc9ee323a2160afb4cd7f1b49bb6e3886a28a76449772b685598e0dd134"
+      },
+      {
+        "path": "src/bitcask/mod.rs",
+        "sha256": "f8280b336926eb4fb99083c4fad8a63f9924f841bf7d38278933001584d7f84c"
+      },
+      {
+        "path": "src/bitcask/storage.rs",
+        "sha256": "ff4f2e136d955ee8d5fc34b90ebb7b0d505c95179aa03c08b49b095ddee3eba0"
+      },
+      {
+        "path": "src/bitcask/wal.rs",
+        "sha256": "b30fcf36dc249eea6f9b2b9b256959949dab7d9ddec9f696199975af5ad5a4db"
+      },
+      {
+        "path": "src/bplus_tree/bplus_tree.rs",
+        "sha256": "6e75e8c40c9945c6c8831217a1838e18a152de5c40a136448cc0da349c57a520"
+      },
+      {
+        "path": "src/bplus_tree/bplus_tree_mvcc.rs",
+        "sha256": "a8f8a9f5b35983735f2e152ebad8a47e5cb44216d09beced59865c7395d9c8c4"
+      },
+      {
+        "path": "src/bplus_tree/kv_ops.rs",
+        "sha256": "b5591a94f1f2633f9ffab0ce9c2863342013de3529169e2d841bd419d1d6afe4"
+      },
+      {
+        "path": "src/bplus_tree/mod.rs",
+        "sha256": "73edb97227ab56971dbe5f62a3282ab444da1eb1336c52c859e968699155191b"
+      },
+      {
+        "path": "src/bplus_tree/page.rs",
+        "sha256": "e89f7f08f401775d8388235389168d2cdd26e2f4739197126863362f3acdcdaa"
+      },
+      {
+        "path": "src/bplus_tree/storage.rs",
+        "sha256": "25449c9072981c14b510c2abccb79af95d02d17faef4bfe7c37d9f1f6f8481a8"
+      },
+      {
+        "path": "src/bplus_tree/wal.rs",
+        "sha256": "d248f7f6e8658c80ffafa6146e59f156b575bb986d7d76938b9a9b53b302c21b"
+      },
+      {
+        "path": "src/common/codec.rs",
+        "sha256": "41dbd91017d77d1a55d62157adeab6c4694f0bd5da6a7d192d26fcd8d235bc91"
+      },
+      {
+        "path": "src/common/disk.rs",
+        "sha256": "6716f01e35f034ae4cc15e4340580b5e77f5aaf0d8d86e24e28144bfeb972164"
+      },
+      {
+        "path": "src/common/kernel.rs",
+        "sha256": "4f28b93d98005feecbbe737d309f25ee38383bd52870508e0e568c81dd201192"
+      },
+      {
+        "path": "src/common/kv_snapshot.rs",
+        "sha256": "48f372d5165be2cf039afc0db4fa2e4e0565463489723bf8b5f811dbd581f258"
+      },
+      {
+        "path": "src/common/maintenance_probe.rs",
+        "sha256": "6300da4a9219e414290a61313151e979bee1731791147a29dba1279d25af30fe"
+      },
+      {
+        "path": "src/common/mod.rs",
+        "sha256": "bac30297f91c1e790d7cabc72a3c1b9c7a95bb091d1fe21d649065102f9e8843"
+      },
+      {
+        "path": "src/common/order.rs",
+        "sha256": "f0a81b9a8525f1793c0a60c8f3ab6dd3458ff7f891a2f97f79b25d1f8ad52cda"
+      },
+      {
+        "path": "src/common/store.rs",
+        "sha256": "23799e89ff57cb0462c38b6f6819f7c42c6c1925df6d347a8f6b50626fc62009"
+      },
+      {
+        "path": "src/common/transaction_error.rs",
+        "sha256": "a1a14d4a92b3caac9a10f56c03316063c1eca758dc3294a2e25e89c05cfee20a"
+      },
+      {
+        "path": "src/common/txn.rs",
+        "sha256": "7827695e4c20f607886bb21d99f7e43dfbe8fa90cf1538448b90580d524cd038"
+      },
+      {
+        "path": "src/common/types.rs",
+        "sha256": "8bcdec8965215144359724e8b963101b3c05aa6a5de8125cc255151f4503dd42"
+      },
+      {
+        "path": "src/common/version.rs",
+        "sha256": "e8881d10d2a44354f8af1688f78e18a1274a0a80f139bbcdeb7d2eb491694c09"
+      },
+      {
+        "path": "src/common/wal.rs",
+        "sha256": "704bd8f11bd23a40174126230275fda799866158c6ad8f0c5df721dfd237f102"
+      },
+      {
+        "path": "src/engine.rs",
+        "sha256": "5c9a2d1a192cd897d574f109079d61e576981c471d943cc969899012729ed45a"
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "f96acc7de93f98575b085c66a375984f42e00d81c114e0af68b3cd9910023f25"
+      },
+      {
+        "path": "src/lsm_allocation_bench.rs",
+        "sha256": "b460abf4769abec9b3e4ba9f58f03ffda1ce0d05ebaa63cabdefc0abab130be9"
+      },
+      {
+        "path": "src/lsm_tree/bloom.rs",
+        "sha256": "ab7197d8246006da52261d3226340395ae367a3422d8abacdaa7f154eb0e97f4"
+      },
+      {
+        "path": "src/lsm_tree/cf.rs",
+        "sha256": "8268519d236fdee89456cf6b0cc2d37eeb5376c05e40024b47dcfc23f8ab61dc"
+      },
+      {
+        "path": "src/lsm_tree/kv_ops.rs",
+        "sha256": "d163b9699d5bf00589b349d76f82a673a961e9a3caed4ea14e795fda50e45711"
+      },
+      {
+        "path": "src/lsm_tree/lsm_tree.rs",
+        "sha256": "485253c1dc2b62838828df1ec6fe07c63375729090c137c2410ccad38150c863"
+      },
+      {
+        "path": "src/lsm_tree/lsm_tree_mvcc.rs",
+        "sha256": "bbe8f8daad58b6049761d125e9b7952191d49ced44fc697a3163f5e80c746256"
+      },
+      {
+        "path": "src/lsm_tree/mem_wal.rs",
+        "sha256": "360fecda096aeb4bcd468410ef23f1fd5759c4af4d7eb83a055dc4b76511693f"
+      },
+      {
+        "path": "src/lsm_tree/mod.rs",
+        "sha256": "f274d4cc70924ce7eb950f86db5c549cad9483ba42d65eed963aa40c6efc51b8"
+      },
+      {
+        "path": "src/lsm_tree/sst.rs",
+        "sha256": "370d30b8daf01971d2cc28d67a90c27a6ce4343a42c37e356b9fa2cbce701be5"
+      },
+      {
+        "path": "src/lsm_tree/storage.rs",
+        "sha256": "bc6b3dc1f27b92fde7bf086b07d9ebea7300aa8e4dc8c4dc9a3b0ff621df4e00"
+      },
+      {
+        "path": "src/lsm_tree/wal.rs",
+        "sha256": "0b7f36528f05a6f778e0e196c97c2814e00e75d420020d42cd6d1f680cb7368a"
+      },
+      {
+        "path": "src/main.rs",
+        "sha256": "676551ccc9139ad373db3369def2396eeb1fbc47a7c20854534175c7b517d57b"
+      },
+      {
+        "path": "src/maintenance.rs",
+        "sha256": "aa9a1675e10ea9e9724778f7f93cb2c411282758c6fe845939c02ebe0faa017b"
+      },
+      {
+        "path": "src/memory/kv_ops.rs",
+        "sha256": "2258b5667ef53bfe7f94cfac4c5296185e273dcdc56dc06f895a9ca7ece5191a"
+      },
+      {
+        "path": "src/memory/mem_store.rs",
+        "sha256": "b16c47f445074c0078ed1ad9f549a1681285b940d41e96e022076a78eb3ab5f9"
+      },
+      {
+        "path": "src/memory/memory_mvcc.rs",
+        "sha256": "f02640ae9ff9aabb1844b125db31baa0e1f4fddc2023d53c13e3e46cbfb6d47f"
+      },
+      {
+        "path": "src/memory/mod.rs",
+        "sha256": "e19312536377d63fc41d8ec576bff0bca2b621cd74514508ef83d40af3a63424"
+      },
+      {
+        "path": "src/scale_bench.rs",
+        "sha256": "79ef1b792971228b573b1e485313bc15f52a9d8e02557d02a6853c13413a2ea8"
+      },
+      {
+        "path": "src/scale_probe.rs",
+        "sha256": "04a7c7f2310042e649166c67c53eec9453e0ac96b908bc5dfc76924d1f2fe86d"
+      },
+      {
+        "path": "src/terminal.rs",
+        "sha256": "0e7a27b817f831991f53986e1111ec5bf4b3106f07aa16ddd05dac815976871a"
+      },
+      {
+        "path": "src/tools/migrate.rs",
+        "sha256": "8cc3f9a3c3b5455d9ffa56e47dcc8f34281174d094e7fcbdee1e46d1ce0bd403"
+      },
+      {
+        "path": "src/tools/mod.rs",
+        "sha256": "43b154fbb416ee6ce9cb2989819671b0422cfc5b5847c5f25f80c33ff3a5e607"
+      }
+    ]
+  },
+  "artifact_hashes": {
+    "build.log": "fd1518f2b3b012390f74c7c42a9ef94439d793da97bdd9c3e6085098c1f061dd",
+    "rows_2000_pass_1.csv": "7556ee918b560587b7e23b375a378ba46abe7beb7c105c2ae62ebf912bf7a55d",
+    "rows_2000_pass_1.diagnostics.json": "0f5455cf7c8aae0d8d4e93b3077797eba031f06a1bd5200c01d2d3211a4891c8",
+    "rows_2000_pass_1.log": "8102fd8a64262f3a19b668b8ec37572a9f57550debcd0ede50588e1e28bf7729",
+    "rows_3000_pass_1.csv": "0ddcfaa0db1f55587c3f812688d0e6f5522d022ab77915517bbf06a94546d58c",
+    "rows_3000_pass_1.diagnostics.json": "9981d8e8c242a802c1efef78d14454df110911988092a68988b9c60611dd48d7",
+    "rows_3000_pass_1.log": "31a06983a317214857ba65208589802e5566c12962136c464b607a11af967534",
+    "run.json": "ace83cedd83757f86fa4cd57618dc5c9a03a8a71729ddc6fb16843f80a182bc9",
+    "source.json": "a85f34bc2ad5087ff99bb1ea6051bc475b095f87f12ba8a49c06fc1f5e367e2f",
+    "summary.json": "661538ab71070b1782feee91896d79a850ee2c6aea4684c5a42c94bfbf271f59"
+  }
+}
