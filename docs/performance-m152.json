@@ -1,0 +1,319 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M152",
+  "date": "2026-11-22",
+  "objective": "延迟 B+ 回收期间 freelist 发布；保留双写、主文件同步、失败锁存和发布前禁止页复用",
+  "base_commit": "4da7450fc280909591402e678762cb14db86924c",
+  "changes": [
+    "src/bplus_tree/page.rs",
+    "src/bplus_tree/bplus_tree.rs",
+    "src/bplus_tree/bplus_tree_mvcc.rs"
+  ],
+  "environment": {
+    "scratch": "C:/Users/Administrator/.cache/storage-engines/test-data",
+    "build": "cargo release; lto=true; codegen-units=1",
+    "rustc": "1.92.0 (ded5c06cf 2025-12-08)"
+  },
+  "commands": [
+    "cargo test --release --lib --offline --quiet -- --test-threads=1",
+    "cargo test --release --lib --offline --quiet reclamation_freelist_same_seed_abba -- --ignored --nocapture --test-threads=1",
+    "cargo check --all-targets --offline --quiet"
+  ],
+  "validation": {
+    "tests": {
+      "passed": 537,
+      "failed": 0,
+      "ignored": 77,
+      "seconds": 116.04
+    },
+    "abba": [
+      {
+        "arm": "A1",
+        "improved": false,
+        "ms": 202.766,
+        "freelist_sync": 10,
+        "page_sync": 11,
+        "dblwr_sync": 34
+      },
+      {
+        "arm": "B1",
+        "improved": true,
+        "ms": 202.984,
+        "freelist_sync": 1,
+        "page_sync": 11,
+        "dblwr_sync": 34
+      },
+      {
+        "arm": "B2",
+        "improved": true,
+        "ms": 201.159,
+        "freelist_sync": 1,
+        "page_sync": 11,
+        "dblwr_sync": 34
+      },
+      {
+        "arm": "A2",
+        "improved": false,
+        "ms": 205.163,
+        "freelist_sync": 10,
+        "page_sync": 11,
+        "dblwr_sync": 34
+      }
+    ],
+    "checkAllTargets": 0,
+    "abba_old_mean_ms": 203.9645,
+    "abba_new_mean_ms": 202.07150000000001,
+    "abba_reduction_percent": 0.9281026845357809
+  },
+  "limitations": [
+    "12000 键、两版本、同一关闭种子 ABBA；各臂回收后和重开后均逐值验证12000键；未跑正式五档",
+    "旧候选8.4838%来自不同测试构建，本次正式Release均值0.9281%取代其作为本轮实测结论；两个实验不混算",
+    "主文件双写仍逐批同步；不宣称已解决20M更新和回收的所有同步成本"
+  ],
+  "source_files": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "2a55091d1fd2c82443525a5c4f168c75afcfbdf4cc8d462c5773acfeeb65be66"
+    },
+    {
+      "path": "src/bin/bitcask-bench-bulk.rs",
+      "sha256": "04a0f01d9087ccffe304eb73173dcf03b86740808f8a854bb72b7326f8f28a92"
+    },
+    {
+      "path": "src/bin/bplus-bench.rs",
+      "sha256": "b03d85f1efd1923aecacd248432de52738be7e26598ace8c458f4537525c236e"
+    },
+    {
+      "path": "src/bin/export-kv.rs",
+      "sha256": "aaf9a4c02c4a1b84ee1071f854bcb1f05eeec822bf01e011c25e509dfceb616f"
+    },
+    {
+      "path": "src/bin/import-kv.rs",
+      "sha256": "36536f3ca44c8a68378e9b715ec57c777afc435240e560cb286ca9fb675e8561"
+    },
+    {
+      "path": "src/bin/lsm-bench-bulk.rs",
+      "sha256": "810ef34a67cbaa69273ceda7943579893fbcd34aadca0fc34feec88f3a15097a"
+    },
+    {
+      "path": "src/bin/memory-bench.rs",
+      "sha256": "3eff085e0ea457ee29328fb6046f852a5aa53bb732ba67898f996aea2f1178b1"
+    },
+    {
+      "path": "src/bin/shell.rs",
+      "sha256": "2becf0668d7808ebfa5236aaa42d92febe77535b6a327014901d667234ef42f0"
+    },
+    {
+      "path": "src/bin/web.rs",
+      "sha256": "6adb352a1d5aea167bddd9efb42fcc61f96a383161e0710bba0096699ab03379"
+    },
+    {
+      "path": "src/bitcask/bitcask.rs",
+      "sha256": "1abe7e4f2a9da69dd320a844847c75b2d24980374fe24c0ea79eae496484d99e"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc.rs",
+      "sha256": "f9ce2e33df90758b448b68258ace8b139648b380b33eef563772bbfeda89b576"
+    },
+    {
+      "path": "src/bitcask/checkpoint_probe.rs",
+      "sha256": "410aae99b6fb620bd3b2339e8adca9c6132ef1b9a15e0b37b7114c8c376c6c09"
+    },
+    {
+      "path": "src/bitcask/error.rs",
+      "sha256": "a75039a5dc999bcc25724160f3a860b49c799aeda6d5ff9283aa8ecc82f333ff"
+    },
+    {
+      "path": "src/bitcask/kv_ops.rs",
+      "sha256": "c565ebc9ee323a2160afb4cd7f1b49bb6e3886a28a76449772b685598e0dd134"
+    },
+    {
+      "path": "src/bitcask/mod.rs",
+      "sha256": "f8280b336926eb4fb99083c4fad8a63f9924f841bf7d38278933001584d7f84c"
+    },
+    {
+      "path": "src/bitcask/storage.rs",
+      "sha256": "ff4f2e136d955ee8d5fc34b90ebb7b0d505c95179aa03c08b49b095ddee3eba0"
+    },
+    {
+      "path": "src/bitcask/wal.rs",
+      "sha256": "b30fcf36dc249eea6f9b2b9b256959949dab7d9ddec9f696199975af5ad5a4db"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree.rs",
+      "sha256": "6e75e8c40c9945c6c8831217a1838e18a152de5c40a136448cc0da349c57a520"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc.rs",
+      "sha256": "cb41d25c13270f4c2995b6691d14afc575845e313721f15a7f12df59668ceec8"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops.rs",
+      "sha256": "b5591a94f1f2633f9ffab0ce9c2863342013de3529169e2d841bd419d1d6afe4"
+    },
+    {
+      "path": "src/bplus_tree/mod.rs",
+      "sha256": "73edb97227ab56971dbe5f62a3282ab444da1eb1336c52c859e968699155191b"
+    },
+    {
+      "path": "src/bplus_tree/page.rs",
+      "sha256": "e89f7f08f401775d8388235389168d2cdd26e2f4739197126863362f3acdcdaa"
+    },
+    {
+      "path": "src/bplus_tree/storage.rs",
+      "sha256": "25449c9072981c14b510c2abccb79af95d02d17faef4bfe7c37d9f1f6f8481a8"
+    },
+    {
+      "path": "src/bplus_tree/wal.rs",
+      "sha256": "d248f7f6e8658c80ffafa6146e59f156b575bb986d7d76938b9a9b53b302c21b"
+    },
+    {
+      "path": "src/common/codec.rs",
+      "sha256": "41dbd91017d77d1a55d62157adeab6c4694f0bd5da6a7d192d26fcd8d235bc91"
+    },
+    {
+      "path": "src/common/disk.rs",
+      "sha256": "6716f01e35f034ae4cc15e4340580b5e77f5aaf0d8d86e24e28144bfeb972164"
+    },
+    {
+      "path": "src/common/kernel.rs",
+      "sha256": "4f28b93d98005feecbbe737d309f25ee38383bd52870508e0e568c81dd201192"
+    },
+    {
+      "path": "src/common/kv_snapshot.rs",
+      "sha256": "48f372d5165be2cf039afc0db4fa2e4e0565463489723bf8b5f811dbd581f258"
+    },
+    {
+      "path": "src/common/maintenance_probe.rs",
+      "sha256": "ec1c895acd56405eb6bd30823c5d02cc78cddd71a84df6aa912da79ad0efb8b5"
+    },
+    {
+      "path": "src/common/mod.rs",
+      "sha256": "bac30297f91c1e790d7cabc72a3c1b9c7a95bb091d1fe21d649065102f9e8843"
+    },
+    {
+      "path": "src/common/order.rs",
+      "sha256": "f0a81b9a8525f1793c0a60c8f3ab6dd3458ff7f891a2f97f79b25d1f8ad52cda"
+    },
+    {
+      "path": "src/common/store.rs",
+      "sha256": "961231ff74704715d7cfaf54eb00b657f5f28a466572ccccdaef551d0b536bc5"
+    },
+    {
+      "path": "src/common/transaction_error.rs",
+      "sha256": "a1a14d4a92b3caac9a10f56c03316063c1eca758dc3294a2e25e89c05cfee20a"
+    },
+    {
+      "path": "src/common/txn.rs",
+      "sha256": "7827695e4c20f607886bb21d99f7e43dfbe8fa90cf1538448b90580d524cd038"
+    },
+    {
+      "path": "src/common/types.rs",
+      "sha256": "8bcdec8965215144359724e8b963101b3c05aa6a5de8125cc255151f4503dd42"
+    },
+    {
+      "path": "src/common/version.rs",
+      "sha256": "e8881d10d2a44354f8af1688f78e18a1274a0a80f139bbcdeb7d2eb491694c09"
+    },
+    {
+      "path": "src/common/wal.rs",
+      "sha256": "704bd8f11bd23a40174126230275fda799866158c6ad8f0c5df721dfd237f102"
+    },
+    {
+      "path": "src/engine.rs",
+      "sha256": "cf04a409526253f63fdfa5d0e19ec83016a269f090cfbbbdb7d57374fe6b41f4"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "f96acc7de93f98575b085c66a375984f42e00d81c114e0af68b3cd9910023f25"
+    },
+    {
+      "path": "src/lsm_allocation_bench.rs",
+      "sha256": "b460abf4769abec9b3e4ba9f58f03ffda1ce0d05ebaa63cabdefc0abab130be9"
+    },
+    {
+      "path": "src/lsm_tree/bloom.rs",
+      "sha256": "ab7197d8246006da52261d3226340395ae367a3422d8abacdaa7f154eb0e97f4"
+    },
+    {
+      "path": "src/lsm_tree/cf.rs",
+      "sha256": "8268519d236fdee89456cf6b0cc2d37eeb5376c05e40024b47dcfc23f8ab61dc"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops.rs",
+      "sha256": "d163b9699d5bf00589b349d76f82a673a961e9a3caed4ea14e795fda50e45711"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree.rs",
+      "sha256": "08d26e9df7451e6ff4b098a553e3e5c4c04f4b682b76586e5375a6c7b29f59a7"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc.rs",
+      "sha256": "9c2dec6ecf29045bc254984a2a0811a2c754546b7f4a423bc94291bfa29a4638"
+    },
+    {
+      "path": "src/lsm_tree/mem_wal.rs",
+      "sha256": "360fecda096aeb4bcd468410ef23f1fd5759c4af4d7eb83a055dc4b76511693f"
+    },
+    {
+      "path": "src/lsm_tree/mod.rs",
+      "sha256": "f274d4cc70924ce7eb950f86db5c549cad9483ba42d65eed963aa40c6efc51b8"
+    },
+    {
+      "path": "src/lsm_tree/sst.rs",
+      "sha256": "370d30b8daf01971d2cc28d67a90c27a6ce4343a42c37e356b9fa2cbce701be5"
+    },
+    {
+      "path": "src/lsm_tree/storage.rs",
+      "sha256": "bc6b3dc1f27b92fde7bf086b07d9ebea7300aa8e4dc8c4dc9a3b0ff621df4e00"
+    },
+    {
+      "path": "src/lsm_tree/wal.rs",
+      "sha256": "0b7f36528f05a6f778e0e196c97c2814e00e75d420020d42cd6d1f680cb7368a"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "676551ccc9139ad373db3369def2396eeb1fbc47a7c20854534175c7b517d57b"
+    },
+    {
+      "path": "src/maintenance.rs",
+      "sha256": "aa9a1675e10ea9e9724778f7f93cb2c411282758c6fe845939c02ebe0faa017b"
+    },
+    {
+      "path": "src/memory/kv_ops.rs",
+      "sha256": "2258b5667ef53bfe7f94cfac4c5296185e273dcdc56dc06f895a9ca7ece5191a"
+    },
+    {
+      "path": "src/memory/mem_store.rs",
+      "sha256": "b16c47f445074c0078ed1ad9f549a1681285b940d41e96e022076a78eb3ab5f9"
+    },
+    {
+      "path": "src/memory/memory_mvcc.rs",
+      "sha256": "ab82a4c3961f2f6a293b47c66678eec14a9b0b25094330d9d0a8404bc24dcc1b"
+    },
+    {
+      "path": "src/memory/mod.rs",
+      "sha256": "e19312536377d63fc41d8ec576bff0bca2b621cd74514508ef83d40af3a63424"
+    },
+    {
+      "path": "src/scale_bench.rs",
+      "sha256": "79ef1b792971228b573b1e485313bc15f52a9d8e02557d02a6853c13413a2ea8"
+    },
+    {
+      "path": "src/scale_probe.rs",
+      "sha256": "d95dd62681b631aa3fbb0106c17c38b969bff8e06834981de146aafece98708e"
+    },
+    {
+      "path": "src/terminal.rs",
+      "sha256": "0e7a27b817f831991f53986e1111ec5bf4b3106f07aa16ddd05dac815976871a"
+    },
+    {
+      "path": "src/tools/migrate.rs",
+      "sha256": "8cc3f9a3c3b5455d9ffa56e47dcc8f34281174d094e7fcbdee1e46d1ce0bd403"
+    },
+    {
+      "path": "src/tools/mod.rs",
+      "sha256": "43b154fbb416ee6ce9cb2989819671b0422cfc5b5847c5f25f80c33ff3a5e607"
+    }
+  ]
+}

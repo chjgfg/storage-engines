@@ -582,6 +582,26 @@ impl BPlusTree {
         self.page_manager.ensure_healthy()
     }
 
+    pub(crate) fn with_reclamation<T>(
+        &mut self,
+        reclaim: impl FnOnce(&mut Self) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        match self.page_manager.begin_reclamation()? {
+            crate::bplus_tree::page::ReclamationPublication::ExistingBulk => return reclaim(self),
+            crate::bplus_tree::page::ReclamationPublication::DeferredFreelist => {}
+        }
+        match reclaim(self) {
+            Ok(result) => {
+                self.page_manager.finish_reclamation()?;
+                Ok(result)
+            }
+            Err(error) => {
+                self.page_manager.mark_maintenance_failed(&error);
+                Err(error)
+            }
+        }
+    }
+
     pub fn try_flush_all(&mut self) -> std::io::Result<()> {
         self.page_manager.set_root_page_id(self.root);
         self.page_manager.try_flush_all()?;

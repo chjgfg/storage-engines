@@ -82,6 +82,18 @@ enum PageIoState {
     Failed { kind: std::io::ErrorKind, message: String },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReclamationState {
+    Idle,
+    Scanning,
+    UnpublishedFrees,
+}
+
+pub(crate) enum ReclamationPublication {
+    DeferredFreelist,
+    ExistingBulk,
+}
+
 /// 页管理器
 pub struct PageManager {
     /// 单写者锁（持有即占用库；Drop 释放）
@@ -111,6 +123,7 @@ pub struct PageManager {
     /// Bulk eviction can leave no dirty cache pages while disk writes still need sync.
     bulk_pending_sync: bool,
     io_state: PageIoState,
+    reclamation: ReclamationState,
     /// 每页被写入过几次（`write_page` / `allocate_page` 各算一次）。
     ///
     /// 上层用它验证"解析过的节点还新不新"：数字一变，那份 `BTreeNode` 就是陈旧的，必须重解析。
@@ -428,6 +441,7 @@ impl PageManager {
             bulk_mode: false,
             bulk_pending_sync: false,
             io_state: PageIoState::Healthy,
+            reclamation: ReclamationState::Idle,
             page_writes: HashMap::new(),
             pinned: HashSet::new(),
             pin_budget: DEFAULT_PIN_BUDGET_PAGES,
@@ -612,6 +626,27 @@ impl PageManager {
         payload
     }
 
+    pub(crate) fn begin_reclamation(&mut self) -> std::io::Result<ReclamationPublication> {
+        self.ensure_healthy()?;
+        if self.reclamation != ReclamationState::Idle {
+            return Err(std::io::Error::other("reclamation publication is already active"));
+        }
+        if self.bulk_mode { return Ok(ReclamationPublication::ExistingBulk); }
+        self.reclamation = ReclamationState::Scanning;
+        Ok(ReclamationPublication::DeferredFreelist)
+    }
+
+    pub(crate) fn finish_reclamation(&mut self) -> std::io::Result<()> {
+        self.ensure_healthy()?;
+        if self.reclamation != ReclamationState::Scanning {
+            let error = std::io::Error::other("reclamation returned with unpublished free pages");
+            self.mark_maintenance_failed(&error);
+            return Err(error);
+        }
+        self.reclamation = ReclamationState::Idle;
+        Ok(())
+    }
+
     fn persist_freelist(&mut self) -> std::io::Result<()> {
         if !self.freelist_dirty {
             return Ok(());
@@ -623,6 +658,7 @@ impl PageManager {
         }
         self.freelist_writer.as_mut().unwrap().write(self.free_page_ids.iter().map(|p| p.0))?;
         self.freelist_dirty = false;
+        if self.reclamation != ReclamationState::Idle { self.reclamation = ReclamationState::Scanning; }
         Ok(())
     }
 
@@ -763,7 +799,10 @@ impl PageManager {
         }
 
         // Mark clean only after the entire publication succeeds.
-        if !self.bulk_mode || do_sync { self.persist_freelist()?; }
+        let defer = self.reclamation != ReclamationState::Idle;
+        #[cfg(test)]
+        let defer = defer && !reclamation_reference::enabled();
+        if !defer && (!self.bulk_mode || do_sync) { self.persist_freelist()?; }
         for &pid in page_ids {
             if let Some(entry) = self.cache.get_mut(&pid) {
                 if entry.state == PageState::Dirty {
@@ -787,7 +826,8 @@ impl PageManager {
         self.evict_if_needed_for_insert();
 
         let empty = vec![0u8; PAGE_PAYLOAD_SIZE];
-        let page_id = if let Some(page_id) = self.free_page_ids.pop_front() {
+        let reusable = if self.reclamation == ReclamationState::Idle { self.free_page_ids.pop_front() } else { None };
+        let page_id = if let Some(page_id) = reusable {
             self.free_set.remove(&page_id.0);
             self.freelist_dirty = true;
             self.meta_dirty = true;
@@ -1039,7 +1079,12 @@ impl PageManager {
             .map(|(id, _)| *id)
             .collect();
         // The batch owns data, meta and freelist publication and error latching.
-        self.flush_pages_batch(&dirty, true)
+        self.flush_pages_batch(&dirty, true)?;
+        if let Err(error) = self.persist_freelist() {
+            self.mark_maintenance_failed(&error);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// 释放页：归还 freelist（文件不收缩，槽位可复用）
@@ -1055,6 +1100,7 @@ impl PageManager {
         if self.free_set.insert(page_id.0) {
             self.free_page_ids.push_back(page_id);
             self.freelist_dirty = true;
+            if self.reclamation != ReclamationState::Idle { self.reclamation = ReclamationState::UnpublishedFrees; }
             self.meta_dirty = true;
         }
         true
@@ -1217,8 +1263,96 @@ pub(crate) mod eviction_reference {
 }
 
 #[cfg(test)]
+
+#[cfg(test)]
+pub(crate) mod reclamation_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub(crate) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reclamation_defers_freelist_but_keeps_double_write_and_prevents_reuse() {
+        use crate::common::disk::{fsync_counts, SITE_BPLUS_DBLWR, SITE_BPLUS_FREELIST, SITE_BPLUS_PAGE_FLUSH};
+        let path = crate::common::ScratchPath::new("page", "reclamation_publication", ".db");
+        {
+            let mut pm = PageManager::open(&path, 16).unwrap();
+            for i in 1..=128_u64 {
+                let pid = pm.allocate_page();
+                assert!(pm.write_page(pid, &i.to_le_bytes()));
+            }
+            pm.try_flush_all().unwrap();
+            for i in 1..=8 { assert!(pm.free_page(PageId(i))); }
+            pm.try_flush_all().unwrap();
+            pm.begin_reclamation().unwrap();
+            let before = fsync_counts();
+            for i in 9..=24 { assert!(pm.free_page(PageId(i))); }
+            for i in 25..=128_u64 {
+                assert!(pm.write_page(PageId(i), &(i + 1000).to_le_bytes()));
+            }
+            assert_eq!(fsync_counts()[SITE_BPLUS_FREELIST] - before[SITE_BPLUS_FREELIST], 0);
+            assert!(fsync_counts()[SITE_BPLUS_DBLWR] > before[SITE_BPLUS_DBLWR]);
+            assert!(fsync_counts()[SITE_BPLUS_PAGE_FLUSH] > before[SITE_BPLUS_PAGE_FLUSH]);
+            assert_eq!(read_freelist(&freelist_path(&path)).unwrap().unwrap(), (1..=8).collect::<Vec<u64>>());
+            assert_eq!(pm.allocate_page(), PageId(129), "unpublished free pages must not be reused");
+            pm.try_flush_all().unwrap();
+            pm.finish_reclamation().unwrap();
+            assert_eq!(fsync_counts()[SITE_BPLUS_FREELIST] - before[SITE_BPLUS_FREELIST], 1);
+            pm.try_flush_all().unwrap();
+            assert_eq!(fsync_counts()[SITE_BPLUS_FREELIST] - before[SITE_BPLUS_FREELIST], 1);
+        }
+        let mut pm = PageManager::open(&path, 16).unwrap();
+        for i in 25..=128_u64 {
+            assert_eq!(&pm.read_page(PageId(i)).unwrap()[..8], &(i + 1000).to_le_bytes());
+        }
+        for i in 1..=24 { assert_eq!(pm.allocate_page(), PageId(i)); }
+        std::eprintln!("RECLAMATION_VERIFIED freelist_sync=1 double_write=retained reused_after_publication=24");
+    }
+
+    #[test]
+    fn reclamation_refuses_unpublished_return_and_latches_publication_faults() {
+        for fault in [0, 1, 2, 3, 4, 5, 6, 7] {
+            let path = crate::common::ScratchPath::new("page", "reclamation_fault", ".db");
+            let mut pm = PageManager::open(&path, 64).unwrap();
+            for _ in 0..4 { pm.allocate_page(); }
+            pm.try_flush_all().unwrap();
+            pm.begin_reclamation().unwrap();
+            assert!(pm.free_page(PageId(1)));
+            assert!(pm.write_page(PageId(2), b"retained"));
+            if fault == 0 {
+                assert!(pm.finish_reclamation().is_err());
+            } else {
+                let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(fault);
+                assert!(pm.try_flush_all().is_err(), "fault {fault} must reach its publication door");
+                assert!(pm.finish_reclamation().is_err());
+            }
+            assert!(pm.ensure_healthy().is_err());
+            assert!(pm.try_flush_all().is_err());
+        }
+    }
+
+    #[test]
+    fn reclamation_empty_scope_preserves_unrelated_dirty_pages() {
+        use crate::common::disk::fsync_counts;
+        let path = crate::common::ScratchPath::new("page", "reclamation_empty", ".db");
+        let mut pm = PageManager::open(&path, 64).unwrap();
+        let pid = pm.allocate_page();
+        assert!(pm.write_page(pid, b"ordinary"));
+        let before = fsync_counts();
+        pm.begin_reclamation().unwrap();
+        pm.finish_reclamation().unwrap();
+        assert_eq!(fsync_counts(), before);
+        assert_eq!(pm.get_page_state(pid), Some(PageState::Dirty));
+    }
+
     use std::assert;
     use std::assert_eq;
 
