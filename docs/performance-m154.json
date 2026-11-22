@@ -1,0 +1,317 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M154",
+  "date": "2026-11-22",
+  "base_commit": "11b985de242f38e420af32699bd9ff0b504fb6db",
+  "objective": "LSM vacuum 真实删除写入与阈值 flush 分段，避免把嵌套维护成本混作删除算法成本",
+  "changes": [
+    "src/lsm_tree/lsm_tree.rs",
+    "src/lsm_tree/lsm_tree_mvcc.rs",
+    "src/engine.rs"
+  ],
+  "environment": {
+    "scratch": "C:/Users/Administrator/.cache/storage-engines/test-data",
+    "build": "cargo release; lto=true; codegen-units=1",
+    "rows": 200000,
+    "value_bytes": 128,
+    "versions_per_key": 2,
+    "options": "LSMTreeOptions::for_mvcc defaults; automatic vacuum disabled; checkpoint before measurement"
+  },
+  "commands": [
+    "cargo check --all-targets --offline --quiet",
+    "cargo test --release --lib --offline --quiet -- --test-threads=1",
+    "cargo test --release --lib --offline --quiet vacuum_delete_stage_cost -- --ignored --nocapture --test-threads=1"
+  ],
+  "validation": {
+    "tests": {
+      "passed": 541,
+      "failed": 0,
+      "ignored": 79,
+      "seconds": 123.06
+    },
+    "specialist": {
+      "passed": 1,
+      "failed": 0,
+      "seconds": 12.38
+    },
+    "benchmark": {
+      "raw": "LSM_VACUUM_DELETE_STAGES rows=200000 wall_ms=735.902 delete_ms=465.589 write_ms=104.157 threshold_flush_ms=345.317 delete_residual_ms=16.114 threshold_flushes=2 sst_flush_ms=238.297 compact_ms=175.788 manifest_ms=186.390 sst_finish_ms=49.827 sst_sync_ms=29.743 latest_values_verified=200000 reopened_values_verified=200000",
+      "wall_ms": 735.902,
+      "delete_ms": 465.589,
+      "delete_write_ms": 104.157,
+      "threshold_flush_ms": 345.317,
+      "delete_residual_ms": 16.114,
+      "threshold_flushes": 2,
+      "sst_flush_ms": 238.297,
+      "compact_ms": 175.788,
+      "manifest_ms": 186.39,
+      "sst_finish_ms": 49.827,
+      "sst_sync_ms": 29.743,
+      "mem_wal_syncs": 0,
+      "latest_values_verified": 200000,
+      "reopened_values_verified": 200000
+    },
+    "guard": "1024 keys, threshold=128, l0=2: real flush and compaction required; delete_calls=removed; checked_sub proves write/threshold-flush fit within delete; MVCC memory WAL sync count=0; latest values and normal reopen checked"
+  },
+  "accounting": {
+    "disjoint": "delete_write + threshold_flush + delete_residual = VacuumDelete (unrounded ns checked)",
+    "nested": "sst flush/compact/manifest/sst finish/sst sync overlap threshold flush and each other; never add them to delete or wall",
+    "scope": "All probes cfg(test), no production algorithm change"
+  },
+  "decision": "Do not bypass durability, retune thresholds or add speculative compaction optimization. On the measured seed threshold flush dominates deletion; old 20M lacks the new split and requires a comparable real run for attribution.",
+  "limits": [
+    "C SSD diagnostic is not comparable with D HDD scale latency",
+    "No before/after throughput claim: this milestone adds diagnosis",
+    "No extrapolation from 200k to 20M"
+  ],
+  "source_manifest": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "2a55091d1fd2c82443525a5c4f168c75afcfbdf4cc8d462c5773acfeeb65be66"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "06a642091be8fcaa23f7e46dc42abe41d174ec29509cc79fcfcb22325d639dfd"
+    },
+    {
+      "path": "src/bin/bitcask-bench-bulk.rs",
+      "sha256": "04a0f01d9087ccffe304eb73173dcf03b86740808f8a854bb72b7326f8f28a92"
+    },
+    {
+      "path": "src/bin/bplus-bench.rs",
+      "sha256": "b03d85f1efd1923aecacd248432de52738be7e26598ace8c458f4537525c236e"
+    },
+    {
+      "path": "src/bin/export-kv.rs",
+      "sha256": "aaf9a4c02c4a1b84ee1071f854bcb1f05eeec822bf01e011c25e509dfceb616f"
+    },
+    {
+      "path": "src/bin/import-kv.rs",
+      "sha256": "36536f3ca44c8a68378e9b715ec57c777afc435240e560cb286ca9fb675e8561"
+    },
+    {
+      "path": "src/bin/lsm-bench-bulk.rs",
+      "sha256": "810ef34a67cbaa69273ceda7943579893fbcd34aadca0fc34feec88f3a15097a"
+    },
+    {
+      "path": "src/bin/memory-bench.rs",
+      "sha256": "3eff085e0ea457ee29328fb6046f852a5aa53bb732ba67898f996aea2f1178b1"
+    },
+    {
+      "path": "src/bin/shell.rs",
+      "sha256": "2becf0668d7808ebfa5236aaa42d92febe77535b6a327014901d667234ef42f0"
+    },
+    {
+      "path": "src/bin/web.rs",
+      "sha256": "6adb352a1d5aea167bddd9efb42fcc61f96a383161e0710bba0096699ab03379"
+    },
+    {
+      "path": "src/bitcask/bitcask.rs",
+      "sha256": "1abe7e4f2a9da69dd320a844847c75b2d24980374fe24c0ea79eae496484d99e"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc.rs",
+      "sha256": "f9ce2e33df90758b448b68258ace8b139648b380b33eef563772bbfeda89b576"
+    },
+    {
+      "path": "src/bitcask/checkpoint_probe.rs",
+      "sha256": "410aae99b6fb620bd3b2339e8adca9c6132ef1b9a15e0b37b7114c8c376c6c09"
+    },
+    {
+      "path": "src/bitcask/error.rs",
+      "sha256": "a75039a5dc999bcc25724160f3a860b49c799aeda6d5ff9283aa8ecc82f333ff"
+    },
+    {
+      "path": "src/bitcask/kv_ops.rs",
+      "sha256": "c565ebc9ee323a2160afb4cd7f1b49bb6e3886a28a76449772b685598e0dd134"
+    },
+    {
+      "path": "src/bitcask/mod.rs",
+      "sha256": "f8280b336926eb4fb99083c4fad8a63f9924f841bf7d38278933001584d7f84c"
+    },
+    {
+      "path": "src/bitcask/storage.rs",
+      "sha256": "ff4f2e136d955ee8d5fc34b90ebb7b0d505c95179aa03c08b49b095ddee3eba0"
+    },
+    {
+      "path": "src/bitcask/wal.rs",
+      "sha256": "b30fcf36dc249eea6f9b2b9b256959949dab7d9ddec9f696199975af5ad5a4db"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree.rs",
+      "sha256": "6e75e8c40c9945c6c8831217a1838e18a152de5c40a136448cc0da349c57a520"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc.rs",
+      "sha256": "cb41d25c13270f4c2995b6691d14afc575845e313721f15a7f12df59668ceec8"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops.rs",
+      "sha256": "b5591a94f1f2633f9ffab0ce9c2863342013de3529169e2d841bd419d1d6afe4"
+    },
+    {
+      "path": "src/bplus_tree/mod.rs",
+      "sha256": "73edb97227ab56971dbe5f62a3282ab444da1eb1336c52c859e968699155191b"
+    },
+    {
+      "path": "src/bplus_tree/page.rs",
+      "sha256": "e89f7f08f401775d8388235389168d2cdd26e2f4739197126863362f3acdcdaa"
+    },
+    {
+      "path": "src/bplus_tree/storage.rs",
+      "sha256": "25449c9072981c14b510c2abccb79af95d02d17faef4bfe7c37d9f1f6f8481a8"
+    },
+    {
+      "path": "src/bplus_tree/wal.rs",
+      "sha256": "d248f7f6e8658c80ffafa6146e59f156b575bb986d7d76938b9a9b53b302c21b"
+    },
+    {
+      "path": "src/common/codec.rs",
+      "sha256": "41dbd91017d77d1a55d62157adeab6c4694f0bd5da6a7d192d26fcd8d235bc91"
+    },
+    {
+      "path": "src/common/disk.rs",
+      "sha256": "6716f01e35f034ae4cc15e4340580b5e77f5aaf0d8d86e24e28144bfeb972164"
+    },
+    {
+      "path": "src/common/kernel.rs",
+      "sha256": "4f28b93d98005feecbbe737d309f25ee38383bd52870508e0e568c81dd201192"
+    },
+    {
+      "path": "src/common/kv_snapshot.rs",
+      "sha256": "48f372d5165be2cf039afc0db4fa2e4e0565463489723bf8b5f811dbd581f258"
+    },
+    {
+      "path": "src/common/maintenance_probe.rs",
+      "sha256": "ec1c895acd56405eb6bd30823c5d02cc78cddd71a84df6aa912da79ad0efb8b5"
+    },
+    {
+      "path": "src/common/mod.rs",
+      "sha256": "bac30297f91c1e790d7cabc72a3c1b9c7a95bb091d1fe21d649065102f9e8843"
+    },
+    {
+      "path": "src/common/order.rs",
+      "sha256": "f0a81b9a8525f1793c0a60c8f3ab6dd3458ff7f891a2f97f79b25d1f8ad52cda"
+    },
+    {
+      "path": "src/common/store.rs",
+      "sha256": "23799e89ff57cb0462c38b6f6819f7c42c6c1925df6d347a8f6b50626fc62009"
+    },
+    {
+      "path": "src/common/transaction_error.rs",
+      "sha256": "a1a14d4a92b3caac9a10f56c03316063c1eca758dc3294a2e25e89c05cfee20a"
+    },
+    {
+      "path": "src/common/txn.rs",
+      "sha256": "7827695e4c20f607886bb21d99f7e43dfbe8fa90cf1538448b90580d524cd038"
+    },
+    {
+      "path": "src/common/types.rs",
+      "sha256": "8bcdec8965215144359724e8b963101b3c05aa6a5de8125cc255151f4503dd42"
+    },
+    {
+      "path": "src/common/version.rs",
+      "sha256": "e8881d10d2a44354f8af1688f78e18a1274a0a80f139bbcdeb7d2eb491694c09"
+    },
+    {
+      "path": "src/common/wal.rs",
+      "sha256": "704bd8f11bd23a40174126230275fda799866158c6ad8f0c5df721dfd237f102"
+    },
+    {
+      "path": "src/engine.rs",
+      "sha256": "ba03091cd1281babaa0dae330a8357779d60cc471758deda9557483448c0c697"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "f96acc7de93f98575b085c66a375984f42e00d81c114e0af68b3cd9910023f25"
+    },
+    {
+      "path": "src/lsm_allocation_bench.rs",
+      "sha256": "b460abf4769abec9b3e4ba9f58f03ffda1ce0d05ebaa63cabdefc0abab130be9"
+    },
+    {
+      "path": "src/lsm_tree/bloom.rs",
+      "sha256": "ab7197d8246006da52261d3226340395ae367a3422d8abacdaa7f154eb0e97f4"
+    },
+    {
+      "path": "src/lsm_tree/cf.rs",
+      "sha256": "8268519d236fdee89456cf6b0cc2d37eeb5376c05e40024b47dcfc23f8ab61dc"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops.rs",
+      "sha256": "d163b9699d5bf00589b349d76f82a673a961e9a3caed4ea14e795fda50e45711"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree.rs",
+      "sha256": "485253c1dc2b62838828df1ec6fe07c63375729090c137c2410ccad38150c863"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc.rs",
+      "sha256": "565cc4e94e1235d42cef50a3397221858f36d6170b936b7a0f815452ca3fc924"
+    },
+    {
+      "path": "src/lsm_tree/mem_wal.rs",
+      "sha256": "360fecda096aeb4bcd468410ef23f1fd5759c4af4d7eb83a055dc4b76511693f"
+    },
+    {
+      "path": "src/lsm_tree/mod.rs",
+      "sha256": "f274d4cc70924ce7eb950f86db5c549cad9483ba42d65eed963aa40c6efc51b8"
+    },
+    {
+      "path": "src/lsm_tree/sst.rs",
+      "sha256": "370d30b8daf01971d2cc28d67a90c27a6ce4343a42c37e356b9fa2cbce701be5"
+    },
+    {
+      "path": "src/lsm_tree/storage.rs",
+      "sha256": "bc6b3dc1f27b92fde7bf086b07d9ebea7300aa8e4dc8c4dc9a3b0ff621df4e00"
+    },
+    {
+      "path": "src/lsm_tree/wal.rs",
+      "sha256": "0b7f36528f05a6f778e0e196c97c2814e00e75d420020d42cd6d1f680cb7368a"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "676551ccc9139ad373db3369def2396eeb1fbc47a7c20854534175c7b517d57b"
+    },
+    {
+      "path": "src/maintenance.rs",
+      "sha256": "aa9a1675e10ea9e9724778f7f93cb2c411282758c6fe845939c02ebe0faa017b"
+    },
+    {
+      "path": "src/memory/kv_ops.rs",
+      "sha256": "2258b5667ef53bfe7f94cfac4c5296185e273dcdc56dc06f895a9ca7ece5191a"
+    },
+    {
+      "path": "src/memory/mem_store.rs",
+      "sha256": "b16c47f445074c0078ed1ad9f549a1681285b940d41e96e022076a78eb3ab5f9"
+    },
+    {
+      "path": "src/memory/memory_mvcc.rs",
+      "sha256": "c4bdd7cc6e36fd4c2c8789eb4b9ddd8e81f9c7d615c8c55cff242525a4c0fa7c"
+    },
+    {
+      "path": "src/memory/mod.rs",
+      "sha256": "e19312536377d63fc41d8ec576bff0bca2b621cd74514508ef83d40af3a63424"
+    },
+    {
+      "path": "src/scale_bench.rs",
+      "sha256": "79ef1b792971228b573b1e485313bc15f52a9d8e02557d02a6853c13413a2ea8"
+    },
+    {
+      "path": "src/scale_probe.rs",
+      "sha256": "d95dd62681b631aa3fbb0106c17c38b969bff8e06834981de146aafece98708e"
+    },
+    {
+      "path": "src/terminal.rs",
+      "sha256": "0e7a27b817f831991f53986e1111ec5bf4b3106f07aa16ddd05dac815976871a"
+    },
+    {
+      "path": "src/tools/migrate.rs",
+      "sha256": "8cc3f9a3c3b5455d9ffa56e47dcc8f34281174d094e7fcbdee1e46d1ce0bd403"
+    },
+    {
+      "path": "src/tools/mod.rs",
+      "sha256": "43b154fbb416ee6ce9cb2989819671b0422cfc5b5847c5f25f80c33ff3a5e607"
+    }
+  ]
+}

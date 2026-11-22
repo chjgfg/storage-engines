@@ -1584,6 +1584,90 @@ impl Transaction {
 
 #[cfg(test)]
 mod tests {
+
+    fn measure_vacuum_delete_stages(rows: usize, small_threshold: bool) {
+        use std::{assert, assert_eq, eprintln, vec};
+        use crate::lsm_tree::lsm_tree::maintenance_probe::{Scope, Timer, Kind};
+        use crate::common::maintenance_probe::{Scope as VacuumScope, Stage};
+        assert!(Timer::start(Kind::DeleteWrite).is_none());
+        let path = tmp_db("vacuum_delete_stages");
+        let mut opts = LSMTreeOptions::for_mvcc();
+        if small_threshold {
+            opts.mem_threshold_entries = 128;
+            opts.mem_threshold_bytes = usize::MAX;
+            opts.l0_compact_threshold = 2;
+        }
+        let db = MVCC::try_open_with(&path, Some(opts)).unwrap();
+        db.set_vacuum_auto_slice(0);
+        for round in 0..2u8 {
+            for base in (0..rows).step_by(1000) {
+                let tx = db.begin_transaction();
+                for i in base..(base + 1000).min(rows) {
+                    let mut value = vec![round; 128];
+                    value[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    assert!(tx.set_raw(&(i as u64).to_be_bytes(), value));
+                }
+                tx.commit();
+            }
+        }
+        db.checkpoint();
+        let scope = Scope::start();
+        let vacuum = VacuumScope::start();
+        let now = std::time::Instant::now();
+        let stats = db.vacuum().unwrap();
+        let wall_ms = now.elapsed().as_secs_f64() * 1e3;
+        let measured = scope.stats();
+        let doors = vacuum.stats();
+        drop(vacuum); drop(scope);
+        let delete_ns = doors.ns[Stage::VacuumDelete as usize];
+        let residual = delete_ns.checked_sub(
+            measured.delete_write_ns + measured.threshold_flush_ns
+        ).expect("write and threshold flush must be disjoint parts of delete");
+        assert_eq!(stats.versions_removed, rows);
+        assert_eq!(measured.delete_calls, rows as u64);
+        assert_eq!(measured.mem_wal_syncs, 0, "MVCC uses its transaction WAL");
+        assert!(measured.threshold_flushes > 0, "seed must trigger flush during deletion");
+        if small_threshold { assert!(measured.compactions > 0); }
+        let tx = db.begin_transaction();
+        for i in 0..rows {
+            let mut value = vec![1; 128];
+            value[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_eq!(tx.get(&(i as u64).to_be_bytes()), Some(value));
+        }
+        tx.commit();
+        drop(tx);
+        drop(db);
+        let db = MVCC::open(&path);
+        let tx = db.begin_transaction();
+        for i in 0..rows {
+            let mut value = vec![1; 128];
+            value[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert_eq!(tx.get(&(i as u64).to_be_bytes()), Some(value));
+        }
+        tx.commit();
+        eprintln!("LSM_VACUUM_DELETE_STAGES rows={rows} wall_ms={wall_ms:.3} delete_ms={:.3} write_ms={:.3} threshold_flush_ms={:.3} delete_residual_ms={:.3} threshold_flushes={} sst_flush_ms={:.3} compact_ms={:.3} manifest_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3} latest_values_verified={rows} reopened_values_verified={rows}",
+            delete_ns as f64 / 1e6, measured.delete_write_ns as f64 / 1e6,
+            measured.threshold_flush_ns as f64 / 1e6, residual as f64 / 1e6,
+            measured.threshold_flushes, measured.flush_ns as f64 / 1e6,
+            measured.compact_ns as f64 / 1e6, measured.manifest_ns as f64 / 1e6,
+            measured.sst_finish_ns as f64 / 1e6, measured.sst_sync_ns as f64 / 1e6);
+        assert!(Timer::start(Kind::DeleteWrite).is_none());
+    }
+
+    #[test]
+    fn vacuum_delete_stage_accounting_observes_real_threshold_flush() {
+        measure_vacuum_delete_stages(1024, true);
+    }
+
+    #[test]
+    #[ignore = "LSM vacuum stages; default options, release single thread"]
+    fn vacuum_delete_stage_cost() {
+        let rows = std::env::var("LSM_VACUUM_DIAG_ROWS")
+            .map(|v| v.parse().expect("positive diagnostic rows")).unwrap_or(200_000);
+        assert!(rows >= 100_000, "default threshold needs enough deletes");
+        measure_vacuum_delete_stages(rows, false);
+    }
+
     #[test]
     fn scan_mem_versions_copy_only_the_logical_winner() {
         use crate::common::VersionedStore;

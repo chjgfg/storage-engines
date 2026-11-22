@@ -520,6 +520,12 @@ pub(crate) mod maintenance_probe {
         pub cleanup_ns: u128,
         pub sst_finish_ns: u128,
         pub sst_sync_ns: u128,
+        pub delete_calls: u64,
+        pub delete_write_ns: u128,
+        pub threshold_flushes: u64,
+        pub threshold_flush_ns: u128,
+        pub mem_wal_syncs: u64,
+        pub mem_wal_sync_ns: u128,
     }
     thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
     pub(crate) struct Scope;
@@ -540,7 +546,7 @@ pub(crate) mod maintenance_probe {
     pub(crate) fn input_block() {
         ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.compaction_blocks += 1; });
     }
-    pub(crate) enum Kind { Flush, Compact, Merge, Repair, Manifest, Guard, Cleanup, SstFinish, SstSync }
+    pub(crate) enum Kind { Flush, Compact, Merge, Repair, Manifest, Guard, Cleanup, SstFinish, SstSync, DeleteWrite, ThresholdFlush, MemWalSync }
     pub(crate) struct Timer { kind: Kind, start: Instant }
     impl Timer {
         pub fn start(kind: Kind) -> Option<Self> {
@@ -561,6 +567,9 @@ pub(crate) mod maintenance_probe {
                     Kind::Cleanup => stats.cleanup_ns += ns,
                     Kind::SstFinish => stats.sst_finish_ns += ns,
                     Kind::SstSync => stats.sst_sync_ns += ns,
+                    Kind::DeleteWrite => { stats.delete_calls += 1; stats.delete_write_ns += ns; }
+                    Kind::ThresholdFlush => { stats.threshold_flushes += 1; stats.threshold_flush_ns += ns; }
+                    Kind::MemWalSync => { stats.mem_wal_syncs += 1; stats.mem_wal_sync_ns += ns; }
                 }
             });
         }
@@ -1284,16 +1293,24 @@ impl LSMTree {
             assert!(self.remove(&row.key));
             return Ok(());
         }
+        #[cfg(test)]
+        let write_timer = maintenance_probe::Timer::start(maintenance_probe::Kind::DeleteWrite);
         let seq = self.write_seq.fetch_add(1, Ordering::SeqCst);
         if let Some(wal) = self.mem_wal.as_mut() {
             wal.append(MemWalRecord::Drop { key: row.key.clone(), seq })?;
-            if self.opts.mem_wal_sync_on_write { wal.sync()?; }
+            if self.opts.mem_wal_sync_on_write {
+                #[cfg(test)]
+                let _sync = maintenance_probe::Timer::start(maintenance_probe::Kind::MemWalSync);
+                wal.sync()?;
+            }
         }
         if row.live { self.cached_live = self.cached_live.saturating_sub(1); }
         self.ttl_meta.remove(&row.key);
         self.mem_insert_no_wal(row.key, StoredEntry::drop_at(seq));
         self.dirty = true;
         self.stats_dirty = true;
+        #[cfg(test)]
+        drop(write_timer);
         // Failures leave maintenance incomplete before blob reclamation.
         self.maybe_flush_mem_checked()?;
         #[cfg(test)]
@@ -1670,6 +1687,8 @@ impl LSMTree {
             .saturating_add(self.mem_entries.saturating_mul(MEM_ENTRY_OVERHEAD))
             >= self.opts.mem_threshold_bytes;
         if by_entries || by_bytes {
+            #[cfg(test)]
+            let _flush = maintenance_probe::Timer::start(maintenance_probe::Kind::ThresholdFlush);
             self.flush_mem()?;
         }
         Ok(())

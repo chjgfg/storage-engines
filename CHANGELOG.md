@@ -2,6 +2,18 @@
 
 ## 未发布（2026-11-22）
 
+### M154：LSM vacuum 删除与阈值 flush 分段诊断
+
+- 在真实删除写入、阈值 flush 与 mem WAL sync 门增加 cfg(test) 探针；写入计时在 flush 前结束。
+  输出 SCALE_LSM_DELETE_STAGES 累计读数，既有 SST/压实/manifest/sync 是嵌套成本，不可相加。
+- 实际仓库 Release 回归 **541 passed / 0 failed / 79 ignored**（123.06 s），all-targets check 通过。
+  1024 键守卫要求真实 flush/压实、删除数一致、MVCC mem WAL sync 为 0，回收后与正常重开逐值验收。
+- 默认配置 20 万键两版本：vacuum **735.902 ms**，delete **465.589 ms**，其中写入 **104.157 ms**、
+  阈值 flush **345.317 ms**、互斥残差 **16.114 ms**；回收后与重开后各验收 20 万键。
+  完整读数与源码哈希见 [performance-m154.json](docs/performance-m154.json)。
+- 本项新增诊断，未改生产删除或压实算法；小档表明 flush 主导删除成本，旧 20M 无此拆分，
+  暂不据此调整阈值或放松同步，须以同负载实测决定下一轮优化。
+
 ### M153：memory 计数与分页只复制所需页的值
 
 - 共享搜索驱动增加显式 Excluded/Counted/Retained 行状态，拒绝行保留键以推进游标；
