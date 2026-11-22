@@ -1,9 +1,12 @@
 # storage-engines
 
-M151 修复 B+ 自动回收空扫时的额外刷页，以及 bulk 复用空闲页时的提前 freelist 同步。
-普通事务与有删除的回收保留同步，freelist 复用文件句柄、单缓冲编码并仅在缩短时截尾；磁盘格式不变。
-本轮新增 insert/bulk 分段及 freelist I/O 计量；验证结果和大档复测边界见 [更新日志](CHANGELOG.md)。
-Release 库回归 534 passed / 0 failed / 76 ignored；正式脚本 2k/3k 各 132 格、迁移和 bulk 重开逐值验收通过。
+最新完整五档（600k/1M/5M/10M/20M，M151 构建）各 132 格通过，20 次迁移与 20 次 bulk 重开逐值验收通过。
+20M B+ bulk 本次 60.628 s，前次 881.803 s；这是跨构建观察，不能代替同种子 ABBA。
+本轮 M152 合并回收 freelist 发布，M153 memory 计数/分页只复制返回值；M154 拆开 LSM 删除与阈值 flush，
+M155 补真实 bounded 删除、锁/堆/RSS、正常重开和维护差分诊断。Release 回归 **543 passed / 0 failed / 79 ignored**；
+正式脚本 2k/3k 各 132 格，四家各删除 16 个历史版本，迁移/重开与 JSON 往返验收通过。
+**最新代码完整五档性能尚未复测**，不能宣称全部退化已解决。分析单一账本与 M152–M155 证据入口见
+[performance-m156.json](docs/performance-m156.json)，运行和诊断口径见 [压测手册](docs/大规模压测手册.md)。
 
 M147 减少 LSM 批写、点读和 vacuum 的重复分配；同一 Release 构建的五档 20 臂、240 条阶段记录与全量重开核验已完成。
 20M 插入分配约 5.666 亿→4.879 亿次，vacuum 均值下降 24.68%；但 10M/20M 插入均值仍慢 4.83%/1.29%，不宣称稳定写吞吐提速。
@@ -36,7 +39,7 @@ test13 后四项改动见 [CHANGELOG](CHANGELOG.md) M134–M139：压测进程�
 四个从零手写的 KV 存储引擎，共享 MVCC 快照隔离与运行时可切换的 trait 门面：
 LSM Tree / B+ Tree / Bitcask / 纯内存。项目定位为教学与存储实现研究。
 
-- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M147 为未发布记录**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
+- 当前 Cargo 版本 **0.5.1**；本轮 **M85–M156 为未发布记录**，完整记录以 [CHANGELOG.md](CHANGELOG.md) 为准。
 - M127 将 LSM 内存表/旧格式的值复制延迟到逻辑版本胜者确定，100 版本守卫只复制最终 1 行。
 - M126 的 memory 停机快照直接编码已证完整的组，批尾/二进制重叠保留窗口折叠；memory debug 49 项通过。test11 四步代码已落实，最终 release 库回归通过，大档验收见 M128。
 - M128 已完成 LSM 20M 复用、B+ 20M 回收后重开、memory 20M/22M 停机专项及 50k 四引擎台架；memory 22M 最后一轮末尾验收两行未从终端取回，账本保留该证据边界。
