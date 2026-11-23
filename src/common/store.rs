@@ -33,7 +33,9 @@ pub enum RowValue {
 
 
 /// Search keeps rejected candidates for cursor progress and counts page-external rows.
-pub enum SearchRow {
+pub enum SearchRow<R = ()> {
+    /// Owned credentials are resolved only when the fold reaches this row.
+    Deferred(R),
     Excluded,
     Counted,
     Retained(Option<Vec<u8>>),
@@ -65,10 +67,10 @@ impl SearchRetention {
     }
 }
 
-pub(crate) fn retain_search_row(
+pub(crate) fn retain_search_row<R>(
     selection: SearchSelection,
     owned: impl FnOnce() -> Option<Vec<u8>>,
-) -> SearchRow {
+) -> SearchRow<R> {
     match selection {
         SearchSelection::Excluded => SearchRow::Excluded,
         SearchSelection::Counted => SearchRow::Counted,
@@ -77,21 +79,26 @@ pub(crate) fn retain_search_row(
     }
 }
 
-/// Default for engines whose candidate credential requires owned materialization.
+fn classify_search_value<R>(value: RowValue, retention: &mut SearchRetention) -> SearchRow<R> {
+    match value {
+        RowValue::Missing => SearchRow::Excluded,
+        RowValue::Tombstone => retain_search_row(retention.select(None), || None),
+        RowValue::Value(bytes) =>
+            retain_search_row(retention.select(Some(&bytes)), || Some(bytes)),
+    }
+}
+
+/// Frozen M153 whole-batch materialization, used by the negative control.
+#[cfg(test)]
 pub fn owned_search_candidates<S: VersionedStore + ?Sized>(
     store: &S,
     start: Option<&[u8]>, end: Option<&[u8]>,
     accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
     mut retention: SearchRetention,
-) -> (Vec<WinCandidate<SearchRow>>, bool) {
+) -> (Vec<WinCandidate<SearchRow<S::Row>>>, bool) {
     let (rows, complete) = store.scan_candidates(start, end, accept, after, budget);
     let rows = rows.into_iter().map(|c| {
-        let row = match store.materialize(c.row) {
-            RowValue::Missing => SearchRow::Excluded,
-            RowValue::Tombstone => retain_search_row(retention.select(None), || None),
-            RowValue::Value(bytes) =>
-                retain_search_row(retention.select(Some(&bytes)), || Some(bytes)),
-        };
+        let row = classify_search_value(store.materialize(c.row), &mut retention);
         WinCandidate { key: c.key, version: c.version, row }
     }).collect();
     (rows, complete)
@@ -134,17 +141,115 @@ pub trait VersionedStore {
     /// 合成一个 `Option` 就会把那两种情况混成一种 —— 折叠统一的前提是不改语义。
     fn materialize(&self, row: Self::Row) -> RowValue;
 
-    /// Classify under the engine's read boundary; copy only retained page values.
+    /// Borrowing engines may classify under their read boundary. The default
+    /// leaves owned credentials deferred, so a no-total page stops value reads.
     /// Excluded candidates must remain in the batch so the fold cursor advances.
     fn scan_search_candidates(
         &self,
         start: Option<&[u8]>, end: Option<&[u8]>,
         accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
-        retention: SearchRetention,
-    ) -> (Vec<WinCandidate<SearchRow>>, bool) {
-        owned_search_candidates(self, start, end, accept, after, budget, retention)
+        _retention: SearchRetention,
+    ) -> (Vec<WinCandidate<SearchRow<Self::Row>>>, bool) {
+        #[cfg(test)]
+        if search_materialize_reference::enabled() {
+            return owned_search_candidates(self, start, end, accept, after, budget, _retention);
+        }
+        let (rows, complete) = self.scan_candidates(start, end, accept, after, budget);
+        (rows.into_iter().map(|c| WinCandidate {
+            key: c.key, version: c.version, row: SearchRow::Deferred(c.row),
+        }).collect(), complete)
     }
 
+}
+
+#[cfg(test)]
+pub(crate) mod search_materialize_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
+mod deferred_search_tests {
+    use super::*;
+    use std::{assert, assert_eq, cell::Cell, vec};
+
+    struct Store { calls: Cell<usize>, excluded: usize, rows: usize }
+    impl VersionedStore for Store {
+        type Row = usize;
+        fn scan_candidates(&self, start: Option<&[u8]>, end: Option<&[u8]>,
+            accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+        ) -> (Vec<WinCandidate<usize>>, bool) {
+            let first = after.map_or(0, |key| u64::from_be_bytes(key.try_into().unwrap()) as usize + 1);
+            let mut out = Vec::new();
+            for i in first..self.rows {
+                let key = (i as u64).to_be_bytes();
+                if start.is_some_and(|lo| key.as_slice() < lo)
+                    || end.is_some_and(|hi| key.as_slice() >= hi)
+                    || accept.is_some_and(|f| !f(&key)) { continue; }
+                if out.len() == budget { return (out, false); }
+                out.push(WinCandidate { key: key.to_vec(), version: 1, row: i });
+            }
+            (out, true)
+        }
+        fn materialize(&self, row: usize) -> RowValue {
+            self.calls.set(self.calls.get() + 1);
+            if row < self.excluded {
+                match row % 3 {
+                    0 => RowValue::Missing,
+                    1 => RowValue::Tombstone,
+                    _ => RowValue::Value(crate::common::codec::pack_ttl(b"expired", 1)),
+                }
+            } else { RowValue::Value(crate::common::codec::pack_plain(&vec![7; 64])) }
+        }
+    }
+
+    #[test]
+    fn search_default_materializes_only_reached_rows() {
+        let store = Store { calls: Cell::new(0), excluded: 0, rows: 10_000 };
+        for reference in [true, false] {
+            let mode = reference.then(search_materialize_reference::Scope::start);
+            store.calls.set(0);
+            let (page, more, _) = search_page_walk(&store, false, None,
+                KeyMatchMode::Prefix, 0, 100, false);
+            assert_eq!(page.len(), 100); assert!(more);
+            assert_eq!(page[99].key, 99u64.to_be_bytes());
+            let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                assert_eq!(store.calls.get(), 101, "no-total must stop materialization")));
+            assert_eq!(guard.is_err(), reference, "restored eager arm must fail the same guard");
+            assert_eq!(store.calls.get(), if reference { 4096 } else { 101 });
+            drop(mode);
+        }
+    }
+
+    #[test]
+    fn search_deferred_keeps_missing_ttl_deleted_and_chunk_cursor_semantics() {
+        let store = Store { calls: Cell::new(0), excluded: 5000, rows: 9000 };
+        for include_deleted in [false, true] {
+            let expected = (0..store.rows).filter(|&i|
+                i >= store.excluded || (include_deleted && i % 3 != 0)).collect::<Vec<_>>();
+            for total in [false, true] {
+                for skip in [0, 4100, 8990] {
+                    let mut results = Vec::new();
+                    for reference in [true, false] {
+                        let mode = reference.then(search_materialize_reference::Scope::start);
+                        let result = search_page_walk(&store, include_deleted, None,
+                            KeyMatchMode::Contains, skip, 17, total);
+                        let keys = result.0.iter().map(|r| u64::from_be_bytes(r.key.as_slice().try_into().unwrap()) as usize).collect::<Vec<_>>();
+                        assert_eq!(keys, expected.iter().skip(skip).take(17).copied().collect::<Vec<_>>());
+                        assert_eq!(result.1, expected.len() > skip + 17);
+                        if total { assert_eq!(result.2, expected.len()); }
+                        results.push(result); drop(mode);
+                    }
+                    assert_eq!(results[0], results[1]);
+                }
+            }
+            assert_eq!(count_window(&store, include_deleted, None, KeyMatchMode::Prefix), expected.len());
+        }
+    }
 }
 
 /// 界内折叠 + 窗口化：`after` 之后最多 `limit` 组，返回 `(行, 是否还有更多)`。
@@ -469,9 +574,18 @@ pub fn search_page_walk<S: VersionedStore>(
             lo, hi.as_deref(), Some(&accept), after, budget,
             SearchRetention::new(include_deleted, skip.saturating_sub(seen.get()),
                 page_size.saturating_sub(retained.get()))),
-        |c| match c.row {
-            SearchRow::Excluded => None,
-            row => Some((c.key, row)),
+        |c| {
+            let row = match c.row {
+                SearchRow::Deferred(credential) => classify_search_value(
+                    store.materialize(credential),
+                    &mut SearchRetention::new(include_deleted, skip.saturating_sub(seen.get()),
+                        page_size.saturating_sub(retained.get()))),
+                row => row,
+            };
+            match row {
+                SearchRow::Excluded => None,
+                row => Some((c.key, row)),
+            }
         },
         |(key, row)| {
             let next = seen.get() + 1;
@@ -492,7 +606,7 @@ pub fn search_page_walk<S: VersionedStore>(
                     has_more = true;
                     want_total
                 }
-                SearchRow::Excluded => unreachable!(),
+                SearchRow::Deferred(_) | SearchRow::Excluded => unreachable!(),
             }
         },
     );
@@ -675,7 +789,14 @@ pub fn count_window<S: VersionedStore>(
         |after, budget| store.scan_search_candidates(
             lo, hi.as_deref(), Some(&accept), after, budget,
             SearchRetention::new(include_deleted, 0, 0)),
-        |c| match c.row { SearchRow::Excluded => None, _ => Some(()) },
+        |c| {
+            let row = match c.row {
+                SearchRow::Deferred(credential) => classify_search_value(
+                    store.materialize(credential), &mut SearchRetention::new(include_deleted, 0, 0)),
+                row => row,
+            };
+            match row { SearchRow::Excluded => None, _ => Some(()) }
+        },
         |_| true,
     )
 }

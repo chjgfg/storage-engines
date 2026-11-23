@@ -2747,7 +2747,7 @@ impl crate::common::VersionedStore for Transaction {
         start: Option<&[u8]>, end: Option<&[u8]>,
         accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
         mut retention: crate::common::store::SearchRetention,
-    ) -> (Vec<crate::common::WinCandidate<crate::common::store::SearchRow>>, bool) {
+    ) -> (Vec<crate::common::WinCandidate<crate::common::store::SearchRow<Self::Row>>>, bool) {
         #[cfg(test)]
         if search_copy_reference::enabled() || scan_reference::enabled() {
             return crate::common::store::owned_search_candidates(

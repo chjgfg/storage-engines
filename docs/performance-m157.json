@@ -1,0 +1,75 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M157",
+  "date": "2026-11-23",
+  "base_commit": "cf6985a29833751781e13f2cd62e8a4187f43ef0",
+  "objective": "恢复 bitcask/B+/LSM 免 total 页的按需物化，保留 memory 借用分类",
+  "source_run": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba",
+  "changes": [
+    "src/common/store.rs",
+    "src/memory/memory_mvcc.rs",
+    "src/lsm_tree/lsm_tree_mvcc.rs"
+  ],
+  "mechanism": {
+    "strategy": "SearchRow<R>::Deferred 或已分类结果；共用折叠/分页判据",
+    "page_rows": 100,
+    "eager_sst_value_clones": 4096,
+    "deferred_sst_value_clones": 101,
+    "negative_control": "恢复 M153 整块物化后，同一 copies==101 守卫失败，catch_unwind 验证",
+    "semantic_guard": "5000 个 Missing/墓碑/过期候选跨 4096 片；include_deleted、total、深页/空页；现有 memory 0/17 值复制守卫"
+  },
+  "commands": [
+    "cargo check --all-targets --offline --quiet",
+    "cargo test --release --lib --offline --quiet search_ -- --test-threads=1",
+    "cargo test --release --lib --offline --quiet search_deferred_sst_same_seed_abba -- --ignored --nocapture --test-threads=1"
+  ],
+  "validation": {
+    "all_targets_check_exit": 0,
+    "search_tests": {
+      "passed": 17,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 3.72
+    },
+    "abba": {
+      "rows": 20000,
+      "value_bytes": 512,
+      "arms": [
+        {
+          "arm": 0,
+          "eager": true,
+          "ms": 5.769,
+          "copies": 4096,
+          "allocations": 24949
+        },
+        {
+          "arm": 1,
+          "eager": false,
+          "ms": 2.726,
+          "copies": 101,
+          "allocations": 12415
+        },
+        {
+          "arm": 2,
+          "eager": false,
+          "ms": 2.18,
+          "copies": 101,
+          "allocations": 12415
+        },
+        {
+          "arm": 3,
+          "eager": true,
+          "ms": 2.48,
+          "copies": 4096,
+          "allocations": 16410
+        }
+      ],
+      "raw_output": "\nrunning 1 test\nSEARCH_DEFERRED_ABBA arm=0 eager=true ms=5.769 copies=4096 allocations=24949\nSEARCH_DEFERRED_ABBA arm=1 eager=false ms=2.726 copies=101 allocations=12415\nSEARCH_DEFERRED_ABBA arm=2 eager=false ms=2.180 copies=101 allocations=12415\nSEARCH_DEFERRED_ABBA arm=3 eager=true ms=2.480 copies=4096 allocations=16410\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 625 filtered out; finished in 0.41s\n\n"
+    }
+  },
+  "limitations": [
+    "首臂含冷缓存读块，与后续热臂不对称；不从该 ABBA 下墙钟提升结论。热臂额外分配减少 3995，与取值差一致。",
+    "本里程碑未复跑用户完整五档；后续阶段完成后运行全库回归与正式小档。",
+    "memory 值复制守卫仍保持原有分配上限，不用放宽阈值通过。"
+  ]
+}

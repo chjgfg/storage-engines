@@ -1754,6 +1754,61 @@ mod tests {
     }
 
     #[test]
+    fn search_sst_no_total_stops_value_clones_with_eager_negative_control() {
+        let path = tmp_db("search_deferred_sst");
+        let db = MVCC::open(&path);
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..10_000u64 { assert!(tx.set_raw(&i.to_be_bytes(), vec![9; 128])); }
+        tx.commit(); db.flush();
+        let tx = db.begin_transaction();
+        let mut query = crate::common::SearchQuery::contains(b"", 0, 100);
+        query.need_total = false;
+        for eager in [true, false] {
+            let mode = eager.then(crate::common::store::search_materialize_reference::Scope::start);
+            let before = crate::lsm_tree::sst::entry_value_clones();
+            let page = tx.search_keys(&query);
+            let copies = crate::lsm_tree::sst::entry_value_clones() - before;
+            assert_eq!(page.items.len(), 100); assert!(page.has_next);
+            assert_eq!(page.items[99].value, Some(vec![9; 128]));
+            assert_eq!(copies, if eager { 4096 } else { 101 });
+            let guard = std::panic::catch_unwind(|| assert_eq!(copies, 101));
+            assert_eq!(guard.is_err(), eager);
+            drop(mode);
+        }
+        tx.commit();
+    }
+
+    #[test]
+    #[ignore = "same SST seed ABBA for deferred search materialization"]
+    fn search_deferred_sst_same_seed_abba() {
+        let path = tmp_db("search_deferred_abba");
+        let db = MVCC::open(&path);
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..20_000u64 { assert!(tx.set_raw(&i.to_be_bytes(), vec![9; 512])); }
+        tx.commit(); db.flush();
+        let tx = db.begin_transaction();
+        for (arm, eager) in [true, false, false, true].into_iter().enumerate() {
+            let mode = eager.then(crate::common::store::search_materialize_reference::Scope::start);
+            let before = crate::lsm_tree::sst::entry_value_clones();
+            let mut q = crate::common::SearchQuery::contains(b"", 0, 100);
+            q.need_total = false;
+            let now = std::time::Instant::now();
+            let (page, allocations) = crate::mem_probe::count_thread_allocations(|| tx.search_keys(&q));
+            let ms = now.elapsed().as_secs_f64() * 1000.0;
+            let copies = crate::lsm_tree::sst::entry_value_clones() - before;
+            assert_eq!(copies, if eager { 4096 } else { 101 });
+            assert_eq!(page.items.len(), 100); assert!(page.has_next);
+            assert_eq!(page.items[0].key, 0u64.to_be_bytes());
+            assert_eq!(page.items[99].value, Some(vec![9; 512]));
+            eprintln!("SEARCH_DEFERRED_ABBA arm={arm} eager={eager} ms={ms:.3} copies={copies} allocations={allocations}");
+            drop(mode);
+        }
+        tx.commit();
+    }
+
+    #[test]
     fn conflict_key_lookup_does_not_copy_values_and_keeps_visibility() {
         use crate::lsm_tree::sst::{entry_value_clones, point_read_reference};
         let path = tmp_db("conflict_metadata");
