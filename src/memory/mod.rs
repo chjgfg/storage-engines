@@ -6,7 +6,7 @@
 //! 应用 / main / bench
 //!   ↓ begin / set / get / delete / commit
 //!   ↓ batch_set / scan / search_keys / TTL …
-//! MVCC / Transaction / BulkLoader     ← mvcc.rs
+//! MVCC / Transaction / BulkLoader     ← memory_mvcc.rs（类型入口）与同名目录（按职责实现）
 //!   ↓ encode_key + insert / range_scan
 //! MemStore (BTreeMap 多版本)          ← mem_store.rs
 //!

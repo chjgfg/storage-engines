@@ -1,6 +1,6 @@
 //! 高级 KV 操作（独立模块）：批量、范围扫描、模糊搜索分页、元数据、TTL。
 //!
-//! 全部建立在 [`crate::mvcc::Transaction`] 的快照可见性之上。
+//! 全部建立在 [`crate::lsm_tree::lsm_tree_mvcc::Transaction`] 的快照可见性之上。
 //!
 //! ## 能力一览
 //!
@@ -25,8 +25,8 @@
 //! 旧数据无 tag 时按「永久裸 value」兼容。
 //! 读路径（`get` / scan / multi_get / search）自动剥信封并丢弃已过期条目。
 
-use std::{debug_assert_eq, unreachable};
 use std::time::Duration;
+use std::{debug_assert_eq, unreachable};
 
 use crate::common::codec::parse_i64_user;
 use crate::lsm_tree::lsm_tree_mvcc::{MVCC, Transaction, TxnSide};
@@ -37,11 +37,10 @@ const BATCH_SET_PAGE_ROWS: usize = 1024;
 ///
 /// 这里按原路径重导出，保证 `lsm_tree::kv_ops::pack_plain` 等既有调用点不变。
 pub use crate::common::{
+    ExportRecord, IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery, ValueMeta,
     decode_value_meta, key_matches, logical_to_user, now_unix_secs, pack_plain, pack_ttl,
-    prefix_upper_bound, ExportRecord, IncrError, KeyMatchMode, KeyMeta, SearchPage, SearchQuery,
-    ValueMeta,
+    prefix_upper_bound,
 };
-
 
 // ─── Transaction 扩展 ───────────────────────────────────────────────────────
 
@@ -58,8 +57,7 @@ impl Transaction {
             return self.batch_set_reference(items);
         }
         for (page_index, page) in items.chunks(BATCH_SET_PAGE_ROWS).enumerate() {
-            // Bound the time spent holding shared engine locks even when a
-            // caller passes a very large slice. The input remains borrowed.
+            // 即使调用方传入很大的切片，也限制一次持有共享锁的时间；输入始终借用。
             let mut reg = self.core.lock_registry();
             let mut wal = self.wal.lock().unwrap();
             let mut kv = self.kv.lock().unwrap();
@@ -73,11 +71,7 @@ impl Transaction {
                 &mut side,
                 page_start,
                 page.iter().enumerate().map(|(i, (key, value))| {
-                    (
-                        page_start + i,
-                        key.as_slice(),
-                        Some(pack_plain(value)),
-                    )
+                    (page_start + i, key.as_slice(), Some(pack_plain(value)))
                 }),
             );
             if let Err((failed_at, _error)) = result {
@@ -129,8 +123,14 @@ impl Transaction {
         let mut reg = self.core.lock_registry();
         let mut wal = self.wal.lock().unwrap();
         let mut kv = self.kv.lock().unwrap();
-        self.core
-            .undo(&mut reg, &mut TxnSide { wal: &mut wal, kv: &mut kv }, keys);
+        self.core.undo(
+            &mut reg,
+            &mut TxnSide {
+                wal: &mut wal,
+                kv: &mut kv,
+            },
+            keys,
+        );
     }
 
     // ── multi_get ──
@@ -156,12 +156,7 @@ impl Transaction {
     }
 
     /// 带 TTL 的自增
-    pub fn incr_with_ttl(
-        &self,
-        key: &[u8],
-        delta: i64,
-        ttl: Duration,
-    ) -> Result<i64, IncrError> {
+    pub fn incr_with_ttl(&self, key: &[u8], delta: i64, ttl: Duration) -> Result<i64, IncrError> {
         let expire = now_unix_secs().saturating_add(ttl.as_secs().max(1));
         self.incr_inner(key, delta, Some(expire))
     }
@@ -217,7 +212,11 @@ impl Transaction {
 
     /// 游标式有界扫描（实现见 [`crate::common::scan_page`]）：`after` 之后最多 `limit` 行，
     /// 返回 `(行, 下一页游标)`，游标 `None` = 到底。翻页/迁移用它，别用 `scan(start, None)`。
-    pub fn scan_page(&self, after: Option<&[u8]>, limit: usize) -> (Vec<ExportRecord>, Option<Vec<u8>>) {
+    pub fn scan_page(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> (Vec<ExportRecord>, Option<Vec<u8>>) {
         crate::common::scan_page(self, after, limit)
     }
     pub fn scan_foreach(
@@ -240,11 +239,7 @@ impl Transaction {
     }
 
     /// 前缀流式扫描
-    pub fn prefix_scan_foreach(
-        &self,
-        prefix: &[u8],
-        f: impl FnMut(ExportRecord) -> bool,
-    ) {
+    pub fn prefix_scan_foreach(&self, prefix: &[u8], f: impl FnMut(ExportRecord) -> bool) {
         let end = prefix_upper_bound(prefix);
         self.scan_foreach(Some(prefix), end.as_deref(), f);
     }
@@ -274,9 +269,12 @@ impl Transaction {
     /// [`LSMTree::find_back`]（逐源、命中即停），单键可见行走 `latest_visible_raw`。
     /// ⚠️ 这里**不能**用整段 `scan`：LSM 的 scan 要跨源归并，一次 seek_prev 会把窗口内所有源
     /// 都拖一遍（200k 实测单次 610 ms，四家最贵）。
-    // Strict physical predecessor; logical reordering is shared in common::order.
+    // 先取严格物理前驱，逻辑顺序的重排由 common::order 统一处理。
     fn prev_encoded(&self, bound: &[u8]) -> Option<Vec<u8>> {
-        self.kv.lock().unwrap().find_back(b"", bound, u64::MAX, |enc, _| enc < bound)
+        self.kv
+            .lock()
+            .unwrap()
+            .find_back(b"", bound, u64::MAX, |enc, _| enc < bound)
             .map(|(enc, _)| enc)
     }
 
@@ -287,22 +285,35 @@ impl Transaction {
 
     pub fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
         use crate::common::order::{ReverseOutcome, range_end, reverse_window};
-        match reverse_window(1, usize::MAX,
-            Some(range_end(key, self.core.version, true)), Some(key),
-            |bound| self.prev_encoded(bound), |raw| self.live_of(raw)) {
+        match reverse_window(
+            1,
+            usize::MAX,
+            Some(range_end(key, self.core.version, true)),
+            Some(key),
+            |bound| self.prev_encoded(bound),
+            |raw| self.live_of(raw),
+        ) {
             ReverseOutcome::Complete(mut rows) => rows.pop(),
             ReverseOutcome::BudgetExceeded { .. } => unreachable!("unlimited reverse walk"),
         }
     }
 
-    /// Reverse physical walk with logical-key ordering. Binary prefixes and long
-    /// histories count against the same 8192-step budget; fallback is explicit.
+    /// 反向物理扫描按逻辑键排序；二进制前缀和长历史都计入8192步预算，超出后显式回退。
     pub fn search_last_page(&self, page_size: usize) -> SearchPage {
         use crate::common::order::{ReverseOutcome, reverse_window};
         const MAX_STEPS: usize = 8 * 1024;
-        let bound = (self.kv.lock().unwrap().store_max_key()).map(|mut enc| { enc.push(0); enc });
-        let items = match reverse_window(page_size, MAX_STEPS, bound, None,
-            |bound| self.prev_encoded(bound), |raw| self.live_of(raw)) {
+        let bound = (self.kv.lock().unwrap().store_max_key()).map(|mut enc| {
+            enc.push(0);
+            enc
+        });
+        let items = match reverse_window(
+            page_size,
+            MAX_STEPS,
+            bound,
+            None,
+            |bound| self.prev_encoded(bound),
+            |raw| self.live_of(raw),
+        ) {
             ReverseOutcome::Complete(rows) => rows,
             ReverseOutcome::BudgetExceeded { physical_steps } => {
                 debug_assert_eq!(physical_steps, MAX_STEPS);
@@ -312,8 +323,14 @@ impl Transaction {
                 rows
             }
         };
-        SearchPage { items, total: None, page: 0, page_size,
-            total_pages: None, has_next: false }
+        SearchPage {
+            items,
+            total: None,
+            page: 0,
+            page_size,
+            total_pages: None,
+            has_next: false,
+        }
     }
 
     pub fn search_keys(&self, query: &SearchQuery) -> SearchPage {
@@ -350,11 +367,7 @@ impl Transaction {
                 let expired = m.is_expired_at(now_unix_secs());
                 Some(KeyMeta {
                     key: key.to_vec(),
-                    value_len: if expired {
-                        None
-                    } else {
-                        Some(m.user().len())
-                    },
+                    value_len: if expired { None } else { Some(m.user().len()) },
                     version,
                     expire_unix_secs: m.expire_unix_secs(),
                     expired,
@@ -471,442 +484,6 @@ impl MVCC {
 // ─── 测试 ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::assert;
-    use std::assert_eq;
-    use std::panic;
-    use std::eprintln;
-    use std::vec;
-    use std::format;
-    use std::matches;
-    use std::path::Path;
+mod tests;
 
-    /// 返回 **RAII 句柄**（M82）：把它声明在引擎之前，用例结束（含 panic 展开）自动删，
-    /// 不必再指望人记得写 `cleanup` —— 而"引擎还开着就删"在 Windows 上是静默失败。
-    fn tmp(tag: &str) -> crate::common::ScratchPath {
-        crate::common::ScratchPath::new("lsm_kv_ops", tag, "")
-    }
-
-    fn cleanup(path: &Path) {
-        let _ = std::fs::remove_dir_all(path);
-    }
-
-    #[test]
-    fn test_value_meta_roundtrip() {
-        let p = pack_plain(b"hi");
-        match decode_value_meta(&p) {
-            ValueMeta::Plain { user } => assert_eq!(user, b"hi"),
-            _ => panic!(),
-        }
-        let t = pack_ttl(b"x", 1000);
-        match decode_value_meta(&t) {
-            ValueMeta::Ttl {
-                expire_unix_secs,
-                user,
-            } => {
-                assert_eq!(expire_unix_secs, 1000);
-                assert_eq!(user, b"x");
-            }
-            _ => panic!(),
-        }
-        assert_eq!(
-            decode_value_meta(b"raw"),
-            ValueMeta::Plain {
-                user: b"raw".to_vec()
-            }
-        );
-    }
-
-    #[test]
-    fn test_batch_and_multi_get() {
-        let path = tmp("batch");
-        {
-            let mvcc = MVCC::open(&path);
-            let tx = mvcc.begin_transaction();
-            let items = vec![
-                (b"a".to_vec(), b"1".to_vec()),
-                (b"b".to_vec(), b"2".to_vec()),
-                (b"c".to_vec(), b"3".to_vec()),
-            ];
-            tx.batch_set(&items).unwrap();
-            let got = tx.multi_get(&[b"a".to_vec(), b"b".to_vec(), b"z".to_vec()]);
-            assert_eq!(got[0], Some(b"1".to_vec()));
-            assert_eq!(got[1], Some(b"2".to_vec()));
-            assert_eq!(got[2], None);
-            tx.batch_delete(&[b"b".to_vec()]).unwrap();
-            assert!(!tx.exists(b"b"));
-            tx.commit();
-        }
-        cleanup(&path);
-    }
-
-    #[test]
-    fn batch_failure_undoes_only_successful_prefix_and_survives_reopen() {
-        #[cfg(feature = "lsm-allocation-reference")]
-        let references = [true, false];
-        #[cfg(not(feature = "lsm-allocation-reference"))]
-        let references = [false];
-        for _reference in references {
-            #[cfg(feature = "lsm-allocation-reference")]
-            let mode = _reference.then(super::super::lsm_tree::allocation_reference::Scope::start);
-            let path = tmp("batch_failure_prefix");
-            {
-                let mvcc = MVCC::open(&path);
-                let seed = mvcc.begin_transaction();
-                seed.batch_set(&[(b"a".to_vec(), b"old".to_vec()),
-                    (b"hot".to_vec(), b"original".to_vec())]).unwrap();
-                seed.commit();
-                let holder = mvcc.begin_transaction();
-                assert!(holder.set(b"hot", pack_plain(b"locked")));
-                let tx = mvcc.begin_transaction();
-                assert!(tx.batch_set(&[]).is_ok());
-                assert!(tx.batch_delete(&[]).is_ok());
-                assert!(tx.set(b"outside", pack_plain(b"keep")));
-                let items = [(b"new".to_vec(), b"one".to_vec()),
-                    (b"new".to_vec(), b"two".to_vec()),
-                    (b"hot".to_vec(), b"rejected".to_vec()),
-                    (b"untouched".to_vec(), b"never".to_vec())];
-                let lookups_before = crate::common::txn::write_registry_lookups();
-                assert_eq!(tx.batch_set(&items), Err(b"hot".to_vec()));
-                assert_eq!(crate::common::txn::write_registry_lookups() - lookups_before,
-                    if _reference { 2 } else { 1 },
-                    "the reference resolves the write registry for each successful row; the batch path resolves it once");
-                assert_eq!(tx.get(b"new"), None);
-                assert_eq!(tx.get(b"untouched"), None);
-                assert_eq!(tx.batch_delete(&[b"a".to_vec(), b"a".to_vec(), b"hot".to_vec()]),
-                    Err(b"hot".to_vec()));
-                assert_eq!(tx.get(b"a"), Some(b"old".to_vec()));
-                assert_eq!(tx.batch_delete(&[b"hot".to_vec(), b"outside".to_vec()]),
-                    Err(b"hot".to_vec()));
-                assert_eq!(tx.get(b"outside"), Some(b"keep".to_vec()));
-                // KvTxn's failure contract requires aborting the whole txn;
-                // partial undo is not a durable savepoint that can be committed.
-                tx.rollback();
-                holder.rollback();
-            }
-            {
-                let mvcc = MVCC::open(&path);
-                let tx = mvcc.begin_transaction();
-                assert_eq!(tx.get(b"a"), Some(b"old".to_vec()));
-                assert_eq!(tx.get(b"hot"), Some(b"original".to_vec()));
-                assert_eq!(tx.get(b"outside"), None);
-                assert_eq!(tx.get(b"new"), None);
-                assert_eq!(tx.get(b"untouched"), None);
-                tx.commit();
-            }
-            #[cfg(feature = "lsm-allocation-reference")]
-            drop(mode);
-        }
-    }
-
-    #[test]
-    fn batch_set_rolls_back_prefix_across_lock_pages() {
-        let path = tmp("batch_set_lock_pages");
-        let mvcc = MVCC::open(&path);
-        let holder = mvcc.begin_transaction();
-        assert!(holder.set(b"locked", pack_plain(b"held")));
-        let tx = mvcc.begin_transaction();
-        let items: Vec<_> = (0..BATCH_SET_PAGE_ROWS + 2)
-            .map(|index| {
-                if index == BATCH_SET_PAGE_ROWS {
-                    (b"locked".to_vec(), b"rejected".to_vec())
-                } else {
-                    (index.to_be_bytes().to_vec(), b"value".to_vec())
-                }
-            })
-            .collect();
-
-        let lookups_before = crate::common::txn::write_registry_lookups();
-        assert_eq!(tx.batch_set(&items), Err(b"locked".to_vec()));
-        assert_eq!(
-            crate::common::txn::write_registry_lookups() - lookups_before,
-            2,
-            "the write registry is resolved once for each attempted lock page"
-        );
-        assert_eq!(tx.get(&0usize.to_be_bytes()), None);
-        assert_eq!(tx.get(&1023usize.to_be_bytes()), None);
-        assert_eq!(tx.get(&1025usize.to_be_bytes()), None);
-
-        tx.rollback();
-        holder.rollback();
-        drop(tx);
-        drop(holder);
-        drop(mvcc);
-
-        let reopened = MVCC::open(&path);
-        let check = reopened.begin_transaction();
-        assert_eq!(check.get(&0usize.to_be_bytes()), None);
-        assert_eq!(check.get(&1023usize.to_be_bytes()), None);
-        assert_eq!(check.get(&1025usize.to_be_bytes()), None);
-        check.commit();
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_scan_prefix_seek() {
-        let path = tmp("scan");
-        {
-            let mvcc = MVCC::open(&path);
-            let tx = mvcc.begin_transaction();
-            for (k, v) in [
-                (&b"order:01"[..], &b"a"[..]),
-                (&b"order:02"[..], &b"b"[..]),
-                (&b"order:10"[..], &b"c"[..]),
-                (&b"user:1"[..], &b"u"[..]),
-            ] {
-                assert!(tx.set(k, pack_plain(v)));
-            }
-            tx.commit();
-
-            let tx = mvcc.begin_transaction();
-            let s = tx.prefix_scan(b"order:");
-            assert_eq!(s.len(), 3);
-            assert_eq!(s[0].key, b"order:01");
-            let one = tx.seek(b"order:05").unwrap();
-            assert_eq!(one.key, b"order:10");
-            let prev = tx.seek_prev(b"order:05").unwrap();
-            assert_eq!(prev.key, b"order:02");
-            assert_eq!(tx.key_count(b"order:"), 3);
-            tx.commit();
-        }
-        cleanup(&path);
-    }
-
-
-    /// 不要精确 total 的翻页，代价必须只看**窗口宽**，不看库有多大（M15 的验收）。
-    ///
-    /// 以前 `search_keys` 为了报一个 `total` 把整库折一遍 ⇒ 首页与末页一样贵
-    /// （实测 20000 键时首页也要 100 ms 量级）。尺子是本引擎自己的代价单位。
-    /// 顺序是**先量窗口、再量全量**：后跑那次缓存更热，偏差只会让断言更难通过，不会骗人。
-    /// M21 守卫：**翻页的代价要跟着页宽走，不能跟着库大小走** —— 而且必须测"后面的页"。
-    ///
-    /// 首页从库头起，游标 `after` 就算没下推它也一样便宜 ⇒ 只测首页会一路绿灯（bitcask 那条
-    /// `scan_page_costs_the_page_and_walks_the_whole_library_once` 量的就是首页，这个洞在它眼皮
-    /// 底下活了一整个版本）。所以这里量**最后一页**，并要求它与首页同阶。
-    /// 尺子用本引擎自己的（`light_visits()`（归并吐出多少把键）），判完代价还判**等价**：最后一页的起点必须正好是全库
-    /// 第 `(pages-1)×PAGE` 把键 —— 只测便宜不测内容，就是拿错数据换性能。
-    #[test]
-    fn test_scan_page_later_pages_cost_the_page_not_the_library() {
-        const N: usize = 2000;
-        const PAGE: usize = 50;
-        let path = tmp("scan_page_later");
-        {
-            let mvcc = MVCC::open(&path);
-            {
-                let tx = mvcc.begin_transaction();
-                for i in 0..N {
-                    assert!(tx.set(format!("k{i:05}").as_bytes(), pack_plain(b"v")));
-                }
-                tx.commit();
-            }
-            let _ = mvcc.flush();
-            let b0 = crate::lsm_tree::sst::light_visits();
-            let (_first, mut cur) = {
-                let tx = mvcc.begin_transaction();
-                let p = tx.scan_page(None, PAGE);
-                tx.commit();
-                p
-            };
-            let first_cost = crate::lsm_tree::sst::light_visits() - b0;
-
-            let mut pages = 1usize;
-            let mut last_rows = Vec::new();
-            // **只量最后一页**：把整段翻页的总和当一页看，会把 39 页的成本当成一页去断言
-            let mut last_cost = 0u64;
-            while let Some(c) = cur {
-                let b1 = crate::lsm_tree::sst::light_visits();
-                let tx = mvcc.begin_transaction();
-                let (rows, next) = tx.scan_page(Some(&c), PAGE);
-                tx.commit();
-                last_cost = crate::lsm_tree::sst::light_visits() - b1;
-                last_rows = rows;
-                pages += 1;
-                cur = next;
-                assert!(pages <= N / PAGE + 2, "游标不前进？已 {pages} 页");
-            }
-
-            let want = (pages - 1) * PAGE;
-            assert!(!last_rows.is_empty(), "最后一页不能是空的");
-            {
-                let tx = mvcc.begin_transaction();
-                let all = tx.scan(None, None);
-                tx.commit();
-                assert_eq!(all.len(), N, "全库应折出 {N} 行");
-                assert_eq!(
-                    last_rows[0].key, all[want].key,
-                    "第 {pages} 页的起点不是全库第 {want} 把键 ⇒ 翻页漏行或重行"
-                );
-                assert_eq!(
-                    all[want + last_rows.len() - 1].key,
-                    last_rows.last().unwrap().key,
-                    "最后一页的终点也对不上"
-                );
-            }
-            eprintln!(
-                "[scan_page 翻页] 首页 {first_cost} / 最后一页 {last_cost}（页宽 {PAGE}，共 {pages} 页，N={N}）"
-            );
-            assert!(
-                last_cost <= 2 * (first_cost + PAGE as u64),
-                "最后一页付了 {last_cost}，首页只 {first_cost} ⇒ 游标 `after` 没下推成迭代起点，\
-                 每页都从库头重走（翻完整库 = O(库²/页宽)）"
-            );
-            cleanup(&path);
-        }
-    }
-
-    #[test]
-    fn test_search_window_costs_the_window_not_the_library() {
-        const N: usize = 2000;
-        const PAGE: usize = 20;
-        let path = tmp("search_window");
-        {
-            let mvcc = MVCC::open(&path);
-            let tx = mvcc.begin_transaction();
-            for i in 0..N {
-                assert!(tx.set(format!("user{i:05}").as_bytes(), pack_plain(b"x")), "第 {i} 行没写进去");
-            }
-            tx.commit();
-            let _ = mvcc.flush();
-
-            let vb = crate::lsm_tree::sst::light_visits();
-            let bb = crate::lsm_tree::sst::block_reads();
-            let w = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE).without_total());
-            let window_cost = crate::lsm_tree::sst::light_visits() - vb;
-            let window_blocks = crate::lsm_tree::sst::block_reads() - bb;
-
-            let vb = crate::lsm_tree::sst::light_visits();
-            let bb = crate::lsm_tree::sst::block_reads();
-            let full = mvcc.search_keys(&SearchQuery::contains(b"user", 0, PAGE));
-            let full_cost = crate::lsm_tree::sst::light_visits() - vb;
-            let full_blocks = crate::lsm_tree::sst::block_reads() - bb;
-
-            // 尺子的对照臂（M75b）：`key_count` 走 [`crate::common::count_window`] = **一趟全界**，
-            // 是"数一个数最少要付多少"的现成基线。旧判据 `window_cost * 2 <= full_cost` 把这个
-            // 守卫要钉的东西写成了"**两趟**"（窗口一趟 + 计数一趟），合成一趟之后它必然红 ⇒
-            // 换成"要 total 的成本 ≤ 那一趟全界 + 一页"。改回两步会读到近 2 倍，这条就红。
-            let yard = mvcc.begin_transaction();
-            let vb = crate::lsm_tree::sst::light_visits();
-            let counted = yard.key_count(b"user");
-            let count_cost = crate::lsm_tree::sst::light_visits() - vb;
-
-            assert_eq!(full.total, Some(N), "要 total 时语义与改前完全一致");
-            assert_eq!(w.total, None, "没数就不许报一个数出来");
-            assert_eq!(w.total_pages, None);
-            assert_eq!(w.items.len(), PAGE);
-            assert_eq!(w.items, full.items, "窗口必须是同一页的全量结果：分页语义一个字节都不许变");
-            assert!(w.has_next(), "后面还有 {} 条，必须报得出来", N - PAGE);
-            assert_eq!(counted, N, "对照臂数出来的条数不对 ⇒ 对照没建立，下面那条不算数");
-            eprintln!(
-                "[search 窗口] 首页 {window_cost} 把键 / {window_blocks} 块；全量 {full_cost} 把 / {full_blocks} 块；\
-                 对照臂 `key_count` 一趟全界 {count_cost} 把（N={N}）"
-            );
-
-            assert!(
-                full_cost > 0 && full_cost <= count_cost + (2 * PAGE) as u64,
-                "要 total 走了 {full_cost} 把键，而『只数不取』那一趟全界只走 {count_cost} 把 ⇒ \
-                 取页与数数还是各走一趟（M75b 合成一趟后这两个数应当同量）"
-            );
-            // 块读也要跟着窗口走。**这条才是 M15b 的守卫**：上一行只数"归并吐出多少键",
-            // 而旧的 `scan_latest_light_range` 先把每个源整篇物化 ⇒ 键数看着对了,块却读满全库
-            // （实测首页 53 块,而这库总共才 32 块）。判据取"每交付一把键最多两块"——
-            // 内含每个源启动一块的余量,改回 eager 就会红。
-            assert!(
-                window_blocks <= 2 * (window_cost + 1),
-                "首页交付 {window_cost} 把键却读了 {window_blocks} 个块 ⇒ 源被整篇物化了，                 不是惰性拉取（改回 `scan_latest_light_range` 正是这个形状）"
-            );
-
-            let last = N / PAGE - 1;
-            let w2 = mvcc.search_keys(&SearchQuery::contains(b"user", last, PAGE).without_total());
-            let f2 = mvcc.search_keys(&SearchQuery::contains(b"user", last, PAGE));
-            assert_eq!(w2.items.len(), PAGE);
-            assert_eq!(w2.items, f2.items, "同一页的内容与要不要 total 无关");
-            assert!(!w2.has_next(), "最后一页之后没有东西了");
-        }
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_search_pagination() {
-        let path = tmp("search");
-        {
-            let mvcc = MVCC::open(&path);
-            let tx = mvcc.begin_transaction();
-            for k in [&b"apple"[..], &b"apply"[..], &b"banana"[..], &b"user:1"[..]] {
-                assert!(tx.set(k, pack_plain(b"v")));
-            }
-            tx.commit();
-
-            let page = mvcc.search_keys(&SearchQuery::contains(b"pp", 0, 10));
-            assert_eq!(page.total, Some(2));
-            assert_eq!(page.items.len(), 2);
-
-            let p0 = mvcc.search_keys(&SearchQuery::prefix(b"user:", 0, 1));
-            assert_eq!(p0.total, Some(1));
-            assert!(!p0.has_next());
-        }
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_incr_and_ttl() {
-        let path = tmp("incr");
-        {
-            let mvcc = MVCC::open(&path);
-            let tx = mvcc.begin_transaction();
-            assert_eq!(tx.incr(b"n", 1).unwrap(), 1);
-            assert_eq!(tx.incr(b"n", 9).unwrap(), 10);
-            assert_eq!(tx.decr(b"n", 3).unwrap(), 7);
-            assert_eq!(tx.get(b"n"), Some(b"7".to_vec()));
-
-            assert_eq!(
-                tx.incr_with_ttl(b"hits", 1, Duration::from_secs(60))
-                    .unwrap(),
-                1
-            );
-            assert!(matches!(tx.get_ttl(b"hits"), Some(Some(_))));
-
-            assert!(tx.set_with_ttl(b"tmp", b"x".to_vec(), Duration::from_secs(120)));
-            assert!(tx.exists(b"tmp"));
-            assert!(tx.persist(b"tmp"));
-            assert_eq!(tx.get_ttl(b"tmp"), Some(None));
-
-            // 过期清理
-            let stale = pack_ttl(b"old", now_unix_secs().saturating_sub(5));
-            assert!(tx.set(b"gone", stale));
-            assert!(!tx.exists(b"gone"));
-            let n = tx.purge_expired();
-            assert!(n >= 1);
-            tx.commit();
-        }
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_meta_and_exists() {
-        let path = tmp("meta");
-        {
-            let mvcc = MVCC::open(&path);
-            let tx = mvcc.begin_transaction();
-            assert!(tx.set(b"k", pack_plain(b"hello")));
-            assert!(tx.exists(b"k"));
-            let m = tx.get_meta(b"k").unwrap();
-            assert_eq!(m.value_len, Some(5));
-            assert!(!m.deleted);
-            assert!(!m.expired);
-            assert!(tx.delete(b"k"));
-            assert!(!tx.exists(b"k"));
-            tx.commit();
-        }
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_prefix_upper_bound() {
-        assert_eq!(
-            prefix_upper_bound(b"ab"),
-            Some(b"ac".to_vec())
-        );
-        assert_eq!(prefix_upper_bound(b"a\xff"), Some(b"b".to_vec()));
-    }
-}
+// 按职责组织的内部实现；公开类型与原模块路径保持一致。

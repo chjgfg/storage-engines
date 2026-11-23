@@ -5,10 +5,10 @@
 //! 三家不一样）。编解码和保留规则都是**纯逻辑**，不涉及存储结构，所以先抽出来；
 //! 各引擎仍然保留自己的遍历原语和自己的守卫测试 —— 合并的是判定，不是扫描。
 
-#[cfg(test)]
-use std::thread_local;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::thread_local;
 
 /// 逻辑键 + 版本（调试用）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,10 +30,13 @@ pub fn encode_key(raw_key: &[u8], version: u64) -> Vec<u8> {
 
 /// 解码
 pub fn decode_key(enc: &[u8]) -> Option<VersionedKey> {
-    decode_key_ref(enc).map(|(raw_key, version)| VersionedKey { raw_key: raw_key.to_vec(), version })
+    decode_key_ref(enc).map(|(raw_key, version)| VersionedKey {
+        raw_key: raw_key.to_vec(),
+        version,
+    })
 }
 
-/// Borrow the raw key when a caller needs only identity and version.
+/// 只需要键身份和版本时，借用原始键。
 pub(crate) fn decode_key_ref(enc: &[u8]) -> Option<(&[u8], u64)> {
     let split = enc.len().checked_sub(8)?;
     let (raw, version) = enc.split_at(split);
@@ -107,25 +110,36 @@ pub(crate) fn reset_vacuum_group_counters() {
 ///
 /// 组被 drain 清空但保留容量，调用方可直接复用同一缓冲接下一把键。
 pub fn vacuum_plan_group<V: Clone, R: Clone>(
-    group: &mut Vec<(u64, V, bool, R)>, xmin: u64,
+    group: &mut Vec<(u64, V, bool, R)>,
+    xmin: u64,
 ) -> (Vec<V>, Vec<(V, R)>) {
     let mut delete = Vec::new();
     let mut keep = Vec::new();
-    vacuum_drain_group(group, xmin, |row| delete.push(row), |row, extra| keep.push((row, extra)));
+    vacuum_drain_group(
+        group,
+        xmin,
+        |row| delete.push(row),
+        |row, extra| keep.push((row, extra)),
+    );
     (delete, keep)
 }
 
-/// Move each owned row directly to its destination. Callers that need no kept
-/// rows can discard them without allocating an intermediate keep Vec.
+/// 拥有型记录直接移向目标；不需要保留行的调用方可直接丢弃，免建中间保留数组。
 pub(crate) fn vacuum_drain_group<V: Clone, R: Clone>(
-    group: &mut Vec<(u64, V, bool, R)>, xmin: u64,
-    mut delete: impl FnMut(V), mut keep: impl FnMut(V, R),
+    group: &mut Vec<(u64, V, bool, R)>,
+    xmin: u64,
+    mut delete: impl FnMut(V),
+    mut keep: impl FnMut(V, R),
 ) {
     #[cfg(test)]
     if vacuum_reference::enabled() {
         let (d, k) = vacuum_plan_group_reference(group, xmin);
-        for row in d { delete(row); }
-        for (row, extra) in k { keep(row, extra); }
+        for row in d {
+            delete(row);
+        }
+        for (row, extra) in k {
+            keep(row, extra);
+        }
         return;
     }
     let versions = group;
@@ -134,7 +148,7 @@ pub(crate) fn vacuum_drain_group<V: Clone, R: Clone>(
         VACUUM_GROUP_CALLS.with(|c| c.set(c.get() + 1));
         VACUUM_GROUP_MAX_ROWS.with(|m| m.set(m.get().max(versions.len() as u64)));
     }
-    // Stable sorting preserves the old rule for duplicate version numbers.
+    // 稳定排序保留重复版本号的原处理次序。
     versions.sort_by_key(|(v, _, _, _)| *v);
     let last_old = versions.iter().rposition(|(v, _, _, _)| *v < xmin);
     let reap_last = last_old.is_some_and(|i| versions[i].2 && i + 1 == versions.len());
@@ -151,12 +165,21 @@ pub(crate) fn vacuum_drain_group<V: Clone, R: Clone>(
 pub(crate) mod vacuum_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
-    pub(crate) fn enabled() -> bool { ENABLED.with(|c| c.get()) }
+    pub(crate) fn enabled() -> bool {
+        ENABLED.with(|c| c.get())
+    }
     pub(crate) struct Scope;
     impl Scope {
-        pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self }
+        pub fn start() -> Self {
+            ENABLED.with(|c| assert!(!c.replace(true)));
+            Self
+        }
     }
-    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ENABLED.with(|c| c.set(false));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +210,11 @@ where
     let last_old = versions.iter().rposition(|(ver, _, _, _)| *ver < xmin);
     match last_old {
         // 整条链都在 xmin 之上：全部保留
-        None => keep.extend(versions.iter().map(|(_, row, _, extra)| (row.clone(), extra.clone()))),
+        None => keep.extend(
+            versions
+                .iter()
+                .map(|(_, row, _, extra)| (row.clone(), extra.clone())),
+        ),
         Some(keep_old) => {
             for i in 0..keep_old {
                 to_delete.push(versions[i].1.clone());
@@ -265,16 +292,30 @@ mod tests {
             }
         }
         let clones = Rc::new(Cell::new(0));
-        let mut group = vec![(1, Row(1, clones.clone()), false, ()), (2, Row(2, clones.clone()), false, ())];
+        let mut group = vec![
+            (1, Row(1, clones.clone()), false, ()),
+            (2, Row(2, clones.clone()), false, ()),
+        ];
         let (delete, keep) = vacuum_plan_group(&mut group, 3);
         assert_eq!(delete[0].0, 1);
         assert_eq!(keep[0].0.0, 2);
         assert!(group.is_empty());
-        assert_eq!(clones.get(), 0, "owned rows must be moved into their destination");
+        assert_eq!(
+            clones.get(),
+            0,
+            "owned rows must be moved into their destination"
+        );
         let _reference = vacuum_reference::Scope::start();
-        let mut group = vec![(1, Row(1, clones.clone()), false, ()), (2, Row(2, clones.clone()), false, ())];
+        let mut group = vec![
+            (1, Row(1, clones.clone()), false, ()),
+            (2, Row(2, clones.clone()), false, ()),
+        ];
         let _ = vacuum_plan_group(&mut group, 3);
-        assert_eq!(clones.get(), 2, "reference arm must exercise the original copies");
+        assert_eq!(
+            clones.get(),
+            2,
+            "reference arm must exercise the original copies"
+        );
     }
 
     #[test]
@@ -297,7 +338,11 @@ mod tests {
     /// 大端编码 ⇒ 版本递增即字节序递增，链尾就是最新版
     #[test]
     fn version_key_orders_by_version_big_endian() {
-        let (k1, k2, k10) = (encode_key(b"user", 1), encode_key(b"user", 2), encode_key(b"user", 10));
+        let (k1, k2, k10) = (
+            encode_key(b"user", 1),
+            encode_key(b"user", 2),
+            encode_key(b"user", 10),
+        );
         assert!(k1 < k2, "小端会把 10 排在 2 之前，反向早停就不成立");
         assert!(k2 < k10);
         let d = decode_key(&k10).unwrap();
@@ -325,11 +370,16 @@ mod tests {
         let mut named: BTreeMap<Vec<u8>, Vec<(u64, &str, bool, ())>> = BTreeMap::new();
         named.insert(
             b"hot".to_vec(),
-            (1..=5u64).map(|v| (v, ROWS[(v - 1) as usize], false, ())).collect(),
+            (1..=5u64)
+                .map(|v| (v, ROWS[(v - 1) as usize], false, ()))
+                .collect(),
         );
         let (delete, keep) = vacuum_plan(named, 6);
         assert_eq!(delete, vec!["v1", "v2", "v3", "v4"]);
-        assert_eq!(keep.iter().map(|(row, _)| *row).collect::<Vec<_>>(), vec!["v5"]);
+        assert_eq!(
+            keep.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            vec!["v5"]
+        );
     }
 
     /// 墓碑的终局回收：xmin 之前最终是墓碑、且没有更新版本 ⇒ 整 key 消失。
@@ -339,39 +389,63 @@ mod tests {
     #[test]
     fn plan_reaps_final_tombstone_but_keeps_newer_versions() {
         let mut tomb_only: BTreeMap<Vec<u8>, Vec<(u64, &str, bool, ())>> = BTreeMap::new();
-        tomb_only.insert(b"gone".to_vec(), vec![(1, "v1", false, ()), (2, "v2", true, ())]);
+        tomb_only.insert(
+            b"gone".to_vec(),
+            vec![(1, "v1", false, ()), (2, "v2", true, ())],
+        );
         let (delete, keep) = vacuum_plan(tomb_only, 5);
-        assert_eq!(delete, vec!["v1", "v2"], "墓碑是最终状态 ⇒ 连同旧值一起收掉");
+        assert_eq!(
+            delete,
+            vec!["v1", "v2"],
+            "墓碑是最终状态 ⇒ 连同旧值一起收掉"
+        );
         assert!(keep.is_empty(), "整 key 都不该留行");
 
         let mut resurrected: BTreeMap<Vec<u8>, Vec<(u64, &str, bool, ())>> = BTreeMap::new();
         resurrected.insert(
             b"back".to_vec(),
-            vec![(1, "v1", false, ()), (2, "v2", true, ()), (4, "v4", false, ())],
+            vec![
+                (1, "v1", false, ()),
+                (2, "v2", true, ()),
+                (4, "v4", false, ()),
+            ],
         );
         // xmin=3 ⇒ 「最后一个 < xmin」是 v2 那版墓碑，而它之上还有 v4：墓碑必须留着，
         // 因为 version ≥ xmin 的快照可能正好落在它上面（这条留错了就是静默读到旧值）
         let (delete, keep) = vacuum_plan(resurrected, 3);
         assert_eq!(delete, vec!["v1"]);
-        assert_eq!(keep.iter().map(|(row, _)| *row).collect::<Vec<_>>(), vec!["v2", "v4"]);
+        assert_eq!(
+            keep.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            vec!["v2", "v4"]
+        );
 
         // 同一组数据把 xmin 推到 5：此时「最后一个 < xmin」变成活着的 v4，
         // 那版墓碑只是又老了一版，按普通旧版本被收掉
         let mut resurrected2: BTreeMap<Vec<u8>, Vec<(u64, &str, bool, ())>> = BTreeMap::new();
         resurrected2.insert(
             b"back".to_vec(),
-            vec![(1, "v1", false, ()), (2, "v2", true, ()), (4, "v4", false, ())],
+            vec![
+                (1, "v1", false, ()),
+                (2, "v2", true, ()),
+                (4, "v4", false, ()),
+            ],
         );
         let (delete, keep) = vacuum_plan(resurrected2, 5);
         assert_eq!(delete, vec!["v1", "v2"]);
-        assert_eq!(keep.iter().map(|(row, _)| *row).collect::<Vec<_>>(), vec!["v4"]);
+        assert_eq!(
+            keep.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            vec!["v4"]
+        );
     }
 
     /// 链全在 xmin 之上（还有活跃事务可能看到）⇒ 一行都不能动。
     #[test]
     fn plan_keeps_everything_above_xmin() {
         let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, &str, bool, ())>> = BTreeMap::new();
-        by_key.insert(b"new".to_vec(), vec![(7, "new", false, ()), (8, "new", false, ())]);
+        by_key.insert(
+            b"new".to_vec(),
+            vec![(7, "new", false, ()), (8, "new", false, ())],
+        );
         let (delete, keep) = vacuum_plan(by_key, 5);
         assert!(delete.is_empty());
         assert_eq!(keep.len(), 2);

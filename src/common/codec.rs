@@ -1,4 +1,4 @@
-//! TTL 信封编解码 + key 匹配 / 前缀上界（唯一定义，四个引擎共享）。
+//! 本文件负责SST 块、索引和格式编解码。
 //!
 //! ## TTL 存储约定
 //!
@@ -45,24 +45,29 @@ pub fn pack_ttl(user: &[u8], expire_unix_secs: u64) -> Vec<u8> {
     out
 }
 
-/// The fallback's allocation/copy remains explicit for callers and guards.
-pub(crate) enum SealedValue { Reused(Vec<u8>), Copied(Vec<u8>) }
+/// 回退的分配和复制成本向调用方及守卫明确暴露。
+pub(crate) enum SealedValue {
+    Reused(Vec<u8>),
+    Copied(Vec<u8>),
+}
 
 impl SealedValue {
     pub(crate) fn into_bytes(self) -> Vec<u8> {
-        match self { Self::Reused(bytes) | Self::Copied(bytes) => bytes }
+        match self {
+            Self::Reused(bytes) | Self::Copied(bytes) => bytes,
+        }
     }
 }
 
-/// Own the user value while adding its logical envelope.
+/// 保留用户值所有权，并加上逻辑值信封。
 pub(crate) fn pack_owned(mut user: Vec<u8>, expire: Option<u64>) -> SealedValue {
     let prefix = if expire.is_some() { 9 } else { 1 };
     let len = user.len();
     if user.capacity() - len < prefix {
-        // TTL decoded with only a plain-tag slot keeps the original single-copy
-        // allocation path; it does not realloc and then shift the payload again.
+        // TTL 解码仅预留普通标志槽时保留单次复制分配路径，不先扩容再搬移载荷。
         return SealedValue::Copied(match expire {
-            Some(expiry) => pack_ttl(&user, expiry), None => pack_plain(&user),
+            Some(expiry) => pack_ttl(&user, expiry),
+            None => pack_plain(&user),
         });
     }
     user.resize(len + prefix, 0);
@@ -89,9 +94,16 @@ fn owned_seal_reuses_prepared_buffer_and_preserves_bytes() {
             let sealed = pack_owned(value, expiry);
             assert!(matches!(&sealed, SealedValue::Reused(_)));
             let actual = sealed.into_bytes();
-            let expected = match expiry { Some(e) => pack_ttl(&payload, e), None => pack_plain(&payload) };
+            let expected = match expiry {
+                Some(e) => pack_ttl(&payload, e),
+                None => pack_plain(&payload),
+            };
             assert_eq!(actual, expected);
-            assert_eq!(actual.as_ptr(), pointer, "prepared payload must keep its allocation");
+            assert_eq!(
+                actual.as_ptr(),
+                pointer,
+                "prepared payload must keep its allocation"
+            );
             let mut exact = Vec::with_capacity(payload.len());
             exact.extend_from_slice(&payload);
             let sealed = pack_owned(exact, expiry);
@@ -106,31 +118,41 @@ pub fn decode_value_meta(logical: &[u8]) -> ValueMeta {
     let (offset, expire) = envelope(logical);
     let user = logical[offset..].to_vec();
     match expire {
-        Some(expire_unix_secs) => ValueMeta::Ttl { expire_unix_secs, user },
+        Some(expire_unix_secs) => ValueMeta::Ttl {
+            expire_unix_secs,
+            user,
+        },
         None => ValueMeta::Plain { user },
     }
 }
 
-// One parser for owned decoding, borrowed metadata and in-place unsealing.
+// 拥有解码、借用元数据和原位去信封共用一个解析器。
 fn envelope(logical: &[u8]) -> (usize, Option<u64>) {
     match logical.first() {
         Some(&VAL_META_PLAIN) => (1, None),
-        Some(&VAL_META_TTL) if logical.len() >= 9 =>
-            (9, Some(u64::from_le_bytes(logical[1..9].try_into().unwrap()))),
+        Some(&VAL_META_TTL) if logical.len() >= 9 => (
+            9,
+            Some(u64::from_le_bytes(logical[1..9].try_into().unwrap())),
+        ),
         _ => (0, None),
     }
 }
 
-pub(crate) fn logical_expiry(logical: &[u8]) -> Option<u64> { envelope(logical).1 }
-
-/// Borrow the same export value and absolute TTL as the owned decoder.
-pub(crate) fn snapshot_value(logical: &[u8]) -> (Option<&[u8]>, Option<u64>) {
-    let (offset, expire) = envelope(logical);
-    if expire.is_some_and(|e| now_unix_secs() >= e) { (None, None) }
-    else { (Some(&logical[offset..]), expire) }
+pub(crate) fn logical_expiry(logical: &[u8]) -> Option<u64> {
+    envelope(logical).1
 }
 
-/// Keep expiry and ownership together when handing out a visible record.
+/// 借用解码返回与拥有版相同的导出值和绝对 TTL。
+pub(crate) fn snapshot_value(logical: &[u8]) -> (Option<&[u8]>, Option<u64>) {
+    let (offset, expire) = envelope(logical);
+    if expire.is_some_and(|e| now_unix_secs() >= e) {
+        (None, None)
+    } else {
+        (Some(&logical[offset..]), expire)
+    }
+}
+
+/// 返回可见记录时，值所有权和过期时间一起传递。
 pub(crate) enum VisibleOwnedValue {
     Expired,
     Live { user: Vec<u8>, expire: Option<u64> },
@@ -145,7 +167,10 @@ pub(crate) fn visible_owned_value(mut logical: Vec<u8>, now: u64) -> VisibleOwne
         note_user_value_copied();
         logical.copy_within(offset.., 0);
         logical.truncate(logical.len() - offset);
-        VisibleOwnedValue::Live { user: logical, expire }
+        VisibleOwnedValue::Live {
+            user: logical,
+            expire,
+        }
     }
 }
 
@@ -194,12 +219,20 @@ pub(crate) fn user_value_copies() -> u64 {
 #[test]
 fn owned_unseal_reuses_allocation() {
     use std::assert_eq;
-    for mut bytes in [pack_plain(b"payload"), pack_ttl(b"payload", u64::MAX), b"payload".to_vec()] {
+    for mut bytes in [
+        pack_plain(b"payload"),
+        pack_ttl(b"payload", u64::MAX),
+        b"payload".to_vec(),
+    ] {
         bytes.reserve(64);
         let pointer = bytes.as_ptr();
         let user = logical_to_user(bytes).unwrap();
         assert_eq!(user, b"payload");
-        assert_eq!(user.as_ptr(), pointer, "unsealing an owned buffer must reuse its allocation");
+        assert_eq!(
+            user.as_ptr(),
+            pointer,
+            "unsealing an owned buffer must reuse its allocation"
+        );
     }
 }
 
@@ -208,9 +241,15 @@ fn owned_unseal_reuses_allocation() {
 fn unseal_keeps_legacy_tags_and_exact_expiry() {
     use std::{assert_eq, vec};
     for (logical, expected) in [
-        (vec![], vec![]), (vec![0], vec![]), (vec![0, 0, 1], vec![0, 1]),
-        (vec![1, 2], vec![1, 2]), (vec![2, 0, 1], vec![2, 0, 1]),
-        (vec![1, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1], vec![0, 1]),
+        (vec![], vec![]),
+        (vec![0], vec![]),
+        (vec![0, 0, 1], vec![0, 1]),
+        (vec![1, 2], vec![1, 2]),
+        (vec![2, 0, 1], vec![2, 0, 1]),
+        (
+            vec![1, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1],
+            vec![0, 1],
+        ),
     ] {
         assert_eq!(decode_value_meta(&logical).user(), expected.as_slice());
         assert_eq!(logical_to_user(logical), Some(expected));

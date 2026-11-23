@@ -1,0 +1,2919 @@
+{
+  "milestone": "M163",
+  "status": "完成",
+  "baseline": "5025f91f7c8b89dd9b4fbd6a650086cf108d2a65",
+  "scope": "按职责拆分源码并补中文业务注释，不改变生产算法",
+  "before_test_executable": {
+    "path": "target/release/deps/storage_engines-7533728b253b9a38.exe",
+    "sha256": "34cd5891f7856cc42227c989c92519879c5d4a146da1c7f2ebb9535124bf3233",
+    "tests": [
+      "bitcask::bitcask::tests::bitcask_hint_load_stage_split",
+      "bitcask::bitcask::tests::bulk_sorted_rebuild_agrees_with_the_insert_rebuild",
+      "bitcask::bitcask::tests::hint_rejected_file_heap_growth",
+      "bitcask::bitcask::tests::hint_reserve_bound_is_the_file_not_the_header_claim",
+      "bitcask::bitcask::tests::merge_rebuild_goes_through_the_bulk_door",
+      "bitcask::bitcask::tests::test_corrupt_hint_falls_back",
+      "bitcask::bitcask::tests::test_flush_fsyncs_only_when_something_was_written",
+      "bitcask::bitcask::tests::test_hint_incremental_tail_scan",
+      "bitcask::bitcask::tests::test_hint_naming_missing_segment_falls_back_to_full_scan",
+      "bitcask::bitcask::tests::test_hint_read_matches_record_by_record_insert",
+      "bitcask::bitcask::tests::test_hint_roundtrip_and_fast_open",
+      "bitcask::bitcask::tests::test_merge_rebuilds_index_by_rescanning_the_log",
+      "bitcask::bitcask::tests::test_merge_walks_key_dir_in_bounded_chunks",
+      "bitcask::bitcask::tests::test_merge_writes_hint",
+      "bitcask::bitcask::tests::test_open_discards_merge_debris_when_log_survives",
+      "bitcask::bitcask::tests::test_open_recovers_merge_left_behind_by_crashed_merge",
+      "bitcask::bitcask::tests::test_quarantined_engine_errors_instead_of_claiming_keys_missing",
+      "bitcask::bitcask::tests::test_rotate_and_reopen",
+      "bitcask::bitcask::tests::test_soft_tombstone_in_hint",
+      "bitcask::bitcask::tests::test_stale_hint_crosses_rotations_without_losing_deletes",
+      "bitcask::bitcask::tests::test_write_buffer_is_allocated_lazily",
+      "bitcask::bitcask_mvcc::tests::automatic_checkpoint_amortizes_hint_work",
+      "bitcask::bitcask_mvcc::tests::bitcask_vacuum_blob_crc_or_main_read_failure_never_rewrites_blob",
+      "bitcask::bitcask_mvcc::tests::bitcask_vacuum_blob_preserves_latest_large_values_and_inline_rows",
+      "bitcask::bitcask_mvcc::tests::bitcask_vacuum_empty_blob_skips_value_reads_with_reference_control",
+      "bitcask::bitcask_mvcc::tests::bitcask_vacuum_retained_two_passes",
+      "bitcask::bitcask_mvcc::tests::bitcask_vacuum_stage_split",
+      "bitcask::bitcask_mvcc::tests::checkpoint_cost_5m",
+      "bitcask::bitcask_mvcc::tests::checkpoint_probe_counts_real_hint_work_and_obeys_gate",
+      "bitcask::bitcask_mvcc::tests::test_auto_vacuum_off_switch",
+      "bitcask::bitcask_mvcc::tests::test_auto_vacuum_reclaims_without_being_asked",
+      "bitcask::bitcask_mvcc::tests::test_basic_set_get_delete",
+      "bitcask::bitcask_mvcc::tests::test_bulk_finish_leaves_a_usable_wal_checkpoint",
+      "bitcask::bitcask_mvcc::tests::test_bulk_load_and_reopen",
+      "bitcask::bitcask_mvcc::tests::test_collect_latest_reads_scale_with_live_keys_not_rows",
+      "bitcask::bitcask_mvcc::tests::test_conflict_after_other_commits",
+      "bitcask::bitcask_mvcc::tests::test_disk_persist_across_reopen",
+      "bitcask::bitcask_mvcc::tests::test_encode_order",
+      "bitcask::bitcask_mvcc::tests::test_export_latest_visible",
+      "bitcask::bitcask_mvcc::tests::test_health_reports_chain_length",
+      "bitcask::bitcask_mvcc::tests::test_instances_isolated",
+      "bitcask::bitcask_mvcc::tests::test_large_value_blob_roundtrip",
+      "bitcask::bitcask_mvcc::tests::test_leaked_transaction_does_not_block_vacuum",
+      "bitcask::bitcask_mvcc::tests::test_long_run_baseline",
+      "bitcask::bitcask_mvcc::tests::test_point_op_cost_independent_of_chain_length",
+      "bitcask::bitcask_mvcc::tests::test_print_all_latest_visible",
+      "bitcask::bitcask_mvcc::tests::test_read_only_transaction_touches_no_wal",
+      "bitcask::bitcask_mvcc::tests::test_reopen_uses_checkpoint_instead_of_full_scan",
+      "bitcask::bitcask_mvcc::tests::test_rollback_discards_writes",
+      "bitcask::bitcask_mvcc::tests::test_scan_foreach_stops_without_folding_the_library",
+      "bitcask::bitcask_mvcc::tests::test_self_write_visible",
+      "bitcask::bitcask_mvcc::tests::test_snapshot_isolation",
+      "bitcask::bitcask_mvcc::tests::test_try_open_lock_conflict",
+      "bitcask::bitcask_mvcc::tests::test_vacuum_bounded_slices_and_converges",
+      "bitcask::bitcask_mvcc::tests::test_vacuum_deletes_in_bounded_chunks",
+      "bitcask::bitcask_mvcc::tests::test_vacuum_does_not_read_every_version",
+      "bitcask::bitcask_mvcc::tests::test_vacuum_keeps_versions_needed_by_active_txn",
+      "bitcask::bitcask_mvcc::tests::test_vacuum_removes_old_versions",
+      "bitcask::bitcask_mvcc::tests::test_wal_auto_checkpoint_bounds_file_and_keeps_data",
+      "bitcask::bitcask_mvcc::tests::test_wal_redo_after_commit_without_data_flush",
+      "bitcask::bitcask_mvcc::tests::test_wal_undo_uncommitted",
+      "bitcask::bitcask_mvcc::tests::test_windowed_scan_cost_scales_with_window_not_library",
+      "bitcask::bitcask_mvcc::tests::test_write_write_conflict",
+      "bitcask::bitcask_mvcc::tests::wal_cost_per_single_write_txn",
+      "bitcask::kv_ops::tests::scan_page_costs_the_page_and_walks_the_whole_library_once",
+      "bitcask::kv_ops::tests::test_batch_and_multi_get",
+      "bitcask::kv_ops::tests::test_incr_and_ttl",
+      "bitcask::kv_ops::tests::test_meta_and_exists",
+      "bitcask::kv_ops::tests::test_prefix_upper_bound",
+      "bitcask::kv_ops::tests::test_scan_page_later_pages_cost_the_page_not_the_library",
+      "bitcask::kv_ops::tests::test_scan_prefix_seek",
+      "bitcask::kv_ops::tests::test_search_pagination",
+      "bitcask::kv_ops::tests::test_search_window_costs_the_window_not_the_library",
+      "bitcask::kv_ops::tests::test_value_meta_roundtrip",
+      "bitcask::storage::reference_scan_tests::blob_reference_mode_accounts_for_buffer_and_rejects_changed_file",
+      "bplus_tree::bplus_tree::tests::batch_door_really_shares_one_descent_per_leaf",
+      "bplus_tree::bplus_tree::tests::batched_delete_reuses_unchanged_parent_with_old_path_control",
+      "bplus_tree::bplus_tree::tests::batched_deletes_really_restructure_and_stay_correct",
+      "bplus_tree::bplus_tree::tests::bplus_delete_path_buckets",
+      "bplus_tree::bplus_tree::tests::compact_internal_cache_promotes_and_invalidates_after_writes",
+      "bplus_tree::bplus_tree::tests::compact_internal_routes_match_owned_and_reject_invalid_nodes",
+      "bplus_tree::bplus_tree::tests::delete_buffers_preserve_serialized_bytes_and_reject_oversized_node",
+      "bplus_tree::bplus_tree::tests::delete_page_projection_preserves_dirty_reads_and_restructure",
+      "bplus_tree::bplus_tree::tests::maintenance_borrowed_nodes_match_bincode_without_row_allocations",
+      "bplus_tree::bplus_tree::tests::maintenance_walk_matches_old_dirty_binary_rows_and_stop",
+      "bplus_tree::bplus_tree::tests::packed_leaf_delete_matches_owned_bytes_and_rebalances",
+      "bplus_tree::bplus_tree::tests::point_projection_matches_reference_and_avoids_leaf_materialization",
+      "bplus_tree::bplus_tree::tests::rebalance_failed_borrow_reloads_unmodified_pages",
+      "bplus_tree::bplus_tree::tests::rebalance_reuses_nodes_and_preserves_tree_bytes",
+      "bplus_tree::bplus_tree::tests::separator_refresh_only_happens_when_the_subtree_minimum_moves",
+      "bplus_tree::bplus_tree::tests::test_child_location_is_binary_not_linear",
+      "bplus_tree::bplus_tree::tests::test_delete_and_rebalance",
+      "bplus_tree::bplus_tree::tests::test_delete_missing_key",
+      "bplus_tree::bplus_tree::tests::test_insert_get_update_range",
+      "bplus_tree::bplus_tree::tests::test_iter_order",
+      "bplus_tree::bplus_tree::tests::test_node_cache_never_serves_stale_content",
+      "bplus_tree::bplus_tree::tests::test_oversized_row_is_refused_not_dropped_silently",
+      "bplus_tree::bplus_tree::tests::test_overwrite_on_insert",
+      "bplus_tree::bplus_tree::tests::test_reorg_never_drops_oversized_pages",
+      "bplus_tree::bplus_tree::tests::test_reorg_packs_leaves_instead_of_leaving_them_half_empty",
+      "bplus_tree::bplus_tree::tests::test_reorg_size_formula_matches_bincode",
+      "bplus_tree::bplus_tree::tests::test_sequential_insert_descends_without_touching_pages",
+      "bplus_tree::bplus_tree_mvcc::tests::bplus_miss_price_probe",
+      "bplus_tree::bplus_tree_mvcc::tests::bplus_pin_budget_sweep",
+      "bplus_tree::bplus_tree_mvcc::tests::bplus_vacuum_cost_attribution",
+      "bplus_tree::bplus_tree_mvcc::tests::bplus_write_cost_attribution",
+      "bplus_tree::bplus_tree_mvcc::tests::bulk_finish_freelist_failure_does_not_seal_wal",
+      "bplus_tree::bplus_tree_mvcc::tests::bulk_finish_propagates_page_sync_failure_without_sealing_wal",
+      "bplus_tree::bplus_tree_mvcc::tests::empty_auto_vacuum_leaves_page_sync_to_checkpoint",
+      "bplus_tree::bplus_tree_mvcc::tests::eviction_failure_blocks_commit_and_checkpoint_preserves_recovery",
+      "bplus_tree::bplus_tree_mvcc::tests::page_failure_without_active_transaction_keeps_checkpoint_wal",
+      "bplus_tree::bplus_tree_mvcc::tests::reclamation_batch_same_seed_abba",
+      "bplus_tree::bplus_tree_mvcc::tests::reclamation_freelist_same_seed_abba",
+      "bplus_tree::bplus_tree_mvcc::tests::rollback_page_failure_keeps_remaining_versions_invisible",
+      "bplus_tree::bplus_tree_mvcc::tests::test_auto_vacuum_off_switch",
+      "bplus_tree::bplus_tree_mvcc::tests::test_auto_vacuum_reclaims_without_being_asked",
+      "bplus_tree::bplus_tree_mvcc::tests::test_basic_set_get_delete",
+      "bplus_tree::bplus_tree_mvcc::tests::test_bplus_read_cost_attribution",
+      "bplus_tree::bplus_tree_mvcc::tests::test_bulk_finish_leaves_a_usable_wal_checkpoint",
+      "bplus_tree::bplus_tree_mvcc::tests::test_bulk_load_and_reopen",
+      "bplus_tree::bplus_tree_mvcc::tests::test_cache_auto_max_is_raisable_and_misses_go_to_zero",
+      "bplus_tree::bplus_tree_mvcc::tests::test_cache_budget_bytes_prices_slots_and_is_enforced",
+      "bplus_tree::bplus_tree_mvcc::tests::test_cache_capacity_follows_the_library",
+      "bplus_tree::bplus_tree_mvcc::tests::test_collect_latest_decodes_only_live_keys",
+      "bplus_tree::bplus_tree_mvcc::tests::test_conflict_after_other_commits",
+      "bplus_tree::bplus_tree_mvcc::tests::test_disk_persist_across_reopen",
+      "bplus_tree::bplus_tree_mvcc::tests::test_drop_leaves_a_usable_wal_checkpoint",
+      "bplus_tree::bplus_tree_mvcc::tests::test_encode_order",
+      "bplus_tree::bplus_tree_mvcc::tests::test_export_latest_visible",
+      "bplus_tree::bplus_tree_mvcc::tests::test_full_scan_pages_scale_with_leaves_not_with_keys_times_height",
+      "bplus_tree::bplus_tree_mvcc::tests::test_full_walk_does_not_evict_the_working_set",
+      "bplus_tree::bplus_tree_mvcc::tests::test_health_reports_chain_length",
+      "bplus_tree::bplus_tree_mvcc::tests::test_instances_isolated",
+      "bplus_tree::bplus_tree_mvcc::tests::test_large_value_blob_roundtrip",
+      "bplus_tree::bplus_tree_mvcc::tests::test_oversized_row_is_refused_before_the_wal",
+      "bplus_tree::bplus_tree_mvcc::tests::test_pin_budget_is_configurable_and_leaves_get_the_room",
+      "bplus_tree::bplus_tree_mvcc::tests::test_point_op_cost_independent_of_chain_length",
+      "bplus_tree::bplus_tree_mvcc::tests::test_print_all_latest_visible",
+      "bplus_tree::bplus_tree_mvcc::tests::test_read_only_transaction_touches_no_wal",
+      "bplus_tree::bplus_tree_mvcc::tests::test_reopen_preserves_next_version_after_checkpoint",
+      "bplus_tree::bplus_tree_mvcc::tests::test_reopen_uses_wal_max_xid_without_checkpoint",
+      "bplus_tree::bplus_tree_mvcc::tests::test_rollback_discards_writes",
+      "bplus_tree::bplus_tree_mvcc::tests::test_scan_foreach_stops_without_folding_the_library",
+      "bplus_tree::bplus_tree_mvcc::tests::test_self_write_visible",
+      "bplus_tree::bplus_tree_mvcc::tests::test_snapshot_isolation",
+      "bplus_tree::bplus_tree_mvcc::tests::test_try_open_lock_conflict",
+      "bplus_tree::bplus_tree_mvcc::tests::test_upper_levels_survive_a_full_walk",
+      "bplus_tree::bplus_tree_mvcc::tests::test_vacuum_bounded_slices_and_converges",
+      "bplus_tree::bplus_tree_mvcc::tests::test_vacuum_deletes_in_bounded_chunks",
+      "bplus_tree::bplus_tree_mvcc::tests::test_vacuum_does_not_clone_values",
+      "bplus_tree::bplus_tree_mvcc::tests::test_vacuum_removes_old_versions_and_rewrites_blob",
+      "bplus_tree::bplus_tree_mvcc::tests::test_wal_auto_checkpoint_bounds_file_and_keeps_data",
+      "bplus_tree::bplus_tree_mvcc::tests::test_wal_redo_after_commit_without_page_flush",
+      "bplus_tree::bplus_tree_mvcc::tests::test_wal_undo_uncommitted",
+      "bplus_tree::bplus_tree_mvcc::tests::test_windowed_scan_cost_scales_with_window_not_library",
+      "bplus_tree::bplus_tree_mvcc::tests::test_write_write_conflict",
+      "bplus_tree::bplus_tree_mvcc::tests::vacuum_bad_crc_or_valid_crc_bad_node_preserves_blob_and_wal",
+      "bplus_tree::bplus_tree_mvcc::tests::vacuum_chunk_resume_must_not_readjudicate_carried_group",
+      "bplus_tree::bplus_tree_mvcc::tests::vacuum_rejects_truncated_tree_before_blob_clear",
+      "bplus_tree::bplus_tree_mvcc::tests::vacuum_sync_skips_unchanged_blobs_but_persists_reclamation",
+      "bplus_tree::kv_ops::tests::test_batch_and_multi_get",
+      "bplus_tree::kv_ops::tests::test_batch_conflict_rolls_back_batch",
+      "bplus_tree::kv_ops::tests::test_incr_and_incr_with_ttl",
+      "bplus_tree::kv_ops::tests::test_key_matches_helpers",
+      "bplus_tree::kv_ops::tests::test_prefix_upper_bound",
+      "bplus_tree::kv_ops::tests::test_scan_foreach_early_stop",
+      "bplus_tree::kv_ops::tests::test_scan_page_later_pages_cost_the_page_not_the_library",
+      "bplus_tree::kv_ops::tests::test_scan_prefix_seek",
+      "bplus_tree::kv_ops::tests::test_search_keys_fuzzy_and_paginate",
+      "bplus_tree::kv_ops::tests::test_search_window_costs_the_window_not_the_library",
+      "bplus_tree::kv_ops::tests::test_ttl_and_purge",
+      "bplus_tree::kv_ops::tests::test_value_meta_roundtrip",
+      "bplus_tree::page::tests::bulk_eviction_defers_freelist_sync_until_finish",
+      "bplus_tree::page::tests::bulk_finish_syncs_evicted_clean_pages_and_latches_failure",
+      "bplus_tree::page::tests::eviction_failure_retains_dirty_pages",
+      "bplus_tree::page::tests::eviction_reserves_metadata_and_preserves_every_page",
+      "bplus_tree::page::tests::freelist_publication_failure_keeps_dirty_state_and_refuses_retry",
+      "bplus_tree::page::tests::reclamation_coalesces_dirty_pages_with_failure_and_old_path_control",
+      "bplus_tree::page::tests::reclamation_defers_freelist_but_keeps_double_write_and_prevents_reuse",
+      "bplus_tree::page::tests::reclamation_empty_scope_preserves_unrelated_dirty_pages",
+      "bplus_tree::page::tests::reclamation_refuses_unpublished_return_and_latches_publication_faults",
+      "bplus_tree::page::tests::test_crc_on_disk",
+      "bplus_tree::page::tests::test_dblwr_recovers_torn_page",
+      "bplus_tree::page::tests::test_free_and_reuse",
+      "bplus_tree::page::tests::test_lru_eviction_writes_through",
+      "bplus_tree::page::tests::test_many_free_pages_persist_across_reopen",
+      "bplus_tree::page::tests::test_page_manager_disk",
+      "bplus_tree::page::tests::test_root_persists",
+      "bplus_tree::page::tests::test_single_writer_lock_rejects_second_open",
+      "bplus_tree::storage::tests::dblwr_batches_payload_and_preserves_slots",
+      "bplus_tree::storage::tests::dblwr_durable_empty_does_not_repeat_invalidation_sync",
+      "bplus_tree::storage::tests::dblwr_reopen_and_interrupted_writes_require_reset",
+      "bplus_tree::storage::tests::freelist_writer_reuses_handle_and_preserves_exact_layout",
+      "bplus_tree::storage::tests::test_blob_store_large_value",
+      "bplus_tree::storage::tests::test_crc32_known",
+      "bplus_tree::storage::tests::test_crc_detects_corruption",
+      "bplus_tree::storage::tests::test_dblwr_batch",
+      "bplus_tree::storage::tests::test_disk_file_rw",
+      "bplus_tree::storage::tests::test_freelist_roundtrip",
+      "bplus_tree::storage::tests::test_pack_unpack_roundtrip",
+      "common::codec::owned_seal_reuses_prepared_buffer_and_preserves_bytes",
+      "common::codec::owned_unseal_reuses_allocation",
+      "common::codec::unseal_keeps_legacy_tags_and_exact_expiry",
+      "common::disk::tests::crc32_matches_known_vector",
+      "common::disk::tests::crc32_slice_by_8_matches_bytewise_everywhere",
+      "common::disk::tests::disk_file_round_trips_offsets",
+      "common::disk::tests::file_lock_blocks_second_holder",
+      "common::disk::tests::file_lock_hint_is_written_without_an_fsync",
+      "common::disk::tests::page_ops_require_declared_block_size",
+      "common::disk::tests::paged_file_reads_and_writes_whole_blocks",
+      "common::disk::tests::test_read_page_does_not_ask_file_length",
+      "common::disk::tests::test_read_page_tail_shapes_match_the_old_length_guarded_form",
+      "common::kernel::streaming_cursor_copies_only_chunk_ends_with_rejected_last_rows",
+      "common::kernel::tests::cursor_round_trips",
+      "common::kernel::tests::failed_slice_refunds_exactly_what_it_charged",
+      "common::kernel::tests::fold_window_resumes_when_keep_drops_candidates",
+      "common::kernel::tests::fold_window_unbounded_walks_in_chunks",
+      "common::kernel::tests::health_fold_counts_adjacent_blocks",
+      "common::kernel::tests::scheduler_does_not_push_an_open_round_from_begin_without_debt",
+      "common::kernel::tests::scheduler_only_ticks_when_debt_reaches_slice",
+      "common::kernel::tests::scheduler_refunds_errors_and_panics_and_serializes_cursor",
+      "common::kernel::tests::search_page_kernel_distinguishes_unmeasured_from_exhausted",
+      "common::kernel::tests::unfinished_is_answered_by_membership",
+      "common::kernel::tests::visible_at_requires_committed_and_not_newer",
+      "common::kernel::tests::wal_policy_opens_only_on_first_write",
+      "common::kv_snapshot::tests::atomic_snapshot_preserves_previous_on_write_or_publish_failure",
+      "common::kv_snapshot::tests::bin_v3_carries_expire_and_all_three_versions_read_back",
+      "common::kv_snapshot::tests::record_batch_flush_failure_preserves_previous_and_unaccepted_counts",
+      "common::kv_snapshot::tests::record_batch_keeps_legacy_crc_and_io_controls",
+      "common::kv_snapshot::tests::record_batches_keep_bytes_counts_large_fallback_and_finish_flush",
+      "common::kv_snapshot::tests::snapshot_buffered_crc_matches_reference_and_batches_calls",
+      "common::kv_snapshot::tests::snapshot_crc_chunks_match_whole_file",
+      "common::kv_snapshot::tests::snapshot_io_buffer_bounds_real_writes",
+      "common::kv_snapshot::tests::snapshot_streaming_memory_probe",
+      "common::kv_snapshot::tests::snapshot_streaming_stops_before_the_next_record",
+      "common::kv_snapshot::tests::strict_snapshot_keeps_legacy_formats_and_import_tolerance",
+      "common::kv_snapshot::tests::test_b64_decode_rejects_illegal_length",
+      "common::kv_snapshot::tests::test_b64_known",
+      "common::kv_snapshot::tests::test_b64_round_trips_every_length",
+      "common::kv_snapshot::tests::test_bin_roundtrip",
+      "common::kv_snapshot::tests::test_bin_v2_roundtrip",
+      "common::kv_snapshot::tests::test_jsonl_round_trip_does_not_collapse_keys",
+      "common::kv_snapshot::tests::test_jsonl_roundtrip",
+      "common::kv_snapshot::tests::test_plain_is_bpexp001",
+      "common::kv_snapshot::tests::test_streaming_sink_writes_identical_bytes",
+      "common::order::candidates_copy_only_new_visible_groups_with_old_control",
+      "common::order::lazy_window_factory_is_called_only_for_new_groups",
+      "common::order::tests::binary_order_bounds_cover_prefixes_and_all_version_bytes",
+      "common::order::tests::bounded_tail_handles_interleaved_versions_and_empty_answers",
+      "common::order::tests::logical_health_cost",
+      "common::order::tests::logical_health_preserves_binary_overlap_and_group_transitions",
+      "common::order::tests::window_bound_matches_original_floor_exhaustively",
+      "common::store::deferred_search_tests::search_default_materializes_only_reached_rows",
+      "common::store::deferred_search_tests::search_deferred_keeps_missing_ttl_deleted_and_chunk_cursor_semantics",
+      "common::store::live_owned_record_keeps_buffer_and_exact_ttl_with_old_control",
+      "common::txn::checked_tests::checked_partial_storage_write_cannot_commit_and_is_rolled_back",
+      "common::version::tests::plan_keeps_everything_above_xmin",
+      "common::version::tests::plan_keeps_last_old_and_drops_older",
+      "common::version::tests::plan_reaps_final_tombstone_but_keeps_newer_versions",
+      "common::version::tests::upper_bound_keeps_trailing_zero_end",
+      "common::version::tests::vacuum_plan_matches_reference_for_unsorted_duplicate_versions_and_tombstones",
+      "common::version::tests::vacuum_plan_moves_rows_without_cloning",
+      "common::version::tests::version_key_orders_by_version_big_endian",
+      "common::version::vacuum_drain_retains_the_group_allocation",
+      "common::wal::tests::commit_probe_separates_wal_append_and_sync",
+      "common::wal::tests::plan_is_identical_with_or_without_begin",
+      "common::wal::tests::test_corrupt_tail_is_discarded_but_good_frames_survive",
+      "common::wal::tests::test_recovery_undo_uncommitted",
+      "common::wal::tests::test_wal_append_and_read",
+      "common::wal::tests::wal_seal_fsyncs_exactly_once",
+      "engine::migration_stage_tests::memory_migration_stage_cost",
+      "engine::migration_stage_tests::migration_stage_accounting_uses_actual_scan_write_commit_gates",
+      "engine::tests::all_engines_auto_reclaim_by_default",
+      "engine::tests::all_engines_bulk_load",
+      "engine::tests::all_engines_count_without_materializing_values",
+      "engine::tests::all_engines_detect_write_conflict",
+      "engine::tests::all_engines_export_streams_without_holding_the_library",
+      "engine::tests::all_engines_report_the_same_health",
+      "engine::tests::all_engines_roundtrip_set_get_delete",
+      "engine::tests::all_engines_support_batch_and_scan",
+      "engine::tests::all_engines_ttl_and_meta",
+      "engine::tests::all_engines_vacuum_and_flush",
+      "engine::tests::all_engines_vacuum_judges_per_group_not_whole_library",
+      "engine::tests::big_transaction_write_cost",
+      "engine::tests::binary_key_bitcask",
+      "engine::tests::binary_key_bplus",
+      "engine::tests::binary_key_lsm",
+      "engine::tests::binary_key_memory",
+      "engine::tests::binary_key_views_match_a_logical_map",
+      "engine::tests::bitcask_vacuum_buffer_cost",
+      "engine::tests::bplus_delete_buffer_cost",
+      "engine::tests::bplus_delete_leaf_cost",
+      "engine::tests::bplus_delete_read_cost",
+      "engine::tests::bplus_internal_projection_cost",
+      "engine::tests::bplus_maintenance_large_cost",
+      "engine::tests::bplus_maintenance_scan_cost",
+      "engine::tests::bplus_point_projection_cost",
+      "engine::tests::bplus_rebalance_read_cost",
+      "engine::tests::bplus_vacuum_buffer_cost",
+      "engine::tests::bplus_vacuum_sync_cost",
+      "engine::tests::cache_auto_max_knob_routes_to_two_engines_and_is_refused_by_the_other_two",
+      "engine::tests::cache_budget_bytes_acceptance",
+      "engine::tests::cache_budget_knob_routes_to_two_engines_and_is_refused_by_the_other_two",
+      "engine::tests::cache_slot_resident_price",
+      "engine::tests::canonical_name_accepts_aliases",
+      "engine::tests::checked_checkpoint_preserves_active_transaction_log",
+      "engine::tests::checked_commit_quarantines_failures_and_recovers",
+      "engine::tests::checked_writes_distinguish_conflict_capacity_and_closed",
+      "engine::tests::deep_page_stage_split",
+      "engine::tests::deep_paging_posture_ab",
+      "engine::tests::deep_search_pages_do_not_materialize_earlier_pages",
+      "engine::tests::disk_engines_expose_their_path",
+      "engine::tests::disk_engines_require_path",
+      "engine::tests::durability_profiles_are_honestly_different",
+      "engine::tests::engine_config_knobs_reach_the_engine_and_are_readable_back",
+      "engine::tests::engine_is_object_safe_in_collections",
+      "engine::tests::engine_kind_selection_is_typed_and_honest",
+      "engine::tests::enum_without_path_is_path_required",
+      "engine::tests::facade_is_usable_across_threads",
+      "engine::tests::last_page_agrees_with_the_tail_and_stays_bounded",
+      "engine::tests::last_page_fallback_bounds_results_with_dead_tail_and_binary_keys",
+      "engine::tests::lsm_disjoint_move_cost",
+      "engine::tests::lsm_mixed_read_cost",
+      "engine::tests::lsm_mvcc_pins_the_two_fields_that_would_break_crash_safety",
+      "engine::tests::lsm_ordinary_rw_cost",
+      "engine::tests::lsm_owned_compaction_cost",
+      "engine::tests::lsm_packed_point_cost",
+      "engine::tests::lsm_scan_row_cost",
+      "engine::tests::lsm_vacuum_buffer_cost",
+      "engine::tests::lsm_vacuum_delete_cost",
+      "engine::tests::memory_engine_has_no_path_and_no_merge",
+      "engine::tests::memory_export_does_not_reseek_each_winner",
+      "engine::tests::memory_replay_allocation_cost",
+      "engine::tests::memory_replay_page_cost",
+      "engine::tests::memory_scan_buffer_cost",
+      "engine::tests::memory_snapshot_binary_values_survive_repeated_reopens",
+      "engine::tests::memory_snapshot_io_owned_cost",
+      "engine::tests::memory_snapshot_rejects_damage_without_rewriting_source",
+      "engine::tests::memory_snapshot_replay_neither_scans_nor_accrues_debt",
+      "engine::tests::memory_snapshot_round_trips_only_at_open_and_stop",
+      "engine::tests::memory_snapshot_scan_cost",
+      "engine::tests::memory_snapshot_stop_cost",
+      "engine::tests::memory_stop_batch_cost",
+      "engine::tests::memory_stop_emit_cost",
+      "engine::tests::memory_stop_fold_cost",
+      "engine::tests::memory_stop_ownership_cost",
+      "engine::tests::memory_stop_release_cost",
+      "engine::tests::memory_vacuum_buffer_cost",
+      "engine::tests::migrate_walks_a_ring_of_engines_byte_for_byte",
+      "engine::tests::open_engine_accepts_enum_and_string_in_every_ownership_shape",
+      "engine::tests::open_startup_tax_by_site",
+      "engine::tests::scale_baseline_all_engines",
+      "engine::tests::scale_bench::all_scales_serial",
+      "engine::tests::scale_bench::rows_1000000",
+      "engine::tests::scale_bench::rows_10000000",
+      "engine::tests::scale_bench::rows_20000000",
+      "engine::tests::scale_bench::rows_5000000",
+      "engine::tests::scale_bench::rows_600000",
+      "engine::tests::scale_bounded_vacuum_seed_is_required_and_preserves_latest_values",
+      "engine::tests::scale_bulk_manifest_rejects_nonfirst_damage",
+      "engine::tests::scale_bulk_reopen_verifies_all_engines",
+      "engine::tests::scale_fixture_persist_preserves_all_engines_and_migration_values",
+      "engine::tests::scale_last_page_matches_seed_across_page_boundaries",
+      "engine::tests::scale_maintenance_probe_observes_real_flush_and_obeys_gate",
+      "engine::tests::scale_maintenance_recheck",
+      "engine::tests::scale_migration_manifest_rejects_missing_and_corrupt_data",
+      "engine::tests::scale_persist_auxiliary_rejects_missing_keys_without_reseeding",
+      "engine::tests::scale_scratch_cleans_owned_directory_on_unwind",
+      "engine::tests::scale_ttl_deadline_and_migration_have_exact_before_after_sets",
+      "engine::tests::scale_update_probe_observes_bplus_doors_and_obeys_gate",
+      "engine::tests::seek_prev_costs_a_walk_not_the_library",
+      "engine::tests::set_raw_round_trips_every_byte_pattern",
+      "engine::tests::single_call_shape_attribution",
+      "engine::tests::tools_migrate_scale",
+      "engine::tests::txn_kernel_agrees_across_engines",
+      "engine::tests::unknown_engine_is_reported",
+      "engine::tests::unknown_name_is_echoed_verbatim_whatever_the_shape",
+      "engine::tests::vacuum_bounded_is_bounded_and_ends_where_vacuum_does",
+      "engine::tests::vacuum_lock_probe_observes_skip_and_real_storage_holds",
+      "engine::tests::vacuum_plan_cost",
+      "engine::tests::windowed_search_agrees_across_engines",
+      "engine::tests::write_set_registration_costs_a_hash_not_a_walk",
+      "lsm_tree::bloom::tests::test_bloom_basic",
+      "lsm_tree::cf::tests::test_multi_cf",
+      "lsm_tree::kv_ops::tests::batch_failure_undoes_only_successful_prefix_and_survives_reopen",
+      "lsm_tree::kv_ops::tests::batch_set_rolls_back_prefix_across_lock_pages",
+      "lsm_tree::kv_ops::tests::test_batch_and_multi_get",
+      "lsm_tree::kv_ops::tests::test_incr_and_ttl",
+      "lsm_tree::kv_ops::tests::test_meta_and_exists",
+      "lsm_tree::kv_ops::tests::test_prefix_upper_bound",
+      "lsm_tree::kv_ops::tests::test_scan_page_later_pages_cost_the_page_not_the_library",
+      "lsm_tree::kv_ops::tests::test_scan_prefix_seek",
+      "lsm_tree::kv_ops::tests::test_search_pagination",
+      "lsm_tree::kv_ops::tests::test_search_window_costs_the_window_not_the_library",
+      "lsm_tree::kv_ops::tests::test_value_meta_roundtrip",
+      "lsm_tree::lsm_tree::tests::compaction_does_not_resurrect_deleted_keys_from_deeper_levels",
+      "lsm_tree::lsm_tree::tests::disjoint_l0_move_failure_restores_source_order_and_target",
+      "lsm_tree::lsm_tree::tests::disjoint_l0_move_fallbacks_match_reference",
+      "lsm_tree::lsm_tree::tests::disjoint_l0_move_preserves_files_and_reopen_with_reference_control",
+      "lsm_tree::lsm_tree::tests::failed_compaction_input_restores_manifest_and_sources",
+      "lsm_tree::lsm_tree::tests::failed_compaction_publish_restores_repaired_sources",
+      "lsm_tree::lsm_tree::tests::flush_manifest_failed_publication_cannot_be_reused",
+      "lsm_tree::lsm_tree::tests::flush_manifest_reuses_exact_published_state_with_negative_control",
+      "lsm_tree::lsm_tree::tests::key_lookup_full_scan_is_explicit_and_keeps_the_byte_interval",
+      "lsm_tree::lsm_tree::tests::known_vacuum_delete_matches_remove_without_point_reads",
+      "lsm_tree::lsm_tree::tests::known_vacuum_delete_propagates_threshold_publish_failure",
+      "lsm_tree::lsm_tree::tests::known_vacuum_delete_wal_failure_does_not_apply_memory",
+      "lsm_tree::lsm_tree::tests::known_vacuum_delete_wal_replay_and_deep_source_barrier",
+      "lsm_tree::lsm_tree::tests::l0_candidate_order_uses_stack_and_keeps_source_tie_order",
+      "lsm_tree::lsm_tree::tests::lsm_counting_doors_peak",
+      "lsm_tree::lsm_tree::tests::lsm_memtable_bytes_per_entry",
+      "lsm_tree::lsm_tree::tests::lsm_raw_export_peak",
+      "lsm_tree::lsm_tree::tests::manifest_buffer_preserves_bytes_and_bounds_writes",
+      "lsm_tree::lsm_tree::tests::manifest_buffer_propagates_flush_write_error",
+      "lsm_tree::lsm_tree::tests::manifest_publication_guard_requires_target_level",
+      "lsm_tree::lsm_tree::tests::scan_row_ties_keep_point_read_fallback",
+      "lsm_tree::lsm_tree::tests::test_auto_flush_and_compact",
+      "lsm_tree::lsm_tree::tests::test_bg_compactor_helper",
+      "lsm_tree::lsm_tree::tests::test_compact_l0_until",
+      "lsm_tree::lsm_tree::tests::test_compaction_does_not_materialize_its_inputs",
+      "lsm_tree::lsm_tree::tests::test_compaction_filter_drops_keys",
+      "lsm_tree::lsm_tree::tests::test_compaction_repairs_level_overlap",
+      "lsm_tree::lsm_tree::tests::test_counting_paths_do_not_materialize_values",
+      "lsm_tree::lsm_tree::tests::test_drop_hides_old_put",
+      "lsm_tree::lsm_tree::tests::test_flush_check_does_not_scan_memtable_per_insert",
+      "lsm_tree::lsm_tree::tests::test_flush_moves_memtable_entries_without_cloning_them",
+      "lsm_tree::lsm_tree::tests::test_fold_agrees_with_point_read_on_overlapping_level",
+      "lsm_tree::lsm_tree::tests::test_lazy_source_activation_agrees_with_eager_everywhere",
+      "lsm_tree::lsm_tree::tests::test_lazy_source_activation_first_page_does_not_scale_with_files",
+      "lsm_tree::lsm_tree::tests::test_leveled_compact_multi_level",
+      "lsm_tree::lsm_tree::tests::test_light_scan_without_upper_bound_keeps_files_past_the_old_sentinel",
+      "lsm_tree::lsm_tree::tests::test_mem_entry_counter_matches_slow_scan",
+      "lsm_tree::lsm_tree::tests::test_mem_wal_recovers",
+      "lsm_tree::lsm_tree::tests::test_memtable_flush_trigger_reads_real_bytes",
+      "lsm_tree::lsm_tree::tests::test_merge_streams_sources_instead_of_materializing_them",
+      "lsm_tree::lsm_tree::tests::test_mmap_roundtrip",
+      "lsm_tree::lsm_tree::tests::test_overwrite_across_levels",
+      "lsm_tree::lsm_tree::tests::test_put_get_flush_reopen",
+      "lsm_tree::lsm_tree::tests::test_range_scan_and_remove",
+      "lsm_tree::lsm_tree::tests::test_set_options_and_snapshot_seq",
+      "lsm_tree::lsm_tree::tests::test_snapshot_hides_newer_writes",
+      "lsm_tree::lsm_tree::tests::test_sst_pruning_keeps_l0_overlap_and_source_seq_rules",
+      "lsm_tree::lsm_tree::tests::test_sst_pruning_l0_descending_files_and_light_bounds",
+      "lsm_tree::lsm_tree::tests::test_sst_pruning_refreshes_ranges_after_compaction",
+      "lsm_tree::lsm_tree::tests::test_sst_pruning_rejection_fallback_preserves_snapshot",
+      "lsm_tree::lsm_tree::tests::test_sst_pruning_seek_blocks_do_not_scale_with_files",
+      "lsm_tree::lsm_tree::tests::test_stats_open_is_approximate",
+      "lsm_tree::lsm_tree::tests::trivial_move_cost_comparison",
+      "lsm_tree::lsm_tree::tests::trivial_move_manifest_failure_preserves_file_and_source_membership",
+      "lsm_tree::lsm_tree::tests::trivial_move_preserves_file_identity_and_bytes",
+      "lsm_tree::lsm_tree::tests::trivial_move_reference_rewrites_and_fallbacks_preserve_semantics",
+      "lsm_tree::lsm_tree::tests::vacuum_merge_late_error_stops_and_discards_pending_output",
+      "lsm_tree::lsm_tree::tests::vacuum_merge_matches_light_merge_for_ties_drops_and_lazy_bounds",
+      "lsm_tree::lsm_tree::tests::vacuum_schedule_keeps_threshold_durability_and_restores_failure_paths",
+      "lsm_tree::lsm_tree_mvcc::tests::blob_gc_rechecks_after_writes_and_rejects_directory_errors",
+      "lsm_tree::lsm_tree_mvcc::tests::compaction_cost_split",
+      "lsm_tree::lsm_tree_mvcc::tests::conflict_key_lookup_does_not_copy_values_and_keeps_visibility",
+      "lsm_tree::lsm_tree_mvcc::tests::lsm_fill_attribution_per_row_cost",
+      "lsm_tree::lsm_tree_mvcc::tests::lsm_seek_prev_shape_ab",
+      "lsm_tree::lsm_tree_mvcc::tests::lsm_vacuum_stage_split",
+      "lsm_tree::lsm_tree_mvcc::tests::reopen_shape_probe",
+      "lsm_tree::lsm_tree_mvcc::tests::scan_mem_versions_copy_only_the_logical_winner",
+      "lsm_tree::lsm_tree_mvcc::tests::scan_rows_reuse_blocks_and_filter_before_copying_values",
+      "lsm_tree::lsm_tree_mvcc::tests::search_borrow_preserves_blob_ttl_binary_and_snapshot_fallbacks",
+      "lsm_tree::lsm_tree_mvcc::tests::search_deferred_sst_same_seed_abba",
+      "lsm_tree::lsm_tree_mvcc::tests::search_inline_count_borrows_values_with_real_old_path_control",
+      "lsm_tree::lsm_tree_mvcc::tests::search_inline_count_same_seed_abba",
+      "lsm_tree::lsm_tree_mvcc::tests::search_sst_no_total_stops_value_clones_with_eager_negative_control",
+      "lsm_tree::lsm_tree_mvcc::tests::test_auto_vacuum_off_switch",
+      "lsm_tree::lsm_tree_mvcc::tests::test_auto_vacuum_reclaims_without_being_asked",
+      "lsm_tree::lsm_tree_mvcc::tests::test_basic_set_get_delete",
+      "lsm_tree::lsm_tree_mvcc::tests::test_big_value_roundtrips_through_every_read_path",
+      "lsm_tree::lsm_tree_mvcc::tests::test_block_cache_auto_max_is_raisable_and_coverage_is_readable",
+      "lsm_tree::lsm_tree_mvcc::tests::test_block_cache_budget_bytes_replaces_the_clamp_and_respects_explicit",
+      "lsm_tree::lsm_tree_mvcc::tests::test_block_cache_capacity_follows_the_library",
+      "lsm_tree::lsm_tree_mvcc::tests::test_bulk_finish_leaves_a_usable_wal_checkpoint",
+      "lsm_tree::lsm_tree_mvcc::tests::test_bulk_finish_with_compact",
+      "lsm_tree::lsm_tree_mvcc::tests::test_bulk_load_and_reopen",
+      "lsm_tree::lsm_tree_mvcc::tests::test_collect_latest_does_not_materialize_values",
+      "lsm_tree::lsm_tree_mvcc::tests::test_conflict_after_other_commits",
+      "lsm_tree::lsm_tree_mvcc::tests::test_disk_persist_across_reopen",
+      "lsm_tree::lsm_tree_mvcc::tests::test_encode_order",
+      "lsm_tree::lsm_tree_mvcc::tests::test_export_latest_visible",
+      "lsm_tree::lsm_tree_mvcc::tests::test_health_does_not_materialize_its_sources",
+      "lsm_tree::lsm_tree_mvcc::tests::test_health_reports_chain_length",
+      "lsm_tree::lsm_tree_mvcc::tests::test_instances_isolated",
+      "lsm_tree::lsm_tree_mvcc::tests::test_lsm_point_read_baseline_5000_keys",
+      "lsm_tree::lsm_tree_mvcc::tests::test_open_does_not_compact_when_nothing_to_redo",
+      "lsm_tree::lsm_tree_mvcc::tests::test_open_persists_redo_before_truncating_wal",
+      "lsm_tree::lsm_tree_mvcc::tests::test_point_op_cost_independent_of_chain_length",
+      "lsm_tree::lsm_tree_mvcc::tests::test_print_all_latest_visible",
+      "lsm_tree::lsm_tree_mvcc::tests::test_read_only_transaction_touches_no_wal",
+      "lsm_tree::lsm_tree_mvcc::tests::test_rollback_discards_writes",
+      "lsm_tree::lsm_tree_mvcc::tests::test_scan_foreach_stops_without_folding_the_library",
+      "lsm_tree::lsm_tree_mvcc::tests::test_self_write_visible",
+      "lsm_tree::lsm_tree_mvcc::tests::test_snapshot_isolation",
+      "lsm_tree::lsm_tree_mvcc::tests::test_try_open_lock_conflict",
+      "lsm_tree::lsm_tree_mvcc::tests::test_vacuum_bounded_slices_and_converges",
+      "lsm_tree::lsm_tree_mvcc::tests::test_vacuum_deletes_in_bounded_chunks",
+      "lsm_tree::lsm_tree_mvcc::tests::test_vacuum_does_not_materialize_values",
+      "lsm_tree::lsm_tree_mvcc::tests::test_vacuum_reclaims_unreferenced_blobs",
+      "lsm_tree::lsm_tree_mvcc::tests::test_vacuum_removes_old_versions",
+      "lsm_tree::lsm_tree_mvcc::tests::test_vacuum_slice_walks_only_its_budget",
+      "lsm_tree::lsm_tree_mvcc::tests::test_wal_auto_checkpoint_bounds_file_and_keeps_data",
+      "lsm_tree::lsm_tree_mvcc::tests::test_wal_redo_after_commit_without_page_flush",
+      "lsm_tree::lsm_tree_mvcc::tests::test_wal_undo_uncommitted",
+      "lsm_tree::lsm_tree_mvcc::tests::test_windowed_scan_cost_scales_with_window_not_library",
+      "lsm_tree::lsm_tree_mvcc::tests::test_write_write_conflict",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_bad_sst_aborts_before_blob_gc_with_reference_control",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_compaction_coalesces_real_deletion_files",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_compaction_same_seed_abba",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_delete_flush_failure_preserves_blobs",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_delete_stage_accounting_observes_real_threshold_flush",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_delete_stage_cost",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_slice_fold_attribution",
+      "lsm_tree::lsm_tree_mvcc::tests::vacuum_without_blobs_does_not_point_read_survivors",
+      "lsm_tree::lsm_tree_mvcc::tests::version_point_bounds_save_one_allocation_per_lookup",
+      "lsm_tree::mem_wal::tests::test_mem_wal_seq_roundtrip",
+      "lsm_tree::sst::tests::compaction_corruption_is_an_error_instead_of_eof",
+      "lsm_tree::sst::tests::compaction_owns_blocks_and_counts_legacy_fallback",
+      "lsm_tree::sst::tests::light_decode_matches_full_and_rejects_the_same_bad_frames",
+      "lsm_tree::sst::tests::lru_touch_cost_does_not_scale_with_residency",
+      "lsm_tree::sst::tests::merge_heap_moves_values_and_preserves_seq_source_ties",
+      "lsm_tree::sst::tests::packed_point_blocks_preserve_records_crc_and_reduce_miss_allocations",
+      "lsm_tree::sst::tests::packed_scan_reuses_point_blocks_and_keeps_rows_alive_after_eviction",
+      "lsm_tree::sst::tests::point_get_projects_only_matching_rows_and_winning_value",
+      "lsm_tree::sst::tests::positioned_sst_point_reads_match_seek_reads",
+      "lsm_tree::sst::tests::positioned_sst_read_retries_short_reads_and_interrupts",
+      "lsm_tree::sst::tests::test_builder_emits_blocks_incrementally",
+      "lsm_tree::sst::tests::test_builder_estimated_bytes_matches_slow_scan",
+      "lsm_tree::sst::tests::test_builder_size_check_does_not_walk_entries_per_add",
+      "lsm_tree::sst::tests::test_find_back_matches_range_at_tail",
+      "lsm_tree::sst::tests::test_find_block_is_binary_and_agrees_with_linear",
+      "lsm_tree::sst::tests::test_merge_latest",
+      "lsm_tree::sst::tests::test_merge_to_ssts_does_not_walk_entries_for_size_check",
+      "lsm_tree::sst::tests::test_mmap",
+      "lsm_tree::sst::tests::test_range_at_window_equals_full_scan",
+      "lsm_tree::sst::tests::test_snapshot_hides_newer_seq",
+      "lsm_tree::sst::tests::test_sst_builder_byteprint_is_stable",
+      "lsm_tree::sst::tests::test_sst_pruning_back_and_get_keep_cross_block_versions",
+      "lsm_tree::sst::tests::test_sst_pruning_half_open_bounds_and_empty_key",
+      "lsm_tree::sst::tests::test_stream_iter",
+      "lsm_tree::sst::tests::test_write_read_get_v2",
+      "lsm_tree::sst::tests::vacuum_light_owned_blocks_match_cached_ranges_and_surface_bad_blocks",
+      "maintenance::tests::all_engines_keep_large_commit_debt",
+      "maintenance::tests::all_engines_retry_blocked_auto_vacuum_without_new_writes",
+      "maintenance::tests::auto_vacuum_scanning_keeps_pace_with_writes_not_with_transactions",
+      "maintenance::tests::bplus_long_reader_does_not_lose_live_rows_at_scale",
+      "maintenance::tests::full_maintenance_waits_for_interval_and_active_reader",
+      "maintenance::tests::maintenance_config_rejects_busy_loop_and_full_slice",
+      "maintenance::tests::worker_stop_wakes_long_interval_and_joins",
+      "mem_probe::thread_allocation_scope_excludes_concurrent_allocations",
+      "memory::kv_ops::tests::test_batch_and_multi_get",
+      "memory::kv_ops::tests::test_batch_conflict_rolls_back_batch",
+      "memory::kv_ops::tests::test_incr_and_incr_with_ttl",
+      "memory::kv_ops::tests::test_key_matches_helpers",
+      "memory::kv_ops::tests::test_prefix_upper_bound",
+      "memory::kv_ops::tests::test_scan_foreach_early_stop",
+      "memory::kv_ops::tests::test_scan_page_later_pages_cost_the_page_not_the_library",
+      "memory::kv_ops::tests::test_scan_prefix_seek",
+      "memory::kv_ops::tests::test_search_keys_fuzzy_and_paginate",
+      "memory::kv_ops::tests::test_search_window_costs_the_window_not_the_library",
+      "memory::kv_ops::tests::test_ttl_and_purge",
+      "memory::kv_ops::tests::test_value_meta_roundtrip",
+      "memory::mem_store::tests::certified_tail_survives_all_mutation_gates_and_reference_scope",
+      "memory::mem_store::tests::prefixed_lookup_reuses_bounds_without_confusing_binary_prefixes",
+      "memory::mem_store::tests::test_insert_get_delete",
+      "memory::mem_store::tests::test_range_scan_order",
+      "memory::memory_mvcc::tests::memory_owned_write_keeps_conflict_and_closed_checks",
+      "memory::memory_mvcc::tests::memory_owned_write_retains_encoded_key_buffer",
+      "memory::memory_mvcc::tests::memory_owned_write_retains_registry_key_buffer",
+      "memory::memory_mvcc::tests::ordered_writes_skip_only_proven_absent_version_searches",
+      "memory::memory_mvcc::tests::replay_failure_rolls_back_entire_page",
+      "memory::memory_mvcc::tests::replay_owned_page_uses_one_registry_lookup_and_preserves_duplicate_keys",
+      "memory::memory_mvcc::tests::scan_owned_pages_preserve_expiry_progress_and_visibility",
+      "memory::memory_mvcc::tests::search_borrowed_keys_same_seed_abba",
+      "memory::memory_mvcc::tests::search_borrows_nonpage_keys_and_keeps_only_page_and_chunk_cursors",
+      "memory::memory_mvcc::tests::search_count_and_offset_allocate_keys_but_only_page_values",
+      "memory::memory_mvcc::tests::search_reference_fails_the_same_allocation_guard",
+      "memory::memory_mvcc::tests::search_retention_preserves_binary_snapshots_ttl_and_rejected_chunk_progress",
+      "memory::memory_mvcc::tests::search_retention_same_seed_abba",
+      "memory::memory_mvcc::tests::search_streaming_cpu_same_seed_abba",
+      "memory::memory_mvcc::tests::search_streaming_removes_chunk_arrays_with_old_path_control",
+      "memory::memory_mvcc::tests::snapshot_batches_keep_cross_batch_versions_and_prefixes",
+      "memory::memory_mvcc::tests::snapshot_completed_rows_bypass_window_with_real_reference",
+      "memory::memory_mvcc::tests::snapshot_owned_replay_preserves_duplicates_prefixes_and_ttl",
+      "memory::memory_mvcc::tests::snapshot_stop_modes_preserve_bytes_and_shared_transactions",
+      "memory::memory_mvcc::tests::test_auto_vacuum_off_switch",
+      "memory::memory_mvcc::tests::test_auto_vacuum_reclaims_without_being_asked",
+      "memory::memory_mvcc::tests::test_basic_set_get_delete",
+      "memory::memory_mvcc::tests::test_bulk_load",
+      "memory::memory_mvcc::tests::test_collect_latest_does_not_clone_values",
+      "memory::memory_mvcc::tests::test_conflict_after_other_commits",
+      "memory::memory_mvcc::tests::test_encode_order",
+      "memory::memory_mvcc::tests::test_health_does_not_clone_values",
+      "memory::memory_mvcc::tests::test_health_reports_chain_length",
+      "memory::memory_mvcc::tests::test_instances_isolated",
+      "memory::memory_mvcc::tests::test_point_op_cost_independent_of_chain_length",
+      "memory::memory_mvcc::tests::test_print_all_latest_visible",
+      "memory::memory_mvcc::tests::test_rollback_discards_writes",
+      "memory::memory_mvcc::tests::test_scan_foreach_stops_without_folding_the_library",
+      "memory::memory_mvcc::tests::test_self_write_visible",
+      "memory::memory_mvcc::tests::test_snapshot_isolation",
+      "memory::memory_mvcc::tests::test_vacuum_bounded_slices_and_converges",
+      "memory::memory_mvcc::tests::test_vacuum_deletes_in_bounded_chunks",
+      "memory::memory_mvcc::tests::test_vacuum_does_not_clone_values",
+      "memory::memory_mvcc::tests::test_vacuum_removes_old_versions",
+      "memory::memory_mvcc::tests::test_windowed_scan_cost_scales_with_window_not_library",
+      "memory::memory_mvcc::tests::test_write_write_conflict",
+      "scale_probe::scale_lock_child",
+      "scale_probe::scale_lock_excludes_other_process_and_releases_on_close",
+      "scale_probe::scale_probe_reports_process_memory_and_executable",
+      "terminal::tests::arity_errors_carry_usage",
+      "terminal::tests::checked_terminal_commit_failures_are_errors",
+      "terminal::tests::engine_switch_blocked_by_pending_txn_and_parses_names",
+      "terminal::tests::find_paginates_with_total_and_next_hint",
+      "terminal::tests::incr_needs_integer_value",
+      "terminal::tests::meta_ttl_persist_and_exit",
+      "terminal::tests::mset_mget_count_scan_and_prefix",
+      "terminal::tests::scan_caps_display_at_100_rows",
+      "terminal::tests::set_get_roundtrip_and_nil",
+      "terminal::tests::tokenize_keeps_quoted_whitespace_and_doubled_quotes",
+      "terminal::tests::txn_begin_commit_and_rollback_roundtrip",
+      "terminal::tests::vacuum_skips_while_txn_pending",
+      "tools::migrate::tests::file_carries_ttl_through_export_and_import",
+      "tools::migrate::tests::import_skip_existing_door_differs_from_the_overwrite_door",
+      "tools::migrate::tests::memory_snapshot_keeps_tombstones_alive",
+      "tools::migrate::tests::migrate_carries_ttl_across_engines",
+      "tools::migrate::tests::sync_after_vacuum_resurrects_the_deleted_key_characterization",
+      "tools::migrate::tests::sync_carries_ttl_and_does_not_extend_existing",
+      "tools::migrate::tests::sync_fills_missing_and_is_idempotent",
+      "tools::migrate::tests::sync_tombstone_counts_as_seen_in_every_engine",
+      "tools::migrate::tests::tools_arrow_parsing_and_rejections",
+      "tools::migrate::tests::tools_bin_format_matches_downstream_bytes",
+      "tools::migrate::tests::tools_import_leaves_no_double_envelope",
+      "tools::migrate::tests::tools_migrate_carries_values_byte_for_byte",
+      "tools::migrate::tests::tools_migrate_uses_the_downstream_bplus_file_name",
+      "tools::migrate::tests::tools_round_trip_keeps_tombstones_dead",
+      "tools::migrate::tests::tools_still_finds_the_old_bplus_file_name",
+      "tools::migrate::tests::tools_streaming_readers_agree_with_the_collecting_shells",
+      "tools::migrate::tests::tools_wipe_target_removes_old_keys_and_sidecars",
+      "tools::migrate::tests::v1_snapshot_reads_back_as_permanent"
+    ],
+    "count": 642
+  },
+  "file_lengths": [
+    {
+      "path": "src/engine.rs",
+      "before_lines": 8552,
+      "after_lines": 84
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree.rs",
+      "before_lines": 6175,
+      "after_lines": 312
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc.rs",
+      "before_lines": 5493,
+      "after_lines": 156
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree.rs",
+      "before_lines": 4496,
+      "after_lines": 437
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc.rs",
+      "before_lines": 5092,
+      "after_lines": 144
+    },
+    {
+      "path": "src/lsm_tree/sst.rs",
+      "before_lines": 3699,
+      "after_lines": 571
+    },
+    {
+      "path": "src/bitcask/bitcask.rs",
+      "before_lines": 3659,
+      "after_lines": 383
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc.rs",
+      "before_lines": 3534,
+      "after_lines": 158
+    },
+    {
+      "path": "src/memory/memory_mvcc.rs",
+      "before_lines": 3014,
+      "after_lines": 173
+    },
+    {
+      "path": "src/terminal.rs",
+      "before_lines": 1068,
+      "after_lines": 129
+    },
+    {
+      "path": "src/tools/migrate.rs",
+      "before_lines": 1642,
+      "after_lines": 128
+    }
+  ],
+  "validation": {
+    "all_targets": {
+      "command": "cargo check --all-targets --all-features --offline --quiet",
+      "exit_code": 0,
+      "output": "",
+      "final_source_rechecked": true
+    },
+    "doc_build": {
+      "command": "cargo doc --lib --all-features --no-deps --offline --quiet",
+      "exit_code": 0,
+      "warnings": 0,
+      "output": "",
+      "final_source_rechecked": true
+    },
+    "release_library": {
+      "command": "cargo test --release --lib --offline --quiet -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 556,
+      "failed": 0,
+      "ignored": 86,
+      "seconds": 129.55,
+      "output_tail": "test result: ok. 556 passed; 0 failed; 86 ignored; 0 measured; 0 filtered out; finished in 129.55s"
+    },
+    "release_tests": {
+      "command": "cargo test --release --tests --offline --quiet -- --test-threads=1",
+      "exit_code": 0,
+      "library_passed": 556,
+      "library_ignored": 86,
+      "library_seconds": 135.74,
+      "bin_passed": 8,
+      "integration_passed": 5,
+      "failed": 0
+    },
+    "doctests": {
+      "command": "cargo test --doc --offline --quiet",
+      "exit_code": 0,
+      "passed": 6,
+      "ignored": 1,
+      "failed": 0,
+      "output_tail": "test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    }
+  },
+  "limitations": [
+    "本轮不增加性能算法；小档台架验证入口与数据正确性，不外推大档吞吐。",
+    "代码项审计忽略导入、模块包装和父级可见性，并在相同缩进下经同一 rustfmt 规整两侧；API、条件编译和运行行为由 Cargo 检查和既有回归验证。"
+  ],
+  "entrypoints": {
+    "readme": "README.md",
+    "changelog": "CHANGELOG.md",
+    "layout": "docs/module-layout.md",
+    "performance_authority": "docs/performance-m162.json",
+    "validator": "scripts/validate-module-layout.py",
+    "scale_runner": "scripts/run-scale-bench.ps1"
+  },
+  "module_reachability": {
+    "source_files": 481,
+    "reachable": 481,
+    "unreachable": [],
+    "external_test_support": [
+      "tests/support/mod.rs"
+    ],
+    "method": "从 lib.rs、main.rs、所有 src/bin 入口解析 mod/include 引用；两个 CLI 的 path 属性指向现有 tests/support/mod.rs。"
+  },
+  "module_layout_audit": {
+    "baseline": "5025f91f7c8b89dd9b4fbd6a650086cf108d2a65",
+    "before_files": 66,
+    "after_files": 487,
+    "before_atoms": 3231,
+    "after_atoms": 3231,
+    "missing": [],
+    "added": [],
+    "pass": true,
+    "command": "python -B -u -X utf8 scripts/validate-module-layout.py"
+  },
+  "comment_scope": "新增与改写的业务说明使用中文；类型、API、字段、格式标记、错误枚举和测试入口保留原名。覆盖模块职责、提交与回滚、候选可见性、回收、双写、WAL、刷盘压实、迁移与快照边界。",
+  "audit_negative_controls": {
+    "command": "python -B -u -X utf8 scripts/validate-module-layout.py --self-test",
+    "negative_controls_rejected": {
+      "literal": true,
+      "constant": true,
+      "operator": true,
+      "tuple": true,
+      "macro": true,
+      "missing_item": true
+    },
+    "pass": true
+  },
+  "aborted_scale_run": {
+    "path": "data/bench-results/20261124-060541-dc4c4ac3a1404a77adac920481fac98a",
+    "exit_code": 1,
+    "stage": "build",
+    "reason": "构建期间修正了测试中文注释，Source-Manifest 检查拒绝混用源码；未运行数据档位。",
+    "output_tail": "Finished release profile [optimized] target(s) in 5m 30s\n构建期间源码发生变化，拒绝混用版本；请重新运行。"
+  },
+  "test_entrypoints": {
+    "before_count": 642,
+    "after_count": 642,
+    "missing": [],
+    "added": [],
+    "exact_name_list_preserved": true
+  },
+  "source_files": [
+    {
+      "path": "Cargo.toml",
+      "sha256": "2a55091d1fd2c82443525a5c4f168c75afcfbdf4cc8d462c5773acfeeb65be66"
+    },
+    {
+      "path": "src/bin/bitcask-bench-bulk.rs",
+      "sha256": "446a548c1777938a1ffdb252ca91508003621191d2d3b17ecf2995d23d02812f"
+    },
+    {
+      "path": "src/bin/bplus-bench.rs",
+      "sha256": "05ba03d4329d1e52f6616b5771fd41a78fd304175f1e09a0dec3c9029c60362e"
+    },
+    {
+      "path": "src/bin/export-kv.rs",
+      "sha256": "aaf9a4c02c4a1b84ee1071f854bcb1f05eeec822bf01e011c25e509dfceb616f"
+    },
+    {
+      "path": "src/bin/import-kv.rs",
+      "sha256": "36536f3ca44c8a68378e9b715ec57c777afc435240e560cb286ca9fb675e8561"
+    },
+    {
+      "path": "src/bin/lsm-bench-bulk.rs",
+      "sha256": "600b3a9f05188feede1b9bc7869f770ad2a7aaeecd4a57940a199e8c6b2add25"
+    },
+    {
+      "path": "src/bin/memory-bench.rs",
+      "sha256": "31e45a820b94155c7c2dc41170c91efec701e5f4148469a90c53177c790d0a65"
+    },
+    {
+      "path": "src/bin/shell.rs",
+      "sha256": "ffc8c424abb13500b25fa67740d06ca27f8a0f02ac6eb9c5568defb194ca11d6"
+    },
+    {
+      "path": "src/bin/web.rs",
+      "sha256": "6adb352a1d5aea167bddd9efb42fcc61f96a383161e0710bba0096699ab03379"
+    },
+    {
+      "path": "src/bitcask/bitcask.rs",
+      "sha256": "0e308b9fc492f6c487dafe1732eaed2a949ec3950f00a22c8b38773110877e96"
+    },
+    {
+      "path": "src/bitcask/bitcask/hint.rs",
+      "sha256": "c8edead4205e2b1d8b926184499809e8f461b59142a3a912db7168b4b02cc225"
+    },
+    {
+      "path": "src/bitcask/bitcask/keydir.rs",
+      "sha256": "da351d0c87d9d81d2f0a7177fa43eca629d903144f9146f8dd44af17bb4a2419"
+    },
+    {
+      "path": "src/bitcask/bitcask/lifecycle.rs",
+      "sha256": "18046dbaa4226ade69a3d92c7b3bdd0dc995cedd14715c63c1165cdfd2d46fea"
+    },
+    {
+      "path": "src/bitcask/bitcask/merge.rs",
+      "sha256": "79e53474703ed6669de65a334b8ae7724fce8ac4fd8da71cfef6db9acbc50633"
+    },
+    {
+      "path": "src/bitcask/bitcask/probes.rs",
+      "sha256": "1be13428c9e14cf8b4d72626b59a785cfa624f86ba34354719702f79a898d119"
+    },
+    {
+      "path": "src/bitcask/bitcask/read.rs",
+      "sha256": "0271e0308006527f4bd2f8d896f2df39261ea56261babd208c203cad9b2dc7e3"
+    },
+    {
+      "path": "src/bitcask/bitcask/record_log.rs",
+      "sha256": "869984aeb81d831fd04cea3d60cd8c32ef5a2deae0b45c19b5c666ba11f7d85f"
+    },
+    {
+      "path": "src/bitcask/bitcask/rotation.rs",
+      "sha256": "84844dc0abbbbc228643f244730b2b614f379f58d9fa1033ab69cbf736e03942"
+    },
+    {
+      "path": "src/bitcask/bitcask/scan.rs",
+      "sha256": "9118fce177f988d4556de4eb3245a7d5766b0703d5cc7482ae7c63d7bd19c911"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests.rs",
+      "sha256": "67b82cfd54f7e73714325d562acf4b591b77deef79f6f68495e3bd4b3342a6ae"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/compaction.rs",
+      "sha256": "2b4bf29bb409deee300d5e9c7ef065622a818cbe53898476506a763b15cd253b"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/contracts.rs",
+      "sha256": "e70edaeb81a22908f061c86e69a8a270e93762a8c5335d661a1c573bc1b827d1"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/encoding.rs",
+      "sha256": "1a466879a73490264f488e0192d7a2682744f73270cdb38f614ec1e49d884dbf"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/hint.rs",
+      "sha256": "cc27e88176688ecff713fab1673b541b52721daf668d0c9bf3ed317128f5f7be"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/recovery.rs",
+      "sha256": "de0065df9daa064f461570448b86ba5cb24e10501dc10f57aad4917d900b6bc6"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/search.rs",
+      "sha256": "2f15150d3c73e44aa34e6c124c43bd8e2ac464cdc88461f9aa8783167ac89aee"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/support.rs",
+      "sha256": "185c7fee564938231c88263695a71542f3c869793b82ad56577b93afbf0bac8b"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/transaction.rs",
+      "sha256": "30e3f9f72a97750c1dec2a0520d0efb10458a174cc180b680b1c2b3cfdef2edf"
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/write_failures.rs",
+      "sha256": "27bebe6dd62a2a203e454297d4a09be74189ab8900402cfa72a2acb5b3cd7ba2"
+    },
+    {
+      "path": "src/bitcask/bitcask/write.rs",
+      "sha256": "1c75e489ff7c2d23c8f15854c3eafca916f7d035026fe406088f5cc7635e6432"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc.rs",
+      "sha256": "d504947f423dab2c54f6d00bda77adaf34d630e35db4039f22f32db5b2567939"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/bulk.rs",
+      "sha256": "ee19bfde5ae971ac3417d44f3f1173205a4b0d8eee10fad30a827920e2131e6c"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/export.rs",
+      "sha256": "3f330eaaba4250fa68a174f7c3e71e30dff9b3356803a19a7be477a23d19109e"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/health.rs",
+      "sha256": "92ec2f027a65f175000fdedd712e868461cde6063a3881be528620a076e6a029"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/lifecycle.rs",
+      "sha256": "b8c75267f0b45d14767551c38adbac024f5373b91280b890d53c8a17f944b320"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/probes.rs",
+      "sha256": "4a9a4112eb6f2c8c32ebe8b85c2a7cad96e7f857bbb391431403fe74748caf2b"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/recovery.rs",
+      "sha256": "290287e693a403a1317a29f01c2b494f5199401bdb20dfad7d83f52c7fcd64ca"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/search.rs",
+      "sha256": "5457a10c86c84d7e87ac0a01df14c635ae07cd4616b6eb82a5696b6cfe63ca5f"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests.rs",
+      "sha256": "9c05f691a526c86740aa751d483cf10fad8560f3e7a040432346a70570c06904"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/contracts.rs",
+      "sha256": "4d8fe97f46947232baeff6b28cc5f195a63449d3bf43d0467c179acb29d1a6ed"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/encoding.rs",
+      "sha256": "677568e5419157647630da7ed7bb6de0948f280e74c204d7e844670be56cbe35"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/recovery.rs",
+      "sha256": "c95f546f2aceff334a20369d2009457fc5e5169aafe07971103fd50ecceaa2b5"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/search.rs",
+      "sha256": "f3f77dba47e9c276164be1365e06719cf4ef1eeda55f3d48f9ccfa5cac562563"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/snapshot.rs",
+      "sha256": "e03c901ea5b376328010999133a4cf14b9b12719ce4ddbe7b75fddcc28f44cce"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/support.rs",
+      "sha256": "c8c77ba05333d955f0a0b73857ea3db388c65c0676d595ef0e645c2545923e4f"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/transaction.rs",
+      "sha256": "636688eab42b70d2510dcda086775e4b8958ffcbf6263bf42c737cb5552245b6"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/vacuum.rs",
+      "sha256": "b53a9953fdf195ff2530a30e5aee7ad8da427926d1a36d5473d323ee4dbf5f98"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/transaction.rs",
+      "sha256": "03f1d09aff705ace51c5ac44f0b81cca1626e7086d736edf7707673b1ebe17bd"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/vacuum.rs",
+      "sha256": "7027f2bfa103d40af314b6c2360e56770d5e025264ef64eadd28a972cba98028"
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/vacuum_cost_reference.rs",
+      "sha256": "95e6848be1d5d7929fc05ca6523d190de93a630d8a220a7ed5368a4cb13f6416"
+    },
+    {
+      "path": "src/bitcask/checkpoint_probe.rs",
+      "sha256": "4768f281f241757cd79e7194e935ff1a890e22b57f734a102ab60ab287dc779a"
+    },
+    {
+      "path": "src/bitcask/error.rs",
+      "sha256": "639e0344c1a01882c7a6eb6b88af12ef03295f98d05c9a7067bdf868a6a29808"
+    },
+    {
+      "path": "src/bitcask/kv_ops.rs",
+      "sha256": "d48a8c6ddc0b07ab53b63a270522ffb6aedc3e14890f3cf5041eb3fcbcee01d9"
+    },
+    {
+      "path": "src/bitcask/kv_ops/tests.rs",
+      "sha256": "f778ba284e82c3602f8929ef29020501c15ae6324877f0c81be4ff91beb51ed3"
+    },
+    {
+      "path": "src/bitcask/kv_ops/tests/contracts.rs",
+      "sha256": "db53a8ccd58909e2f2f3cd6aeec631f74892f84d647108f953dee0c86144d5b8"
+    },
+    {
+      "path": "src/bitcask/kv_ops/tests/search.rs",
+      "sha256": "5c67f82655eb144e3f761ac99cddfc90d64565acbe5f7225c4b8c4505b388f50"
+    },
+    {
+      "path": "src/bitcask/kv_ops/tests/support.rs",
+      "sha256": "ea02b8e99d06aa6b9253903f270210d4a6624d6cb01436644001a347f19b0c65"
+    },
+    {
+      "path": "src/bitcask/kv_ops/tests/transaction.rs",
+      "sha256": "9f2e07d96119d327e4d89dd4834361972ea7b868cddf96e4ae3fb8e236ba9a96"
+    },
+    {
+      "path": "src/bitcask/kv_ops/tests/ttl.rs",
+      "sha256": "3400c46ac19b2a6a26162305d684fb3ee8470617c6dd3af1035d944c2ec44055"
+    },
+    {
+      "path": "src/bitcask/mod.rs",
+      "sha256": "e191ce28bc4f00ed97931078f458a9e0d69ffededb8eaad6c7b000085d75f148"
+    },
+    {
+      "path": "src/bitcask/storage.rs",
+      "sha256": "a483e56967a4a1be2fd544bf2801d10fbc869ac29b083ff5e63435a01425a511"
+    },
+    {
+      "path": "src/bitcask/wal.rs",
+      "sha256": "b30fcf36dc249eea6f9b2b9b256959949dab7d9ddec9f696199975af5ad5a4db"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree.rs",
+      "sha256": "b1c709f8a827eb02ec0fdc0d0a65d4033feb43d32011ed7994a6f38f1e4b7a8d"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/cache.rs",
+      "sha256": "ab5a1da99fff0e5948e6ae265a8a712248eb6128e2b69d5774a47a914a486560"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/delete.rs",
+      "sha256": "b067cb43f6e642a8151cc79abdf6dcf9c4f96d597e1f90f2aa12da86929b14a1"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/delete_cost_reference.rs",
+      "sha256": "87865313c6d58df2b68a7612767f7d035ac92ccd2969b763e609078b7ea25d94"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/delete_leaf_reference.rs",
+      "sha256": "3b2f5e0a9a108873df935eaf1d6c08c3983da78bee473936c0654ab528892af1"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/delete_read_reference.rs",
+      "sha256": "e954bdd19764d17d0dd62ce3b89ef43d5b168b7ab32d60b44a2cdce8228305f8"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/insert.rs",
+      "sha256": "fc3e38158d86b001187a0246dd0a818e1bb7a2de47767bbe245b0dd23fae486e"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/lifecycle.rs",
+      "sha256": "c259fc4731694fa13ebe49d96fcda545dd3f3ae574d5a596f4f0a8141d1da13d"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/maintenance_reference.rs",
+      "sha256": "3579950e89b5b4e68226ade1473e2acaf9fdbda84d9519aaa91910c91990ccf6"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/node_codec.rs",
+      "sha256": "dc616d2ca7b0a80861ca59b6a903f7d03482a523ac314bb3baf3d26e068674bb"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/node_size.rs",
+      "sha256": "f4b9a5443ca475ce91105f8a6b8059e088028206587425c41da477a7af2c6742"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/point_internal_reference.rs",
+      "sha256": "b1d026e756bb48951f4653d518b16eb49ee2d8fc0f7f7bf3b65d6a3afd0b2c7e"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/point_projection_reference.rs",
+      "sha256": "324bc009490f669fb5c95e47b6dc2f2b8aa94dd88c54a23e19b15bc267dabfbe"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/probes.rs",
+      "sha256": "dd2c82fff5119e2214d87b9fd704d22822e6457466562e09ab13db273b456ea9"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/read.rs",
+      "sha256": "35f7652c02ea81f12b31a88ae2041d7bfd9f12a56322da12cde7d2425440b494"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/rebalance.rs",
+      "sha256": "0098726afca96362d0513fc73807f703f8c406e5b33aaf6ddedf5d3f75a26833"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/rebalance_read_reference.rs",
+      "sha256": "46fbf54141bff35f5de1a768916a723c139827bc160e9dbc8180fac645166722"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/scan.rs",
+      "sha256": "4962c47be4839ba9b25ab2335fca277fc54d6afedaa13293b6ac070197937cad"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/stats.rs",
+      "sha256": "e25c23e046a624aeb0d26081911c2e3dbe26bfd9b51db9510719f86063b26e99"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests.rs",
+      "sha256": "9bbf3c1a5a5061012e01ab8d50baedcf06d36079fb73087950862ed86e2ff8c7"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests/cache.rs",
+      "sha256": "ae1481e4de597b49cd1bd010f7a3c97d397d18ed722ff7abc9c5ecbd811ca9ec"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests/compaction.rs",
+      "sha256": "4ec855740cbc9059de6dfe1ca79bde3011dc9fad6e6779412ebb14dd3d33b0c4"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests/contracts.rs",
+      "sha256": "c523da70594ec15915d1957da6089d4bce84561ffabee4c52535b0e684c2dbad"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests/encoding.rs",
+      "sha256": "899aed7f1bf555dc684c79b73a4e6ac294e880c38dde689d9c0a2b4e946ea22a"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests/support.rs",
+      "sha256": "237c88ef779d59273df3ccddc60ab9f02ad82a30132bd636bdcf8a865b0bcf08"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests/transaction.rs",
+      "sha256": "ebab6fa9f9930f809fffc75ad4bf459742672955719f86f55e15104fef2b3b26"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc.rs",
+      "sha256": "61f08629a363aa5699e2025b41dd4da1faa45660ccb14bb3ae8a712bdee1168f"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/bulk.rs",
+      "sha256": "a271abb939c08e4bf6e85cdefcba4276346bf94a41352787a698dd2b4a4d6e64"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/export.rs",
+      "sha256": "3f330eaaba4250fa68a174f7c3e71e30dff9b3356803a19a7be477a23d19109e"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/health.rs",
+      "sha256": "341762f8a8d1592cb6568570c05c8242354af15f0b33dc83b7309b6a81eb190d"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/lifecycle.rs",
+      "sha256": "ca04521e11d63002cb43226ec207156661a0ee5f0fb625e88a9c3da15a7ad996"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/probes.rs",
+      "sha256": "cdcbe7da1df508ba3d9fa7b4de3dcb4089fd9b8f08419b6a4f288b7b64a50953"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/recovery.rs",
+      "sha256": "3b4978a0e83aa82204d9d57dc38b14f5240bbb380bc6a5645a09a98631ed167d"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/search.rs",
+      "sha256": "999c1f07442dec13e09f832e38e7a9cbe54b7a3fedfa516ef6d5094351f898c1"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests.rs",
+      "sha256": "0f89aac92a021e6fc3f8368802b8c077ddc4e693a03782f26ad745fed4aafde8"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/auto_vacuum.rs",
+      "sha256": "782048c4ad3d5ea4d1066f2333a0a04ae3bdcb331b832cf2cf9e2d16dbc95093"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/bounded_vacuum.rs",
+      "sha256": "15f79f534c4bb19a66fed47794b5262414bc493602f26ce7b78f8b9bd64122e3"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/cache.rs",
+      "sha256": "4f19f443e03cafb6a55cfe90806b51f26ccb9d53539b88e3deff3ae401104ace"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/cache_budget.rs",
+      "sha256": "7abe4e5225802766b1a9a5619495dcc47db5bb6878f5e9e5aa2a46ff883480d2"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/contracts.rs",
+      "sha256": "cdaf3bbf3318ff7fcd8e00766c338be6e07a7f17c95fb28a00c8d6991a75c904"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/contracts_bench.rs",
+      "sha256": "3fef4248aea99962e2f1c50790ad4f31a9b9399763bcedad28da01dd4fe4fb92"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/encoding.rs",
+      "sha256": "677568e5419157647630da7ed7bb6de0948f280e74c204d7e844670be56cbe35"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/export.rs",
+      "sha256": "9715121d0095f6891fe0a69593b8003c8f38542cee2ad7a2f753c82fae2c7bf1"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/health.rs",
+      "sha256": "463468eb15e802a9b4dfcfe07c41239933c37c4950f719fc04ebc02b5c6b955f"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/point_read.rs",
+      "sha256": "f9146ecbfad973cae5b8903f87981dc5ba65494c15768bd47a418858586a5461"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/recovery.rs",
+      "sha256": "e9f27a0bc4a38c7bf7dc8c4af5c416aeeb6013ea5d91723a5b9c6cfabb6f56f5"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/search.rs",
+      "sha256": "1d0b53f095989330a78ea72bdc93b10c4e26dbcbd46a9dec75f68e2a23db3e64"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/snapshot.rs",
+      "sha256": "1989d06ec89d77b12a0c8ba6b95726a9993f77f2660aaade020fbd389dad33cd"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/support.rs",
+      "sha256": "79825d04a197403b62e9820e8ce605a951a344089a3ff1f1bff5f100671c5cc6"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/transaction.rs",
+      "sha256": "054801c00cc8b47da63b13f651f39e6a78ea6961a955d6f15de33b051b70fd6c"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/vacuum.rs",
+      "sha256": "469f716372080a8bccbafe7d063c064fcd0a2707586c29b44f442ac8a62e1f9d"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/vacuum_bench.rs",
+      "sha256": "d33b56cd2342c7931233aff968d464aa3a2aacf91bea0e5419659ff5a0ccf9b8"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/vacuum_faults.rs",
+      "sha256": "f4eea3dfbac1e1a2fc1e39197677872745ec8cc81489460040e413d0f50daed3"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/write_failures.rs",
+      "sha256": "15cde5902bdc4f6b93de6eb53d67550b8d306626a6cfdfdcefc2a5d3fefce2e0"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/transaction.rs",
+      "sha256": "7f6d352e110150ae0c54eeab4d253d3205f29d0879193b965b668617eee89541"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/vacuum.rs",
+      "sha256": "b7d84d896fe3ca8dfe093137406460960cc124b1e073bf10c03e75aa93aa38b0"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/vacuum_scan_reference.rs",
+      "sha256": "d84d3317fe9c896f18075593292de4984ea0d3121ca2742f19e9baf189b3c570"
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/vacuum_sync_reference.rs",
+      "sha256": "0a0de0ab95ef9fabe2e158ecfb95a90bbd1bb7a6b863ceaaa43b0cf2eeaf9405"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops.rs",
+      "sha256": "eed65c6d901363fd2424a0cdd2e23a5711dbcec0cea5b196c444c0f7db26a335"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops/tests.rs",
+      "sha256": "f33877e0e0db7a5f0d94acc4a5c1b144da612375e5c037410eb37a74eecb159d"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops/tests/contracts.rs",
+      "sha256": "c7f3e3862ccd6382c79084393f914d803fb7d710eed116f0f931b54c9b32d501"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops/tests/search.rs",
+      "sha256": "0779f7d14b3c61b3ae3ef89441799fd9f2043342a8c5499a44534b7538f01cf9"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops/tests/support.rs",
+      "sha256": "58662122e77373e773b14cca3ea035669eb4fcdb98fa43dc52eb88121d978ea2"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops/tests/transaction.rs",
+      "sha256": "757a1a098d3e6558c11ebf2e3f04995b60962c1c6eadd3b9876a87cf40ba3b30"
+    },
+    {
+      "path": "src/bplus_tree/kv_ops/tests/ttl.rs",
+      "sha256": "3c9b4204c305b74de13a845eca5ce446a80d49be123b1e94295d2846ddfedc44"
+    },
+    {
+      "path": "src/bplus_tree/mod.rs",
+      "sha256": "51fd8af38ac9bc72f131960060dbe47a795f302c661878497092ee38d0bc668d"
+    },
+    {
+      "path": "src/bplus_tree/page.rs",
+      "sha256": "0a0642bb0c6d6bae132b0ec8ea54d408763ebec80e9fd6696d9a86ab4d0234e1"
+    },
+    {
+      "path": "src/bplus_tree/page/allocation.rs",
+      "sha256": "8ec67f74d1165994c9b1b152105a136184535c27ccaf46891ce0d5a17b76c314"
+    },
+    {
+      "path": "src/bplus_tree/page/cache.rs",
+      "sha256": "2cbef697acb7c67223b73716efe828fdb7dc12643581292e6b31316e588dc709"
+    },
+    {
+      "path": "src/bplus_tree/page/eviction_reference.rs",
+      "sha256": "35813b6ed7ab42b4f725759a822364cf549e882f3d07399f114de0e1f209de67"
+    },
+    {
+      "path": "src/bplus_tree/page/lifecycle.rs",
+      "sha256": "efdda9a2c113eb96b3d5ca1c1be9ab44c809eb3f877564c7ba50bcec643cd233"
+    },
+    {
+      "path": "src/bplus_tree/page/metadata.rs",
+      "sha256": "dc28b0e85be657a362e695dd33d127b24d124ef706ef57d1d56303564065a51f"
+    },
+    {
+      "path": "src/bplus_tree/page/page_io.rs",
+      "sha256": "b417714dde6d89ca5e291350caf8a5ba51e2422d822612b30b30c159c834d0c0"
+    },
+    {
+      "path": "src/bplus_tree/page/probes.rs",
+      "sha256": "813fae53dd5f818101af19d82b5452a6c9a03e5492a5cdbc3aceace064392517"
+    },
+    {
+      "path": "src/bplus_tree/page/reclamation_batch_reference.rs",
+      "sha256": "ba47b4b5d280b8a879b830c3588d03c2c0d0d0b0e802b0ec27ce5df583afb26d"
+    },
+    {
+      "path": "src/bplus_tree/page/reclamation_reference.rs",
+      "sha256": "6ccd8397c7538f6a979ec490e70d2b6e490219c80713b186b654a6a7bea786a4"
+    },
+    {
+      "path": "src/bplus_tree/page/tests.rs",
+      "sha256": "78618d684405a45ea919e6c3300367a7f08e3e1492c3d5012d83aa490192952c"
+    },
+    {
+      "path": "src/bplus_tree/page/tests/cache.rs",
+      "sha256": "69c5e4e38a43aaf4be569002b66162dfd5522eb2519a510643a77c14eec6952d"
+    },
+    {
+      "path": "src/bplus_tree/page/tests/contracts.rs",
+      "sha256": "d01ca7f8b17d68ea18c4616d7149b8ab160b63df43951b0e8d8dd66e391a68dd"
+    },
+    {
+      "path": "src/bplus_tree/page/tests/encoding.rs",
+      "sha256": "f7128158764c7a3768f77e127b6de27155de15ac26f20703d279e74a1668a1c1"
+    },
+    {
+      "path": "src/bplus_tree/page/tests/recovery.rs",
+      "sha256": "523fdfed2f01970f99f55d374ec72b79714523e6af88b9fb5609c9c795e092a6"
+    },
+    {
+      "path": "src/bplus_tree/page/tests/support.rs",
+      "sha256": "ab079a51c04946b53172e392cd28a7327b8706cb82d94d2061e72fb5dd494104"
+    },
+    {
+      "path": "src/bplus_tree/page/tests/transaction.rs",
+      "sha256": "bf9c364eac6ab6f708189884417aaf180978366fe18bb0c9ffb737691d1e9b1e"
+    },
+    {
+      "path": "src/bplus_tree/storage.rs",
+      "sha256": "b8a774988e8fd0d543638cf9a829e63edddb95892ce714c37646b63647ab0158"
+    },
+    {
+      "path": "src/bplus_tree/storage/blob.rs",
+      "sha256": "8a2b707f67e499af2cfe8e16879324c0534724c34ccb9332999bca618931b469"
+    },
+    {
+      "path": "src/bplus_tree/storage/dblwr_probe.rs",
+      "sha256": "a4aff181e756183b405b699ffacf77a7611e33c93add8757543f270e5ba56b40"
+    },
+    {
+      "path": "src/bplus_tree/storage/double_write.rs",
+      "sha256": "510c5b6b482f950f57e1e176702ab4f05f9234d26d511082bea9eac153aefeff"
+    },
+    {
+      "path": "src/bplus_tree/storage/freelist.rs",
+      "sha256": "adf4f80ebcb31317186052a93ae62af5b2640e4c86cc5f359a323bb914718131"
+    },
+    {
+      "path": "src/bplus_tree/storage/page_codec.rs",
+      "sha256": "d6a6a6a30baee5ce1ccd56eaad6c6416f4d008e8011a5d745de873cb4b3b322f"
+    },
+    {
+      "path": "src/bplus_tree/storage/paths.rs",
+      "sha256": "6838b11da99849af06c0ebec626f4e95c8094efbac47f8d0ffa372a8afe9ccf8"
+    },
+    {
+      "path": "src/bplus_tree/storage/probes.rs",
+      "sha256": "0b8d12b46491b7828de30c028b7857f9fbc474ed08cca4d40cf535eef50efd3b"
+    },
+    {
+      "path": "src/bplus_tree/storage/tests.rs",
+      "sha256": "09b590d2d4467b7f967a2af06d84989c68992e22eed7b5787dcf96ac799f1bf5"
+    },
+    {
+      "path": "src/bplus_tree/storage/tests/contracts.rs",
+      "sha256": "27f5865f1e45bd3e2f16127c037b2afaa06afe582aa08ab7f7b50d4a8cc9e494"
+    },
+    {
+      "path": "src/bplus_tree/storage/tests/encoding.rs",
+      "sha256": "347223254849843356826fe3c472617231de1b7c3455707e43ac5a91a6fa539f"
+    },
+    {
+      "path": "src/bplus_tree/storage/tests/transaction.rs",
+      "sha256": "8b7b6094dd5aae7fc0d8848d14c7d1e07cef460b7a786943fc3461bc3bb5c6aa"
+    },
+    {
+      "path": "src/bplus_tree/storage/value_codec.rs",
+      "sha256": "cc946139120840e4bab6dd67241763c3d023927ec074e93c3f6ae63c913aa134"
+    },
+    {
+      "path": "src/bplus_tree/wal.rs",
+      "sha256": "d248f7f6e8658c80ffafa6146e59f156b575bb986d7d76938b9a9b53b302c21b"
+    },
+    {
+      "path": "src/common/codec.rs",
+      "sha256": "6b3470d8f823c7c3ffb64ed64c12831cf437932bb6439ed9e47c260933457343"
+    },
+    {
+      "path": "src/common/disk.rs",
+      "sha256": "5769f5d4b2948df9c98c22325fe10927f05569b28980cf5595cfd25d9d48c122"
+    },
+    {
+      "path": "src/common/disk/crc.rs",
+      "sha256": "96d3fc4b850809ea0e49cbbc1cdbda3da1a3f3e28500aaf459ae07ef017c98fc"
+    },
+    {
+      "path": "src/common/disk/disk_file.rs",
+      "sha256": "bf1ca85ef78fff779daaf56c88eaef6cc1097cc5199ce9accb7fc6c043b96138"
+    },
+    {
+      "path": "src/common/disk/file_lock.rs",
+      "sha256": "df42eeb059495ceb045f412398eff05b27d5a4e034fdf588e857d2921e353e51"
+    },
+    {
+      "path": "src/common/disk/probes.rs",
+      "sha256": "bd9cd1750a857529d9e871fe27739bb5900aac4316edfebe52729f9791ac9646"
+    },
+    {
+      "path": "src/common/disk/tests.rs",
+      "sha256": "a8a91f36afa98d78b8dc9e957a80245914c5b65034d41d85894cbcdb720eef7b"
+    },
+    {
+      "path": "src/common/disk/tests/contracts.rs",
+      "sha256": "4bf78f1d72128b9e72336863126a94911a4369619fbabea244968a9806a2764e"
+    },
+    {
+      "path": "src/common/disk/tests/encoding.rs",
+      "sha256": "4194065ec0548c31025df5efbed6aa4af6b1e5bea81bbb6ebbdfd98f4274ec61"
+    },
+    {
+      "path": "src/common/disk/tests/recovery.rs",
+      "sha256": "3526e6856d88fd2d2c68f23f5a2ab70a3fc7283ae8f695f9ea8ac0cf13731a79"
+    },
+    {
+      "path": "src/common/disk/tests/search.rs",
+      "sha256": "5000897060046c850cf8fc8d8663f86e083b56dc49dce9dc19774c91d15022c9"
+    },
+    {
+      "path": "src/common/disk/tests/transaction.rs",
+      "sha256": "71b5500ad437729da88216f72cf07a87237169578014a884e46c1502f640e02e"
+    },
+    {
+      "path": "src/common/kernel.rs",
+      "sha256": "53d934d658308322bc676686544a620e06e07c7b359e76ad99f92b854bee62b2"
+    },
+    {
+      "path": "src/common/kernel/cursor_tests.rs",
+      "sha256": "3cd937d11b03a2b8ab74812f3862c111ad83ea404ad6ce333b2bdf8b4137d3b7"
+    },
+    {
+      "path": "src/common/kernel/health.rs",
+      "sha256": "d5ff726a961bc782cfe2835c060f2a413989ed156de3bbec46a4cfc19f7dd827"
+    },
+    {
+      "path": "src/common/kernel/probes.rs",
+      "sha256": "29d15ee2fa5e8193c2191c7e56938d0222fb0fdf6400b5a80eb082ace39d5ba3"
+    },
+    {
+      "path": "src/common/kernel/search_page.rs",
+      "sha256": "8d05926b23f3a221508165291f6fadac479d8a6e18f5a0106e9d4504f30d1c72"
+    },
+    {
+      "path": "src/common/kernel/tests.rs",
+      "sha256": "5f42f6ce68c011aa5035fb707c834fdc8e1832fa6de08754414111a58c110fbc"
+    },
+    {
+      "path": "src/common/kernel/tests/contracts.rs",
+      "sha256": "4778662a12d8661c9dbbb555ed12f5ff8db4dc8f2e74f513a94c3496524555a0"
+    },
+    {
+      "path": "src/common/kernel/tests/recovery.rs",
+      "sha256": "45a1a7ef83a43337baca03a4f2e95a4228e31281f437e322c4cf1896843ad213"
+    },
+    {
+      "path": "src/common/kernel/tests/search.rs",
+      "sha256": "e07b63088933e6b20455f3e53a49e829b6c16670d178222c7b4e24840c003fd2"
+    },
+    {
+      "path": "src/common/kernel/tests/transaction.rs",
+      "sha256": "b3df52e9bd7adefe044f284d70d7d0e58f3b033bd12c8c4a013636c56243edef"
+    },
+    {
+      "path": "src/common/kernel/vacuum_scheduler.rs",
+      "sha256": "657f180e8bc34280b07e20887bb5c1802164d057d85ba92967457f56b26a7c8b"
+    },
+    {
+      "path": "src/common/kernel/visibility.rs",
+      "sha256": "8f9edece03133de91a79d02bb212208773ab4e47e427b16108afe6e1c3d81133"
+    },
+    {
+      "path": "src/common/kernel/wal_policy.rs",
+      "sha256": "dda4d44697f654513936a45beb34d17ba467951e1525f419a4e3235d3566a67c"
+    },
+    {
+      "path": "src/common/kernel/window_fold.rs",
+      "sha256": "4a9b9c4ed0532d3abbaacf968675c134078a77041d457a2575f5b86f421e869f"
+    },
+    {
+      "path": "src/common/kv_snapshot.rs",
+      "sha256": "e0bbb848a8b2a4b74fb22b936ce291d8023622cf7ec40ba51c3701aae61b4ef9"
+    },
+    {
+      "path": "src/common/kv_snapshot/atomic_snapshot.rs",
+      "sha256": "645ecdce9aed62a53568a5ee1234ddeee4225eb5f1c194fee0a5c24a532e4aef"
+    },
+    {
+      "path": "src/common/kv_snapshot/base64.rs",
+      "sha256": "19eda7e58ef7aa3b1161cb6c1f668d1ab7303553c7f1178f0ca4823df230a2b2"
+    },
+    {
+      "path": "src/common/kv_snapshot/binary_reader.rs",
+      "sha256": "535ed960a91e4209dea95885c79390088043106cba177a71f28e1e6b2cb6531b"
+    },
+    {
+      "path": "src/common/kv_snapshot/binary_writer.rs",
+      "sha256": "28447526efda60fed81329571dfaa2b2a9597309fff0da5965a000e850136780"
+    },
+    {
+      "path": "src/common/kv_snapshot/export.rs",
+      "sha256": "8e72e1a3c8b8eb4086ed1399bb6f3257b44906633d6ab77a36043de930707b28"
+    },
+    {
+      "path": "src/common/kv_snapshot/io_reference.rs",
+      "sha256": "69c00a639c3461e31d14dae15becf4307c0b7c18c9e387b6b431ee6e9f5bcd6f"
+    },
+    {
+      "path": "src/common/kv_snapshot/jsonl.rs",
+      "sha256": "c698f8c235b9976dcef9ffd961dbca88ab5720e0f18ea0009596d64c27132876"
+    },
+    {
+      "path": "src/common/kv_snapshot/record_encoding.rs",
+      "sha256": "8cd7a5749f674bfb7a0c2aa01dcc448df9556369ca262ae157f247688b8743ad"
+    },
+    {
+      "path": "src/common/kv_snapshot/recovery_probe.rs",
+      "sha256": "d0a1bab10d8d3de35fe8e55282cea9cd8c781fff81bce895544d08fc43214f57"
+    },
+    {
+      "path": "src/common/kv_snapshot/snapshot_emit_reference.rs",
+      "sha256": "79cef89a0f7e5a6b6538d151ae2ae5b4bc16aed8a6a395284557a56b5030b7e5"
+    },
+    {
+      "path": "src/common/kv_snapshot/snapshot_io.rs",
+      "sha256": "401b983f41aff82fc8d5cd9b32a14637fd2fddc109f28202410fd86c71478637"
+    },
+    {
+      "path": "src/common/kv_snapshot/snapshot_probe.rs",
+      "sha256": "0fec5ef3ddba5ce2add0c55dbe0b15dba40bf3342823e40f709177359505a694"
+    },
+    {
+      "path": "src/common/kv_snapshot/tests.rs",
+      "sha256": "a39e2cd64a6f8598ab206b8d4ebd7ae0ee59cb96118415dc86572a67948f1fe3"
+    },
+    {
+      "path": "src/common/kv_snapshot/tests/contracts.rs",
+      "sha256": "16f9d1045641c9736e2067fb363e3060bf18f64b5656639dc3187aded32dbed4"
+    },
+    {
+      "path": "src/common/kv_snapshot/tests/encoding.rs",
+      "sha256": "c5f725f0d2ecbe7d1b5a50e103831be6b30c2c0dfaa33a5f566c3f7b4baa823a"
+    },
+    {
+      "path": "src/common/kv_snapshot/tests/search.rs",
+      "sha256": "c4ae2dd13226e77250b92cb8e8e713dc648b1be5d16b7450edd82f2c1cd75675"
+    },
+    {
+      "path": "src/common/kv_snapshot/tests/snapshot.rs",
+      "sha256": "74f8a14807808e43e2659131490d34408eb9459810e0735c1f72340a973b7d24"
+    },
+    {
+      "path": "src/common/kv_snapshot/tests/ttl.rs",
+      "sha256": "2cd17be522b71cbe249fb91f5aa3cf857de09ea7972e8f67bb64d72147063fb6"
+    },
+    {
+      "path": "src/common/maintenance_probe.rs",
+      "sha256": "fa7ab16c7201557c268d4dca8e39cecf60fdbdad3efc953a9de43d915affd61b"
+    },
+    {
+      "path": "src/common/mod.rs",
+      "sha256": "603cfd9b5f9fd49a96132ca417a31f31642413635f7079b59943dd72cc4b53ae"
+    },
+    {
+      "path": "src/common/order.rs",
+      "sha256": "c5e73cece5681cbc486d89eb59369572e4b7717d3e8806a557bcbdd47228d220"
+    },
+    {
+      "path": "src/common/order/bounds.rs",
+      "sha256": "35b0df58fe98bf372401c427ed7920b835d4cc47a6025d360a36894444aaf6cd"
+    },
+    {
+      "path": "src/common/order/candidate_fold.rs",
+      "sha256": "070c7903055a24a6183711d0fc1c0fd522813cb52ecbb6d15ad0abfe1e6a7486"
+    },
+    {
+      "path": "src/common/order/fold_tests.rs",
+      "sha256": "c4685484a4ae16256ad1809d61daed4adcd2b931163798afe27070d404a8b986"
+    },
+    {
+      "path": "src/common/order/health.rs",
+      "sha256": "f2cd7c2e4040f82e57f445fffdfbf5cdfe23c88d96c912189bf84e45bd098ab1"
+    },
+    {
+      "path": "src/common/order/key_window.rs",
+      "sha256": "f1ca2242159ce2d98b0fa9344e0c17ee6a841b6e003956b74c233230265a2364"
+    },
+    {
+      "path": "src/common/order/probes.rs",
+      "sha256": "81b0914083dc6aa3d5f83279898b4d2916d978cb5034ffa654ab452882cc7575"
+    },
+    {
+      "path": "src/common/order/reverse.rs",
+      "sha256": "32e759ffad43bb517a737f4a4340d2c60bbb495febea56842ff37de9760b9f13"
+    },
+    {
+      "path": "src/common/order/tests.rs",
+      "sha256": "ca66702401ea740c37ee05bad299ea0eb32412ba67882cb3f075d6a77882e8c8"
+    },
+    {
+      "path": "src/common/order/tests/contracts.rs",
+      "sha256": "492c35504f992de101b44ea2e9d8d420fdf8ab310a4727e992ba32fa7e94892a"
+    },
+    {
+      "path": "src/common/order/tests/encoding.rs",
+      "sha256": "7717b8279b13ff0fb9bb060df55deb2f913ef29b7dfed429bc794661951d5745"
+    },
+    {
+      "path": "src/common/order/tests/search.rs",
+      "sha256": "936439411c56e03791175d57696883b1403715f2249883b4549f209be8efe867"
+    },
+    {
+      "path": "src/common/order/tests/support.rs",
+      "sha256": "dbec3146dbb7a3b6ea6b725afd9e0a4c80b2c01022ee9133cc2c5291e529d500"
+    },
+    {
+      "path": "src/common/store.rs",
+      "sha256": "a6d770a7a62cd3133ebbc8187f30c9733254732a36660e569131dea87d8df3a2"
+    },
+    {
+      "path": "src/common/store/deferred_search_tests.rs",
+      "sha256": "2aa2e11e69a9b0b71394c0efeb9d86d8ca4165b1482f68e8f96b5e62f951c76f"
+    },
+    {
+      "path": "src/common/store/export.rs",
+      "sha256": "6446890dc3093d37c37e73b5094a5016db1219f61bec74958319f19790ed56bd"
+    },
+    {
+      "path": "src/common/store/reverse.rs",
+      "sha256": "320b3fadd1c212a209d71e80cbf7a5a98dd41800378a7fc68995b6f4c1c94ced"
+    },
+    {
+      "path": "src/common/store/scan.rs",
+      "sha256": "6f15127b542f98a6d7ba77e6e66d4b406f56289139295de80de175ceca761ce3"
+    },
+    {
+      "path": "src/common/store/scan_cost_reference.rs",
+      "sha256": "e54f47734ada498b45fc6ecc754c606c009667a5b3950d2ba7d9e0b7caed7ec5"
+    },
+    {
+      "path": "src/common/store/search.rs",
+      "sha256": "283ce76d80bba6dc795fb1c96f4d5196032649405f0821ddcfa0afcbabbc1c5c"
+    },
+    {
+      "path": "src/common/store/search_materialize_reference.rs",
+      "sha256": "dcacee58baef5d9ae64acc82e6a6de604655f53b834bb500316e3932e7adb908"
+    },
+    {
+      "path": "src/common/store/visibility_tests.rs",
+      "sha256": "c34914c48a617398deb767e919bceefcc8a94913dfb83298dcb2c2e38ae15aa0"
+    },
+    {
+      "path": "src/common/transaction_error.rs",
+      "sha256": "c231a279291bf93d4321cb46520ae1320650f982d2839ad230ace446f37684f4"
+    },
+    {
+      "path": "src/common/txn.rs",
+      "sha256": "92a74b91d7c05d2413341649cd436e3dc00dd6fb20c7668d7207f80b2f1b49a5"
+    },
+    {
+      "path": "src/common/txn/checked_tests.rs",
+      "sha256": "9a143b396f8ab3f7ced988922c5f8588d1e7fa13594c051f734dcb15f9f354b7"
+    },
+    {
+      "path": "src/common/txn/checked_tests/transaction.rs",
+      "sha256": "4b9b803ba0bc7735fa47ed53b0a36646044cd557b1d6a92d1ffbb3d73622b3ff"
+    },
+    {
+      "path": "src/common/txn/owned_reference.rs",
+      "sha256": "88f42a1efb8edda9aea2dc25224f21feb198ce379a12407339ead81e410fd0f1"
+    },
+    {
+      "path": "src/common/types.rs",
+      "sha256": "ec394c3d89cc1191f63bdb9fe1afe1552b8ce38b3fc0f2d0057641a7f2c4b3e8"
+    },
+    {
+      "path": "src/common/version.rs",
+      "sha256": "8884fb7556d86c6b407862affb18c595f2ec0b798ecc47f1eeada10080e1be5a"
+    },
+    {
+      "path": "src/common/wal.rs",
+      "sha256": "c3584685e9cc6d997ab99837e20f3376f9b87893daa05ae64bfe5598756157f8"
+    },
+    {
+      "path": "src/common/wal/append.rs",
+      "sha256": "e2767cf1b76b8f93891be21a834c1c44b704ddca43e8b4e64588a4f3a07ecc64"
+    },
+    {
+      "path": "src/common/wal/commit_probe.rs",
+      "sha256": "85fbec567a0b0d625a33b2a26ce23fb9bee8de64c4fb9ff6fa0798cbbe8385ec"
+    },
+    {
+      "path": "src/common/wal/recovery.rs",
+      "sha256": "0eecbb7280ea1312feda7cf1402e3a4049c461e58b88630239811edc58c9a324"
+    },
+    {
+      "path": "src/common/wal/tests.rs",
+      "sha256": "a4bf4500460b8e78243158565fed08491fad7dfd1bbdae9b2e9aa70f3e71e87c"
+    },
+    {
+      "path": "src/common/wal/tests/contracts.rs",
+      "sha256": "4b76f7b67d88820a049e6ced754a763fd7390b0672c6d256df7042be13c2f8b6"
+    },
+    {
+      "path": "src/common/wal/tests/search.rs",
+      "sha256": "63e4c18c0e271f42a43bcdf16d622c5d0677dff0882e657dc698271e5f45ba9f"
+    },
+    {
+      "path": "src/common/wal/tests/support.rs",
+      "sha256": "76148cdca51d72a17cea793ddab912a2a900ab2068d0c1e7e901f0971e8642f5"
+    },
+    {
+      "path": "src/common/wal/tests/transaction.rs",
+      "sha256": "ac880795de9f70cccc96470ebd08633cbbc0fe3301ce857bca586685ccd693c8"
+    },
+    {
+      "path": "src/engine.rs",
+      "sha256": "6ed3935e22aa5acdf100b9ac033ab9248f7b8d221d5537505b68d99a40a27b15"
+    },
+    {
+      "path": "src/engine/adapters.rs",
+      "sha256": "9e4ba651f72cc45799d96dc101c7d4005500b71099fa9531b0ecce62be027361"
+    },
+    {
+      "path": "src/engine/bulk_api.rs",
+      "sha256": "ca29a4d1951d8e5cfdb2b98b318af865d2377c2aca7166f5b8a084376173e7e8"
+    },
+    {
+      "path": "src/engine/config.rs",
+      "sha256": "054de9927ee4cee1acafd1be8fda61f3c7a80d36b8da801e9031c9763c84e9f2"
+    },
+    {
+      "path": "src/engine/engine_api.rs",
+      "sha256": "733fbe13618a548a72ace7e40ee14bb13bc886b529d7c18ab38cae2a127429d2"
+    },
+    {
+      "path": "src/engine/error.rs",
+      "sha256": "8ba4cfe811a60e251b193540a0c069040947776211dbc85cf02e468e5d997b84"
+    },
+    {
+      "path": "src/engine/factory.rs",
+      "sha256": "b78c7167c82cae4409f06f1a07fae20daccf96b0c38c465db283959351dbcad7"
+    },
+    {
+      "path": "src/engine/migration.rs",
+      "sha256": "2f1b3f65f5885ab449e68d21f60fec1b59188b3a3687394a24e28e6e76574e2b"
+    },
+    {
+      "path": "src/engine/migration_probe.rs",
+      "sha256": "48af12733996f5ba3f8ea5279a6aabcf838e4fa7baf53ff8384d41b083813217"
+    },
+    {
+      "path": "src/engine/migration_stage_tests.rs",
+      "sha256": "cc559655aa54bdd6da4dcce00e2778ddf188321b9abc0beb00b8f348e8ce3840"
+    },
+    {
+      "path": "src/engine/selection.rs",
+      "sha256": "4c8f7a707f8b9c69d57fbf72d921453474a4ca62aa2535343d18fcf5885dc562"
+    },
+    {
+      "path": "src/engine/tests.rs",
+      "sha256": "7487985370706326e1484e78a74ca09ef21c57662e5e2d5c1beeb243638b0db2"
+    },
+    {
+      "path": "src/engine/tests/bitcask_bench.rs",
+      "sha256": "551424bee7b23dca7f7d926cb5217fe9f0ecac673cbcd8d8b90ca7e3b931428e"
+    },
+    {
+      "path": "src/engine/tests/bounded_vacuum.rs",
+      "sha256": "14852d656904ba75ea744a710f34038df47bd112423b0136439248071097c8cf"
+    },
+    {
+      "path": "src/engine/tests/bplus_delete_bench.rs",
+      "sha256": "23d636bbb290f60deff30b2d973f2b06be9016ddaffed25ec873b908a384f0d7"
+    },
+    {
+      "path": "src/engine/tests/bplus_read_bench.rs",
+      "sha256": "517e4ff1d8caec2334eb7547ec04d65b7d4eb665614793bfeb607b6028ee4082"
+    },
+    {
+      "path": "src/engine/tests/bplus_vacuum_bench.rs",
+      "sha256": "c21b9b4513a34ac2c742260df7cb7a0905ab0eb502672d8bc5f28e40c9a41cd5"
+    },
+    {
+      "path": "src/engine/tests/cache.rs",
+      "sha256": "6c447c7bae611d737b0daa1835efd375e6e32b94eedf722dc8572ebeb52b04b3"
+    },
+    {
+      "path": "src/engine/tests/cache_bench.rs",
+      "sha256": "2d48dadddeea352d63e774597da1038fd2fbceaa3f61d4afeccc8eba8052485f"
+    },
+    {
+      "path": "src/engine/tests/compaction.rs",
+      "sha256": "d9227508439c5f404736ccc066d1062203ff135119e208348aca322cd65d4bbb"
+    },
+    {
+      "path": "src/engine/tests/configuration.rs",
+      "sha256": "9e2e364316a4496c582150f426a29fa5ef7f9104713c797bf97435227c4fddf0"
+    },
+    {
+      "path": "src/engine/tests/contracts.rs",
+      "sha256": "22d9f9fc1a764f57a8cf0259d71a261c5b51716f6c805fc4b9978b91df590d97"
+    },
+    {
+      "path": "src/engine/tests/encoding.rs",
+      "sha256": "2a342516550f5892a6efbbda9f86bf69f317fb198986afe57fccb1acac205c17"
+    },
+    {
+      "path": "src/engine/tests/export.rs",
+      "sha256": "4494389b9a0cbf4a3e00d0faa7ce9b9560aebb56958bb847e36206da53fe41a9"
+    },
+    {
+      "path": "src/engine/tests/health.rs",
+      "sha256": "9152a2b128f851234ba5d2f90042d69410fc0391810928285551e48ef16dd1aa"
+    },
+    {
+      "path": "src/engine/tests/lsm_maintenance_bench.rs",
+      "sha256": "6745038cb0fa3355ed3637b79404b7b310eccfbdd41bd926b505061811f48a90"
+    },
+    {
+      "path": "src/engine/tests/lsm_read_bench.rs",
+      "sha256": "3c2d1f66b514d240e9d615c1cdefcb83415a5c2c8054b3ce34c0b50c0a367d32"
+    },
+    {
+      "path": "src/engine/tests/measurement.rs",
+      "sha256": "9da0dbca7f1846f4edb359a7b320806c0f424d8f17f48eee4a8239822965de85"
+    },
+    {
+      "path": "src/engine/tests/memory_replay_bench.rs",
+      "sha256": "223014dfd41427fd9423d2656480f0c3845f86d60ad09ba6c5686596845879c5"
+    },
+    {
+      "path": "src/engine/tests/memory_scan_bench.rs",
+      "sha256": "04e244465bfe6f96df1f997526d14315d998685278608ae093f7731523b4ae5a"
+    },
+    {
+      "path": "src/engine/tests/memory_snapshot_bench.rs",
+      "sha256": "d2d63de9d4dde21958dcf59b3f16d10d647004dad579f5b91c66e6247865018f"
+    },
+    {
+      "path": "src/engine/tests/migration.rs",
+      "sha256": "86217b73a4c05b006f918ab2e3d2ac7261f7487f0e0621925bc8eac643e7ad13"
+    },
+    {
+      "path": "src/engine/tests/pagination.rs",
+      "sha256": "acba375ee8b83273838af016b38d0019fa0919bb6fac84ac45fb6f0ef7ed0565"
+    },
+    {
+      "path": "src/engine/tests/recovery.rs",
+      "sha256": "67d37c94b97742723721ac4eb89ef97e8438536ddde8d8e398547527e947726b"
+    },
+    {
+      "path": "src/engine/tests/scale_contracts.rs",
+      "sha256": "4da7a15854e67c70096b8f0cefb9f9db195169985d430bd9e123fa30f6a51cde"
+    },
+    {
+      "path": "src/engine/tests/scale_fixtures.rs",
+      "sha256": "4905625c66fa43f936870c4aa58581faf4700f2d2be1fda9e2c15e5a45bd27e6"
+    },
+    {
+      "path": "src/engine/tests/scale_workload.rs",
+      "sha256": "ab35cdb0a846502860c49b4689677426f74cc3050a20ad0981b6a1ff77ea830b"
+    },
+    {
+      "path": "src/engine/tests/search.rs",
+      "sha256": "040fb66ee8b3aaad5f83776f4a059da5336c5de9fc582781c98626e0004f1ca0"
+    },
+    {
+      "path": "src/engine/tests/search_bench.rs",
+      "sha256": "aa29987408deaf9a8c4ca34dbec1301d3c3a13d397d83c5cc454c4698ce9f0a5"
+    },
+    {
+      "path": "src/engine/tests/selection.rs",
+      "sha256": "ec573ab96317e92159a64f84be333e21153e7f6ae62d670064a969da2ac57bef"
+    },
+    {
+      "path": "src/engine/tests/snapshot.rs",
+      "sha256": "3b489515b80a6bdd98a41c4033b97363754267f5cda06e2a53053da95f0039d5"
+    },
+    {
+      "path": "src/engine/tests/startup_bench.rs",
+      "sha256": "e3e239151bbdcc8b23dd6c5c3259b2915abd96501d0b56f1e90b1b28713c953d"
+    },
+    {
+      "path": "src/engine/tests/support.rs",
+      "sha256": "d64d4e97abb426100225ad57097c11acc6083203c2474a9d89090858c2ea93f4"
+    },
+    {
+      "path": "src/engine/tests/threading.rs",
+      "sha256": "7ae57b78190e26f74316ab9b5be95c9f2163b8bbbb3b098f92b2fff7fc613bec"
+    },
+    {
+      "path": "src/engine/tests/transaction.rs",
+      "sha256": "6153e4b0d013f88f6f26efbba25f85cd9e68601826ee523cd13600d12094ebcd"
+    },
+    {
+      "path": "src/engine/tests/transaction_bench.rs",
+      "sha256": "e65a72031f6dea2e442e8678bb59022c5aa5cb186ae2baeb40fc36ae3a36417b"
+    },
+    {
+      "path": "src/engine/tests/ttl.rs",
+      "sha256": "24caef3e4605d874096077c59a9e93a559e25aabae363cc6f630906deb96a0e4"
+    },
+    {
+      "path": "src/engine/tests/vacuum.rs",
+      "sha256": "6c5bcb42900587f7d77c44aca4b37aff84c6ea32d6c3913be46e0bc2f273c892"
+    },
+    {
+      "path": "src/engine/txn_api.rs",
+      "sha256": "1697829dafcf0006fd817d51af146b4829742971b07a48ecf28310b592c23c88"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "5e665ed6a6e77cd793b8c6078d63da4a7ba7d4b0da6d5174bf559ab5739b3794"
+    },
+    {
+      "path": "src/lsm_allocation_bench.rs",
+      "sha256": "0c2675d306773634717bb33bb932f47e1ad9875834d8076a019c57f55a955692"
+    },
+    {
+      "path": "src/lsm_tree/bloom.rs",
+      "sha256": "5e1ae3fa6c3fb7ef1fa73634baf1ce1c8f0588ccb74d298180c2217201cc2883"
+    },
+    {
+      "path": "src/lsm_tree/cf.rs",
+      "sha256": "1311fb7dfdf97a46b74f6f10c40a39365747cdef3ff76cfd5a332880bf818178"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops.rs",
+      "sha256": "7c65943a1efb6ffcb538dd79069ed48d4ddae5fcd667ae3c39373d70e4c88ec4"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops/tests.rs",
+      "sha256": "f778ba284e82c3602f8929ef29020501c15ae6324877f0c81be4ff91beb51ed3"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops/tests/contracts.rs",
+      "sha256": "db53a8ccd58909e2f2f3cd6aeec631f74892f84d647108f953dee0c86144d5b8"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops/tests/search.rs",
+      "sha256": "c41af0870109db34380e20c04182a30c0a1fbc37613fcc188276db38f5bd8c28"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops/tests/support.rs",
+      "sha256": "ad315c276098ee172b1bbeac8da4b363965bc26101a35480845c45c0d467be6e"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops/tests/transaction.rs",
+      "sha256": "188dbab5e0c36723c99dfe48b9d50ab4b302ca98c557649e919cd62890353fa2"
+    },
+    {
+      "path": "src/lsm_tree/kv_ops/tests/ttl.rs",
+      "sha256": "3400c46ac19b2a6a26162305d684fb3ee8470617c6dd3af1035d944c2ec44055"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree.rs",
+      "sha256": "0fe2d485aace6f4c2b936cd00ece5b7395f9f9ead505fe3686c151637f60ccf9"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/allocation_reference.rs",
+      "sha256": "2816367a95442ed25852b7492f6816c4787d1dbe16ce6e10a28919956a5e9f3d"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/background.rs",
+      "sha256": "d1ceed67a917ecf172dfa4dffface5669aca503a6223afb8a680e15c3c9c111f"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/blob.rs",
+      "sha256": "c2fb4caa563ed22e115b140ffaf33c4d37562e921e7d2741fa44ec53d35e1a9f"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/blob_reference.rs",
+      "sha256": "4842c7403e83ea15fbdd9801cce86503d7496dba1b6dc3a0a3f76f83c89ebde0"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/bulk.rs",
+      "sha256": "c9bc682b6e6af90df76828d3494556f2e238b3d1fe971307f3c3912bcefae892"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/cache.rs",
+      "sha256": "cdad111585a0c14656ec8c051bc5998bfdbd82a1ec8b532bbeb7e5a8c4356ea3"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/compaction.rs",
+      "sha256": "afbb1287d26a2c90042304f86e55c4478aa0441395ce94022f65277552eb4829"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/disjoint_move_reference.rs",
+      "sha256": "fcc900da7568b571197c8b467c3955f731f4dc4b5e46e5540b62d782f537e3d5"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/flush.rs",
+      "sha256": "e87133eef2371086e4765fdf57f471f0269869bccda50fa788a97c03a7433e89"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/lifecycle.rs",
+      "sha256": "a039eeaf9750b5dd418fd68c0ea21e0e5f476e556c2bb76eebfbb4d87fa7c52c"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/maintenance_probe.rs",
+      "sha256": "8c17cda99ee7d6e4946de204af53afc1449e85f12bd8111aceb11125f588c76b"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/manifest.rs",
+      "sha256": "2e9423d90ea8560f2e04a0235f19df287f085d60ae0b4ff44116404a046cb53f"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/manifest_reference.rs",
+      "sha256": "bcfe8b72107042377ebde5494f0074d5be3b80235321720566552390109010bd"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/manifest_repeat_reference.rs",
+      "sha256": "39619b4767001a4463ca867482b0fd297ff69446ea105ae62ed9fff57d09f154"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/memtable.rs",
+      "sha256": "a2bd3fa31e3ce085014643da7e804a9c5100a6327e51c5102c0210eefca97bb2"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/merge.rs",
+      "sha256": "8f9ba45c16797cf55010c9c7927361881b72725a5e38c365a319c291984ac117"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/options.rs",
+      "sha256": "c2fcc84e8a6fb5842000692648c7b97bca24077121f0a082c5e30fa3ad40c024"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/probes.rs",
+      "sha256": "b19d2343c80a7ff764824a8d7a1f212686f7adb576d12a370ae79419bff6867d"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/read.rs",
+      "sha256": "de1d0d1ac54b1542683204d895b5aee05513cc14eea6795cddec9a4b6c23d9d9"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/scan.rs",
+      "sha256": "a423cf5954b16f0a6be8c8dfde6873ee3d1ce9a424233e902aef89966f9e9313"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/stats.rs",
+      "sha256": "b7caed8c8c4383819da468337af5f2ce0c140979bfd72aa9a0b89050dbf83be1"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests.rs",
+      "sha256": "beb83d23464130b18a281481bf0b144a23e300384c97b70b35e5baa709f9ee42"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/compaction.rs",
+      "sha256": "8c440283160d7ac6771612233c9a1c91a345b7cb45ecdc114251fc8d5bee0053"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/contracts.rs",
+      "sha256": "e857a4dc60a016bf2ce09f256488e68bff2832fd3581c342dc3506b3581101e4"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/direct_move.rs",
+      "sha256": "e4d86940deeb3db59d71accca09392605a5cc65468929bc04c9ffce294c23962"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/encoding.rs",
+      "sha256": "af15900dd1f95ec63aa83957b16d3cd4e328522063b77a9454c8c8c0650d2362"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/manifest.rs",
+      "sha256": "080b9997b1eb075f266384739f23d998e931cfdb3fe7658e5d065581c666af27"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/recovery.rs",
+      "sha256": "7f0e8df81c3447f8317715ceb6cd06fedd63ee8de7b5d017de934f18a8812c55"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/search.rs",
+      "sha256": "02658e4ff205af35766b51032ccdfa2228d24ab4b3508b6e2b153b3bad6def71"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/snapshot.rs",
+      "sha256": "6ae8256a2044318de901783ebfdb9af2855b204d022fa11476dfb5f023c6e026"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/sst_pruning.rs",
+      "sha256": "5042143a4f842862576b76d412cea5a756dd4aaa499dc33d69fb07203cc04462"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/support.rs",
+      "sha256": "5eb9653d1caecff03b54ecfdddb4e8b0f6005222e6fc79871bbd49b09e5c5695"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/transaction.rs",
+      "sha256": "6ad7901957bd7289c7def07287da9c9ad058c154fe5118ceb9eba77cb653cae7"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/tests/vacuum.rs",
+      "sha256": "9cd809b497258108b99c23d68be00024d1ff8e5cb430bc08b0d385c3118894d9"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/trivial_move_probe.rs",
+      "sha256": "de98c413c629470f8cdcabbbc894f7cb03b9ad80dfe53d5a1c342f78d6bb8fad"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/vacuum_compaction_reference.rs",
+      "sha256": "65c45a36351cfe7e3e43470adaec57b6112672f0fcc18574adfa8a3a920824a1"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/vacuum_delete_probe.rs",
+      "sha256": "9f9e39242d1f9332e8c9b8f72654ccea02dbed7ff4173422484d04f34a65c766"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc.rs",
+      "sha256": "62f80f974dc759ebd51fde1640e807fdffbaaffa31f5693a28b08b429c1519d2"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/bulk.rs",
+      "sha256": "66be1e4cd6a671babeda0e0147be54f77a49302e61f8535fd3f63a50e930710b"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/export.rs",
+      "sha256": "3f330eaaba4250fa68a174f7c3e71e30dff9b3356803a19a7be477a23d19109e"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/health.rs",
+      "sha256": "87b7c97bc3f1f4699224d7005adecb0f0d6fcebc89781d01aae1a35a4709dce8"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/lifecycle.rs",
+      "sha256": "c982c728c8549af007a3ffe6087d2f7f5464003e8b2a4d6f4722b70407179ac5"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/probes.rs",
+      "sha256": "f26ca493d0a38e3bd2305323d195362842d2fa2d474e9900f8131215ecee4da0"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/recovery.rs",
+      "sha256": "c6a1e9833ed41d1b8dc58a5c37f40ee3de30e88813458942677038b2cc3d1c2b"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/scan_row_reference.rs",
+      "sha256": "91acbeb670c15be6312c0f9c04c4f64cf427ad874b1c9b6e88fdd20b0656478c"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/search.rs",
+      "sha256": "b9ec670ab723a06d401b8c97b22ed48dd1abe490938f6dd099236830c54bbf74"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/search_borrow_reference.rs",
+      "sha256": "4773a0c10dc51631f69058f38952599e6a2ceca8c0c891fac2bb6bc23072cee8"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests.rs",
+      "sha256": "dd38461a523710e8a07784587d3398f1237793268d9ff4cc4cf2586cfff71b92"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/auto_vacuum.rs",
+      "sha256": "3ec268a404d97736b428d05e3cf92771ab107e45deb7b091bde7734ab18e3a7e"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/bounded_vacuum.rs",
+      "sha256": "36100053475360fa360a417205159faf5421331ba49f6b1a9c1b84e85511d1ab"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/cache.rs",
+      "sha256": "dfdbc9dba51f30d66c43dfb23a456de7e12459b2dfa4c7d8c22d64537501673b"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/compaction.rs",
+      "sha256": "df4db83cfe447dc5c7f506e17946d650604d47a0f0094fe62caa1df27ae8488d"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/contracts.rs",
+      "sha256": "56d7abcb5abef86adb9fd3006d255ee4db8ee42f7170a0cc64212e6c360a527f"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/contracts_bench.rs",
+      "sha256": "bfae9fbca7e9d8697a2abc6575b54a07dcfb87a31721a61714292188e329332c"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/encoding.rs",
+      "sha256": "677568e5419157647630da7ed7bb6de0948f280e74c204d7e844670be56cbe35"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/export.rs",
+      "sha256": "50f36ff3f9cf3942958b8eb8fa4fb5141ecda537b69433acc0fef3ee499ea49a"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/health.rs",
+      "sha256": "7a889020d6ca6539534ef96fc0054ab71bb91f676e0b526e0fb0d127b4e6c72a"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/point_read.rs",
+      "sha256": "d415ea72ef336504c64a7726e9ca995f73f709f96d85974d44efb6f94effcd75"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/recovery.rs",
+      "sha256": "50b4c3bea79b22973dadf309dcee0d8bff9966ec7bc31ec6b4dc37ff2f0d7cb0"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/search.rs",
+      "sha256": "a7047ef03e0cc9d5eebf830b233de9fba6b8aee3d52b3a3bfee3b17d805806d6"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/snapshot.rs",
+      "sha256": "a0ce84dc66ffbf3fb10333a69cc9eb9ea19b82c315a69b319f4080b1e1560a11"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/support.rs",
+      "sha256": "7c13920fa7fa0012cb3d1c7c23ff0471055a01297a640875a2bf4c5f98aa75bc"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/transaction.rs",
+      "sha256": "83a26cd95e3e9cc0265906b48e81d0e740612f92a28843c840594d546250e56b"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/vacuum.rs",
+      "sha256": "a32ea46838de8532e7a7fc0ba4cf2d319b7af9ec3dff6d911f46e54417e6969b"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/vacuum_bench.rs",
+      "sha256": "7a0be9c0ac76a15338db318dbe26b0dba27f6cd15469c3d56cd7c2e7ad39e454"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/tests/vacuum_faults.rs",
+      "sha256": "f8a368a8c04d90aaf6efd31d36c4207eb89beaf1fb9bccd03a4fd06a15e1a4f4"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/transaction.rs",
+      "sha256": "7ec7a6b4990d8f18d050732713f56b23f18b1890a961358955c8af9989557c91"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/vacuum.rs",
+      "sha256": "5ffb35f6e0fe0b171d46ed923ff3df9084b6c0c1c32c97f52dd9795b1d780198"
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree_mvcc/vacuum_cost_reference.rs",
+      "sha256": "95e6848be1d5d7929fc05ca6523d190de93a630d8a220a7ed5368a4cb13f6416"
+    },
+    {
+      "path": "src/lsm_tree/mem_wal.rs",
+      "sha256": "961f072b8a95c5d71d68722cdc4f7e388eee63836c8823d8356be7ad64af47af"
+    },
+    {
+      "path": "src/lsm_tree/mod.rs",
+      "sha256": "34f1e1352713f163dacf6e4132a1c9f12cd02c818395329a926e2809788cba9c"
+    },
+    {
+      "path": "src/lsm_tree/sst.rs",
+      "sha256": "d9c4c4ce6160b4ab53220b3e616ba6d8145354c3ec8b86a712722854583d137a"
+    },
+    {
+      "path": "src/lsm_tree/sst/block_cache.rs",
+      "sha256": "2638e7e603e9c56c6fcf12864ce3dfb12834b062a85206002a8c8e1cbd6bea7e"
+    },
+    {
+      "path": "src/lsm_tree/sst/builder.rs",
+      "sha256": "3089593acf5dcf808ea41f8708b95fe431729cbeb52993147a72855e305ffe49"
+    },
+    {
+      "path": "src/lsm_tree/sst/codec.rs",
+      "sha256": "89467095e0255cd90ca04ad364f2355cd64936f9bd72bd65afdc5dff7378be0c"
+    },
+    {
+      "path": "src/lsm_tree/sst/compaction_reference.rs",
+      "sha256": "c3b9ddf4ccf76906d89b42bcf4f63a2dbe6c450e7aae180f1ff40927dad7d048"
+    },
+    {
+      "path": "src/lsm_tree/sst/entry.rs",
+      "sha256": "48d7f546a81ee9d86b98918e2d65526b25f57f9880dad09ca5a3d68d6e86b378"
+    },
+    {
+      "path": "src/lsm_tree/sst/file_io.rs",
+      "sha256": "8ef68bcab67207e7ba69e9dfc5238654001e9f39dd3af1dcf6d3d709e0e2807c"
+    },
+    {
+      "path": "src/lsm_tree/sst/merge.rs",
+      "sha256": "169a34316f53f4d96d0f714aae33dfd69ae31832b8d57ce42696eb5bc1a695f1"
+    },
+    {
+      "path": "src/lsm_tree/sst/packed_block.rs",
+      "sha256": "dfa1f09bccccc719493ed77182b5977394df0a38d976c5fab0b22f72f8e64f51"
+    },
+    {
+      "path": "src/lsm_tree/sst/packed_point_reference.rs",
+      "sha256": "2de6dab00afe466a73c52eae29d9bcbd36b821d297c1f5fce41ec125a9ac6a41"
+    },
+    {
+      "path": "src/lsm_tree/sst/packed_scan_reference.rs",
+      "sha256": "6d18adb003a19fe2999c7c7ff47426e75fdf5274060bd8a728ef3a1cbff9bea5"
+    },
+    {
+      "path": "src/lsm_tree/sst/point_read_reference.rs",
+      "sha256": "3b5a0714fd20b1c5a82e22aaa1325433e5a44b16d25a0b39c49f7ebcb3faf4fa"
+    },
+    {
+      "path": "src/lsm_tree/sst/positioned_read_reference.rs",
+      "sha256": "11217af6fe92786c87c1eab3736ea74b888435e45a0ea89a58a62a21e57a9dfc"
+    },
+    {
+      "path": "src/lsm_tree/sst/probes.rs",
+      "sha256": "c9b9aff9b9469b87922e6198e18c680f37748a68843b6e0dfdec7229f85088e7"
+    },
+    {
+      "path": "src/lsm_tree/sst/read.rs",
+      "sha256": "7ce60025aee8f7367e1b113d4e9d43fa1d5a555d89163719318ca4b05f33e173"
+    },
+    {
+      "path": "src/lsm_tree/sst/scan.rs",
+      "sha256": "6b8b21e955528f0b76d46d681d49d8eb1f9abc79874e2305fe3e3b4245e025ee"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests.rs",
+      "sha256": "bbab3ff757db9c582bb9f17d1afb22fb766496aade2e30384f06ef68f74d3ea6"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/cache.rs",
+      "sha256": "7d4bf8fd422007f4ae41676de94340291282961b2c7466edb11fed272cc7259e"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/compaction.rs",
+      "sha256": "85eb63ecf961d045248135e99b85aaf6dba30edf245f983f432265189198c51c"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/contracts.rs",
+      "sha256": "6599b25c830b702396ad3177bd7df72006a901ec7ad81b83b2d31aeafcd66968"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/encoding.rs",
+      "sha256": "0523d1d27a89f7bbfad46d932d4ab48ec8ce7e004b81368907738172d87a0352"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/recovery.rs",
+      "sha256": "ba120b9f25c72a9bb4a9441ad59092e056eeb77ffdb42dbccf134754ebf14f48"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/search.rs",
+      "sha256": "d93dd4640ebce0f7684c0d33434862b202fec59e60dfff16a025f9db1bd1ab7b"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/snapshot.rs",
+      "sha256": "664cb3412ae0f4fe93f1dfba77115b8ee6b6bddd7781c487187f50488e74fe63"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/support.rs",
+      "sha256": "826df8d57d2bc00bcdefddf86fabd6782fd8a3607efe822659d8f77a8cf6885f"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/transaction.rs",
+      "sha256": "c43a964bd2614e189a5fc5b387dcbaba6b97e5ad517964ff7c46e98459f6ed8b"
+    },
+    {
+      "path": "src/lsm_tree/sst/tests/vacuum.rs",
+      "sha256": "9a7967e126a3028c0cf4a2a89b6b7f805594a8d48abab7805c6fb9253c6b2f06"
+    },
+    {
+      "path": "src/lsm_tree/storage.rs",
+      "sha256": "bc6b3dc1f27b92fde7bf086b07d9ebea7300aa8e4dc8c4dc9a3b0ff621df4e00"
+    },
+    {
+      "path": "src/lsm_tree/wal.rs",
+      "sha256": "0b7f36528f05a6f778e0e196c97c2814e00e75d420020d42cd6d1f680cb7368a"
+    },
+    {
+      "path": "src/main.rs",
+      "sha256": "8060ac7a12dd4852ba19fe3788515b1ff845198c92690317f8410a23024bc1fa"
+    },
+    {
+      "path": "src/maintenance.rs",
+      "sha256": "b2a0a2da67fdfdc3238778e093dc484839bcd2ebd7a6295894f60c4c38d092c4"
+    },
+    {
+      "path": "src/maintenance/tests.rs",
+      "sha256": "8cb515875f231f709761f3105d16085667f02ebb3a761f0732f643ad7a2c7040"
+    },
+    {
+      "path": "src/maintenance/tests/contracts.rs",
+      "sha256": "fbc98d638692ce1e35336a47805d51d0328f8d5d0c6fca2e46bd1f293dffc5f1"
+    },
+    {
+      "path": "src/maintenance/tests/support.rs",
+      "sha256": "b37ffaa036a2d9860ee3027091c38f6ab46e9486ee53e15726891a264b561b47"
+    },
+    {
+      "path": "src/maintenance/tests/transaction.rs",
+      "sha256": "4a016a3e6c620401d8bb23113120f6546586fb6bcee2b4d93dfb7f749d4063a8"
+    },
+    {
+      "path": "src/maintenance/tests/vacuum.rs",
+      "sha256": "4a7b2dce5f7c4bbc11fead6e45b14d95cd0727fa277aefb906905fbe3fd74c4c"
+    },
+    {
+      "path": "src/mem_probe.rs",
+      "sha256": "a9bb7d78b4c1226d4ff22dc57fc2d0fdcab3ecb869ff61381a85809ae4bf4f67"
+    },
+    {
+      "path": "src/memory/kv_ops.rs",
+      "sha256": "0c8bd61825d114e3855486cdf2f73437a2a1d13478073a2c955b7d09b1da1a89"
+    },
+    {
+      "path": "src/memory/kv_ops/tests.rs",
+      "sha256": "7296f536c83f1c72a117737496946a6d337711113061b8295154454c5e39fe2e"
+    },
+    {
+      "path": "src/memory/kv_ops/tests/contracts.rs",
+      "sha256": "c7f3e3862ccd6382c79084393f914d803fb7d710eed116f0f931b54c9b32d501"
+    },
+    {
+      "path": "src/memory/kv_ops/tests/search.rs",
+      "sha256": "61aa9249364f94dff84de1b5a7d5dbec302c649589bf53bfdcf071d4bc7b2442"
+    },
+    {
+      "path": "src/memory/kv_ops/tests/transaction.rs",
+      "sha256": "26b308b76549be9ce317236f24c60c9a3b3f85b4a8336e9dd75e269733c6ef34"
+    },
+    {
+      "path": "src/memory/kv_ops/tests/ttl.rs",
+      "sha256": "ac54608087730caed5e42b33bb445ed252547cdeeba7cda04692fc40db13eea3"
+    },
+    {
+      "path": "src/memory/mem_store.rs",
+      "sha256": "93cdeb6288e48d0e8b684c95475bd5848e1040b39324d15978fd8d27c93cebda"
+    },
+    {
+      "path": "src/memory/memory_mvcc.rs",
+      "sha256": "a51d309816bb517e697117e055664369bcd4aaa0bfda148a6c98834d7e60d555"
+    },
+    {
+      "path": "src/memory/memory_mvcc/bulk.rs",
+      "sha256": "8a546bdf34111b6c6f46cd1e531ec14a7639a8bf2fd303ce6de7af8375c665d8"
+    },
+    {
+      "path": "src/memory/memory_mvcc/export.rs",
+      "sha256": "d03fcbee6d0ff4a9ccaf61a80fc92d7d5652542e88645dddfd10e53434674c04"
+    },
+    {
+      "path": "src/memory/memory_mvcc/health.rs",
+      "sha256": "a5b3100475d82034a906220e13e97443acfcb9fb8ddf86069d00731e19265b20"
+    },
+    {
+      "path": "src/memory/memory_mvcc/lifecycle.rs",
+      "sha256": "f11594210d62b4969d7d6c78b3c38734009aa64a71fa95aded48884ca4d056f9"
+    },
+    {
+      "path": "src/memory/memory_mvcc/page_apply_reference.rs",
+      "sha256": "cc4426943ad38081016332f16a9265d44827375273b795d3983ecb03d3e12155"
+    },
+    {
+      "path": "src/memory/memory_mvcc/probes.rs",
+      "sha256": "07ed37c5f6f9da5ae7fe2f1948cf8326a73f6f4af94f16dc4d3602f12af4c83a"
+    },
+    {
+      "path": "src/memory/memory_mvcc/replay_cost_reference.rs",
+      "sha256": "0cdbe52525c75d74e89562b43a61603558f5fd67ce9e1ca5e1f089ab05c7c6d7"
+    },
+    {
+      "path": "src/memory/memory_mvcc/replay_reference.rs",
+      "sha256": "54739736b8d20725895c5f7e64e48a3ca80bc21a02ffb25670f5073456b9f2be"
+    },
+    {
+      "path": "src/memory/memory_mvcc/scan_reference.rs",
+      "sha256": "fb50586f848371c15b80e19e974d55b98b0e0feca9b2790e5ca28e9a3ddd8e26"
+    },
+    {
+      "path": "src/memory/memory_mvcc/search.rs",
+      "sha256": "ad9817f782dc2e08b2cccf5bd145bcf378c04cafb10bbf99a4988edf343e2808"
+    },
+    {
+      "path": "src/memory/memory_mvcc/search_copy_reference.rs",
+      "sha256": "8235b75c8b192a28352b8437ce1be2b972c1f2c9e95906f7bbe738aafdc989bf"
+    },
+    {
+      "path": "src/memory/memory_mvcc/search_key_reference.rs",
+      "sha256": "3d9725df89cc32ae5a43f1faeba83da0aa40cd8519446f8cf3a33bbcb16ba8c9"
+    },
+    {
+      "path": "src/memory/memory_mvcc/search_stream_reference.rs",
+      "sha256": "053093c5db654d20f817c4d7bbef7cfadcea723b62227a95af60bf276d991bb9"
+    },
+    {
+      "path": "src/memory/memory_mvcc/snapshot.rs",
+      "sha256": "31f8a029da2093c77bc33d2b847e37357369878b14eb1873281f4f892a8d931a"
+    },
+    {
+      "path": "src/memory/memory_mvcc/stop_batch_release.rs",
+      "sha256": "628689be622ab79de6436a20eca64def01ea23f1bf3aa6b4db42a55daa420d09"
+    },
+    {
+      "path": "src/memory/memory_mvcc/stop_fold_reference.rs",
+      "sha256": "72b87cc9a6f6852c882e6d337d689b2eb00d3cc3b78ed399d1ddf59859638b37"
+    },
+    {
+      "path": "src/memory/memory_mvcc/stop_reference.rs",
+      "sha256": "4948e4bac3a3b564df6fffbd290c98996bd7bdecd77b3e0f2470875b215c57f0"
+    },
+    {
+      "path": "src/memory/memory_mvcc/stop_rows_reference.rs",
+      "sha256": "209736774467b5cfa192454fac1d9bb54e88890c1a2c8c069514731d34c8249f"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests.rs",
+      "sha256": "338592576f7d1e4554dc52868df119b127011e8b05e6285144f7e91504e3c70a"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests/contracts.rs",
+      "sha256": "c3a7779fd6e7cfdd6709af15815cac5fb3bb205a412d47370f81323605681d54"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests/encoding.rs",
+      "sha256": "a02c97e18297fc3f84b5e1bfcabd9e85db4d6ee7dbb243807cb4b5868106e262"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests/search.rs",
+      "sha256": "4aa2265dcdf49d9250adb78c6cc6bdb4c770309b78db542756511a58be982691"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests/snapshot.rs",
+      "sha256": "ecd77242a7b4f6e0953a2ae4399208d7d89e914e3dcca2bc82146108d1cfe333"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests/support.rs",
+      "sha256": "b98654e4f0f73887c42909e8e3087a961e850391ef34d71b63c6008e511727d8"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests/transaction.rs",
+      "sha256": "f494d4ac20fd5c8776df03eb92ebe04fd0b950dcfc87e6830e3a565a2279fbbe"
+    },
+    {
+      "path": "src/memory/memory_mvcc/tests/vacuum.rs",
+      "sha256": "1752cc773a167069384f737354c043e68e5ba72b9265c1cb77c4d6e90e4fcca2"
+    },
+    {
+      "path": "src/memory/memory_mvcc/transaction.rs",
+      "sha256": "72b998f4850b1ce981f7c7f03ab8c9f0a0ee8673a6d6973268e29fba3256b23f"
+    },
+    {
+      "path": "src/memory/memory_mvcc/vacuum.rs",
+      "sha256": "1327a93b9ef9bdeb57b49485c72dc67871c829f37e7ee7ad21f6451a3192fdbe"
+    },
+    {
+      "path": "src/memory/memory_mvcc/vacuum_cost_reference.rs",
+      "sha256": "95e6848be1d5d7929fc05ca6523d190de93a630d8a220a7ed5368a4cb13f6416"
+    },
+    {
+      "path": "src/memory/mod.rs",
+      "sha256": "f61ac02006d2f687c5e270c97b39bd8b10995ff74d8587ad16758efda56cece6"
+    },
+    {
+      "path": "src/scale_bench.rs",
+      "sha256": "febbd05f29d7138795ca482b78383bf636a50faaa35660e4b23d30a06e88a70a"
+    },
+    {
+      "path": "src/scale_probe.rs",
+      "sha256": "25dfb90230d40f547e07be16d6a5f4d0660f91e7fc125ee409216c4a50719f74"
+    },
+    {
+      "path": "src/terminal.rs",
+      "sha256": "0b3c62fdf740e26b140ed6c6c4abdf2bdad4ef30cd991fa0334a8e8b679993bb"
+    },
+    {
+      "path": "src/terminal/data_commands.rs",
+      "sha256": "bb81f4abe2ae7c0e81a446d0ee506e61fea9f3af99811b103aee4c5beb07d5e5"
+    },
+    {
+      "path": "src/terminal/dispatch.rs",
+      "sha256": "313e21b7d17f5f0d76d4395424631412ea484aaaae51a3dff767700a77615d65"
+    },
+    {
+      "path": "src/terminal/engine_commands.rs",
+      "sha256": "37718c0b33936c6627f8faff5728ce1b9ede9b2d48ede7e96ef837b9e36813e4"
+    },
+    {
+      "path": "src/terminal/help.rs",
+      "sha256": "a06cfae1c5c92400e110d2a2c0128e09ecaed7cc95595218a3f6103658027041"
+    },
+    {
+      "path": "src/terminal/output.rs",
+      "sha256": "321c287cca0f3bd2129cf5a1509f61d872a686e459ca088571d683288d579c82"
+    },
+    {
+      "path": "src/terminal/parsing.rs",
+      "sha256": "06c410a3b36cb676fc90574396f82c11342e5a4faa0942f42b70409f21e97e35"
+    },
+    {
+      "path": "src/terminal/tests.rs",
+      "sha256": "1ceb44b96417dc9cac0c601506f61570939ac3365327118a04b62a13fc8d1435"
+    },
+    {
+      "path": "src/terminal/tests/contracts.rs",
+      "sha256": "9ecef0dd8f86d6fa50a072cb38f92bc50948195ce300d0e863ef4fa7e5fa6802"
+    },
+    {
+      "path": "src/terminal/tests/search.rs",
+      "sha256": "eb23da8cf2e752ae83ee50fc56e2694fbaa1e9cac83958a9dcd7a4f909a6767a"
+    },
+    {
+      "path": "src/terminal/tests/support.rs",
+      "sha256": "8e5be6387798ba269f561b5492b7ad071a701a225f2302c4aad527e440053e94"
+    },
+    {
+      "path": "src/terminal/tests/transaction.rs",
+      "sha256": "92b734aa6ad549b288ed75744580c162f2e0ac2c10e03a6ef96485957ff5f422"
+    },
+    {
+      "path": "src/terminal/tests/ttl.rs",
+      "sha256": "d2352dd051583019f216728c4534becb0c32a98a543e0bb6b083b5d36d5c2b96"
+    },
+    {
+      "path": "src/terminal/tests/vacuum.rs",
+      "sha256": "1bba185ca3b3399e9aa64591336fa088345dbd5124248665b51474ee25e8a32b"
+    },
+    {
+      "path": "src/tools/migrate.rs",
+      "sha256": "c446daa4a038d6c3bead0c9b0c018243d13e287caaad5e0e3c22d2d4eaf035b5"
+    },
+    {
+      "path": "src/tools/migrate/copy.rs",
+      "sha256": "4b57aa14c6b4e907aae27d20eee8aa9d2363c5c0d8f6624960be125f793c7d04"
+    },
+    {
+      "path": "src/tools/migrate/directories.rs",
+      "sha256": "99bdebef3beb5e8b6c272c99b61cbbbb292629481edc0c1b79aee0a0ed7c8466"
+    },
+    {
+      "path": "src/tools/migrate/snapshot_io.rs",
+      "sha256": "b88fa2d3751c03737a5fc416d91277321986639555e26d3bc0e29715c8a77e70"
+    },
+    {
+      "path": "src/tools/migrate/sync.rs",
+      "sha256": "fbbb69bc4e7a563f33fb1e9864bef5a9d9ac7d1e7f62cc12986ac2ee2a634f3d"
+    },
+    {
+      "path": "src/tools/migrate/tests.rs",
+      "sha256": "b67f0e6c9d9da7af4cbe87ef10e9442713f6919158812fba9e21cf319b01c058"
+    },
+    {
+      "path": "src/tools/migrate/tests/contracts.rs",
+      "sha256": "2db856839186a586fa0ca2e5fdc73f73bc019bb2d05ebc6e9350f8223b5559e0"
+    },
+    {
+      "path": "src/tools/migrate/tests/encoding.rs",
+      "sha256": "2c603e5e051216bde79fec4d4020879881bc3fd8dea65b3bcea1fdd266795813"
+    },
+    {
+      "path": "src/tools/migrate/tests/search.rs",
+      "sha256": "3c4b4b81b95797c5162f2ae71a883412a480602fafd504dfe0b420fb6c381b6e"
+    },
+    {
+      "path": "src/tools/migrate/tests/snapshot.rs",
+      "sha256": "4e4486b8ce6ccf01f798e2a3efaae7c6305ce431e707b5aae393c04dbf26c437"
+    },
+    {
+      "path": "src/tools/migrate/tests/support.rs",
+      "sha256": "a0bd5743274db6a72158b426a4fe829df000e826add748d8f62f7e6b44542c7a"
+    },
+    {
+      "path": "src/tools/migrate/tests/transaction.rs",
+      "sha256": "232dde6e9b68bee2d5f35be9dfcf9337b3a7d51c5794bec1abea609863b38770"
+    },
+    {
+      "path": "src/tools/migrate/tests/ttl.rs",
+      "sha256": "ec93a3fd84666760f9f855867d05644af1f7513d1eba04fa286e32c166ec85b3"
+    },
+    {
+      "path": "src/tools/migrate/tests/vacuum.rs",
+      "sha256": "44eb044554dc74ea468f1234c4c716f45e0b245a096236bee71715be39440e4b"
+    },
+    {
+      "path": "src/tools/mod.rs",
+      "sha256": "b669791ec214e02853aac8ed5f2ac8f92539c205e1c524f1ef2efe2fcf99f831"
+    }
+  ],
+  "largest_files": [
+    {
+      "path": "src/engine/tests/scale_workload.rs",
+      "lines": 1006
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/tests/contracts.rs",
+      "lines": 815
+    },
+    {
+      "path": "src/memory/memory_mvcc/snapshot.rs",
+      "lines": 774
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree_mvcc/tests/transaction.rs",
+      "lines": 747
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/read.rs",
+      "lines": 747
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/tests/vacuum.rs",
+      "lines": 721
+    },
+    {
+      "path": "src/lsm_tree/lsm_tree/compaction.rs",
+      "lines": 716
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/rebalance.rs",
+      "lines": 692
+    },
+    {
+      "path": "src/bitcask/bitcask_mvcc/vacuum.rs",
+      "lines": 633
+    },
+    {
+      "path": "src/bplus_tree/bplus_tree/delete.rs",
+      "lines": 631
+    },
+    {
+      "path": "src/common/txn.rs",
+      "lines": 624
+    },
+    {
+      "path": "src/lsm_tree/sst/scan.rs",
+      "lines": 619
+    },
+    {
+      "path": "src/bitcask/bitcask/tests/hint.rs",
+      "lines": 589
+    },
+    {
+      "path": "src/memory/mem_store.rs",
+      "lines": 587
+    },
+    {
+      "path": "src/lsm_tree/sst.rs",
+      "lines": 571
+    }
+  ],
+  "json_roundtrip_verified": true,
+  "public_function_visibility": {
+    "before_public_functions": 831,
+    "after_public_functions": 831,
+    "original_public_function_missing": [],
+    "comparison": "按所属 impl 与函数名核对原无范围限制的 pub fn；完整代码项及 trait 再由搬迁审计核对。"
+  },
+  "small_scale": {
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -Rows '2000,3000' -Repeat 1",
+    "exit_code": 0,
+    "run_path": "data/bench-results/20261124-061247-e8c30585f9e34475a3f9f9470cf09e9f",
+    "source_sha256": "3a71e7895f97f3f4af9dd143ff933ea2f9d3b84bd1f08747730b01152a7a5555",
+    "executable_sha256": "72d090a3bce1e0262a7aefba264aa230e2db0f51bc8490494ae35b470a0c0a6d",
+    "source_files_verified": 482,
+    "cases": [
+      {
+        "summary": {
+          "rows": 2000,
+          "pass": 1,
+          "status": "PASS",
+          "exit_code": 0,
+          "elapsed_seconds": 11.978,
+          "metrics": 132,
+          "cleanup": "OK",
+          "error": null,
+          "log": "rows_2000_pass_1.log",
+          "diagnostics": "rows_2000_pass_1.diagnostics.json",
+          "diagnostics_count": 888,
+          "bounded_vacuum_verified": true
+        },
+        "raw_count": 837,
+        "delta_count": 51,
+        "migration_verified": [
+          "bitcask: migrate 验收通过(不计时) 3001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0",
+          "bplus_tree: migrate 验收通过(不计时) 3001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0",
+          "lsm_tree: migrate 验收通过(不计时) 3001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0",
+          "memory: migrate 验收通过(不计时) 3001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0"
+        ],
+        "bulk_reopen_verified": [
+          "bitcask: bulk 重开验收通过(不计时) 3201 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符",
+          "bplus_tree: bulk 重开验收通过(不计时) 3201 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符",
+          "lsm_tree: bulk 重开验收通过(不计时) 3201 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符",
+          "memory: bulk 重开验收通过(不计时) 3201 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符"
+        ],
+        "bounded": [
+          "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+        ],
+        "csv_rows": 132,
+        "log_sha256": "c00b8c195764142b8760f7f7b410aebab09f91e16b8e103549a84aa6afe3d5b4",
+        "diagnostics_sha256": "ff1149b5dda3a756b0b8f63e987745ad5f3f64b8888e18fb9206d1077c476d4a",
+        "raw_fields_and_deltas_roundtrip": true
+      },
+      {
+        "summary": {
+          "rows": 3000,
+          "pass": 1,
+          "status": "PASS",
+          "exit_code": 0,
+          "elapsed_seconds": 15.041,
+          "metrics": 132,
+          "cleanup": "OK",
+          "error": null,
+          "log": "rows_3000_pass_1.log",
+          "diagnostics": "rows_3000_pass_1.diagnostics.json",
+          "diagnostics_count": 888,
+          "bounded_vacuum_verified": true
+        },
+        "raw_count": 837,
+        "delta_count": 51,
+        "migration_verified": [
+          "bitcask: migrate 验收通过(不计时) 4001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0",
+          "bplus_tree: migrate 验收通过(不计时) 4001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0",
+          "lsm_tree: migrate 验收通过(不计时) 4001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0",
+          "memory: migrate 验收通过(不计时) 4001 个唯一键，完整键/最新值/计数器/用户字节均与独立种子相符，TTL=0"
+        ],
+        "bulk_reopen_verified": [
+          "bitcask: bulk 重开验收通过(不计时) 4301 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符",
+          "bplus_tree: bulk 重开验收通过(不计时) 4301 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符",
+          "lsm_tree: bulk 重开验收通过(不计时) 4301 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符",
+          "memory: bulk 重开验收通过(不计时) 4301 个唯一键，完整键/最新值/计数器/用户字节/TTL 均与独立种子相符"
+        ],
+        "bounded": [
+          "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+          "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+        ],
+        "csv_rows": 132,
+        "log_sha256": "83d458d4d8b97bb951a6243af66b17eb369c1a0cdbf6340b0dd3280c49a39a1d",
+        "diagnostics_sha256": "b766fef9376c45fe2a7403ca152d9935b059bb17c2b8049e18632c73f448b585",
+        "raw_fields_and_deltas_roundtrip": true
+      }
+    ],
+    "json_roundtrip_verified": true,
+    "csv_per_engine_verified": true
+  },
+  "final_test_executable": {
+    "path": "target/release/deps/storage_engines-7533728b253b9a38.exe",
+    "sha256": "72d090a3bce1e0262a7aefba264aa230e2db0f51bc8490494ae35b470a0c0a6d",
+    "test_names_preserved": 642
+  },
+  "revisions": [
+    {
+      "reason": "格式化为多行闭包和尾逗号造成搬迁审计误报",
+      "resolution": "按同一作用域缩进格式化两侧完整代码项，保留词法邻接、换行、字面量和方法所属 impl；六个负向对照拒绝真正变化。"
+    },
+    {
+      "reason": "首次小档构建期间修正了中文测试注释",
+      "resolution": "保留失败构建记录，固定源码后重建；最终 2k/3k 对应同一个已核对源码指纹。"
+    }
+  ]
+}

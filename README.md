@@ -1,5 +1,9 @@
 # storage-engines
 
+M163 已按功能拆分过长源码，并补充中文模块职责与业务注释。`engine.rs` 从 8552 行减至 84 行；四个 MVCC 入口减至 144–173 行，事务、搜索、回收、健康统计、恢复和批量灌入在同名目录中分别维护。
+源码导航见 [module-layout.md](docs/module-layout.md)，本轮重构验收见 [refactor-m163.json](docs/refactor-m163.json)。生产算法与 M162 相同，原 API、磁盘格式和压测入口继续使用。
+Release 回归 556 passed / 0 failed / 86 ignored，CLI 与集成测试共 13 passed，文档用例 6 passed；正式 2k/3k 各 132 格、迁移、bulk 重开及四家各删 16 个旧版本通过。
+
 最新完整五档（600k/1M/5M/10M/20M，a86ac6e 构建）各132格通过，20次迁移、20次bulk重开和20次真实bounded删除验收齐全。
 总耗时 **32198.421→33488.603 s（+4.01%）**；B+源码两轮未变，20M仍有19424批双写和20000次WAL提交同步，不能把插入增量归因新B+算法。
 

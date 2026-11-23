@@ -1,4 +1,4 @@
-//! 压测工具
+//! 压测工具 的测试对照门与计量。
 //!
 //! ```text
 //! # 普通事务路径
@@ -9,14 +9,14 @@
 //! ```
 
 use std::assert;
-use std::panic;
-use std::println;
+use std::env;
 use std::eprintln;
 use std::format;
-use storage_engines::bplus_tree::MVCC;
-use std::env;
+use std::panic;
 use std::path::PathBuf;
+use std::println;
 use std::time::Instant;
+use storage_engines::bplus_tree::MVCC;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {

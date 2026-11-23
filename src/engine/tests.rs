@@ -1,0 +1,48 @@
+//! 该模块的回归与机制守卫。
+
+use super::*;
+use std::assert;
+use std::assert_eq;
+use std::assert_ne;
+use std::eprintln;
+use std::format;
+use std::matches;
+use std::panic;
+use std::vec;
+// 仅测试使用 include!，保持历史 --exact 测试名和压测脚本入口。
+include!("tests/support.rs");
+include!("tests/encoding.rs");
+include!("tests/transaction.rs");
+include!("tests/bounded_vacuum.rs");
+include!("tests/pagination.rs");
+include!("tests/search.rs");
+include!("tests/export.rs");
+include!("tests/selection.rs");
+include!("tests/contracts.rs");
+include!("tests/threading.rs");
+include!("tests/migration.rs");
+include!("tests/health.rs");
+include!("tests/configuration.rs");
+include!("tests/recovery.rs");
+include!("tests/transaction_bench.rs");
+include!("tests/ttl.rs");
+include!("tests/vacuum.rs");
+include!("tests/snapshot.rs");
+include!("tests/memory_snapshot_bench.rs");
+include!("tests/compaction.rs");
+include!("tests/cache.rs");
+include!("tests/measurement.rs");
+include!("tests/startup_bench.rs");
+include!("tests/search_bench.rs");
+include!("tests/cache_bench.rs");
+include!("tests/scale_fixtures.rs");
+include!("tests/scale_contracts.rs");
+include!("tests/memory_replay_bench.rs");
+include!("tests/lsm_read_bench.rs");
+include!("tests/lsm_maintenance_bench.rs");
+include!("tests/bitcask_bench.rs");
+include!("tests/memory_scan_bench.rs");
+include!("tests/bplus_delete_bench.rs");
+include!("tests/bplus_read_bench.rs");
+include!("tests/bplus_vacuum_bench.rs");
+include!("tests/scale_workload.rs");

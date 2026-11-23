@@ -10,7 +10,7 @@
 // 中 scratch= 指向的本次精确目录，不要通配删除其它测试库。
 
 mod scale_bench {
-    /// One entry point fixes scale order even when invoked from an IDE.
+    /// 统一入口固定各规模运行顺序，IDE 调用也遵循相同顺序。
     #[test]
     #[ignore = "完整五档串行压测；release + exact + 单测试线程"]
     fn all_scales_serial() {

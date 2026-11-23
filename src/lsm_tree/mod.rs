@@ -3,7 +3,7 @@
 //! - [`lsm_tree`]：MemTable + SST 分层 + flush / compaction + Snapshot
 //! - [`sst`]：SSTable（block + 稀疏索引 + bloom + mmap + 流式 iter）
 //! - [`cf`]：多列族 [`LsmDB`]
-//! - [`mvcc`]：快照隔离事务 / WAL / vacuum / bulk load
+//! - [`lsm_tree_mvcc`]：快照隔离事务 / WAL / vacuum / bulk load
 //! - [`kv_ops`]：批量 / 范围 / 搜索分页 / 元数据 / TTL（`Transaction` 扩展）
 //! - [`wal`] / [`mem_wal`] / [`storage`]
 //!

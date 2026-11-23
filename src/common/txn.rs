@@ -46,17 +46,17 @@
 //! 每搬一家都当场证明它没改语义 —— 靠的是 `txn_kernel_agrees_across_engines`（同一段事务脚本
 //! 在四家跑出同一个终态），各家原有测试只测自家那一份副本，跨引擎对拍才看得见"内核写歪了"。
 
-#[cfg(test)]
-use std::thread_local;
-use std::collections::{HashMap, HashSet};
+use crate::common::{CommitError, WriteError};
 use std::borrow::Cow;
 use std::cell::Cell;
-use crate::common::{CommitError, WriteError};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(test)]
+use std::thread_local;
 
 use crate::common::version::encode_key;
-use crate::common::{WalPolicy, is_unfinished, visible_at, VacuumScheduler};
+use crate::common::{VacuumScheduler, WalPolicy, is_unfinished, visible_at};
 
 /// 活跃事务表：`xid → 本事务写过的逻辑 key 集合`。四家同一个类型，所以这里给个名字。
 ///
@@ -92,7 +92,9 @@ pub fn write_set_scans() -> u64 {
 }
 
 #[cfg(test)]
-pub(crate) fn write_registry_lookups() -> u64 { WRITE_REG_LOOKUPS.with(Cell::get) }
+pub(crate) fn write_registry_lookups() -> u64 {
+    WRITE_REG_LOOKUPS.with(Cell::get)
+}
 
 /// 登记一行进写集：`true` = 这行是新登记的那把键（同一把键在一个事务里只记一次账）。
 ///
@@ -139,7 +141,7 @@ pub trait WriteSide {
     /// 返回 false 表示存储报告失败（可能已部分修改）。内核阻止提交并登记键供回滚清理。
     fn put_versioned(&mut self, enc: &[u8], value: Option<Vec<u8>>) -> bool;
 
-    /// Consume an encoded key when the backend can retain it directly.
+    /// 后端可以直接接收编码键所有权时，消费该缓冲。
     fn put_versioned_owned(&mut self, enc: Vec<u8>, value: Option<Vec<u8>>) -> bool {
         self.put_versioned(&enc, value)
     }
@@ -147,12 +149,11 @@ pub trait WriteSide {
     /// 物理撤掉本事务写下的一行（回滚用 —— **不是**写墓碑，那会让这行永远留在库里）。
     fn remove_versioned(&mut self, enc: &[u8]);
 
-    /// Keep unfinished versions registered when a backend cannot finish undo.
+    /// 后端无法完成撤销时，未完成版本继续留在注册表中。
     fn try_remove_versioned(&mut self, enc: &[u8]) -> Result<(), WriteError> {
         self.remove_versioned(enc);
         Ok(())
     }
-
 
     /// 逻辑 value → 存储字节（大值走 blob 旁路就在这里）。`None` = 写旁路失败 ⇒ 整次写作废。
     fn encode_value(&mut self, value: Vec<u8>) -> Option<Vec<u8>> {
@@ -181,9 +182,12 @@ pub trait WriteSide {
 ///
 /// 默认实现 = "什么都不做"，因此没有 WAL 的引擎传 `&mut ()` 就行。
 pub trait WalTail {
-    /// Checked durability boundary. Third-party implementations must opt in.
+    /// 可返回错误的持久性边界；第三方实现必须显式提供支持。
     fn try_wal_commit(&mut self, _xid: u64) -> std::io::Result<()> {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "checked WAL commit is not implemented"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "checked WAL commit is not implemented",
+        ))
     }
     /// 提交尾：`Commit` 记录 + fsync。只在事务真进过 WAL 时才被调用。
     fn wal_commit(&mut self, _xid: u64) {}
@@ -194,11 +198,18 @@ pub trait WalTail {
 
 /// 没有 WAL 的引擎（`memory`）用它当收尾占位；顺带也是"这一家不实现写侧"时的空守卫。
 impl WalTail for () {
-    fn try_wal_commit(&mut self, _xid: u64) -> std::io::Result<()> { Ok(()) }
+    fn try_wal_commit(&mut self, _xid: u64) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TxnState { Active, Committed, RolledBack, Indeterminate }
+enum TxnState {
+    Active,
+    Committed,
+    RolledBack,
+    Indeterminate,
+}
 
 /// 事务内核：版本、可见性快照、写集、WAL 开窗状态、回收记账。
 pub struct TxnCore {
@@ -278,13 +289,23 @@ impl TxnCore {
         self.try_write(reg, side, key, value).is_ok()
     }
 
-    pub fn try_write<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
-        key: &[u8], value: Option<Vec<u8>>) -> Result<(), WriteError> {
+    pub fn try_write<S: WriteSide>(
+        &self,
+        reg: &mut Registry,
+        side: &mut S,
+        key: &[u8],
+        value: Option<Vec<u8>>,
+    ) -> Result<(), WriteError> {
         self.try_write_inner(reg, side, Cow::Borrowed(key), value)
     }
 
-    fn try_write_inner<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
-        key: Cow<'_, [u8]>, value: Option<Vec<u8>>) -> Result<(), WriteError> {
+    fn try_write_inner<S: WriteSide>(
+        &self,
+        reg: &mut Registry,
+        side: &mut S,
+        key: Cow<'_, [u8]>,
+        value: Option<Vec<u8>>,
+    ) -> Result<(), WriteError> {
         self.try_write_row(side, key, value, || {
             #[cfg(test)]
             WRITE_REG_LOOKUPS.with(|s| s.set(s.get() + 1));
@@ -292,10 +313,19 @@ impl TxnCore {
         })
     }
 
-    fn try_write_row<'a, S: WriteSide>(&self, side: &mut S, key: Cow<'_, [u8]>,
-        value: Option<Vec<u8>>, writes: impl FnOnce() -> &'a mut HashSet<Vec<u8>>) -> Result<(), WriteError> {
-        if self.state.get() != TxnState::Active { return Err(WriteError::TransactionClosed); }
-        if let Some(error) = self.write_error.get() { return Err(error); }
+    fn try_write_row<'a, S: WriteSide>(
+        &self,
+        side: &mut S,
+        key: Cow<'_, [u8]>,
+        value: Option<Vec<u8>>,
+        writes: impl FnOnce() -> &'a mut HashSet<Vec<u8>>,
+    ) -> Result<(), WriteError> {
+        if self.state.get() != TxnState::Active {
+            return Err(WriteError::TransactionClosed);
+        }
+        if let Some(error) = self.write_error.get() {
+            return Err(error);
+        }
         if let Some(latest) = side.latest_version(&key) {
             if !self.is_visible(latest) {
                 return Err(WriteError::Conflict);
@@ -327,36 +357,54 @@ impl TxnCore {
 
         let writes = writes();
         #[cfg(test)]
-        let inserted = if owned_reference::enabled() { side.put_versioned(&enc, stored) }
-            else { side.put_versioned_owned(enc, stored) };
+        let inserted = if owned_reference::enabled() {
+            side.put_versioned(&enc, stored)
+        } else {
+            side.put_versioned_owned(enc, stored)
+        };
         #[cfg(not(test))]
         let inserted = side.put_versioned_owned(enc, stored);
         if inserted {
             register_write(writes, key);
             return Ok(());
         }
-        // WAL already contains this row. Include it in rollback even when the
-        // storage side reports a failure after partial mutation.
+        // WAL 已包含该行，即使存储侧部分修改后报错，也必须纳入回滚。
         register_write(writes, key);
         self.fail_write(WriteError::StorageWriteFailed)
     }
 
-    pub(crate) fn try_write_owned<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
-        key: Vec<u8>, value: Option<Vec<u8>>) -> Result<(), WriteError> {
+    pub(crate) fn try_write_owned<S: WriteSide>(
+        &self,
+        reg: &mut Registry,
+        side: &mut S,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Result<(), WriteError> {
         #[cfg(test)]
-        if owned_reference::enabled() { return self.try_write(reg, side, &key, value); }
+        if owned_reference::enabled() {
+            return self.try_write(reg, side, &key, value);
+        }
         self.try_write_inner(reg, side, Cow::Owned(key), value)
     }
 
-    /// A bounded owned page uses the same row checks/WAL/registration gate,
-    /// reserving its write set and finding its registry entry once per page.
-    pub(crate) fn try_write_owned_page<S: WriteSide>(&self, reg: &mut Registry, side: &mut S,
-        rows: impl ExactSizeIterator<Item = (Vec<u8>, Option<Vec<u8>>)>) -> Result<(), WriteError> {
-        if self.state.get() != TxnState::Active { return Err(WriteError::TransactionClosed); }
-        if let Some(error) = self.write_error.get() { return Err(error); }
+    /// 按页接收所有权的写入仍经过原有行检查、WAL 和事务注册；每页只预留一次写集合并查找一次注册项。
+    pub(crate) fn try_write_owned_page<S: WriteSide>(
+        &self,
+        reg: &mut Registry,
+        side: &mut S,
+        rows: impl ExactSizeIterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), WriteError> {
+        if self.state.get() != TxnState::Active {
+            return Err(WriteError::TransactionClosed);
+        }
+        if let Some(error) = self.write_error.get() {
+            return Err(error);
+        }
         #[cfg(test)]
         if owned_reference::enabled() {
-            for (key, value) in rows { self.try_write(reg, side, &key, value)?; }
+            for (key, value) in rows {
+                self.try_write(reg, side, &key, value)?;
+            }
             return Ok(());
         }
         #[cfg(test)]
@@ -369,8 +417,7 @@ impl TxnCore {
         Ok(())
     }
 
-    /// Apply borrowed-key rows while retaining the caller's input for
-    /// batch-local rollback. Returns the first failed row index.
+    /// 借用键的批量写入保留调用方输入，供当前批次失败时回滚；返回首个失败行的下标。
     pub(crate) fn try_write_borrowed_page<'a, S: WriteSide>(
         &self,
         reg: &mut Registry,
@@ -389,14 +436,15 @@ impl TxnCore {
         let writes = reg.entry(self.version).or_default();
         writes.reserve(rows.len());
         for (index, key, value) in rows {
-            if let Err(error) = self.try_write_row(side, Cow::Borrowed(key), value, || &mut *writes) {
+            if let Err(error) = self.try_write_row(side, Cow::Borrowed(key), value, || &mut *writes)
+            {
                 return Err((index, error));
             }
         }
         Ok(())
     }
 
-    /// Latch an engine failure without changing an already completed outcome.
+    /// 封锁引擎故障，但不改变此前已经完成的事务结果。
     pub(crate) fn mark_storage_failed(&self) {
         if self.state.get() == TxnState::Active {
             self.write_error.set(Some(WriteError::StorageWriteFailed));
@@ -411,27 +459,39 @@ impl TxnCore {
     /// 兼容提交入口，失败 panic；调用方应使用 try_commit 处理不确定结果。
     /// WAL Commit 与 fsync 成功后才销账；可选 flush/checkpoint 留给引擎处理。
     pub fn commit<W: WalTail>(&self, reg: &mut Registry, wal: &mut W) {
-        self.try_commit(reg, wal).expect("transaction commit failed");
+        self.try_commit(reg, wal)
+            .expect("transaction commit failed");
     }
 
-    pub fn try_commit<W: WalTail>(&self, reg: &mut Registry, wal: &mut W) -> Result<(), CommitError> {
+    pub fn try_commit<W: WalTail>(
+        &self,
+        reg: &mut Registry,
+        wal: &mut W,
+    ) -> Result<(), CommitError> {
         match self.state.get() {
             TxnState::Committed => return Ok(()),
             TxnState::RolledBack => return Err(CommitError::TransactionClosed),
-            TxnState::Indeterminate => return Err(CommitError::Indeterminate {
-                version: self.version, source: std::io::Error::other("previous commit attempt failed"),
-            }),
+            TxnState::Indeterminate => {
+                return Err(CommitError::Indeterminate {
+                    version: self.version,
+                    source: std::io::Error::other("previous commit attempt failed"),
+                });
+            }
             TxnState::Active => {}
         }
-        if let Some(error) = self.write_error.get() { return Err(CommitError::WriteFailed(error)); }
+        if let Some(error) = self.write_error.get() {
+            return Err(CommitError::WriteFailed(error));
+        }
         if self.wal_policy.opened() {
             if let Err(source) = wal.try_wal_commit(self.version) {
                 self.state.set(TxnState::Indeterminate);
-                return Err(CommitError::Indeterminate { version: self.version, source });
+                return Err(CommitError::Indeterminate {
+                    version: self.version,
+                    source,
+                });
             }
         }
-        // Publish only after the durability boundary succeeded. On uncertainty
-        // retain the registry entry so readers and vacuum cannot expose it.
+        // 持久性边界成功后才发布；结果不确定时保留注册项，使读者和回收都无法暴露该版本。
         let rows_written = reg.remove(&self.version).map(|k| k.len()).unwrap_or(0);
         self.vac.on_commit(rows_written as u64);
         self.state.set(TxnState::Committed);
@@ -440,7 +500,9 @@ impl TxnCore {
 
     /// 回滚：按写集把本事务落下的版本行**物理删掉**，并给 WAL 留一条 `Abort`。
     pub fn rollback<S: WriteSide + WalTail>(&self, reg: &mut Registry, side: &mut S) {
-        if self.state.get() != TxnState::Active { return; }
+        if self.state.get() != TxnState::Active {
+            return;
+        }
         let keys = reg.remove(&self.version).unwrap_or_default();
         if self.wal_policy.opened() {
             side.wal_abort(self.version);
@@ -449,8 +511,7 @@ impl TxnCore {
             let enc = encode_key(k, self.version);
             if let Err(error) = side.try_remove_versioned(&enc) {
                 self.write_error.set(Some(error));
-                // Registry is locked throughout: no reader can observe its
-                // temporary removal. Preserve all keys for retry/recovery.
+                // 注册表全程持锁，读者看不到临时移除；保留全部键供重试与恢复。
                 reg.insert(self.version, keys);
                 return;
             }
@@ -554,55 +615,10 @@ impl BulkCore {
     }
 }
 
+#[cfg(test)]
+mod checked_tests;
 
 #[cfg(test)]
-mod checked_tests {
-    use super::*;
-    use std::{assert, assert_eq, matches, vec};
+pub(crate) mod owned_reference;
 
-    #[test]
-    fn checked_partial_storage_write_cannot_commit_and_is_rolled_back() {
-        #[derive(Default)]
-        struct PartialStore { rows: HashMap<Vec<u8>, Option<Vec<u8>>> }
-        impl WriteSide for PartialStore {
-            fn latest_version(&mut self, _: &[u8]) -> Option<u64> { None }
-            fn put_versioned(&mut self, key: &[u8], value: Option<Vec<u8>>) -> bool {
-                self.rows.insert(key.to_vec(), value);
-                false // A storage operation can fail after partial mutation.
-            }
-            fn remove_versioned(&mut self, key: &[u8]) { self.rows.remove(key); }
-        }
-        impl WalTail for PartialStore {
-            fn try_wal_commit(&mut self, _: u64) -> std::io::Result<()> { Ok(()) }
-        }
-        for mode in 0..3 {
-            let reg = Arc::new(Mutex::new(Registry::new()));
-            let tx = TxnCore::begin(reg, &AtomicU64::new(1), Arc::new(VacuumScheduler::default()));
-            let mut guard = tx.lock_registry();
-            let mut store = PartialStore::default();
-            let result = if mode == 2 {
-                tx.try_write_owned_page(&mut guard, &mut store, vec![(b"k".to_vec(), Some(vec![1]))].into_iter())
-            } else if mode == 1 {
-                tx.try_write_owned(&mut guard, &mut store, b"k".to_vec(), Some(vec![1]))
-            } else { tx.try_write(&mut guard, &mut store, b"k", Some(vec![1])) };
-            assert_eq!(result, Err(WriteError::StorageWriteFailed));
-            assert_eq!(store.rows.len(), 1, "must actually mutate before reporting failure");
-            assert!(matches!(tx.try_commit(&mut guard, &mut store),
-                Err(CommitError::WriteFailed(WriteError::StorageWriteFailed))));
-            tx.rollback(&mut guard, &mut store);
-            assert!(store.rows.is_empty(), "rollback must clean a partially written row");
-            assert!(guard.is_empty());
-        }
-    }
-}
-
-
-#[cfg(test)]
-pub(crate) mod owned_reference {
-    use std::{assert, cell::Cell, thread_local};
-    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
-    pub fn enabled() -> bool { ENABLED.with(|c| c.get()) }
-    pub struct Scope;
-    impl Scope { pub fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
-    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
-}
+// 按职责组织的内部实现；公开类型与原模块路径保持一致。

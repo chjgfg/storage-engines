@@ -4,15 +4,14 @@
 //! 的实现正是崩溃语义修一处漏两处的来源，已收进 [`crate::common::disk`]，这里 re-export
 //! 以保持 `crate::bitcask::storage::DiskFile` 这类既有路径不断。
 
-use std::vec;
 use std::format;
 use std::path::{Path, PathBuf};
+use std::vec;
 
 // M53 的站点账：blob 侧文件的 fsync 不认引擎，四家共用同一格
 use crate::common::disk::SITE_BLOB;
 
-pub use crate::common::disk::{crc32, DiskFile, FileLock};
-
+pub use crate::common::disk::{DiskFile, FileLock, crc32};
 
 // ─── 路径辅助 ───────────────────────────────────────────────────────────────
 
@@ -76,8 +75,11 @@ pub struct BlobStore {
 
 const BLOB_BUF_TARGET: usize = 4 * 1024 * 1024;
 
-/// Empty files need no live-value lookup. Pending writes require inspection too.
-pub(crate) enum ReferenceScan { Empty, Inspect }
+/// 空文件无需查询存活值，但尚未落盘的写入仍需要检查。
+pub(crate) enum ReferenceScan {
+    Empty,
+    Inspect,
+}
 
 #[cfg(test)]
 mod reference_scan_tests {
@@ -89,13 +91,30 @@ mod reference_scan_tests {
         let dir = crate::common::ScratchPath::new("blob_mode", "pending", "");
         std::fs::create_dir_all(&dir).unwrap();
         let mut blob = BlobStore::open(&dir).unwrap();
-        assert!(matches!(blob.reference_scan().unwrap(), ReferenceScan::Empty));
+        assert!(matches!(
+            blob.reference_scan().unwrap(),
+            ReferenceScan::Empty
+        ));
         blob.append(&[1; 512]).unwrap();
-        assert!(matches!(blob.reference_scan().unwrap(), ReferenceScan::Inspect), "buffered append must not look empty");
+        assert!(
+            matches!(blob.reference_scan().unwrap(), ReferenceScan::Inspect),
+            "buffered append must not look empty"
+        );
         blob.sync().unwrap();
-        assert!(matches!(blob.reference_scan().unwrap(), ReferenceScan::Inspect));
-        std::fs::OpenOptions::new().write(true).open(blob.path()).unwrap().set_len(8).unwrap();
-        assert!(blob.reference_scan().is_err(), "truncated file is an error, not empty mode");
+        assert!(matches!(
+            blob.reference_scan().unwrap(),
+            ReferenceScan::Inspect
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(blob.path())
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+        assert!(
+            blob.reference_scan().is_err(),
+            "truncated file is an error, not empty mode"
+        );
     }
 }
 
@@ -103,14 +122,24 @@ impl BlobStore {
     pub(crate) fn reference_scan(&mut self) -> std::io::Result<ReferenceScan> {
         let disk_len = self.path().metadata()?.len();
         if disk_len != self.end_pos - self.buf.len() as u64 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "blob file length changed"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "blob file length changed",
+            ));
         }
         let mut magic = [0; 8];
         self.file.read_exact_at(0, &mut magic)?;
         if &magic != BLOB_MAGIC {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid blob header"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid blob header",
+            ));
         }
-        Ok(if self.end_pos == BLOB_MAGIC.len() as u64 { ReferenceScan::Empty } else { ReferenceScan::Inspect })
+        Ok(if self.end_pos == BLOB_MAGIC.len() as u64 {
+            ReferenceScan::Empty
+        } else {
+            ReferenceScan::Inspect
+        })
     }
 
     pub fn open(dir: &Path) -> std::io::Result<Self> {
@@ -167,9 +196,11 @@ impl BlobStore {
         if self.buf.capacity() < self.buf.len() + rec_len {
             // 首次就一步涨到目标大小（此后 flush_buf 只 clear、容量保留）：
             // 既不空留 4 MiB，也不让小步 realloc 抖动
-            self.buf.reserve(BLOB_BUF_TARGET.saturating_sub(self.buf.len()).max(rec_len));
+            self.buf
+                .reserve(BLOB_BUF_TARGET.saturating_sub(self.buf.len()).max(rec_len));
         }
-        self.buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(data.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(&checksum.to_le_bytes());
         self.buf.extend_from_slice(data);
         self.end_pos += rec_len as u64;

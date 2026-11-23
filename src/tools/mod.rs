@@ -4,9 +4,9 @@
 //!
 //! ## 统一 CLI（M81 第 6 项）
 //! `bin/export-kv` / `bin/import-kv`（实体在 `src/bin/`，Cargo 自动发现）只有一对，靠 `--engine` 选家；
-//! 它们调的就是 [`migrate::export_to_dir`] / [`migrate::import_from_dir`]，本身不含任何搬运逻辑。
+//! 它们调的就是 [`crate::tools::migrate::export_to_dir`] / [`crate::tools::migrate::import_from_dir`]，本身不含任何搬运逻辑。
 //! 跨库**补齐**（目标已有的一个字不动、TTL 跟着走、墓碑算"见过"）不在这个口子里 ——
-//! 那是 [`migrate::sync`]，库对库。
+//! 那是 [`crate::tools::migrate::sync`]，库对库。
 //!
 //! ## 为什么要单独有这一层
 //! 在这之前，本仓库的"搬运"散在八个 `bin/*-import-kv` / `bin/*-export-kv` 里：每家一份

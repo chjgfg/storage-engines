@@ -10,15 +10,16 @@
 //! 搬完之后新增一个引擎只要写这两个方法，折叠/窗口/分页/界下推不用重写 —— 那正是
 //! "基座"与"四份复制"的分界。
 
+use crate::common::WinCandidate;
+use crate::common::codec::{
+    VisibleOwnedValue, key_matches, logical_to_user, now_unix_secs, prefix_upper_bound,
+    visible_owned_value,
+};
+use crate::common::types::{ExportRecord, KeyMatchMode, SearchPage, SearchQuery};
+use crate::common::{fold_window, fold_window_emit};
 #[cfg(test)]
 use std::thread_local;
 use std::{matches, unreachable};
-use crate::common::codec::{
-    key_matches, logical_to_user, now_unix_secs, prefix_upper_bound, visible_owned_value, VisibleOwnedValue,
-};
-use crate::common::{fold_window, fold_window_emit};
-use crate::common::types::{ExportRecord, KeyMatchMode, SearchPage, SearchQuery};
-use crate::common::WinCandidate;
 
 /// 一组候选取值的结果，三态（见 [`VersionedStore::materialize`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,17 +32,21 @@ pub enum RowValue {
     Missing,
 }
 
-
-/// Search keeps rejected candidates for cursor progress and counts page-external rows.
+/// 搜索保留被拒绝候选以推进游标，并统计页面以外的行。
 pub enum SearchRow<R = ()> {
-    /// Owned credentials are resolved only when the fold reaches this row.
+    /// 折叠真正处理到此行时才解析拥有型凭据。
     Deferred(R),
     Excluded,
     Counted,
     Retained(Option<Vec<u8>>),
 }
 
-pub(crate) enum SearchSelection { Excluded, Counted, Value, Deleted }
+pub(crate) enum SearchSelection {
+    Excluded,
+    Counted,
+    Value,
+    Deleted,
+}
 
 pub struct SearchRetention {
     include_deleted: bool,
@@ -49,66 +54,14 @@ pub struct SearchRetention {
     take: usize,
 }
 
-impl SearchRetention {
-    pub fn new(include_deleted: bool, skip: usize, take: usize) -> Self {
-        Self { include_deleted, skip, take }
-    }
-
-    pub(crate) fn select(&mut self, logical: Option<&[u8]>) -> SearchSelection {
-        let live = logical.is_some_and(crate::common::codec::logical_is_live);
-        if !live && !self.include_deleted { return SearchSelection::Excluded; }
-        if self.skip > 0 {
-            self.skip -= 1;
-            return SearchSelection::Counted;
-        }
-        if self.take == 0 { return SearchSelection::Counted; }
-        self.take -= 1;
-        if live { SearchSelection::Value } else { SearchSelection::Deleted }
-    }
-}
-
-pub(crate) fn retain_search_row<R>(
-    selection: SearchSelection,
-    owned: impl FnOnce() -> Option<Vec<u8>>,
-) -> SearchRow<R> {
-    match selection {
-        SearchSelection::Excluded => SearchRow::Excluded,
-        SearchSelection::Counted => SearchRow::Counted,
-        SearchSelection::Value => SearchRow::Retained(owned()),
-        SearchSelection::Deleted => SearchRow::Retained(None),
-    }
-}
-
-pub(crate) fn classify_search_value<R>(value: RowValue, retention: &mut SearchRetention) -> SearchRow<R> {
-    match value {
-        RowValue::Missing => SearchRow::Excluded,
-        RowValue::Tombstone => retain_search_row(retention.select(None), || None),
-        RowValue::Value(bytes) =>
-            retain_search_row(retention.select(Some(&bytes)), || Some(bytes)),
-    }
-}
-
-/// A backend may consume groups under its read boundary; fallback remains
-/// explicit so callers cannot mistake an unsupported path for an empty result.
+/// 后端可以在持有读取边界时直接消费逻辑组；不支持该路径时必须显式回退，不能伪装成空结果。
 pub enum SearchWalkOutcome {
     UseDefault,
-    Completed { items: Vec<ExportRecord>, has_more: bool, total: usize },
-}
-
-/// Frozen M153 whole-batch materialization, used by the negative control.
-#[cfg(test)]
-pub fn owned_search_candidates<S: VersionedStore + ?Sized>(
-    store: &S,
-    start: Option<&[u8]>, end: Option<&[u8]>,
-    accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
-    mut retention: SearchRetention,
-) -> (Vec<WinCandidate<SearchRow<S::Row>>>, bool) {
-    let (rows, complete) = store.scan_candidates(start, end, accept, after, budget);
-    let rows = rows.into_iter().map(|c| {
-        let row = classify_search_value(store.materialize(c.row), &mut retention);
-        WinCandidate { key: c.key, version: c.version, row }
-    }).collect();
-    (rows, complete)
+    Completed {
+        items: Vec<ExportRecord>,
+        has_more: bool,
+        total: usize,
+    },
 }
 
 /// 一把逻辑 key 的**版本行**怎么读。
@@ -122,11 +75,18 @@ pub trait VersionedStore {
     /// bitcask 是编码键；LSM 普通值保留共享块，blob/同 seq 歧义保留显式点查凭据。
     type Row;
 
-    /// Optional bounded-lock walk. Visibility, grouping and retention must use
-    /// the shared predicates; unsupported engines return UseDefault explicitly.
-    fn search_walk(&self, _include_deleted: bool, _pattern: Option<&[u8]>,
-        _mode: KeyMatchMode, _skip: usize, _page_size: usize, _want_total: bool,
-    ) -> SearchWalkOutcome { SearchWalkOutcome::UseDefault }
+    /// 可选的有界持锁扫描。可见性、分组和保留判断共用原判据；不支持的引擎显式返回 UseDefault。
+    fn search_walk(
+        &self,
+        _include_deleted: bool,
+        _pattern: Option<&[u8]>,
+        _mode: KeyMatchMode,
+        _skip: usize,
+        _page_size: usize,
+        _want_total: bool,
+    ) -> SearchWalkOutcome {
+        SearchWalkOutcome::UseDefault
+    }
 
     /// 折出候选组：`start`/`end` 是逻辑键界（含下、不含上），`accept` 是**键级**过滤
     /// （不命中的键一个值都不取），`after` 是续跑游标（**不含**该键），`budget` 是组数上限。
@@ -154,13 +114,14 @@ pub trait VersionedStore {
     /// 合成一个 `Option` 就会把那两种情况混成一种 —— 折叠统一的前提是不改语义。
     fn materialize(&self, row: Self::Row) -> RowValue;
 
-    /// Borrowing engines may classify under their read boundary. The default
-    /// leaves owned credentials deferred, so a no-total page stops value reads.
-    /// Excluded candidates must remain in the batch so the fold cursor advances.
+    /// 支持借用的引擎在读取边界内分类；默认路径延迟物化拥有型凭据，使免 total 页面可提前停止读值。排除行仍留在批次中以推进游标。
     fn scan_search_candidates(
         &self,
-        start: Option<&[u8]>, end: Option<&[u8]>,
-        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>,
+        after: Option<&[u8]>,
+        budget: usize,
         _retention: SearchRetention,
     ) -> (Vec<WinCandidate<SearchRow<Self::Row>>>, bool) {
         #[cfg(test)]
@@ -168,691 +129,27 @@ pub trait VersionedStore {
             return owned_search_candidates(self, start, end, accept, after, budget, _retention);
         }
         let (rows, complete) = self.scan_candidates(start, end, accept, after, budget);
-        (rows.into_iter().map(|c| WinCandidate {
-            key: c.key, version: c.version, row: SearchRow::Deferred(c.row),
-        }).collect(), complete)
+        (
+            rows.into_iter()
+                .map(|c| WinCandidate {
+                    key: c.key,
+                    version: c.version,
+                    row: SearchRow::Deferred(c.row),
+                })
+                .collect(),
+            complete,
+        )
     }
-
 }
 
 #[cfg(test)]
-pub(crate) mod search_materialize_reference {
-    use std::{assert, cell::Cell, thread_local};
-    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
-    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
-    pub(crate) struct Scope;
-    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
-    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
-}
+pub(crate) mod search_materialize_reference;
 
 #[cfg(test)]
-mod deferred_search_tests {
-    use super::*;
-    use std::{assert, assert_eq, cell::Cell, vec};
-
-    struct Store { calls: Cell<usize>, excluded: usize, rows: usize }
-    impl VersionedStore for Store {
-        type Row = usize;
-        fn scan_candidates(&self, start: Option<&[u8]>, end: Option<&[u8]>,
-            accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
-        ) -> (Vec<WinCandidate<usize>>, bool) {
-            let first = after.map_or(0, |key| u64::from_be_bytes(key.try_into().unwrap()) as usize + 1);
-            let mut out = Vec::new();
-            for i in first..self.rows {
-                let key = (i as u64).to_be_bytes();
-                if start.is_some_and(|lo| key.as_slice() < lo)
-                    || end.is_some_and(|hi| key.as_slice() >= hi)
-                    || accept.is_some_and(|f| !f(&key)) { continue; }
-                if out.len() == budget { return (out, false); }
-                out.push(WinCandidate { key: key.to_vec(), version: 1, row: i });
-            }
-            (out, true)
-        }
-        fn materialize(&self, row: usize) -> RowValue {
-            self.calls.set(self.calls.get() + 1);
-            if row < self.excluded {
-                match row % 3 {
-                    0 => RowValue::Missing,
-                    1 => RowValue::Tombstone,
-                    _ => RowValue::Value(crate::common::codec::pack_ttl(b"expired", 1)),
-                }
-            } else { RowValue::Value(crate::common::codec::pack_plain(&vec![7; 64])) }
-        }
-    }
-
-    #[test]
-    fn search_default_materializes_only_reached_rows() {
-        let store = Store { calls: Cell::new(0), excluded: 0, rows: 10_000 };
-        for reference in [true, false] {
-            let mode = reference.then(search_materialize_reference::Scope::start);
-            store.calls.set(0);
-            let (page, more, _) = search_page_walk(&store, false, None,
-                KeyMatchMode::Prefix, 0, 100, false);
-            assert_eq!(page.len(), 100); assert!(more);
-            assert_eq!(page[99].key, 99u64.to_be_bytes());
-            let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                assert_eq!(store.calls.get(), 101, "no-total must stop materialization")));
-            assert_eq!(guard.is_err(), reference, "restored eager arm must fail the same guard");
-            assert_eq!(store.calls.get(), if reference { 4096 } else { 101 });
-            drop(mode);
-        }
-    }
-
-    #[test]
-    fn search_deferred_keeps_missing_ttl_deleted_and_chunk_cursor_semantics() {
-        let store = Store { calls: Cell::new(0), excluded: 5000, rows: 9000 };
-        for include_deleted in [false, true] {
-            let expected = (0..store.rows).filter(|&i|
-                i >= store.excluded || (include_deleted && i % 3 != 0)).collect::<Vec<_>>();
-            for total in [false, true] {
-                for skip in [0, 4100, 8990] {
-                    let mut results = Vec::new();
-                    for reference in [true, false] {
-                        let mode = reference.then(search_materialize_reference::Scope::start);
-                        let result = search_page_walk(&store, include_deleted, None,
-                            KeyMatchMode::Contains, skip, 17, total);
-                        let keys = result.0.iter().map(|r| u64::from_be_bytes(r.key.as_slice().try_into().unwrap()) as usize).collect::<Vec<_>>();
-                        assert_eq!(keys, expected.iter().skip(skip).take(17).copied().collect::<Vec<_>>());
-                        assert_eq!(result.1, expected.len() > skip + 17);
-                        if total { assert_eq!(result.2, expected.len()); }
-                        results.push(result); drop(mode);
-                    }
-                    assert_eq!(results[0], results[1]);
-                }
-            }
-            assert_eq!(count_window(&store, include_deleted, None, KeyMatchMode::Prefix), expected.len());
-        }
-    }
-}
-
-/// 界内折叠 + 窗口化：`after` 之后最多 `limit` 组，返回 `(行, 是否还有更多)`。
-///
-/// `include_deleted = false` 时墓碑整行不参与；`limit = None` = 走到底。
-/// 这一份就是原来在四个引擎里各抄一遍的那段折叠。
-pub fn collect_rows<S: VersionedStore>(
-    store: &S,
-    include_deleted: bool,
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-    after: Option<&[u8]>,
-    limit: Option<usize>,
-) -> (Vec<(Vec<u8>, u64, Option<Vec<u8>>)>, bool) {
-    let (rows, more) = collect_rows_as(
-        store,
-        start,
-        end,
-        after,
-        limit,
-        |key, version, value| match value {
-            RowValue::Tombstone => include_deleted.then(|| (key, version, None)),
-            RowValue::Value(bytes) => Some((key, version, Some(bytes))),
-            RowValue::Missing => None,
-        },
-    );
-    (rows, more)
-}
-
-/// [`collect_rows`] 的**通用行形状**版：调用方自己决定折出来长什么样（M27）。
-///
-/// 为什么要有它：`scan` / `export` / `print_all` 这些公开面要的本来就是 `ExportRecord`，
-/// 走 `collect_rows` 会先攒出一份 `(key, version, 字节)` 元组 `Vec`、再逐条搬进
-/// `Vec<ExportRecord>` ⇒ 两份头结构同时活着（200k 键实测那一段 ≈ 15 MB，见 README 的
-/// "一次全量 scan 峰值"条目）。让映射发生在折叠内部，中间那份就不存在了。
-///
-/// 回调签名 `(key, version, RowValue)`：`RowValue` 保持**三态**（与
-/// [`VersionedStore::materialize`] 同）。`Missing` 由驱动直接丢掉（不叫回调），墓碑与
-/// 取值成功都叫 ⇒ **"墓碑要不要出现在结果里"完全由回调决定**（所以这里不需要
-/// `include_deleted` 这个参数：本函数的调用方各自都有判据，塞一个布尔进来只会假装通用）。
-///
-/// 返回 `(行, 是否可能还有更多)`：`limit` 给了就按"多要一条"判，没给就是 `false`。
-pub fn collect_rows_as<S, T, M>(
-    store: &S,
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-    after: Option<&[u8]>,
-    limit: Option<usize>,
-    mut map: M,
-) -> (Vec<T>, bool)
-where
-    S: VersionedStore,
-    M: FnMut(Vec<u8>, u64, RowValue) -> Option<T>,
-{
-    // 多要一条只为了知道"后面还有没有"
-    let wanted = limit.map(|n| n.saturating_add(1));
-    let rows = fold_window(
-        wanted,
-        |round_after, budget| {
-            // 首轮从调用方给的 `after` 起；驱动续跑时用它自己推进的游标（更靠后）
-            let cursor = round_after.as_deref().or(after);
-            store.scan_candidates(start, end, None, cursor, budget)
-        },
-        |c| match store.materialize(c.row) {
-            RowValue::Missing => None,
-            rv => map(c.key, c.version, rv),
-        },
-    );
-    let more = wanted.is_some_and(|w| rows.len() >= w);
-    let rows = match limit {
-        Some(n) => rows.into_iter().take(n).collect(),
-        None => rows,
-    };
-    (rows, more)
-}
-
-/// **流式**折叠：每折出一行立刻交给 `on`，一行都不攒（M27）。
-///
-/// `KvTxn::scan_foreach` 的文档从写下那天起就声称"不收集全库到单一大 Vec"，
-/// 而实现是 `for … in collect_latest_raw_in(...)`（先把全库元组攒出来）。这条把它兑现：
-/// `on` 返回 `false` 就当场收手，**后面的键一个都不再折** —— 这一点有计数守卫钉着
-/// （提前叫停时本引擎的"折过的键数"必须只与已交出的行数同阶，而不是与全库同阶）。
-///
-/// 与 [`collect_rows`] 的分工：值还是在这条路径上取的（`Missing` 不叫回调），
-/// 但结果不进 `Vec`；`include_deleted` 同上，墓碑要不要出现由调用方在 `on` 里判。
-pub fn fold_rows_streaming<S, F>(
-    store: &S,
-    include_deleted: bool,
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-    mut on: F,
-) where
-    S: VersionedStore,
-    F: FnMut(Vec<u8>, u64, RowValue) -> bool,
-{
-    fold_window_emit(
-        None,
-        |round_after, budget| {
-            let cursor = round_after;
-            store.scan_candidates(start, end, None, cursor, budget)
-        },
-        |c| match store.materialize(c.row) {
-            RowValue::Missing => None,
-            rv => Some((c.key, c.version, rv)),
-        },
-        |(key, version, value)| {
-            if !include_deleted && matches!(value, RowValue::Tombstone) {
-                return true; // 墓碑不参与，但**不算交出去一行**，继续走
-            }
-            on(key, version, value)
-        },
-    );
-}
-
-/// 导出行形状**唯一那份判据**（M44）：折一行、判一行、立刻交给 `on`，一行都不攒。
-///
-/// 为什么要新加一条而不是让调用方继续用 `export_latest_visible`：那条返回
-/// `Vec<ExportRecord>` —— 那笔 `Vec` 是"要整库的人"的合同，可**导出到文件**的人要的是
-/// "写出去"，不是"在内存里再摆一份"。600k 档实测一次 `export 全库(物化)` 峰值 **+123.7 MB**，
-/// 而折叠侧（[`fold_rows_streaming`]）从 M27 起就一行不攒 ⇒ 卡住的那一头在出口。
-///
-/// 四家的 `export_latest_visible` 现在都是**这条的收集壳**（M39 那招：判据只剩一份实现）：
-/// 墓碑 / 过期或坏壳 / 读不到三类怎么处置，四家必须一字不差；它们唯一的差别是
-/// "逻辑字节 → 用户字节"那一步住在哪家，所以那一步当参数进来（`unseal`）。
-///
-/// 返回值 = 实际交给 `on` 的行数。`on` 返回 `false` ⇒ 当场收手，**后面的键不再折**。
-pub fn export_rows_streaming<S, U>(
-    store: &S,
-    include_deleted: bool,
-    unseal: U,
-    on: &mut dyn FnMut(ExportRecord) -> bool,
-) -> usize
-where
-    S: VersionedStore,
-    // 按值收：折叠交出来的那份逻辑字节本来就是 owned `Vec`，剥壳要把它拆开看 ——
-    // 借成 `&[u8]` 再复制一份出来，正是这一刀要省掉的那类占用。
-    U: Fn(Vec<u8>) -> Option<Vec<u8>>,
-{
-    let mut handed = 0usize;
-    // `include_deleted` 直接交给折叠放行：为 false 时墓碑根本不会进来，为 true 时
-    // "墓碑记成 value=None" 由下面这份映射判 —— 与改前 `collect_rows_as` 的判据同一份。
-    fold_rows_streaming(store, include_deleted, None, None, |key, _ver, value| {
-        let rec = match value {
-            RowValue::Tombstone => Some(ExportRecord::new(key, None)),
-            RowValue::Value(bytes) => {
-                // 出口必须把 TTL 一起带出去：只交用户字节 = 导入侧无从重打信封 ⇒ 键变永久。
-                // 多解一次信封（1 个标签字节 + 8 字节）换的是"搬一次少一批到期时刻"。
-                // ⚠️ 取账要在 `unseal(bytes)` 把字节交出去**之前** —— 那之后 `bytes` 就没了。
-                let expire = crate::common::codec::logical_expiry(&bytes);
-                match unseal(bytes) {
-                    Some(user) => Some(ExportRecord { key, value: Some(user), expire_unix_secs: expire }),
-                    None => {
-                        if include_deleted {
-                            Some(ExportRecord::new(key, None))
-                        } else {
-                            None
-                        }
-                    }
-                }
-            }
-            // 读不到与墓碑不是一回事：整行不参与
-            RowValue::Missing => None,
-        };
-        match rec {
-            Some(r) => {
-                handed += 1;
-                on(r)
-            }
-            None => true,
-        }
-    });
-    handed
-}
-
-/// 折叠的**迭代下界**：`start`（含）与 `after`（不含）里字节序更大的那个。
-///
-/// 为什么可以拿 `after` 当起点而不是只在循环里过滤它：任何 `raw > after` 的键，它的版本键
-/// `raw ‖ version_be` 一定 `≥ raw > after` ⇒ 从字节界 `after` 起升序走，需要的那些行**一行都不会漏**；
-/// 而 `raw == after` 那一组与"以 after 为前缀的更短键"的高版本仍会被走到，靠调用方那句
-/// `raw <= after ⇒ continue` 挡掉（版本键前缀交错的坑，见 [`crate::common::version`]）。
-/// 反过来**不能**用 `after ‖ 0xFF×8` 当下界：那会把 `"abcd"`（比 `"abc"` 大、字节序却小于
-/// `"abc"‖FF…`）整把键跳掉 —— 静默少行。
-///
-/// 没有这一条，`scan_page` 每翻一页都要从库头重走：每页代价 ∝ 库大小（2026-10-17 的 200k
-/// 实测：bplus 每页 12.5 ms → 189 ms），`migrate` 与 `search` 的续跑共用这条路径。
-pub fn fold_lower_bound<'a>(
-    start: Option<&'a [u8]>,
-    after: Option<&'a [u8]>,
-) -> Option<&'a [u8]> {
-    match (start, after) {
-        (Some(s), Some(a)) => Some(if a > s { a } else { s }),
-        (None, Some(a)) => Some(a),
-        (s, None) => s,
-    }
-}
-
-/// 模式 ⇒ 折叠界。前缀是有界的（可以把界下推给折叠），Contains 只能全库走。
-pub fn search_bounds<'a>(
-    pattern: Option<&'a [u8]>,
-    mode: KeyMatchMode,
-) -> (Option<&'a [u8]>, Option<Vec<u8>>) {
-    let pat = pattern.unwrap_or_default();
-    match mode {
-        KeyMatchMode::Prefix => {
-            let lo = if pat.is_empty() { None } else { Some(pat) };
-            (lo, prefix_upper_bound(pat))
-        }
-        KeyMatchMode::Contains => (None, None),
-    }
-}
-
-/// 一组成员行折出来的**候选** → 用户该看到的那一行（判定的唯一一份实现，M51）。
-///
-/// 为什么单独成一个函数而不是留在 `search_window` 的闭包里：M51 把"取那一页"从
-/// "先把前 `skip+page_size` 行全攒起来"改成"流式只留那一页"，于是**同一条判定出现了第二个用户**。
-/// 判定分两处写就是本仓库反复在防的那件事（M5a/M5b 一路的做法：同形状的判定不许留两份）——
-/// 过期与墓碑同待这条规矩，两处必须永远一致。
-fn record_of<S: VersionedStore>(
-    store: &S,
-    key: Vec<u8>,
-    row: S::Row,
-    include_deleted: bool,
-) -> Option<ExportRecord> {
-    match store.materialize(row) {
-        RowValue::Missing => None,
-        RowValue::Tombstone => include_deleted.then_some(ExportRecord::new(key, None)),
-        // 逻辑值还要剥一次信封；过期与墓碑同待（只在 include_deleted 时出现）
-        RowValue::Value(logical) => {
-            // 取账要在 `logical_to_user` 收走字节之前（同上，`bytes`/`logical` 都是移动语义）
-            let expire = crate::common::codec::logical_expiry(&logical);
-            match logical_to_user(logical) {
-                Some(user) => Some(ExportRecord { key, value: Some(user), expire_unix_secs: expire }),
-                None => include_deleted.then_some(ExportRecord::new(key, None)),
-            }
-        }
-    }
-}
-
-/// 窗口化的模式搜索：返回**按 key 升序**的命中行，最多 `limit` 条（多要一条给 `has_next` 用）。
-///
-/// 与 [`collect_rows`] 的分工：这里额外做两件事 —— 把 `pattern`/`mode` 变成折叠侧的
-/// `accept`（键级，先判它才能少取值）与界，再把存储字节剥成用户 value（`logical_to_user`）。
-/// 剥壳后为 `None`（过期）的行与墓碑同待：只在 `include_deleted` 时出现。
-///
-/// ⚠️ 它**攒的是一个 `Vec`**：`limit` 给多大就攒多大。翻到第 1200 页**不要**用它 ——
-/// 那条路走 [`search_page_rows`]（只留那一页），见 M51。
-pub fn search_window<S: VersionedStore>(
-    store: &S,
-    include_deleted: bool,
-    pattern: Option<&[u8]>,
-    mode: KeyMatchMode,
-    limit: Option<usize>,
-) -> Vec<ExportRecord> {
-    let (lo, hi) = search_bounds(pattern, mode);
-    let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
-    fold_window(
-        limit,
-        |after, budget| store.scan_candidates(lo, hi.as_deref(), Some(&accept), after, budget),
-        |c| record_of(store, c.key, c.row, include_deleted),
-    )
-}
-
-/// 分页要的**那一页**：跳过 `skip` 行、留 `page_size` 行，外加"还有没有下一条"这一格证据。
-///
-/// 只要窗口 ⇒ 走到第 `page_size + 1` 条就收手。**不要精确 `total` 的话别数它**（M75b：
-/// 要 total 就走 [`search_page_walk`] 的 `want_total = true`，一趟同时给数与页）。
-///
-/// 存在的理由（M51，复测抓到的一格）：`search_page` 以前是
-/// `search_window(limit = skip + page_size + 1)` 再切片 ⇒ **翻到末页要先把前面每一页都攒在堆上**。
-/// 600k 键的库翻到第 1200 页，瞬时峰值实测 **188 MB**（四家同形，比"一次全量 scan"的 123.7 MB 还高）。
-/// 那条折叠本身没省（每一行的值都得读出来才判得了过期 ⇒ 见 [`count_window`] 那条同样的老实话），
-/// 省的是**留存**：跳过的行当场丢掉，堆上最多只有 `page_size + 1` 行 ⇒ 峰值从 O(页码×页宽) 变成 O(页宽)。
-pub fn search_page_rows<S: VersionedStore>(
-    store: &S,
-    include_deleted: bool,
-    pattern: Option<&[u8]>,
-    mode: KeyMatchMode,
-    skip: usize,
-    page_size: usize,
-) -> (Vec<ExportRecord>, bool) {
-    let (items, has_more, _) =
-        search_page_walk(store, include_deleted, pattern, mode, skip, page_size, false);
-    (items, has_more)
-}
-
-/// **唯一一份**分页折叠：跳 `skip` 行、留 `page_size` 行，`want_total` 决定要不要顺手数完全界。
-///
-/// 判定口径与 [`count_window`] **一字不差**：`Missing` 不算；墓碑与过期行同待，只在
-/// `include_deleted` 时算一条。所以同一份库上 `total` 与旧的两步必然同数（有守卫对拍）。
-///
-/// 两条合同合成一条的理由（M75b）：以前 `need_total` 那格是"先取窗口、再 `count_window` 数全库"
-/// 两趟，实测 600k 档 ①只数 + ②只翻页 ≈ ③表里那一格（差 −3.7%~+5.3%）⇒ 同一次调用**走了两遍全库**。
-/// 合成一趟除了省掉一遍，还顺带没掉一条瑕疵：两趟之间库被别的线程写过，`total` 与 `items`
-/// 就来自两个瞬间。
-///
-/// ⚠️ 跳过的行**一次都不拷用户字节**：`keep` 只判"算不算一条"并把逻辑字节原样带下去，
-/// 只有落进这一页的那些才过 `logical_to_user`（断这个数的尺子是 `user_value_copies`）。
-///
-/// 返回 `(那一页, 还有没有下一条, 精确命中数)`；`want_total = false` 时第三个数**无意义**
-/// （提前收手了，只是"到目前为止交出的条数"）。
-///
-/// 为什么两支合成一个函数而不是两份：`page_size` 那一段判定（含"多一条当证据"）在两支里
-/// 必须永远一致，分两处写就是本仓库一路在防的那件事（M5a/M5b 的做法）。
-pub fn search_page_walk<S: VersionedStore>(
-    store: &S,
-    include_deleted: bool,
-    pattern: Option<&[u8]>,
-    mode: KeyMatchMode,
-    skip: usize,
-    page_size: usize,
-    want_total: bool,
-) -> (Vec<ExportRecord>, bool, usize) {
-    if let SearchWalkOutcome::Completed { items, has_more, total } =
-        store.search_walk(include_deleted, pattern, mode, skip, page_size, want_total) {
-        return (items, has_more, total);
-    }
-    let (lo, hi) = search_bounds(pattern, mode);
-    let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
-    let mut items = Vec::with_capacity(page_size.min(crate::common::kernel::FOLD_CHUNK));
-    let seen = std::cell::Cell::new(0usize);
-    let retained = std::cell::Cell::new(0usize);
-    let mut has_more = false;
-    let total = fold_window_emit(
-        None,
-        |after, budget| store.scan_search_candidates(
-            lo, hi.as_deref(), Some(&accept), after, budget,
-            SearchRetention::new(include_deleted, skip.saturating_sub(seen.get()),
-                page_size.saturating_sub(retained.get()))),
-        |c| {
-            let row = match c.row {
-                SearchRow::Deferred(credential) => classify_search_value(
-                    store.materialize(credential),
-                    &mut SearchRetention::new(include_deleted, skip.saturating_sub(seen.get()),
-                        page_size.saturating_sub(retained.get()))),
-                row => row,
-            };
-            match row {
-                SearchRow::Excluded => None,
-                row => Some((c.key, row)),
-            }
-        },
-        |(key, row)| {
-            let next = seen.get() + 1;
-            seen.set(next);
-            if next <= skip { return true; }
-            match row {
-                SearchRow::Retained(logical) => {
-                    items.push(ExportRecord {
-                        key,
-                        expire_unix_secs: logical.as_ref()
-                            .and_then(|l| crate::common::codec::logical_expiry(l)),
-                        value: logical.and_then(logical_to_user),
-                    });
-                    retained.set(items.len());
-                    true
-                }
-                SearchRow::Counted => {
-                    has_more = true;
-                    want_total
-                }
-                SearchRow::Deferred(_) | SearchRow::Excluded => unreachable!(),
-            }
-        },
-    );
-    (items, has_more, total)
-}
-
-
-/// 游标式有界扫描：`after`（**不含**）之后最多 `limit` 行可见记录，返回 `(行, 下一页游标)`；
-/// 游标 `None` = 已经到底，调用方该停了。
-///
-/// 存在的理由是 README 里那句"扫描返回物化 `Vec`"的解药：`scan(start, None)` 会把**从 start
-/// 到库尾**的行全折出来（代价按剩余库量算），而翻页的人只要下一页。有了它，"把一个大库
-/// 一页一页搬完"不必先把整库物化 —— 每页只折 `limit + 1` 组。
-///
-/// ⚠️ 游标取的是**折出来的行**的键（包括刚好过期、对用户不可见的那些）：过期行也必须推进游标，
-/// 否则下一次又从同一批过期行撞起、永远走不动。墓碑在 `include_deleted = false` 的折叠里
-/// 整行不参与，库尾若剩一串墓碑会由"折不满一页"如实判成到底。
-pub fn scan_page<S: VersionedStore>(
-    store: &S,
-    after: Option<&[u8]>,
-    limit: usize,
-) -> (Vec<ExportRecord>, Option<Vec<u8>>) {
-    let now = now_unix_secs();
-    let (rows, more) = collect_rows(store, false, None, None, after, Some(limit.max(1)));
-    let mut out = Vec::new();
-    #[cfg(test)]
-    let reference = scan_cost_reference::enabled();
-    #[cfg(not(test))]
-    let reference = false;
-    let mut cursor = if more && !reference {
-        rows.last().map(|(key, _, _)| {
-            #[cfg(test)]
-            scan_cost_reference::note_page_cursor_copy();
-            key.clone()
-        })
-    } else { None };
-    for (key, _ver, raw) in rows {
-        if reference {
-            #[cfg(test)]
-            scan_cost_reference::note_page_cursor_copy();
-            cursor = Some(key.clone());
-        }
-        if let Some(record) = live_record_of_logical(key, raw, now) { out.push(record); }
-    }
-    (out, if more { cursor } else { None })
-}
-
-
-/// 从"某把键的可见逻辑行"造出对外那一行：墓碑 / 过期 / 读不到都返回 `None`。
-///
-/// 这是 `scan_foreach` 里那四行的镜像。之所以要抽出来：`seek_prev` 现在按**单键**问"这把键活着吗"，
-/// 那段判定再抄一遍就会出现"scan 认为它过期、seek_prev 认为它活着"这种两口不一致。
-pub fn live_record_of_logical(
-    key: Vec<u8>,
-    logical: Option<Vec<u8>>,
-    now: u64,
-) -> Option<ExportRecord> {
-    #[cfg(test)]
-    if scan_cost_reference::enabled() {
-        let bytes = logical?;
-        let m = crate::common::codec::decode_value_meta(&bytes);
-        if m.is_expired_at(now) { return None; }
-        crate::common::codec::note_user_value_copied();
-        return Some(ExportRecord { key, value: Some(m.user().to_vec()), expire_unix_secs: m.expire_unix_secs() });
-    }
-    let bytes = logical?;
-    let VisibleOwnedValue::Live { user, expire } = visible_owned_value(bytes, now) else {
-        return None;
-    };
-    Some(ExportRecord {
-        key,
-        value: Some(user),
-        // ⚠️ 这一行就是 0.5.0 的那件事：这条门是 export / migrate / 快照文件**共用**的出口，
-        // 以前只交 `m.user()` ⇒ 到期时刻在出口就被丢掉，导出去再导回来一律变永久。
-        expire_unix_secs: expire,
-    })
-}
+mod deferred_search_tests;
 
 #[cfg(test)]
-pub(crate) mod scan_cost_reference {
-    use std::{assert, cell::Cell, thread_local};
-    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
-    thread_local! { static KEY_COPIES: Cell<u64> = const { Cell::new(0) }; }
-    thread_local! { static FOLD_CURSOR_COPIES: Cell<u64> = const { Cell::new(0) }; }
-    thread_local! { static PAGE_CURSOR_COPIES: Cell<u64> = const { Cell::new(0) }; }
-    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
-    pub(crate) fn note_key_copy() { KEY_COPIES.with(|s| s.set(s.get() + 1)); }
-    pub(crate) fn key_copies() -> u64 { KEY_COPIES.with(Cell::get) }
-    pub(crate) fn note_fold_cursor_copy() { FOLD_CURSOR_COPIES.with(|s| s.set(s.get() + 1)); }
-    pub(crate) fn fold_cursor_copies() -> u64 { FOLD_CURSOR_COPIES.with(Cell::get) }
-    pub(crate) fn note_page_cursor_copy() { PAGE_CURSOR_COPIES.with(|s| s.set(s.get() + 1)); }
-    pub(crate) fn page_cursor_copies() -> u64 { PAGE_CURSOR_COPIES.with(Cell::get) }
-    pub(crate) struct Scope;
-    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|s| assert!(!s.replace(true))); Self } }
-    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|s| s.set(false)); } }
-}
-
-#[cfg(test)]
-#[test]
-fn live_owned_record_keeps_buffer_and_exact_ttl_with_old_control() {
-    use std::{assert_eq, assert_ne, vec};
-    use crate::common::codec::{pack_plain, pack_ttl};
-    for bytes in [vec![], vec![0], vec![1, 2], vec![2, 0, 1], pack_plain(&[0, 1, 255]),
-        pack_ttl(b"future", 101), pack_ttl(b"boundary", 100), pack_ttl(b"expired", 99)] {
-        let old = {
-            let _mode = scan_cost_reference::Scope::start();
-            let logical = bytes.clone();
-            let pointer = logical.as_ptr();
-            let record = live_record_of_logical(vec![0, 255], Some(logical), 100);
-            if let Some(record) = &record {
-                let value = record.value.as_ref().unwrap();
-                if !value.is_empty() { assert_ne!(value.as_ptr(), pointer, "old decoding must allocate a separate user value"); }
-            }
-            record
-        };
-        let pointer = bytes.as_ptr();
-        let new = live_record_of_logical(vec![0, 255], Some(bytes), 100);
-        if let Some(record) = &new { assert_eq!(record.value.as_ref().unwrap().as_ptr(), pointer); }
-        assert_eq!(new, old);
-    }
-    assert_eq!(live_record_of_logical(vec![], None, 100), None);
-}
-
-/// 界内**存活行**的流式扫描 —— 四家 `scan_foreach` 的唯一实现（M35 收拢）。
-///
-/// 四份原先是一字不差的四份复制（折叠 + `RowValue` 三态筛 + 剥壳 + 过期判定），而"存活"的
-/// 判据本来就只在 [`live_record_of_logical`] 一处定义 —— 判定抄四遍的意思是"改一处漏三处"，
-/// 而 `seek_prev` 与 `scan` 一旦对同一行给出不同答案，就是静默的数据不一致。
-///
-/// 语义与四份旧复制逐条相同：`include_deleted = false` ⇒ 墓碑与"读不到"都不参与，过期行同待；
-/// `f` 返回 `false` 当场收手，后面的键不再折（M27 那条流式兑现）。
-pub fn scan_live_records<S, F>(
-    store: &S,
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-    mut f: F,
-) where
-    S: VersionedStore,
-    F: FnMut(ExportRecord) -> bool,
-{
-    let now = now_unix_secs();
-    fold_rows_streaming(store, false, start, end, |key, _ver, value| {
-        let logical = match value {
-            RowValue::Value(bytes) => Some(bytes),
-            // 墓碑与"读不到"都不参与（include_deleted = false）
-            _ => None,
-        };
-        let Some(rec) = live_record_of_logical(key, logical, now) else {
-            return true;
-        };
-        f(rec)
-    });
-}
-
-/// **只数不物化**（M35）：界内"活着行数"，与 [`search_window`] 走同一条折叠、同一套判定，
-/// 但每行只判"算不算一条"，不把用户字节拷出来、不攒结果 `Vec`。
-///
-/// 为什么要有它：`key_count` 原先是 `prefix_scan(prefix).len()`，而 `search_keys` 要精确
-/// total 时是"把界内命中全物化成 `Vec<ExportRecord>` 再取 `len()`" —— 为数一个数把整库的键与值
-/// 都物化一遍（600k 档实测 `key_count` **2.36 s / 峰值 +123.7 MB**、`search 首页(要 total)`
-/// **2.05 s / +123.8 MB**，而免 total 只要 **1.2 ms**）。
-///
-/// ⚠️ 判据与 `search_window` 一字不差，所以两者对同一份库必然给出同一个数：
-/// `Missing` 不算；墓碑与**过期行**同待 —— 只在 `include_deleted` 时算一条。
-/// 过期这一判走 [`crate::common::codec::logical_is_live`]，那是 `decode_value_meta` 的
-/// 不拷贝版（`decode_value_meta` 会把 user 段 `to_vec()` 出来 ⇒ 数一个数要付两次堆分配）。
-///
-/// 落点是 [`crate::common::fold_window_emit`] 的返回值：它数的是"真交给 `emit` 的行数"，
-/// 也就是命中数 ⇒ 一份累加器都不需要。
-pub fn count_window<S: VersionedStore>(
-    store: &S,
-    include_deleted: bool,
-    pattern: Option<&[u8]>,
-    mode: KeyMatchMode,
-) -> usize {
-    if let SearchWalkOutcome::Completed { total, .. } =
-        store.search_walk(include_deleted, pattern, mode, 0, 0, true) {
-        return total;
-    }
-    let (lo, hi) = search_bounds(pattern, mode);
-    let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
-    fold_window_emit(
-        None,
-        |after, budget| store.scan_search_candidates(
-            lo, hi.as_deref(), Some(&accept), after, budget,
-            SearchRetention::new(include_deleted, 0, 0)),
-        |c| {
-            let row = match c.row {
-                SearchRow::Deferred(credential) => classify_search_value(
-                    store.materialize(credential), &mut SearchRetention::new(include_deleted, 0, 0)),
-                row => row,
-            };
-            match row { SearchRow::Excluded => None, _ => Some(()) }
-        },
-        |_| true,
-    )
-}
-
-
-/// 模式搜索 + 分页的公共入口；借用后端可直接消费已收齐组，保留共享的可见性和保留判据。
-///
-/// `need_total` 那一条分支是全部的差别，两支都走 [`search_page_walk`]（M75b 起只有一趟折叠）：
-/// - **不要 total**：`want_total = false` ⇒ 走到第 `page_size + 1` 条就收手。
-/// - **要 total**：`want_total = true` ⇒ 同一趟走完全界，`total` 与那一页来自**同一个瞬间**。
-///
-/// ⚠️ 这一格以前是"两步"（先取窗口、再 `count_window` 数全库），实测 600k 档
-/// ①只数 + ②只翻页 ≈ ③表里那一格（差 −3.7%~+5.3%）⇒ 同一次调用**走了两遍全库**。
-pub fn search_page<S: VersionedStore>(store: &S, query: &SearchQuery) -> SearchPage {
-    let page_size = query.page_size.max(1);
-    let skip = query.page.saturating_mul(page_size);
-    // M51：取那一页走**流式**（只留 `page_size` 行 + 一条"还有下一页"的证据），
-    // 不再把前面每一页都攒进 `Vec`。窗口那条"多要一条"的合同原样保留。
-    let (items, has_more, total) = search_page_walk(
-        store,
-        query.include_deleted,
-        Some(query.pattern.as_slice()),
-        query.mode,
-        skip,
-        page_size,
-        query.need_total,
-    );
-    crate::common::search_page_build(
-        items,
-        query.page,
-        page_size,
-        query.need_total.then_some(total),
-        has_more,
-    )
-}
+pub(crate) mod scan_cost_reference;
 
 // 测试专用：`seek_prev_with` 为了返回一行，往回退过几把键。
 //
@@ -862,47 +159,6 @@ pub fn search_page<S: VersionedStore>(store: &S, query: &SearchQuery) -> SearchP
 #[cfg(test)]
 thread_local! {
     static SEEK_PREV_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// 本线程 `seek_prev` 往回退过的键数（测试探针用）
-#[cfg(test)]
-pub fn seek_prev_steps() -> u64 {
-    SEEK_PREV_STEPS.with(|c| c.get())
-}
-
-/// `seek_prev` 的一份循环：**反向一步取候选键，判定复用引擎现成的单键路径**。
-///
-/// - `prev_raw(bound)`：编码键 `≤ bound` 的**最大那一行**属于哪把逻辑键；`None` = 走到库头了
-/// - `live(raw)`：这把键对**当前事务**可见、未过期、非墓碑时交出那一行（用
-///   [`live_record_of_logical`] 配引擎的 `latest_visible_raw`，别在这里另写判定）
-///
-/// 上界那两条规则都不显然：
-/// - 第一轮用 `version_key_upper_bound(key)` ⇒ 含 `key` **自己那一组**（语义是"≤ key"不是"< key"）；
-/// - 之后用被拒的那把 raw 本身当上界：它的每行都是 `raw ‖ version_be` > `raw` ⇒ 整组自动排除，
-///   而所有更小的键都还在。
-///
-/// ⚠️ "反向第一个见到的 raw 就是最大的那把键"依赖版本键的老合同 **`version < 2^56`**
-/// （见 [`crate::common::version_key_upper_bound`]）：首字节 0x00 小于任何 ASCII，短前缀键的版本行
-/// 才翻不到更长键之上。合同破了这里会**静默返回偏小的键** —— 那条合同自己有守卫，别拆。
-pub fn seek_prev_with(
-    at_or_below: &[u8],
-    mut prev_raw: impl FnMut(&[u8]) -> Option<Vec<u8>>,
-    mut live: impl FnMut(&[u8]) -> Option<ExportRecord>,
-) -> Option<ExportRecord> {
-    let mut bound = crate::common::version_key_upper_bound(at_or_below);
-    loop {
-        #[cfg(test)]
-        SEEK_PREV_STEPS.with(|c| c.set(c.get() + 1));
-        let raw = prev_raw(&bound)?;
-        if let Some(rec) = live(&raw) {
-            return Some(rec);
-        }
-        if raw.as_slice() >= bound.as_slice() {
-            // 只有某家的 `prev_raw` 没按界排除整组时才会走到这里；宁可返回 None 也不原地打转
-            return None;
-        }
-        bound = raw;
-    }
 }
 
 // 测试专用：`back_n_with` 走过的候选键数 / "退太多、让调用方回退"的次数。
@@ -916,76 +172,41 @@ thread_local! {
     static BACK_N_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// 本线程 `back_n_with` 走过的候选键数（测试探针用）
+// 按职责组织的内部实现；公开类型与原模块路径保持一致。
+mod export;
+mod reverse;
+mod scan;
+mod search;
+pub use export::collect_rows;
+pub use export::collect_rows_as;
+pub use export::export_rows_streaming;
+pub use export::fold_lower_bound;
+pub use export::fold_rows_streaming;
+pub use export::live_record_of_logical;
+pub use export::scan_live_records;
 #[cfg(test)]
-pub fn back_n_candidates() -> u64 {
-    BACK_N_CANDIDATES.with(|c| c.get())
-}
-
-/// 本线程 `back_n_with` 退过头、让调用方回退到全库截尾的次数（测试探针用）
+pub use reverse::back_n_candidates;
 #[cfg(test)]
-pub fn back_n_fallbacks() -> u64 {
-    BACK_N_FALLBACKS.with(|c| c.get())
-}
+pub use reverse::back_n_fallbacks;
+pub use reverse::back_n_with;
+#[cfg(test)]
+pub(crate) use reverse::note_reverse_candidate;
+#[cfg(test)]
+pub(crate) use reverse::note_reverse_fallback;
+#[cfg(test)]
+pub use reverse::seek_prev_steps;
+pub use reverse::seek_prev_with;
+pub use scan::scan_page;
+pub(crate) use search::classify_search_value;
+pub use search::count_window;
+#[cfg(test)]
+pub use search::owned_search_candidates;
+pub(crate) use search::retain_search_row;
+pub use search::search_bounds;
+pub use search::search_page;
+pub use search::search_page_rows;
+pub use search::search_page_walk;
+pub use search::search_window;
 
 #[cfg(test)]
-pub(crate) fn note_reverse_candidate() {
-    BACK_N_CANDIDATES.with(|c| c.set(c.get() + 1));
-    SEEK_PREV_STEPS.with(|c| c.set(c.get() + 1));
-}
-
-#[cfg(test)]
-pub(crate) fn note_reverse_fallback() {
-    BACK_N_FALLBACKS.with(|c| c.set(c.get() + 1));
-}
-
-/// 从库尾反向收集 `n` 条**逻辑键**（升序交出）—— `KvTxn::search_last_page` 的逐步退实现（M82）。
-///
-/// 与 [`seek_prev_with`] 同源（那条是"取 1 条"），推进规则也一样：每拿到一把键，就把**它本身**
-/// 当下一轮的上界 —— 版本键合同 `raw ‖ version_be > raw` ⇒ 同一把键的整组自动出局，不会在同一把
-/// 键的旧版本上打转（`find_back` 的 `excluded` 记的是**编码键**，按它拦不住同键旧版本）。
-///
-/// - `max_raw()`：库里**真实存在**的最大 raw_key（`None` = 空库 ⇒ 空页）。
-///   ⚠️ **不造 `\xFF…` 哨兵**：任意字节空间没有最大值，一个"足够长的 0xFF"上界在键更长时就会把
-///   库尾的键整批漏掉。让引擎交出自己索引里的尾键才是对的（三家都是 O(log n)：BTreeMap 的
-///   `next_back`、B+ 树的最右下降）。
-/// - `prev_raw(bound)` / `live(raw)`：与 [`seek_prev_with`] 的两个口子同义，**含端点**（`≤ bound`）。
-/// - 退过 `max_steps` 个候选还凑不满 `n` ⇒ 返回 `None`，调用方回退到 `reverse_scan` 截尾
-///   （慢，但正确）。这一支是给"库尾连着一大片墓碑/过期键"准备的形状，与 lsm 那条
-///   `LAST_PAGE_MAX_STEPS` 同一类问题、同一个界。
-pub fn back_n_with(
-    n: usize,
-    max_steps: usize,
-    max_raw: impl FnOnce() -> Option<Vec<u8>>,
-    mut prev_raw: impl FnMut(&[u8]) -> Option<Vec<u8>>,
-    mut live: impl FnMut(&[u8]) -> Option<ExportRecord>,
-) -> Option<Vec<ExportRecord>> {
-    let mut out: Vec<ExportRecord> = Vec::with_capacity(n.min(4096));
-    let Some(tail) = max_raw() else { return Some(out) };
-    // 第一轮上界含端点：`version_key_upper_bound` 让它覆盖尾键**自己那一组**（语义是"≤ 尾键"）
-    let mut bound = crate::common::version_key_upper_bound(&tail);
-    let mut steps = 0usize;
-    while out.len() < n {
-        let raw = prev_raw(&bound)?;
-        steps += 1;
-        #[cfg(test)]
-        BACK_N_CANDIDATES.with(|c| c.set(c.get() + 1));
-        if steps > max_steps {
-            #[cfg(test)]
-            BACK_N_FALLBACKS.with(|c| c.set(c.get() + 1));
-            return None;
-        }
-        if let Some(rec) = live(&raw) {
-            out.push(rec);
-            bound = raw;
-            continue;
-        }
-        if raw.as_slice() >= bound.as_slice() {
-            // 同 seek_prev_with：`prev_raw` 没按界排除整组时的兜底，宁可收尾也不原地打转
-            break;
-        }
-        bound = raw;
-    }
-    out.reverse(); // 收集是降序，`SearchPage::items` 的合同是升序
-    Some(out)
-}
+include!("store/visibility_tests.rs");

@@ -1,4 +1,4 @@
-//! Typed transaction outcomes. An uncertain commit must not be blindly retried.
+//! 事务结果由明确类型表达；不确定提交不能盲目重试。
 
 use std::{fmt, write};
 
@@ -22,22 +22,20 @@ impl std::error::Error for WriteError {}
 
 #[derive(Debug)]
 pub enum CommitError {
-    /// A write failed earlier. Roll back this transaction before retrying.
+    /// 本事务此前发生写入失败，重试前必须先回滚。
     WriteFailed(WriteError),
     TransactionClosed,
-    /// Commit record or fsync failed. The transaction remains invisible and
-    /// pins reclamation. Close all handles and reopen for WAL recovery.
+    /// 提交记录或同步失败时事务仍不可见，并阻止相关版本被回收；关闭全部句柄后重开，依靠 WAL 恢复。
     Indeterminate {
         version: u64,
         source: std::io::Error,
     },
-    /// WAL commit succeeded; an optional flush/checkpoint failed afterwards.
-    /// The transaction is committed. Do not retry its writes.
+    /// WAL 提交成功后，可选刷盘或 checkpoint 才失败；事务已经提交，不得重试其写入。
     CommittedMaintenance {
         version: u64,
         source: std::io::Error,
     },
-    /// A third-party KvTxn has not implemented a checked commit contract.
+    /// 第三方 KvTxn 尚未实现可返回错误的提交契约。
     Unsupported,
 }
 

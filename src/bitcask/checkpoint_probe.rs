@@ -1,4 +1,4 @@
-//! Opt-in, thread-local test instrumentation. Never compiled into the library.
+//! 显式启用的线程局部测试计量，不进入发布库。
 use std::{cell::RefCell, thread_local, time::Instant};
 
 #[derive(Clone, Default, Debug)]
@@ -31,15 +31,31 @@ impl Scope {
     }
 }
 impl Drop for Scope {
-    fn drop(&mut self) { ACTIVE.with(|slot| *slot.borrow_mut() = None); }
+    fn drop(&mut self) {
+        ACTIVE.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Stage { Checkpoint, Flush, Hint, Wal, Commit }
-pub(crate) struct Timer { stage: Stage, start: Instant }
+pub(crate) enum Stage {
+    Checkpoint,
+    Flush,
+    Hint,
+    Wal,
+    Commit,
+}
+pub(crate) struct Timer {
+    stage: Stage,
+    start: Instant,
+}
 impl Timer {
     pub fn start(stage: Stage) -> Option<Self> {
-        ACTIVE.with(|slot| slot.borrow().is_some().then(|| Self { stage, start: Instant::now() }))
+        ACTIVE.with(|slot| {
+            slot.borrow().is_some().then(|| Self {
+                stage,
+                start: Instant::now(),
+            })
+        })
     }
 }
 impl Drop for Timer {
@@ -48,7 +64,10 @@ impl Drop for Timer {
         ACTIVE.with(|slot| {
             if let Some(stats) = slot.borrow_mut().as_mut() {
                 match self.stage {
-                    Stage::Checkpoint => { stats.checkpoints += 1; stats.checkpoint_ns += elapsed; }
+                    Stage::Checkpoint => {
+                        stats.checkpoints += 1;
+                        stats.checkpoint_ns += elapsed;
+                    }
                     Stage::Flush => stats.flush_ns += elapsed,
                     Stage::Hint => stats.hint_ns += elapsed,
                     Stage::Wal => stats.wal_ns += elapsed,

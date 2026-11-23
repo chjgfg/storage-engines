@@ -1,7 +1,7 @@
 //! 教学用 Bitcask 存储引擎 + MVCC 事务层。
 //!
 //! - [`bitcask`]：append-only 日志 + 内存 KeyDir + hint 快启动（可多分片）
-//! - [`mvcc`]：快照隔离事务 / WAL / vacuum / bulk load
+//! - [`bitcask_mvcc`]：快照隔离事务 / WAL / vacuum / bulk load
 //! - [`kv_ops`]：批量 / 范围 / 搜索分页 / 元数据 / TTL（`Transaction` 扩展）
 //! - [`wal`] / [`storage`] / [`error`]
 

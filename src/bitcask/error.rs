@@ -1,8 +1,8 @@
-//! 统一错误类型
+//! 本文件负责统一门面的错误类型。
 
-use std::write;
 use std::fmt;
 use std::io;
+use std::write;
 
 /// 引擎统一错误
 #[derive(Debug)]

@@ -10,13 +10,13 @@
 
 use std::assert;
 use std::assert_eq;
+use std::format;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::thread_local;
 use std::vec;
-use std::format;
-use std::path::{Path, PathBuf};
 
-pub use crate::common::disk::{crc32, DiskFile, FileLock};
+pub use crate::common::disk::{DiskFile, FileLock, crc32};
 
 // M53 的站点账（不是公开 API，只在 crate 内用于记账）
 use crate::common::disk::{SITE_BLOB, SITE_BPLUS_DBLWR, SITE_BPLUS_FREELIST};
@@ -31,78 +31,6 @@ pub const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 /// 页头魔数 "BPG1"
 pub const PAGE_MAGIC: u32 = u32::from_le_bytes(*b"BPG1");
 
-
-// ─── 页头 pack / unpack ─────────────────────────────────────────────────────
-
-/// 把 payload 打成带 CRC 的完整页（4KB）
-///
-/// 布局：
-/// ```text
-/// 0..4   magic  "BPG1"
-/// 4..8   page_id (u32 LE，页号高 32 位必须为 0，教学简化)
-/// 8..12  crc32(payload)
-/// 12..16 reserved
-/// 16..4096 payload（不足补 0）
-/// ```
-pub fn pack_page(page_id: u64, payload: &[u8]) -> Vec<u8> {
-    assert!(payload.len() <= PAGE_PAYLOAD_SIZE, "payload 超过页载荷上限");
-    let mut page = vec![0u8; PAGE_SIZE];
-    page[0..4].copy_from_slice(&PAGE_MAGIC.to_le_bytes());
-    page[4..8].copy_from_slice(&(page_id as u32).to_le_bytes());
-    // reserved 先置 0
-    let mut body = [0u8; PAGE_PAYLOAD_SIZE];
-    body[..payload.len()].copy_from_slice(payload);
-    let checksum = crc32(&body);
-    page[8..12].copy_from_slice(&checksum.to_le_bytes());
-    page[PAGE_HEADER_SIZE..].copy_from_slice(&body);
-    page
-}
-
-/// 校验并拆页，返回 (page_id, payload_owned)
-pub fn unpack_page(raw: &[u8]) -> Result<(u64, Vec<u8>), String> {
-    if raw.len() != PAGE_SIZE {
-        return Err(format!("页长度错误: {} != {}", raw.len(), PAGE_SIZE));
-    }
-    let magic = u32::from_le_bytes(raw[0..4].try_into().unwrap());
-    if magic != PAGE_MAGIC {
-        // 全 0 页视为空页（新分配尚未写有效数据）
-        if raw.iter().all(|&b| b == 0) {
-            return Ok((0, vec![0u8; PAGE_PAYLOAD_SIZE]));
-        }
-        return Err(format!("页魔数错误: {magic:#x}"));
-    }
-    let page_id = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as u64;
-    let expect_crc = u32::from_le_bytes(raw[8..12].try_into().unwrap());
-    let payload = &raw[PAGE_HEADER_SIZE..];
-    let actual_crc = crc32(payload);
-    if expect_crc != actual_crc {
-        return Err(format!(
-            "页 CRC 校验失败 page_id={page_id}: expect={expect_crc:#x} actual={actual_crc:#x}"
-        ));
-    }
-    Ok((page_id, payload.to_vec()))
-}
-
-/// 只校验 CRC，不拆 payload
-pub(crate) fn maintenance_payload(raw: &[u8], wanted: u64) -> std::io::Result<&[u8]> {
-    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
-    if raw.len() != PAGE_SIZE || raw[..4] != PAGE_MAGIC.to_le_bytes() {
-        return Err(invalid("maintenance page is missing or has an invalid magic"));
-    }
-    let found = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as u64;
-    if found != wanted { return Err(invalid("maintenance page identity mismatch")); }
-    let payload = &raw[PAGE_HEADER_SIZE..];
-    let expected = u32::from_le_bytes(raw[8..12].try_into().unwrap());
-    if crc32(payload) != expected { return Err(invalid("maintenance page CRC mismatch")); }
-    Ok(payload)
-}
-
-/// 只校验 CRC，不拆 payload
-pub fn verify_page(raw: &[u8]) -> bool {
-    unpack_page(raw).is_ok()
-}
-
-
 // ─── 双写缓冲（Double Write Buffer）────────────────────────────────────────
 //
 // 防 torn page：先把整页原子地写到 dblwr 文件并 fsync，再写主文件。
@@ -116,7 +44,11 @@ const DBLWR_HEADER_SIZE: usize = 16;
 pub const DBLWR_MAX_PAGES: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DblwrState { Unknown, DurableEmpty, Published }
+enum DblwrState {
+    Unknown,
+    DurableEmpty,
+    Published,
+}
 
 pub struct DoubleWriteBuffer {
     file: DiskFile,
@@ -124,207 +56,7 @@ pub struct DoubleWriteBuffer {
 }
 
 #[cfg(test)]
-pub(crate) mod dblwr_probe {
-    use std::{assert, assert_eq, cell::Cell, thread_local};
-    thread_local! {
-        static REFERENCE: Cell<bool> = const { Cell::new(false) };
-        static PAYLOAD_WRITES: Cell<u64> = const { Cell::new(0) };
-        static FAULT: Cell<u8> = const { Cell::new(0) };
-    }
-    pub fn reference() -> bool { REFERENCE.with(|c| c.get()) }
-    pub fn writes() -> u64 { PAYLOAD_WRITES.with(|c| c.get()) }
-    pub fn note_write() { PAYLOAD_WRITES.with(|c| c.set(c.get() + 1)); }
-    // 1..3 double-write, 4 main write, 5 main sync, 6 freelist write, 7 freelist sync.
-    pub fn fail_at(at: u8) -> std::io::Result<()> {
-        if FAULT.with(|c| c.get() == at && c.replace(0) == at) {
-            return Err(std::io::Error::other("injected double-write interruption"));
-        }
-        Ok(())
-    }
-    pub struct Scope;
-    impl Scope {
-        pub fn start() -> Self { REFERENCE.with(|c| assert!(!c.replace(true))); Self }
-        pub fn fault(at: u8) -> Self { FAULT.with(|c| assert_eq!(c.replace(at), 0)); Self }
-    }
-    impl Drop for Scope {
-        fn drop(&mut self) { REFERENCE.with(|c| c.set(false)); FAULT.with(|c| c.set(0)); }
-    }
-}
-
-impl DoubleWriteBuffer {
-    pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let mut file = DiskFile::open(path)?;
-        let mut state = DblwrState::Unknown;
-        if file.len()? == 0 {
-            // 初始化空 header
-            let mut hdr = vec![0u8; DBLWR_HEADER_SIZE];
-            hdr[0..8].copy_from_slice(DBLWR_MAGIC);
-            file.write_all_at(0, &hdr)?;
-            file.sync_at(SITE_BPLUS_DBLWR)?;
-            state = DblwrState::DurableEmpty;
-        }
-        Ok(Self { file, state })
-    }
-
-    /// 把一批**已 pack** 的完整页写入双写区并 fsync
-    pub fn write_batch(&mut self, pages: &[(u64, Vec<u8>)]) -> std::io::Result<()> {
-        assert!(pages.len() <= DBLWR_MAX_PAGES);
-        for (_, p) in pages {
-            assert_eq!(p.len(), PAGE_SIZE);
-        }
-
-        let mut hdr = vec![0u8; DBLWR_HEADER_SIZE];
-        hdr[0..8].copy_from_slice(DBLWR_MAGIC);
-        hdr[8..12].copy_from_slice(&(pages.len() as u32).to_le_bytes());
-
-        #[cfg(test)]
-        let reference = dblwr_probe::reference();
-        #[cfg(not(test))]
-        let reference = false;
-        // Only an acknowledged clear/initialization proves the header durably
-        // empty. Reopen and every partial write use the conservative reset.
-        let reset = self.state != DblwrState::DurableEmpty || reference;
-        self.state = DblwrState::Unknown;
-        if reset {
-            #[cfg(test)]
-            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrReset);
-            let mut zero_hdr = hdr.clone();
-            zero_hdr[8..12].copy_from_slice(&0u32.to_le_bytes());
-            self.file.write_all_at(0, &zero_hdr)?;
-            self.file.sync_at(SITE_BPLUS_DBLWR)?;
-        }
-        {
-            #[cfg(test)]
-            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrData);
-            // One bounded contiguous write; the existing on-disk slots and
-            // publication barriers remain identical (at most 64 pages).
-            let slot_size = 8 + PAGE_SIZE;
-            if reference {
-                for (i, (page_id, page)) in pages.iter().enumerate() {
-                    let mut slot = Vec::with_capacity(slot_size);
-                    slot.extend_from_slice(&page_id.to_le_bytes());
-                    slot.extend_from_slice(page);
-                    #[cfg(test)]
-                    dblwr_probe::note_write();
-                    self.file.write_all_at((DBLWR_HEADER_SIZE + i * slot_size) as u64, &slot)?;
-                }
-            } else {
-                let mut payload = Vec::with_capacity(pages.len() * slot_size);
-                for (page_id, page) in pages {
-                    payload.extend_from_slice(&page_id.to_le_bytes());
-                    payload.extend_from_slice(page);
-                }
-                if !payload.is_empty() {
-                    #[cfg(test)]
-                    dblwr_probe::note_write();
-                    self.file.write_all_at(DBLWR_HEADER_SIZE as u64, &payload)?;
-                }
-            }
-            self.file.sync_at(SITE_BPLUS_DBLWR)?;
-        }
-        #[cfg(test)]
-        dblwr_probe::fail_at(1)?;
-        {
-            #[cfg(test)]
-            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrPublish);
-            self.file.write_all_at(0, &hdr)?;
-            #[cfg(test)]
-            dblwr_probe::fail_at(2)?;
-            self.file.sync_at(SITE_BPLUS_DBLWR)?;
-        }
-        self.state = DblwrState::Published;
-        Ok(())
-    }
-
-    /// 读取 batch 中的有效页（page_id, raw_page）
-    pub fn read_batch(&mut self) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
-        let len = self.file.len()?;
-        if len < DBLWR_HEADER_SIZE as u64 {
-            return Ok(Vec::new());
-        }
-        let mut hdr = vec![0u8; DBLWR_HEADER_SIZE];
-        self.file.read_exact_at(0, &mut hdr)?;
-        if &hdr[0..8] != DBLWR_MAGIC {
-            return Ok(Vec::new());
-        }
-        let count = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
-        if count == 0 || count > DBLWR_MAX_PAGES {
-            return Ok(Vec::new());
-        }
-
-        let slot_size = 8 + PAGE_SIZE;
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let offset = (DBLWR_HEADER_SIZE + i * slot_size) as u64;
-            if offset + slot_size as u64 > len {
-                break;
-            }
-            let mut slot = vec![0u8; slot_size];
-            self.file.read_exact_at(offset, &mut slot)?;
-            let page_id = u64::from_le_bytes(slot[0..8].try_into().unwrap());
-            let page = slot[8..].to_vec();
-            // 只接受 CRC 合法的页
-            if verify_page(&page) {
-                out.push((page_id, page));
-            }
-        }
-        Ok(out)
-    }
-
-    /// 清空 batch（flush 主文件成功后调用）
-    pub fn clear(&mut self) -> std::io::Result<()> {
-        #[cfg(test)]
-        let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::DblwrClear);
-        self.state = DblwrState::Unknown;
-        let mut hdr = vec![0u8; DBLWR_HEADER_SIZE];
-        hdr[0..8].copy_from_slice(DBLWR_MAGIC);
-        // count = 0
-        self.file.write_all_at(0, &hdr)?;
-        #[cfg(test)]
-        dblwr_probe::fail_at(3)?;
-        self.file.sync_at(SITE_BPLUS_DBLWR)?;
-        self.state = DblwrState::DurableEmpty;
-        Ok(())
-    }
-}
-
-// ─── 路径辅助 ───────────────────────────────────────────────────────────────
-
-/// `data.db` → `data.db.dblwr`
-pub fn dblwr_path(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_os_string();
-    s.push(".dblwr");
-    PathBuf::from(s)
-}
-
-/// `data.db` → `data.db.wal`
-pub fn wal_path(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_os_string();
-    s.push(".wal");
-    PathBuf::from(s)
-}
-
-/// `data.db` → `data.db.freelist`
-pub fn freelist_path(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_os_string();
-    s.push(".freelist");
-    PathBuf::from(s)
-}
-
-/// `data.db` → `data.db.lock`
-pub fn lock_path(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_os_string();
-    s.push(".lock");
-    PathBuf::from(s)
-}
-
-/// `data.db` → `data.db.blob`
-pub fn blob_path(db_path: &Path) -> PathBuf {
-    let mut s = db_path.as_os_str().to_os_string();
-    s.push(".blob");
-    PathBuf::from(s)
-}
-
+pub(crate) mod dblwr_probe;
 
 // ─── 大 value Blob 存储（append-only）──────────────────────────────────────
 //
@@ -351,180 +83,6 @@ pub struct BlobStore {
     file: DiskFile,
 }
 
-impl BlobStore {
-    pub fn open(db_path: &Path) -> std::io::Result<Self> {
-        let path = blob_path(db_path);
-        let mut file = DiskFile::open(&path)?;
-        if file.len()? == 0 {
-            file.write_all_at(0, BLOB_MAGIC)?;
-            file.sync_at(SITE_BLOB)?;
-        } else {
-            let mut magic = [0u8; 8];
-            file.read_exact_at(0, &mut magic)?;
-            if &magic != BLOB_MAGIC {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("非法 blob 文件: {}", path.display()),
-                ));
-            }
-        }
-        Ok(Self { file })
-    }
-
-    /// 追加一条 blob，返回文件内 offset（记录起点）
-    pub fn append(&mut self, data: &[u8]) -> std::io::Result<u64> {
-        let offset = self.file.len()?;
-        let checksum = crc32(data);
-        let mut rec = Vec::with_capacity(8 + data.len());
-        rec.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        rec.extend_from_slice(&checksum.to_le_bytes());
-        rec.extend_from_slice(data);
-        self.file.write_all_at(offset, &rec)?;
-        Ok(offset)
-    }
-
-    pub fn sync(&mut self) -> std::io::Result<()> {
-        self.file.sync_at(SITE_BLOB)
-    }
-
-    /// 按 offset 读取 blob 记录
-    pub fn read_at(&mut self, offset: u64) -> std::io::Result<Vec<u8>> {
-        let mut hdr = [0u8; 8];
-        self.file.read_exact_at(offset, &mut hdr)?;
-        let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
-        let expect_crc = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-        if len > 64 * 1024 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "blob 长度异常",
-            ));
-        }
-        let mut data: Vec<u8> = vec![0u8; len];
-        if len > 0 {
-            self.file.read_exact_at(offset + 8, &mut data)?;
-        }
-        if crc32(&data) != expect_crc {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "blob CRC 失败",
-            ));
-        }
-        Ok(data)
-    }
-
-    pub fn path(&self) -> &Path {
-        self.file.path()
-    }
-
-    /// 在**已打开**的同一文件上原地重写全部 blob 内容，返回新 offsets。
-    pub fn rewrite_in_place(&mut self, values: &[Vec<u8>]) -> std::io::Result<Vec<u64>> {
-        self.file.set_len(0)?;
-        self.file.write_all_at(0, BLOB_MAGIC)?;
-        let mut offset = BLOB_MAGIC.len() as u64;
-        let mut offsets = Vec::with_capacity(values.len());
-        for v in values {
-            let checksum = crc32(v);
-            let mut rec = Vec::with_capacity(8 + v.len());
-            rec.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            rec.extend_from_slice(&checksum.to_le_bytes());
-            rec.extend_from_slice(v);
-            self.file.write_all_at(offset, &rec)?;
-            offsets.push(offset);
-            offset += rec.len() as u64;
-        }
-        // 截断到实际长度（去掉旧文件尾部垃圾）
-        self.file.set_len(offset)?;
-        self.file.sync_at(SITE_BLOB)?;
-        Ok(offsets)
-    }
-
-    /// 清空为仅魔数
-    pub fn clear_in_place(&mut self) -> std::io::Result<()> {
-        self.rewrite_in_place(&[])?;
-        Ok(())
-    }
-
-    /// 写入全新 blob 文件到 `*.blob.new`（不碰正在打开的旧文件），返回 (new_path, offsets)
-    pub fn write_new_blob_file(
-        db_path: &Path,
-        values: &[Vec<u8>],
-    ) -> std::io::Result<(PathBuf, Vec<u64>)> {
-        let final_path = blob_path(db_path);
-        let mut new_path = final_path.as_os_str().to_os_string();
-        new_path.push(".new");
-        let new_path = PathBuf::from(new_path);
-        let _ = std::fs::remove_file(&new_path);
-
-        let mut file = DiskFile::open(&new_path)?;
-        file.set_len(0)?;
-        file.write_all_at(0, BLOB_MAGIC)?;
-        let mut offsets = Vec::with_capacity(values.len());
-        for v in values {
-            let offset = file.len()?;
-            let checksum = crc32(v);
-            let mut rec = Vec::with_capacity(8 + v.len());
-            rec.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            rec.extend_from_slice(&checksum.to_le_bytes());
-            rec.extend_from_slice(v);
-            file.write_all_at(offset, &rec)?;
-            offsets.push(offset);
-        }
-        file.sync_at(SITE_BLOB)?;
-        drop(file);
-        Ok((new_path, offsets))
-    }
-
-    /// 关闭旧句柄后，将 `*.blob.new` 替换为 `*.blob` 并重新 open
-    pub fn install_new_blob_file(db_path: &Path, new_path: &Path) -> std::io::Result<Self> {
-        let final_path = blob_path(db_path);
-        if final_path.exists() {
-            std::fs::remove_file(&final_path)?;
-        }
-        std::fs::rename(new_path, &final_path)?;
-        BlobStore::open(db_path)
-    }
-
-    /// 用新文件替换（调用方须已 drop 旧 BlobStore）
-    pub fn replace_with_values(
-        db_path: &Path,
-        values: &[Vec<u8>],
-    ) -> std::io::Result<(Self, Vec<u64>)> {
-        let (new_path, offsets) = Self::write_new_blob_file(db_path, values)?;
-        let store = Self::install_new_blob_file(db_path, &new_path)?;
-        Ok((store, offsets))
-    }
-
-    /// 清空并重建为空 blob 文件（无大 value 引用时）
-    pub fn reset_empty(db_path: &Path) -> std::io::Result<Self> {
-        let path = blob_path(db_path);
-        let _ = std::fs::remove_file(&path);
-        BlobStore::open(db_path)
-    }
-}
-
-/// 把逻辑 value 编码为叶子存储形式（可能写 blob）
-pub fn encode_stored_value(
-    blob: &mut BlobStore,
-    value: Vec<u8>,
-    sync_blob: bool,
-) -> std::io::Result<Vec<u8>> {
-    if value.len() <= BLOB_THRESHOLD {
-        let mut out = Vec::with_capacity(1 + value.len());
-        out.push(VAL_TAG_INLINE);
-        out.extend_from_slice(&value);
-        return Ok(out);
-    }
-    let offset = blob.append(&value)?;
-    if sync_blob {
-        blob.sync()?; // BlobStore::sync 内部已经记 SITE_BLOB 这一格
-    }
-    let mut out = Vec::with_capacity(1 + 8 + 4);
-    out.push(VAL_TAG_BLOB);
-    out.extend_from_slice(&offset.to_le_bytes());
-    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    Ok(out)
-}
-
 // 测试专用：本线程的 value 解码次数。
 //
 // B+ 树没有独立键索引，全库折叠的**页读取**次数省不掉；能省的是「每行一次 value 解码」
@@ -533,40 +91,6 @@ pub fn encode_stored_value(
 #[cfg(test)]
 thread_local! {
     static VALUE_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// 当前线程已发生的 value 解码次数（测试探针用）
-#[cfg(test)]
-pub(crate) fn value_decodes() -> u64 {
-    VALUE_DECODES.with(|c| c.get())
-}
-
-/// 叶子存储形式 → 逻辑 value
-pub fn decode_stored_value(
-    blob: &mut BlobStore,
-    stored: &[u8],
-) -> std::io::Result<Option<Vec<u8>>> {
-    #[cfg(test)]
-    VALUE_DECODES.with(|c| c.set(c.get() + 1));
-    if stored.is_empty() {
-        return Ok(None);
-    }
-    match stored[0] {
-        VAL_TAG_INLINE => Ok(Some(stored[1..].to_vec())),
-        VAL_TAG_BLOB => {
-            if stored.len() < 1 + 8 + 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "blob 引用截断",
-                ));
-            }
-            let offset = u64::from_le_bytes(stored[1..9].try_into().unwrap());
-            let _len = u32::from_le_bytes(stored[9..13].try_into().unwrap());
-            Ok(Some(blob.read_at(offset)?))
-        }
-        // 兼容旧数据：无 tag 的裸 value 当内联
-        _ => Ok(Some(stored.to_vec())),
-    }
 }
 
 // ─── 空闲页列表文件（完整持久化，不受 meta 页容量限制）────────────────────
@@ -581,318 +105,36 @@ pub fn decode_stored_value(
 
 const FREELIST_MAGIC: &[u8; 8] = b"FREE0001";
 
-/// 把全部空闲页号写入 sidecar 文件并 fsync
-pub fn write_freelist(path: &Path, free_ids: &[u64]) -> std::io::Result<()> {
-    FreelistWriter::open(path)?.write(free_ids.iter().copied())
-}
-
-/// Reuse the sidecar handle; each publication still ends with fsync. The on-disk
-/// FREE0001 format and its CRC remain compatible with write_freelist/read_freelist.
+/// 复用旁文件句柄，每次发布仍以同步结束；FREE0001 格式和 CRC 与原空闲清单读写兼容。
 pub(crate) struct FreelistWriter {
     file: DiskFile,
     len: u64,
 }
 
-impl FreelistWriter {
-    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
-        #[cfg(test)]
-        let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistOpen);
-        let file = DiskFile::open(path)?;
-        let len = file.len()?;
-        Ok(Self { file, len })
-    }
-
-    pub(crate) fn write(&mut self, ids: impl ExactSizeIterator<Item = u64>) -> std::io::Result<()> {
-        #[cfg(test)]
-        let encode = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistEncode);
-        let count = ids.len();
-        let mut buf = Vec::with_capacity(20 + count * 8);
-        buf.extend_from_slice(FREELIST_MAGIC);
-        buf.extend_from_slice(&(count as u64).to_le_bytes());
-        buf.extend_from_slice(&[0; 4]);
-        for id in ids { buf.extend_from_slice(&id.to_le_bytes()); }
-        let checksum = crc32(&buf[20..]);
-        buf[16..20].copy_from_slice(&checksum.to_le_bytes());
-        #[cfg(test)]
-        drop(encode);
-        let new_len = buf.len() as u64;
-        {
-            #[cfg(test)]
-            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistWrite);
-            #[cfg(test)]
-            dblwr_probe::fail_at(6)?;
-            self.file.write_all_at(0, &buf)?;
-            // Overwrite first; truncate only a shrinking tail, never to zero.
-            if new_len < self.len { self.file.set_len(new_len)?; }
-        }
-        {
-            #[cfg(test)]
-            let _timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::FreelistSync);
-            #[cfg(test)]
-            dblwr_probe::fail_at(7)?;
-            self.file.sync_at(SITE_BPLUS_FREELIST)?;
-        }
-        self.len = new_len;
-        Ok(())
-    }
-}
-
-/// 读取 sidecar 空闲页列表；文件不存在返回 Ok(None)
-pub fn read_freelist(path: &Path) -> std::io::Result<Option<Vec<u64>>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let mut file = match DiskFile::open_existing(path)? {
-        Some(f) => f,
-        None => return Ok(None),
-    };
-    let len = file.len()?;
-    if len < 20 {
-        return Ok(None);
-    }
-    let mut hdr = [0u8; 20];
-    file.read_exact_at(0, &mut hdr)?;
-    if &hdr[0..8] != FREELIST_MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "freelist 魔数错误",
-        ));
-    }
-    let count = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
-    let expect_crc = u32::from_le_bytes(hdr[16..20].try_into().unwrap());
-    let need = 20 + count * 8;
-    if len < need as u64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "freelist 文件截断",
-        ));
-    }
-    let mut body = vec![0u8; count * 8];
-    if count > 0 {
-        file.read_exact_at(20, &mut body)?;
-    }
-    if crc32(&body) != expect_crc {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "freelist CRC 校验失败",
-        ));
-    }
-    let mut ids = Vec::with_capacity(count);
-    for chunk in body.chunks_exact(8) {
-        ids.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    Ok(Some(ids))
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn test_crc32_known() {
-        // "123456789" 的 IEEE CRC32 = 0xCBF43926
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-    }
-
-    #[test]
-    fn test_pack_unpack_roundtrip() {
-        let payload = b"hello b+tree page";
-        let page = pack_page(7, payload);
-        assert_eq!(page.len(), PAGE_SIZE);
-        let (id, body) = unpack_page(&page).unwrap();
-        assert_eq!(id, 7);
-        assert_eq!(&body[..payload.len()], payload);
-    }
-
-    #[test]
-    fn test_crc_detects_corruption() {
-        let mut page = pack_page(1, b"data");
-        page[100] ^= 0xFF; // 破坏 payload
-        assert!(unpack_page(&page).is_err());
-    }
-
-    #[test]
-    fn test_disk_file_rw() {
-        let path = std::env::temp_dir().join(format!(
-            "storage_test_{}.bin",
-            std::process::id()
-        ));
-        {
-            let mut f = DiskFile::open(&path).unwrap();
-            f.write_all_at(0, b"abcdef").unwrap();
-            f.sync().unwrap();
-            let mut buf = [0u8; 6];
-            f.read_exact_at(0, &mut buf).unwrap();
-            assert_eq!(&buf, b"abcdef");
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_dblwr_batch() {
-        let path = std::env::temp_dir().join(format!(
-            "dblwr_test_{}.bin",
-            std::process::id()
-        ));
-        {
-            let mut dw = DoubleWriteBuffer::open(&path).unwrap();
-            let p1 = pack_page(1, b"aaa");
-            let p2 = pack_page(2, b"bbb");
-            dw.write_batch(&[(1, p1.clone()), (2, p2.clone())])
-                .unwrap();
-            let batch = dw.read_batch().unwrap();
-            assert_eq!(batch.len(), 2);
-            assert_eq!(batch[0].0, 1);
-            assert_eq!(batch[1].0, 2);
-            dw.clear().unwrap();
-            assert!(dw.read_batch().unwrap().is_empty());
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn dblwr_durable_empty_does_not_repeat_invalidation_sync() {
-        use crate::common::disk::fsync_counts;
-        let path = crate::common::ScratchPath::new("bplus", "dblwr_empty", ".bin");
-        let mut dw = DoubleWriteBuffer::open(&path).unwrap();
-        let pages = vec![(7, pack_page(7, b"new page"))];
-        let before = fsync_counts()[SITE_BPLUS_DBLWR];
-        dw.write_batch(&pages).unwrap();
-        assert_eq!(dw.read_batch().unwrap(), pages);
-        dw.clear().unwrap();
-        assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3,
-            "durably empty header needs payload/publish/clear sync only");
-    }
-
-    #[test]
-    fn dblwr_reopen_and_interrupted_writes_require_reset() {
-        use crate::common::disk::fsync_counts;
-        let path = crate::common::ScratchPath::new("bplus", "dblwr_states", ".bin");
-        let pages = vec![(7, pack_page(7, b"live page"))];
-        {
-            let mut dw = DoubleWriteBuffer::open(&path).unwrap();
-            dw.write_batch(&pages).unwrap();
-        }
-        let mut dw = DoubleWriteBuffer::open(&path).unwrap();
-        assert_eq!(dw.state, DblwrState::Unknown);
-        assert_eq!(dw.read_batch().unwrap(), pages, "reopen must retain recoverable pages");
-        let before = fsync_counts()[SITE_BPLUS_DBLWR];
-        dw.write_batch(&pages).unwrap();
-        assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3);
-        // A published batch without an acknowledged clear also needs reset.
-        let before = fsync_counts()[SITE_BPLUS_DBLWR];
-        dw.write_batch(&pages).unwrap();
-        assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3);
-        for fault in 1..=3 {
-            dw.clear().unwrap();
-            {
-                let _fault = dblwr_probe::Scope::fault(fault);
-                if fault == 3 {
-                    dw.write_batch(&pages).unwrap();
-                    assert!(dw.clear().is_err());
-                } else {
-                    assert!(dw.write_batch(&pages).is_err());
-                }
-            }
-            assert_eq!(dw.state, DblwrState::Unknown);
-            if fault == 1 { assert!(dw.read_batch().unwrap().is_empty()); }
-            if fault == 2 { assert_eq!(dw.read_batch().unwrap(), pages); }
-            let before = fsync_counts()[SITE_BPLUS_DBLWR];
-            dw.write_batch(&pages).unwrap();
-            assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - before, 3);
-            assert_eq!(dw.read_batch().unwrap(), pages);
-        }
-    }
-
-    #[test]
-    fn dblwr_batches_payload_and_preserves_slots() {
-        use crate::common::disk::fsync_counts;
-        let path = crate::common::ScratchPath::new("bplus", "dblwr_slots", ".bin");
-        let mut dw = DoubleWriteBuffer::open(&path).unwrap();
-        for reference in [true, false] {
-            let _mode = reference.then(dblwr_probe::Scope::start);
-            for len in [0, 1, DBLWR_MAX_PAGES] {
-                dw.clear().unwrap();
-                let pages: Vec<_> = (0..len).map(|i| ((i * 3) as u64, pack_page((i * 3) as u64, &[i as u8; 97]))).collect();
-                let writes = dblwr_probe::writes();
-                let syncs = fsync_counts()[SITE_BPLUS_DBLWR];
-                dw.write_batch(&pages).unwrap();
-                assert_eq!(dw.read_batch().unwrap(), pages);
-                assert_eq!(dblwr_probe::writes() - writes, if reference { len as u64 } else { u64::from(len > 0) });
-                assert_eq!(fsync_counts()[SITE_BPLUS_DBLWR] - syncs, if reference { 3 } else { 2 });
-            }
-        }
-    }
-
-    #[test]
-    fn freelist_writer_reuses_handle_and_preserves_exact_layout() {
-        use crate::common::disk::{file_opens, fsync_counts};
-        use crate::common::maintenance_probe::{Scope, Stage};
-        let path = crate::common::ScratchPath::new("storage", "freelist_writer", ".bin");
-        let before = file_opens();
-        let probe = Scope::start();
-        let mut writer = FreelistWriter::open(&path).unwrap();
-        for count in [256_u64, 3, 0, 129, 1] {
-            let ids: Vec<u64> = (1..count + 1).collect();
-            let syncs = fsync_counts()[SITE_BPLUS_FREELIST];
-            let opens = file_opens();
-            writer.write(ids.iter().copied()).unwrap();
-            assert_eq!(file_opens(), opens);
-            assert_eq!(fsync_counts()[SITE_BPLUS_FREELIST] - syncs, 1);
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), 20 + count * 8);
-            assert_eq!(read_freelist(&path).unwrap().unwrap(), ids);
-            let bytes = std::fs::read(&path).unwrap();
-            let body: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
-            let mut expected = b"FREE0001".to_vec();
-            expected.extend_from_slice(&count.to_le_bytes());
-            expected.extend_from_slice(&crc32(&body).to_le_bytes());
-            expected.extend_from_slice(&body);
-            assert_eq!(bytes, expected);
-        }
-        assert_eq!(file_opens() - before, 6); // one writer, five independent readers
-        let stats = probe.stats();
-        assert_eq!(stats.calls[Stage::FreelistOpen as usize], 1);
-        assert_eq!(stats.calls[Stage::FreelistSync as usize], 5);
-        drop(probe); drop(writer);
-        write_freelist(&path, &[9, 5]).unwrap();
-        assert_eq!(read_freelist(&path).unwrap().unwrap(), vec![9, 5]);
-    }
-
-    #[test]
-    fn test_freelist_roundtrip() {
-        let path = std::env::temp_dir().join(format!(
-            "freelist_test_{}.bin",
-            std::process::id()
-        ));
-        let ids: Vec<u64> = (1..1000).collect();
-        write_freelist(&path, &ids).unwrap();
-        let loaded = read_freelist(&path).unwrap().unwrap();
-        assert_eq!(loaded, ids);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_blob_store_large_value() {
-        let db = std::env::temp_dir().join(format!("blob_db_{}", std::process::id()));
-        let _ = std::fs::remove_file(blob_path(&db));
-        let mut store = BlobStore::open(&db).unwrap();
-        let data = vec![7u8; 5000];
-        let off = store.append(&data).unwrap();
-        store.sync().unwrap();
-        let got = store.read_at(off).unwrap();
-        assert_eq!(got, data);
-
-        let stored = encode_stored_value(&mut store, data.clone(), true).unwrap();
-        assert_eq!(stored[0], VAL_TAG_BLOB);
-        let decoded = decode_stored_value(&mut store, &stored).unwrap().unwrap();
-        assert_eq!(decoded, data);
-
-        let small = encode_stored_value(&mut store, b"ok".to_vec(), false).unwrap();
-        assert_eq!(small[0], VAL_TAG_INLINE);
-        assert_eq!(
-            decode_stored_value(&mut store, &small).unwrap().unwrap(),
-            b"ok"
-        );
-        let _ = std::fs::remove_file(blob_path(&db));
-    }
-}
+// 按职责组织的内部实现；公开类型与原模块路径保持一致。
+mod blob;
+mod double_write;
+mod freelist;
+mod page_codec;
+mod paths;
+#[cfg(test)]
+mod probes;
+mod value_codec;
+pub use freelist::read_freelist;
+pub use freelist::write_freelist;
+pub(crate) use page_codec::maintenance_payload;
+pub use page_codec::pack_page;
+pub use page_codec::unpack_page;
+pub use page_codec::verify_page;
+pub use paths::blob_path;
+pub use paths::dblwr_path;
+pub use paths::freelist_path;
+pub use paths::lock_path;
+pub use paths::wal_path;
+#[cfg(test)]
+pub(crate) use probes::value_decodes;
+pub use value_codec::decode_stored_value;
+pub use value_codec::encode_stored_value;
