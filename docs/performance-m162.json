@@ -3554,7 +3554,7 @@
     }
   },
   "stopping_rule": {
-    "final_user_run": "仅再运行原正式默认五档一次，按源码/可执行指纹、132格/档、迁移重开及真实bounded删除判断。",
+    "final_user_run": "仅再运行原正式默认五档一次，不传ScratchRoot，沿用前两轮D盘data/bench-scratch；C盘仅用于专项与2k/3k设施验收。按源码/可执行指纹、132格/档、迁移重开及真实bounded删除判断。",
     "after_pass": "结束本轮性能优化，保留该版本使用；总耗时波动或新增更低优先级热点不自动开启下一轮改测。",
     "durability": "不能用取消同步、近似total或放宽正确性阈值换取性能通过。"
   },
