@@ -7292,9 +7292,9 @@ mod tests {
             eprintln!("SCALE_LSM_DELETE_STAGES phase={phase} cumulative=true delete_calls={} write_ms={:.3} threshold_flushes={} threshold_flush_ms={:.3} mem_wal_syncs={} mem_wal_sync_ms={:.3}",
                 s.delete_calls, s.delete_write_ns as f64 / 1e6, s.threshold_flushes,
                 s.threshold_flush_ns as f64 / 1e6, s.mem_wal_syncs, s.mem_wal_sync_ns as f64 / 1e6);
-            eprintln!("SCALE_LSM_STAGES phase={phase} merge_ms={:.3} repair_ms={:.3} manifest_ms={:.3} guard_ms={:.3} cleanup_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3}",
+            eprintln!("SCALE_LSM_STAGES phase={phase} merge_ms={:.3} repair_ms={:.3} manifest_ms={:.3} guard_ms={:.3} cleanup_ms={:.3} sst_finish_ms={:.3} sst_sync_ms={:.3} manifest_reuses={}",
                 s.merge_ns as f64 / 1e6, s.repair_ns as f64 / 1e6, s.manifest_ns as f64 / 1e6,
-                s.guard_ns as f64 / 1e6, s.cleanup_ns as f64 / 1e6, s.sst_finish_ns as f64 / 1e6, s.sst_sync_ns as f64 / 1e6);
+                s.guard_ns as f64 / 1e6, s.cleanup_ns as f64 / 1e6, s.sst_finish_ns as f64 / 1e6, s.sst_sync_ns as f64 / 1e6, s.manifest_reuses);
         }
     }
 

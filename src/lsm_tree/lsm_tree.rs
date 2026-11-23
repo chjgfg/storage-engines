@@ -516,6 +516,7 @@ pub(crate) mod maintenance_probe {
         pub merge_ns: u128,
         pub repair_ns: u128,
         pub manifest_ns: u128,
+        pub manifest_reuses: u64,
         pub guard_ns: u128,
         pub cleanup_ns: u128,
         pub sst_finish_ns: u128,
@@ -545,6 +546,9 @@ pub(crate) mod maintenance_probe {
     }
     pub(crate) fn input_block() {
         ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.compaction_blocks += 1; });
+    }
+    pub(crate) fn manifest_reused() {
+        ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() { stats.manifest_reuses += 1; });
     }
     pub(crate) enum Kind { Flush, Compact, Merge, Repair, Manifest, Guard, Cleanup, SstFinish, SstSync, DeleteWrite, ThresholdFlush, MemWalSync }
     pub(crate) struct Timer { kind: Kind, start: Instant }
@@ -589,6 +593,18 @@ pub(crate) mod maintenance_probe {
             stats.output_files += files as u64; stats.output_bytes += bytes;
         });
     }
+}
+
+enum MaintenanceManifest { PublishedByCompaction, PublishedHere }
+
+#[cfg(test)]
+mod manifest_repeat_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub(super) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(super) struct Scope;
+    impl Scope { pub(super) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
 }
 
 impl LSMTree {
@@ -2391,10 +2407,13 @@ impl LSMTree {
     // ─── flush / compact ──────────────────────────────────────────────────────
 
     pub fn flush(&mut self) -> std::io::Result<()> {
+        let mut before_publication = self.manifest_edit_id;
         if !self.mem.is_empty() {
             self.flush_mem()?;
         }
         while !self.immutables.is_empty() {
+            // Each additional immutable changes the file set after any earlier publication.
+            before_publication = self.manifest_edit_id;
             self.flush_one_immutable()?;
         }
         if !self.bulk_mode && !self.opts.enable_bg_compact {
@@ -2402,7 +2421,9 @@ impl LSMTree {
         } else {
             self.notify_bg();
         }
-        self.write_manifest()?;
+        match self.publish_after_maintenance(before_publication)? {
+            MaintenanceManifest::PublishedByCompaction | MaintenanceManifest::PublishedHere => {}
+        }
         self.checkpoint_mem_wal()?;
         self.dirty = false;
         self.stats_dirty = true;
@@ -2432,13 +2453,16 @@ impl LSMTree {
         self.mem_bytes = 0;
         self.immutables.insert(0, frozen);
         self.flush_one_immutable()?;
+        let before_publication = self.manifest_edit_id;
         // bulk：不在写路径 compact；非 bulk 且未开后台时同步 compact
         if !self.bulk_mode && !self.opts.enable_bg_compact {
             self.maybe_compact()?;
         } else {
             self.notify_bg();
         }
-        self.write_manifest()?;
+        match self.publish_after_maintenance(before_publication)? {
+            MaintenanceManifest::PublishedByCompaction | MaintenanceManifest::PublishedHere => {}
+        }
         self.checkpoint_mem_wal()?;
         Ok(())
     }
@@ -3114,6 +3138,39 @@ impl LSMTree {
             let _ = hf.write_all(line.as_bytes());
         }
         Ok(())
+    }
+
+    /// No file/sequence mutation may occur between the final successful
+    /// compaction publication and this gate. Every compaction still publishes
+    /// before input cleanup; only the outer identical edit is omitted.
+    fn publish_after_maintenance(&mut self, before: u64) -> std::io::Result<MaintenanceManifest> {
+        #[cfg(test)]
+        let reference = manifest_repeat_reference::enabled();
+        #[cfg(not(test))]
+        let reference = false;
+        if !reference && !self.bulk_mode && !self.opts.enable_bg_compact
+            && before != self.manifest_edit_id {
+            #[cfg(test)]
+            {
+                let text = fs::read_to_string(self.manifest_path())?;
+                for (level, files) in self.levels.iter().enumerate() {
+                    let expected = files.iter().map(|f| f.id).collect::<Vec<_>>();
+                    let marker = format!("L{level}");
+                    let actual = text.lines().find_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        (fields.next() == Some(marker.as_str())).then(||
+                            fields.map(|id| id.parse::<u64>().unwrap()).collect::<Vec<_>>())
+                    }).expect("published level");
+                    assert_eq!(actual, expected, "reused manifest must name exact current file set");
+                }
+                assert!(text.lines().any(|line| line == format!("next_id {}", self.next_sst_id.load(Ordering::SeqCst))));
+                assert!(text.lines().any(|line| line == format!("next_seq {}", self.write_seq.load(Ordering::SeqCst))));
+                maintenance_probe::manifest_reused();
+            }
+            return Ok(MaintenanceManifest::PublishedByCompaction);
+        }
+        self.write_manifest()?;
+        Ok(MaintenanceManifest::PublishedHere)
     }
 
     fn load_manifest(&mut self) -> std::io::Result<()> {
@@ -3878,6 +3935,51 @@ mod tests {
         db.write_manifest_output(manifest_reference::Sink(&mut old)).unwrap();
         assert_eq!(old, bytes);
         assert!(manifest_reference::writes() - before > 10);
+    }
+
+    #[test]
+    fn flush_manifest_reuses_exact_published_state_with_negative_control() {
+        use crate::common::disk::{fsync_counts, SITE_LSM_MANIFEST};
+        for reference in [true, false] {
+            let dir = tmp_dir("manifest_reuse");
+            let mut db = LSMTree::open(&dir).unwrap();
+            db.opts.mem_threshold_entries = usize::MAX;
+            db.opts.mem_threshold_bytes = usize::MAX;
+            db.opts.l0_compact_threshold = 1;
+            for i in 0..16u64 { db.insert(i.to_be_bytes().to_vec(), Some(vec![i as u8; 128])); }
+            let mode = reference.then(manifest_repeat_reference::Scope::start);
+            let scope = maintenance_probe::Scope::start();
+            let before = fsync_counts()[SITE_LSM_MANIFEST];
+            db.flush().unwrap();
+            let syncs = fsync_counts()[SITE_LSM_MANIFEST] - before;
+            assert_eq!(syncs, if reference { 3 } else { 1 });
+            assert_eq!(scope.stats().manifest_reuses, if reference { 0 } else { 2 });
+            let guard = std::panic::catch_unwind(|| assert_eq!(syncs, 1));
+            assert_eq!(guard.is_err(), reference, "repeated publications must fail unchanged guard");
+            drop(scope); drop(mode); drop(db);
+            let db = LSMTree::open(&dir).unwrap();
+            for i in 0..16u64 { assert_eq!(db.get(&i.to_be_bytes()), Some(vec![i as u8; 128])); }
+        }
+    }
+
+    #[test]
+    fn flush_manifest_failed_publication_cannot_be_reused() {
+        let dir = tmp_dir("manifest_reuse_failure");
+        let mut db = LSMTree::open(&dir).unwrap();
+        db.opts.mem_threshold_entries = usize::MAX;
+        db.opts.mem_threshold_bytes = usize::MAX;
+        db.opts.l0_compact_threshold = 1;
+        db.write_manifest().unwrap(); // A fresh open does not create MANIFEST.
+        let old = fs::read(db.manifest_path()).unwrap();
+        db.insert(b"key".to_vec(), Some(b"value".to_vec()));
+        let blocked = dir.join("MANIFEST.tmp");
+        fs::create_dir(&blocked).unwrap();
+        assert!(db.flush().is_err());
+        assert_eq!(fs::read(db.manifest_path()).unwrap(), old);
+        assert_eq!(db.get(b"key"), Some(b"value".to_vec()));
+        fs::remove_dir(&blocked).unwrap();
+        db.flush().unwrap(); drop(db);
+        assert_eq!(LSMTree::open(&dir).unwrap().get(b"key"), Some(b"value".to_vec()));
     }
 
     #[test]

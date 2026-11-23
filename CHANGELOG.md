@@ -2,6 +2,16 @@
 
 ## 未发布（2026-11-23）
 
+### M159：LSM flush 复用最终 manifest 发布
+
+- compaction 仍在清理输入前持久化新文件集；同步 flush 通过发布 edit_id 区分
+  `PublishedByCompaction/PublishedHere`，省去外层相同状态的重复写入和 fsync。
+  bulk/后台分支保留原发布行为，阈值、SST 同步和压实挑选保持。
+- 16 键实际 flush 的 manifest 同步 **3→1**，复用 2 次，重开逐值通过；
+  恢复重复发布后同一守卫失败。实际 MANIFEST.tmp 写入阻断传播错误，旧字节不变，重试重开通过。
+- Debug manifest 定向 **9 passed / 0 failed**；新增 `SCALE_LSM_STAGES.manifest_reuses` 累计诊断。
+  [performance-m159.json](docs/performance-m159.json) 保留测试判据修订，未宣称解决 SST sync 主导的全部成本。
+
 ### M158：memory 页外键借用
 
 - KeyWindow/CandidateFold 支持借用键，保留同一二进制重叠/版本判据；memory 锁内借用候选键与值，

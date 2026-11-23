@@ -1,0 +1,49 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M159",
+  "date": "2026-11-23",
+  "base_commit": "baf7954337e57f473945f80e9764b3310dc9d4c8",
+  "objective": "LSM flush 复用已经成功发布的最终 manifest，避免相同状态重复 fsync",
+  "changes": [
+    "src/lsm_tree/lsm_tree.rs",
+    "src/engine.rs"
+  ],
+  "mechanism": {
+    "outcome": "MaintenanceManifest::{PublishedByCompaction,PublishedHere}",
+    "proof": "flush 开始或最后 immutable 变更前的 edit_id；仅同步非 bulk/非后台压实路径复用，失败立即返回",
+    "durability": "每次 compaction 仍先持久化新 SST 和 manifest 再删除输入；SST 同步、阈值、压实挑选、mem WAL checkpoint 保持",
+    "diagnostics": "SCALE_LSM_STAGES.manifest_reuses 累计计数；测试重读 exact levels/next_id/next_seq 验证"
+  },
+  "validation": {
+    "commands": [
+      "cargo test --lib --offline --quiet manifest_ -- --test-threads=1",
+      "cargo check --all-targets --offline --quiet"
+    ],
+    "debug_manifest": {
+      "passed": 9,
+      "failed": 0,
+      "seconds": 0.26
+    },
+    "fsync_guard": {
+      "seed_keys": 16,
+      "reference_syncs": 3,
+      "reused_syncs": 1,
+      "reuses": 2,
+      "reopened_values": 16,
+      "negative_control": "重复发布时同一 syncs==1 守卫失败"
+    },
+    "failure": "MANIFEST.tmp 目录阻断实际写入，flush 返回错误，旧 manifest 字节不变；解除阻断后 flush 与正常重开值通过"
+  },
+  "revisions": [
+    {
+      "kind": "test_fixture",
+      "initial_result": "8 passed / 1 failed：新库 open 并不立即创建 MANIFEST，失败注入测试读取不存在的旧文件",
+      "correction": "先显式 write_manifest 建立旧发布状态，再注入失败；无调整守卫阈值"
+    }
+  ],
+  "limitations": [
+    "这是移除重复 manifest 发布，不宣称已经解决 SST sync 主导的整个 LSM vacuum 瓶颈。",
+    "本项定向验证为 Debug；最终里程碑统一运行 Release 全库回归与正式小档。",
+    "验证时同一工作区另有未提交的 B+ 回收换出实验，未纳入本提交；LSM 改动点名提交。"
+  ]
+}
