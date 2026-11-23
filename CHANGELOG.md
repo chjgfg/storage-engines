@@ -2,6 +2,16 @@
 
 ## 未发布（2026-11-23）
 
+### M158：memory 页外键借用
+
+- KeyWindow/CandidateFold 支持借用键，保留同一二进制重叠/版本判据；memory 锁内借用候选键与值，
+  仅返回页与不完整批次的最后候选需要拥有键。16,384 键计数实际复制 **16384→3**，首页 **16384→103**。
+- 恢复 copy_all 时同一守卫失败；完整 Debug 库回归 **547 passed / 0 failed / 81 ignored**，
+  Release 搜索 **18 passed / 0 failed / 3 ignored**。旧 memory 值复制与分配上限守卫保持。
+- 同种子暖读 ABBA 2M：count 均值 **635.360→326.3935 ms**，首页 **715.166→308.6475 ms**，
+  深页 **650.9955→354.0305 ms**；首页分配 **2006459→7046**。1M/2M 全部四臂见
+  [performance-m158.json](docs/performance-m158.json)。未外推 10M/20M、导出、迁移与停机收益。
+
 ### M157：免 total 页恢复按需物化
 
 - 默认候选以 `SearchRow<R>::Deferred` 交给共享驱动，逐条判定再取值；memory 继续在锁内借用分类。

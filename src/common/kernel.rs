@@ -391,8 +391,8 @@ pub fn search_page_from_with_total(
 /// memory / bitcask / lsm 是编码键（值在另一处，要再读一次），bplus 是叶子条目里
 /// 顺手带出来的原始字节。共同点只有一个，也正是驱动需要的那个：**键已经折好了、
 /// 按 key 升序、每组一条**。
-pub struct WinCandidate<V> {
-    pub key: Vec<u8>,
+pub struct WinCandidate<V, K = Vec<u8>> {
+    pub key: K,
     pub version: u64,
     pub row: V,
 }

@@ -1,0 +1,314 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M158",
+  "date": "2026-11-23",
+  "base_commit": "e0c3bcd57e37791866aa3fa61222004160b23e57",
+  "objective": "memory 搜索/计数借用页外键，仅复制返回页与跨片游标",
+  "changes": [
+    "src/common/kernel.rs",
+    "src/common/order.rs",
+    "src/memory/memory_mvcc.rs"
+  ],
+  "mechanism": {
+    "borrow_boundary": "MemStore 锁持有期间借用逻辑键与值；借用不逃出该边界",
+    "fold": "KeyWindow/CandidateFold 以键类型参数保留同一二进制重叠排序与可见性判据",
+    "page_rows": 100,
+    "rows_guard": 16384,
+    "count_key_copies": 3,
+    "page_key_copies": 103,
+    "reference_key_copies": 16384,
+    "negative_control": "copy_all 恢复页外键复制，同一 copies==3 守卫失败",
+    "cursor": "完整批次无需游标键；不完整批次仅保留最后物理候选键，包括 Excluded/Counted"
+  },
+  "commands": [
+    "cargo test --lib --offline --quiet -- --test-threads=1",
+    "cargo test --release --lib --offline --quiet search_ -- --test-threads=1",
+    "MEMORY_KEY_ROWS=1000000/2000000 cargo test --release --lib --offline --quiet search_borrowed_keys_same_seed_abba -- --ignored --nocapture --test-threads=1"
+  ],
+  "validation": {
+    "debug_library": {
+      "passed": 547,
+      "failed": 0,
+      "ignored": 81,
+      "seconds": 247.71
+    },
+    "release_search": {
+      "passed": 18,
+      "failed": 0,
+      "ignored": 3,
+      "seconds": 2.83
+    },
+    "abba": {
+      "value_bytes": 128,
+      "warmed": true,
+      "arms": [
+        {
+          "rows": 1000000,
+          "task": "count",
+          "arm": 0,
+          "reference": true,
+          "ms": 326.066,
+          "copies": 1000000,
+          "allocations": 1003183
+        },
+        {
+          "rows": 1000000,
+          "task": "count",
+          "arm": 1,
+          "reference": false,
+          "ms": 162.552,
+          "copies": 244,
+          "allocations": 3427
+        },
+        {
+          "rows": 1000000,
+          "task": "count",
+          "arm": 2,
+          "reference": false,
+          "ms": 164.935,
+          "copies": 244,
+          "allocations": 3427
+        },
+        {
+          "rows": 1000000,
+          "task": "count",
+          "arm": 3,
+          "reference": true,
+          "ms": 331.604,
+          "copies": 1000000,
+          "allocations": 1003183
+        },
+        {
+          "rows": 1000000,
+          "task": "first_total",
+          "arm": 0,
+          "reference": true,
+          "ms": 344.225,
+          "copies": 1000000,
+          "allocations": 1003287
+        },
+        {
+          "rows": 1000000,
+          "task": "first_total",
+          "arm": 1,
+          "reference": false,
+          "ms": 224.96,
+          "copies": 344,
+          "allocations": 3629
+        },
+        {
+          "rows": 1000000,
+          "task": "first_total",
+          "arm": 2,
+          "reference": false,
+          "ms": 187.064,
+          "copies": 344,
+          "allocations": 3629
+        },
+        {
+          "rows": 1000000,
+          "task": "first_total",
+          "arm": 3,
+          "reference": true,
+          "ms": 362.639,
+          "copies": 1000000,
+          "allocations": 1003285
+        },
+        {
+          "rows": 1000000,
+          "task": "deep_total",
+          "arm": 0,
+          "reference": true,
+          "ms": 329.527,
+          "copies": 1000000,
+          "allocations": 1003285
+        },
+        {
+          "rows": 1000000,
+          "task": "deep_total",
+          "arm": 1,
+          "reference": false,
+          "ms": 172.061,
+          "copies": 344,
+          "allocations": 3629
+        },
+        {
+          "rows": 1000000,
+          "task": "deep_total",
+          "arm": 2,
+          "reference": false,
+          "ms": 181.204,
+          "copies": 344,
+          "allocations": 3629
+        },
+        {
+          "rows": 1000000,
+          "task": "deep_total",
+          "arm": 3,
+          "reference": true,
+          "ms": 366.59,
+          "copies": 1000000,
+          "allocations": 1003285
+        },
+        {
+          "rows": 2000000,
+          "task": "count",
+          "arm": 0,
+          "reference": true,
+          "ms": 665.706,
+          "copies": 2000000,
+          "allocations": 2006356
+        },
+        {
+          "rows": 2000000,
+          "task": "count",
+          "arm": 1,
+          "reference": false,
+          "ms": 336.294,
+          "copies": 488,
+          "allocations": 6844
+        },
+        {
+          "rows": 2000000,
+          "task": "count",
+          "arm": 2,
+          "reference": false,
+          "ms": 316.493,
+          "copies": 488,
+          "allocations": 6844
+        },
+        {
+          "rows": 2000000,
+          "task": "count",
+          "arm": 3,
+          "reference": true,
+          "ms": 605.013,
+          "copies": 2000000,
+          "allocations": 2006356
+        },
+        {
+          "rows": 2000000,
+          "task": "first_total",
+          "arm": 0,
+          "reference": true,
+          "ms": 665.542,
+          "copies": 2000000,
+          "allocations": 2006460
+        },
+        {
+          "rows": 2000000,
+          "task": "first_total",
+          "arm": 1,
+          "reference": false,
+          "ms": 308.062,
+          "copies": 588,
+          "allocations": 7046
+        },
+        {
+          "rows": 2000000,
+          "task": "first_total",
+          "arm": 2,
+          "reference": false,
+          "ms": 309.233,
+          "copies": 588,
+          "allocations": 7046
+        },
+        {
+          "rows": 2000000,
+          "task": "first_total",
+          "arm": 3,
+          "reference": true,
+          "ms": 764.79,
+          "copies": 2000000,
+          "allocations": 2006458
+        },
+        {
+          "rows": 2000000,
+          "task": "deep_total",
+          "arm": 0,
+          "reference": true,
+          "ms": 698.813,
+          "copies": 2000000,
+          "allocations": 2006458
+        },
+        {
+          "rows": 2000000,
+          "task": "deep_total",
+          "arm": 1,
+          "reference": false,
+          "ms": 341.184,
+          "copies": 588,
+          "allocations": 7046
+        },
+        {
+          "rows": 2000000,
+          "task": "deep_total",
+          "arm": 2,
+          "reference": false,
+          "ms": 366.877,
+          "copies": 588,
+          "allocations": 7046
+        },
+        {
+          "rows": 2000000,
+          "task": "deep_total",
+          "arm": 3,
+          "reference": true,
+          "ms": 603.178,
+          "copies": 2000000,
+          "allocations": 2006458
+        }
+      ],
+      "means": [
+        {
+          "rows": 1000000,
+          "task": "count",
+          "before_ms": 328.835,
+          "after_ms": 163.74349999999998,
+          "reduction_percent": 50.2049660163912
+        },
+        {
+          "rows": 1000000,
+          "task": "first_total",
+          "before_ms": 353.432,
+          "after_ms": 206.012,
+          "reduction_percent": 41.71099391113425
+        },
+        {
+          "rows": 1000000,
+          "task": "deep_total",
+          "before_ms": 348.0585,
+          "after_ms": 176.6325,
+          "reduction_percent": 49.252065385560186
+        },
+        {
+          "rows": 2000000,
+          "task": "count",
+          "before_ms": 635.3595,
+          "after_ms": 326.3935,
+          "reduction_percent": 48.62853235058262
+        },
+        {
+          "rows": 2000000,
+          "task": "first_total",
+          "before_ms": 715.1659999999999,
+          "after_ms": 308.64750000000004,
+          "reduction_percent": 56.84253725708436
+        },
+        {
+          "rows": 2000000,
+          "task": "deep_total",
+          "before_ms": 650.9955,
+          "after_ms": 354.0305,
+          "reduction_percent": 45.6170587968734
+        }
+      ],
+      "raw_output": "\nrunning 1 test\nMEMORY_KEY_ABBA rows=1000000 task=count arm=0 reference=true ms=326.066 copies=1000000 allocations=1003183\nMEMORY_KEY_ABBA rows=1000000 task=count arm=1 reference=false ms=162.552 copies=244 allocations=3427\nMEMORY_KEY_ABBA rows=1000000 task=count arm=2 reference=false ms=164.935 copies=244 allocations=3427\nMEMORY_KEY_ABBA rows=1000000 task=count arm=3 reference=true ms=331.604 copies=1000000 allocations=1003183\nMEMORY_KEY_ABBA rows=1000000 task=first_total arm=0 reference=true ms=344.225 copies=1000000 allocations=1003287\nMEMORY_KEY_ABBA rows=1000000 task=first_total arm=1 reference=false ms=224.960 copies=344 allocations=3629\nMEMORY_KEY_ABBA rows=1000000 task=first_total arm=2 reference=false ms=187.064 copies=344 allocations=3629\nMEMORY_KEY_ABBA rows=1000000 task=first_total arm=3 reference=true ms=362.639 copies=1000000 allocations=1003285\nMEMORY_KEY_ABBA rows=1000000 task=deep_total arm=0 reference=true ms=329.527 copies=1000000 allocations=1003285\nMEMORY_KEY_ABBA rows=1000000 task=deep_total arm=1 reference=false ms=172.061 copies=344 allocations=3629\nMEMORY_KEY_ABBA rows=1000000 task=deep_total arm=2 reference=false ms=181.204 copies=344 allocations=3629\nMEMORY_KEY_ABBA rows=1000000 task=deep_total arm=3 reference=true ms=366.590 copies=1000000 allocations=1003285\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 627 filtered out; finished in 5.98s\n\n\nrunning 1 test\nMEMORY_KEY_ABBA rows=2000000 task=count arm=0 reference=true ms=665.706 copies=2000000 allocations=2006356\nMEMORY_KEY_ABBA rows=2000000 task=count arm=1 reference=false ms=336.294 copies=488 allocations=6844\nMEMORY_KEY_ABBA rows=2000000 task=count arm=2 reference=false ms=316.493 copies=488 allocations=6844\nMEMORY_KEY_ABBA rows=2000000 task=count arm=3 reference=true ms=605.013 copies=2000000 allocations=2006356\nMEMORY_KEY_ABBA rows=2000000 task=first_total arm=0 reference=true ms=665.542 copies=2000000 allocations=2006460\nMEMORY_KEY_ABBA rows=2000000 task=first_total arm=1 reference=false ms=308.062 copies=588 allocations=7046\nMEMORY_KEY_ABBA rows=2000000 task=first_total arm=2 reference=false ms=309.233 copies=588 allocations=7046\nMEMORY_KEY_ABBA rows=2000000 task=first_total arm=3 reference=true ms=764.790 copies=2000000 allocations=2006458\nMEMORY_KEY_ABBA rows=2000000 task=deep_total arm=0 reference=true ms=698.813 copies=2000000 allocations=2006458\nMEMORY_KEY_ABBA rows=2000000 task=deep_total arm=1 reference=false ms=341.184 copies=588 allocations=7046\nMEMORY_KEY_ABBA rows=2000000 task=deep_total arm=2 reference=false ms=366.877 copies=588 allocations=7046\nMEMORY_KEY_ABBA rows=2000000 task=deep_total arm=3 reference=true ms=603.178 copies=2000000 allocations=2006458\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 627 filtered out; finished in 10.32s\n\n"
+    }
+  },
+  "limitations": [
+    "ABBA 是同构建下页外键 copy_all 与 borrowed 的对照；键类型参数化导致的其它折叠变化不单独归因。",
+    "只测 1M/2M 搜索与计数，不外推 10M/20M、导出、迁移或快照收益。",
+    "输出需要拥有键/值的 scan/export/migrate 路径仍按原合同复制；后续诊断区分源扫描和目标写入。"
+  ]
+}

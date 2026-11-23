@@ -1352,7 +1352,7 @@ impl Transaction {
         &self, store: &'a MemStore,
         start: Option<&[u8]>, end: Option<&[u8]>,
         accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
-    ) -> (Vec<crate::common::WinCandidate<&'a Option<Vec<u8>>>>, bool) {
+    ) -> (Vec<crate::common::WinCandidate<&'a Option<Vec<u8>>, &'a [u8]>>, bool) {
         let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
         let lo = crate::common::fold_lower_bound(start, after);
         let mut fold = crate::common::order::CandidateFold::new(
@@ -1360,7 +1360,7 @@ impl Transaction {
         for (enc, value) in store.iter_entries_in(lo, hi.as_deref()) {
             #[cfg(test)]
             FOLD_KEYS.with(|c| c.set(c.get() + 1));
-            if fold.push(enc, |v| self.is_visible(v), || value) { break; }
+            if fold.push_borrowed(enc, |v| self.is_visible(v), || value) { break; }
         }
         fold.finish()
     }
@@ -1376,7 +1376,7 @@ impl Transaction {
         let store = self.store.lock().unwrap();
         let (rows, complete) = self.scan_candidate_refs(&store, start, end, accept, after, budget);
         (rows.into_iter().map(|c| crate::common::WinCandidate {
-            key: c.key, version: c.version, row: {
+            key: c.key.to_vec(), version: c.version, row: {
                 #[cfg(test)]
                 if c.row.is_some() { search_copy_reference::note_copy(); }
                 c.row.clone()
@@ -1580,6 +1580,18 @@ pub(crate) mod replay_reference {
 #[cfg(test)]
 
 #[cfg(test)]
+pub(crate) mod search_key_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; static COPIES: Cell<u64> = const { Cell::new(0) }; }
+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub(crate) fn note_copy() { COPIES.with(|c| c.set(c.get() + 1)); }
+    pub(crate) fn copies() -> u64 { COPIES.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
 pub(crate) mod search_copy_reference {
     use std::{assert, cell::Cell, thread_local};
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; static COPIES: Cell<u64> = const { Cell::new(0) }; }
@@ -1603,6 +1615,69 @@ mod tests {
         }
         tx.commit();
         db
+    }
+
+    #[test]
+    fn search_borrows_nonpage_keys_and_keeps_only_page_and_chunk_cursors() {
+        const ROWS: usize = 16_384;
+        let db = search_seed(ROWS, 128);
+        let tx = db.begin_transaction();
+        for reference in [true, false] {
+            let mode = reference.then(search_key_reference::Scope::start);
+            let before = search_key_reference::copies();
+            assert_eq!(tx.key_count(b""), ROWS);
+            let copies = search_key_reference::copies() - before;
+            let guard = std::panic::catch_unwind(|| assert_eq!(copies, 3,
+                "only three incomplete-chunk cursor keys may be owned"));
+            assert_eq!(guard.is_err(), reference, "copy-all control must fail unchanged guard");
+            assert_eq!(copies, if reference { ROWS as u64 } else { 3 });
+            let before = search_key_reference::copies();
+            let q = crate::common::SearchQuery::contains(b"", 0, 100);
+            let page = tx.search_keys(&q);
+            assert_eq!(page.total, Some(ROWS)); assert!(page.has_next);
+            assert_eq!(page.items[99].key, 99u64.to_be_bytes());
+            assert_eq!(page.items[99].value, Some(vec![b'v'; 128]));
+            assert_eq!(search_key_reference::copies() - before,
+                if reference { ROWS as u64 } else { 103 });
+            drop(mode);
+        }
+        tx.commit();
+    }
+
+    #[test]
+    #[ignore = "same memory seed ABBA for borrowed page-external keys"]
+    fn search_borrowed_keys_same_seed_abba() {
+        let rows = std::env::var("MEMORY_KEY_ROWS").map(|s| s.parse().unwrap()).unwrap_or(200_000usize);
+        assert!(rows >= 10_000);
+        let db = search_seed(rows, 128);
+        let tx = db.begin_transaction();
+        assert_eq!(tx.key_count(b""), rows);
+        for task in ["count", "first_total", "deep_total"] {
+            for (arm, reference) in [true, false, false, true].into_iter().enumerate() {
+                let mode = reference.then(search_key_reference::Scope::start);
+                let before = search_key_reference::copies();
+                let now = std::time::Instant::now();
+                let (result, allocations) = crate::mem_probe::count_thread_allocations(|| {
+                    if task == "count" { tx.key_count(b"") } else {
+                        let page = if task == "deep_total" { rows / 100 - 1 } else { 0 };
+                        let q = crate::common::SearchQuery::contains(b"", page, 100);
+                        let result = tx.search_keys(&q);
+                        assert_eq!(result.total, Some(rows)); assert_eq!(result.items.len(), 100);
+                        assert_eq!(result.items[0].key, ((page * 100) as u64).to_be_bytes());
+                        assert_eq!(result.items[99].value, Some(vec![b'v'; 128]));
+                        result.items.len()
+                    }
+                });
+                let ms = now.elapsed().as_secs_f64() * 1000.0;
+                let copies = search_key_reference::copies() - before;
+                assert_eq!(result, if task == "count" { rows } else { 100 });
+                if reference { assert_eq!(copies, rows as u64); }
+                else { assert!(copies <= (rows / 4096 + 100) as u64); }
+                eprintln!("MEMORY_KEY_ABBA rows={rows} task={task} arm={arm} reference={reference} ms={ms:.3} copies={copies} allocations={allocations}");
+                drop(mode);
+            }
+        }
+        tx.commit();
     }
 
     #[test]
@@ -2756,14 +2831,25 @@ impl crate::common::VersionedStore for Transaction {
         let store = self.store.lock().unwrap();
         let (rows, complete) =
             self.scan_candidate_refs(&store, start, end, accept, after, budget);
-        let rows = rows.into_iter().map(|c| {
+        let last = rows.len().saturating_sub(1);
+        let rows = rows.into_iter().enumerate().map(|(index, c)| {
             let selection = retention.select(c.row.as_deref());
             let row = crate::common::store::retain_search_row(selection, || {
                 #[cfg(test)]
                 if c.row.is_some() { search_copy_reference::note_copy(); }
                 c.row.clone()
             });
-            crate::common::WinCandidate { key: c.key, version: c.version, row }
+            #[cfg(test)]
+            let copy_all = search_key_reference::enabled();
+            #[cfg(not(test))]
+            let copy_all = false;
+            let key = if copy_all || matches!(&row, crate::common::store::SearchRow::Retained(_))
+                || (!complete && index == last) {
+                #[cfg(test)]
+                search_key_reference::note_copy();
+                c.key.to_vec()
+            } else { Vec::new() };
+            crate::common::WinCandidate { key, version: c.version, row }
         }).collect();
         (rows, complete)
     }

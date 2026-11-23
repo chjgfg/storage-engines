@@ -6,6 +6,7 @@
 //! overlap window; in the worst case that window can span the database.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Borrow;
 use std::{debug_assert_eq, matches, unreachable};
 
 use super::{WinCandidate, decode_key, encode_key};
@@ -71,19 +72,19 @@ pub(crate) fn range_end(end: &[u8], max_version: u64, inclusive: bool) -> Vec<u8
     bound
 }
 
-pub(crate) struct KeyWindow<T> {
-    pending: WindowStorage<T>,
+pub(crate) struct KeyWindow<T, K = Vec<u8>> {
+    pending: WindowStorage<T, K>,
 }
 
 /// Ordinary groups need no tree node. Binary prefix overlap explicitly promotes
 /// to a sorted window, whose worst-case size remains the full database.
-enum WindowStorage<T> {
+enum WindowStorage<T, K> {
     Empty,
-    Single(Vec<u8>, T),
-    Overlap(BTreeMap<Vec<u8>, T>),
+    Single(K, T),
+    Overlap(BTreeMap<K, T>),
 }
 
-impl<T> KeyWindow<T> {
+impl<T, K: Ord + Borrow<[u8]>> KeyWindow<T, K> {
     pub(crate) fn new() -> Self {
         Self {
             pending: WindowStorage::Empty,
@@ -92,7 +93,7 @@ impl<T> KeyWindow<T> {
     pub(crate) fn is_empty(&self) -> bool {
         matches!(self.pending, WindowStorage::Empty)
     }
-    pub(crate) fn insert(&mut self, key: Vec<u8>, value: T) {
+    pub(crate) fn insert(&mut self, key: K, value: T) {
         match &mut self.pending {
             WindowStorage::Empty => self.pending = WindowStorage::Single(key, value),
             WindowStorage::Single(old, v) if *old == key => *v = value,
@@ -107,7 +108,7 @@ impl<T> KeyWindow<T> {
             WindowStorage::Overlap(map) => { map.insert(key, value); }
         }
     }
-    pub(crate) fn pop_first(&mut self) -> Option<(Vec<u8>, T)> {
+    pub(crate) fn pop_first(&mut self) -> Option<(K, T)> {
         match std::mem::replace(&mut self.pending, WindowStorage::Empty) {
             WindowStorage::Empty => None,
             WindowStorage::Single(key, value) => Some((key, value)),
@@ -122,15 +123,15 @@ impl<T> KeyWindow<T> {
             }
         }
     }
-    pub(crate) fn pop_before(&mut self, enc: &[u8], max_version: u64) -> Option<(Vec<u8>, T)> {
-        let first = match &self.pending {
+    pub(crate) fn pop_before(&mut self, enc: &[u8], max_version: u64) -> Option<(K, T)> {
+        let first: &[u8] = match &self.pending {
             WindowStorage::Empty => return None,
-            WindowStorage::Single(key, _) => key,
-            WindowStorage::Overlap(map) => map.first_key_value().expect("overlap nonempty").0,
+            WindowStorage::Single(key, _) => key.borrow(),
+            WindowStorage::Overlap(map) => map.first_key_value().expect("overlap nonempty").0.borrow(),
         };
         #[cfg(test)]
         let before = if super::kv_snapshot::snapshot_emit_reference::enabled() {
-            first.as_slice() < logical_floor(enc, max_version)
+            first < logical_floor(enc, max_version)
         } else { window_before(first, enc, max_version) };
         #[cfg(not(test))]
         let before = window_before(first, enc, max_version);
@@ -143,8 +144,8 @@ impl<T> KeyWindow<T> {
 
     /// Allocate the logical key and group only on first insertion. The factory
     /// may reuse a finalized group's buffers; overlapping binary groups remain owned.
-    pub(crate) fn entry_with(&mut self, key: &[u8], make: impl FnOnce() -> (Vec<u8>, T)) -> &mut T {
-        if matches!(&self.pending, WindowStorage::Single(old, _) if old.as_slice() == key) {
+    pub(crate) fn entry_with(&mut self, key: &[u8], make: impl FnOnce() -> (K, T)) -> &mut T {
+        if matches!(&self.pending, WindowStorage::Single(old, _) if old.borrow() == key) {
             return match &mut self.pending {
                 WindowStorage::Single(_, value) => value,
                 _ => unreachable!(),
@@ -152,7 +153,7 @@ impl<T> KeyWindow<T> {
         }
         if self.is_empty() {
             let (owned, value) = make();
-            debug_assert_eq!(owned.as_slice(), key);
+            debug_assert_eq!(owned.borrow(), key);
             self.pending = WindowStorage::Single(owned, value);
             return match &mut self.pending {
                 WindowStorage::Single(_, value) => value,
@@ -170,7 +171,7 @@ impl<T> KeyWindow<T> {
             WindowStorage::Overlap(map) => {
                 if map.contains_key(key) { return map.get_mut(key).unwrap(); }
                 let (owned, value) = make();
-                debug_assert_eq!(owned.as_slice(), key);
+                debug_assert_eq!(owned.borrow(), key);
                 map.entry(owned).or_insert(value)
             }
             _ => unreachable!(),
@@ -178,8 +179,8 @@ impl<T> KeyWindow<T> {
     }
 }
 
-impl<T: Default> KeyWindow<T> {
-    pub(crate) fn entry(&mut self, key: Vec<u8>) -> &mut T {
+impl<T: Default, K: Ord + Borrow<[u8]>> KeyWindow<T, K> {
+    pub(crate) fn entry(&mut self, key: K) -> &mut T {
         if let WindowStorage::Single(old, _) = &self.pending {
             if *old != key {
                 let old = std::mem::replace(&mut self.pending, WindowStorage::Empty);
@@ -205,9 +206,9 @@ impl<T: Default> KeyWindow<T> {
 }
 
 /// Shared candidate folding, keeping only the winning row of each pending key.
-pub(crate) struct CandidateFold<'a, R> {
-    window: KeyWindow<(u64, R)>,
-    out: Vec<WinCandidate<R>>,
+pub(crate) struct CandidateFold<'a, R, K = Vec<u8>> {
+    window: KeyWindow<(u64, R), K>,
+    out: Vec<WinCandidate<R, K>>,
     start: Option<&'a [u8]>,
     end: Option<&'a [u8]>,
     after: Option<&'a [u8]>,
@@ -217,7 +218,7 @@ pub(crate) struct CandidateFold<'a, R> {
     stopped: bool,
 }
 
-impl<'a, R> CandidateFold<'a, R> {
+impl<'a, R, K: Ord + Borrow<[u8]>> CandidateFold<'a, R, K> {
     pub(crate) fn new(
         start: Option<&'a [u8]>,
         end: Option<&'a [u8]>,
@@ -239,16 +240,17 @@ impl<'a, R> CandidateFold<'a, R> {
         }
     }
 
-    fn emit(&mut self, key: Vec<u8>, (version, row): (u64, R)) {
+    fn emit(&mut self, key: K, (version, row): (u64, R)) {
         self.out.push(WinCandidate { key, version, row });
     }
 
     /// Returns true once the output budget is full. The caller may stop its walk.
-    pub(crate) fn push(
+    fn push_with_key(
         &mut self,
         enc: &[u8],
         visible: impl FnOnce(u64) -> bool,
         row: impl FnOnce() -> R,
+        key_owned: impl FnOnce() -> K,
     ) -> bool {
         while let Some((key, winner)) = self.window.pop_before(enc, self.max_version) {
             self.emit(key, winner);
@@ -256,18 +258,6 @@ impl<'a, R> CandidateFold<'a, R> {
                 self.stopped = true;
                 return true;
             }
-        }
-        #[cfg(test)]
-        if super::store::scan_cost_reference::enabled() {
-            let Some(VersionedKey { raw_key: key, version }) = decode_key(enc) else { return false; };
-            super::store::scan_cost_reference::note_key_copy();
-            if !visible(version)
-                || self.start.is_some_and(|s| key.as_slice() < s)
-                || self.end.is_some_and(|e| key.as_slice() >= e)
-                || self.after.is_some_and(|a| key.as_slice() <= a)
-                || self.accept.is_some_and(|f| !f(&key)) { return false; }
-            self.window.insert(key, (version, row()));
-            return false;
         }
         let Some((key, version)) = decode_key_ref(enc)
         else {
@@ -284,15 +274,13 @@ impl<'a, R> CandidateFold<'a, R> {
         // Equal logical keys have monotonically increasing physical versions.
         let mut next = Some((version, row()));
         let winner = self.window.entry_with(key, || {
-            #[cfg(test)]
-            super::store::scan_cost_reference::note_key_copy();
-            (key.to_vec(), next.take().unwrap())
+            (key_owned(), next.take().unwrap())
         });
         if let Some(next) = next { *winner = next; }
         false
     }
 
-    pub(crate) fn finish(mut self) -> (Vec<WinCandidate<R>>, bool) {
+    pub(crate) fn finish(mut self) -> (Vec<WinCandidate<R, K>>, bool) {
         if !self.stopped {
             while self.out.len() < self.budget {
                 let Some((key, winner)) = self.window.pop_first() else {
@@ -303,6 +291,43 @@ impl<'a, R> CandidateFold<'a, R> {
         }
         let complete = !self.stopped && self.window.is_empty();
         (self.out, complete)
+    }
+}
+
+impl<'a, R> CandidateFold<'a, R> {
+    pub(crate) fn push(&mut self, enc: &[u8], visible: impl FnOnce(u64) -> bool,
+        row: impl FnOnce() -> R,
+    ) -> bool {
+        #[cfg(test)]
+        if super::store::scan_cost_reference::enabled() {
+            while let Some((key, winner)) = self.window.pop_before(enc, self.max_version) {
+                self.emit(key, winner);
+                if self.out.len() >= self.budget { self.stopped = true; return true; }
+            }
+            let Some(VersionedKey { raw_key: key, version }) = decode_key(enc) else { return false; };
+            super::store::scan_cost_reference::note_key_copy();
+            if !visible(version)
+                || self.start.is_some_and(|s| key.as_slice() < s)
+                || self.end.is_some_and(|e| key.as_slice() >= e)
+                || self.after.is_some_and(|a| key.as_slice() <= a)
+                || self.accept.is_some_and(|f| !f(&key)) { return false; }
+            self.window.insert(key, (version, row()));
+            return false;
+        }
+        self.push_with_key(enc, visible, row, || {
+            #[cfg(test)]
+            super::store::scan_cost_reference::note_key_copy();
+            decode_key_ref(enc).expect("validated encoded key").0.to_vec()
+        })
+    }
+}
+
+impl<'a, 'rows, R> CandidateFold<'a, R, &'rows [u8]> {
+    /// The caller must keep the storage read boundary alive through finish.
+    pub(crate) fn push_borrowed(&mut self, enc: &'rows [u8],
+        visible: impl FnOnce(u64) -> bool, row: impl FnOnce() -> R,
+    ) -> bool {
+        self.push_with_key(enc, visible, row, || &enc[..enc.len() - 8])
     }
 }
 
