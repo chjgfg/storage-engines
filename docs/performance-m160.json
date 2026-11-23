@@ -1,0 +1,98 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M160",
+  "date": "2026-11-23",
+  "base_commit": "7e5316a26685be7e80098ca02350bf314fd184b6",
+  "objective": "检验 B+ 回收期间优先换出干净页是否减少页同步",
+  "status": "rejected",
+  "production_result": "回到 M159 的 B+ page/tree 状态；未保留生产策略变更",
+  "experiment": {
+    "bounded_selection": "在既有缓存中检查至多 target_free + dirty_limit 个有效唯一候选；不扩大缓存，不跳双写；全脏缓存仍经原持久化路径换出",
+    "negative_control": "稀疏脏页在一次换出中 sync=1 vs0；两批真实写入收尾后 sync=2 vs1；重开256页值与释放页复用通过；全脏错误保留全部脏页并拒绝重试",
+    "debug_guard": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 2,
+      "seconds": 0.97
+    },
+    "abba": {
+      "command": "cargo test --lib --offline --quiet reclamation_clean_eviction_same_seed_abba -- --ignored --nocapture --test-threads=1",
+      "exit_code": 1,
+      "arms": [
+        {
+          "arm": 0,
+          "improved": false,
+          "rows": 12000,
+          "ms": 2388.913,
+          "freelist_sync": 1,
+          "page_sync": 11,
+          "dblwr_sync": 34,
+          "removed": 12000,
+          "full_values_verified": 12000,
+          "reopened_values_verified": 12000
+        },
+        {
+          "arm": 1,
+          "improved": true,
+          "rows": 12000,
+          "ms": 2649.754,
+          "freelist_sync": 1,
+          "page_sync": 11,
+          "dblwr_sync": 34,
+          "removed": 12000,
+          "full_values_verified": 12000,
+          "reopened_values_verified": 12000
+        },
+        {
+          "arm": 2,
+          "improved": true,
+          "rows": 12000,
+          "ms": 2714.309,
+          "freelist_sync": 1,
+          "page_sync": 11,
+          "dblwr_sync": 34,
+          "removed": 12000,
+          "full_values_verified": 12000,
+          "reopened_values_verified": 12000
+        },
+        {
+          "arm": 3,
+          "improved": false,
+          "rows": 12000,
+          "ms": 3063.738,
+          "freelist_sync": 1,
+          "page_sync": 11,
+          "dblwr_sync": 34,
+          "removed": 12000,
+          "full_values_verified": 12000,
+          "reopened_values_verified": 12000
+        }
+      ],
+      "raw_output": "\nrunning 1 test\nRECLAMATION_ABBA arm=0 improved=false rows=12000 ms=2388.913 freelist_sync=1 page_sync=11 dblwr_sync=34 removed=12000 full_values_verified=12000 reopened_values_verified=12000\nRECLAMATION_ABBA arm=1 improved=true rows=12000 ms=2649.754 freelist_sync=1 page_sync=11 dblwr_sync=34 removed=12000 full_values_verified=12000 reopened_values_verified=12000\nRECLAMATION_ABBA arm=2 improved=true rows=12000 ms=2714.309 freelist_sync=1 page_sync=11 dblwr_sync=34 removed=12000 full_values_verified=12000 reopened_values_verified=12000\nRECLAMATION_ABBA arm=3 improved=false rows=12000 ms=3063.738 freelist_sync=1 page_sync=11 dblwr_sync=34 removed=12000 full_values_verified=12000 reopened_values_verified=12000\n\nthread 'bplus_tree::bplus_tree_mvcc::tests::reclamation_clean_eviction_same_seed_abba' (28220) panicked at src\\bplus_tree\\bplus_tree_mvcc.rs:1660:13:\nclean-first must reduce actual page syncs: 22 vs 22\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nbplus_tree::bplus_tree_mvcc::tests::reclamation_clean_eviction_same_seed_abba --- FAILED\n\nfailures:\n\nfailures:\n    bplus_tree::bplus_tree_mvcc::tests::reclamation_clean_eviction_same_seed_abba\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 632 filtered out; finished in 26.59s\n\nerror: test failed, to rerun pass `--lib`\n",
+      "gate": "new actual page_sync sum < old actual page_sync sum",
+      "actual": "22 == 22，四臂均11次 page_sync/34次双写/1次freelist",
+      "verdict": "未兑现真实 workload 同步收益；不保留优化、不放宽守卫"
+    }
+  },
+  "revisions": [
+    {
+      "kind": "test_contract",
+      "initial": "单批稀疏写入仅改变同步时机，总 sync 仍1，初次收尾计数判据错误",
+      "correction": "补第二批真实写入并逐页核验，证明两批可合并；真实12k workload依然没有收益，最终拒绝"
+    }
+  ],
+  "replay": {
+    "format": "git unified diff UTF-8",
+    "base_commit": "7e5316a26685be7e80098ca02350bf314fd184b6",
+    "files": [
+      "src/bplus_tree/page.rs",
+      "src/bplus_tree/bplus_tree_mvcc.rs"
+    ],
+    "patch": "diff --git a/src/bplus_tree/bplus_tree_mvcc.rs b/src/bplus_tree/bplus_tree_mvcc.rs\nindex c60864d..ecee7bd 100644\n--- a/src/bplus_tree/bplus_tree_mvcc.rs\n+++ b/src/bplus_tree/bplus_tree_mvcc.rs\n@@ -1577,6 +1577,16 @@ mod tests {\n     #[test]\n     #[ignore = \"same closed seed ABBA for reclamation freelist publication\"]\n     fn reclamation_freelist_same_seed_abba() {\n+        measure_reclamation_same_seed_abba(false);\n+    }\n+\n+    #[test]\n+    #[ignore = \"same closed seed ABBA for clean-first reclamation eviction\"]\n+    fn reclamation_clean_eviction_same_seed_abba() {\n+        measure_reclamation_same_seed_abba(true);\n+    }\n+\n+    fn measure_reclamation_same_seed_abba(clean_eviction: bool) {\n         use crate::common::disk::{fsync_counts, SITE_BPLUS_DBLWR, SITE_BPLUS_FREELIST, SITE_BPLUS_PAGE_FLUSH};\n         use crate::bplus_tree::page::reclamation_reference;\n         use std::{assert, assert_eq, format, vec};\n@@ -1616,13 +1626,14 @@ mod tests {\n             }\n             let db = MVCC::open(&target, 64, 128);\n             db.set_vacuum_auto_slice(0);\n-            let reference = (!improved).then(reclamation_reference::Scope::start);\n+            let reference = (!clean_eviction && !improved).then(reclamation_reference::Scope::start);\n+            let eviction_reference = (clean_eviction && !improved).then(crate::bplus_tree::page::reclamation_eviction_reference::Scope::start);\n             let before = fsync_counts();\n             let t = std::time::Instant::now();\n             let stats = db.vacuum().unwrap();\n             let ms = t.elapsed().as_secs_f64() * 1000.0;\n             let after = fsync_counts();\n-            drop(reference);\n+            drop(reference); drop(eviction_reference);\n             let freelist = after[SITE_BPLUS_FREELIST] - before[SITE_BPLUS_FREELIST];\n             assert_eq!(stats.versions_removed, rows);\n             {\n@@ -1639,10 +1650,18 @@ mod tests {\n             std::eprintln!(\"RECLAMATION_ABBA arm={arm} improved={improved} rows={rows} ms={ms:.3} freelist_sync={freelist} page_sync={} dblwr_sync={} removed={} full_values_verified={rows} reopened_values_verified={rows}\",\n                 after[SITE_BPLUS_PAGE_FLUSH] - before[SITE_BPLUS_PAGE_FLUSH],\n                 after[SITE_BPLUS_DBLWR] - before[SITE_BPLUS_DBLWR], stats.versions_removed);\n-            measured.push((improved, ms, freelist));\n+            measured.push((improved, ms, freelist,\n+                after[SITE_BPLUS_PAGE_FLUSH] - before[SITE_BPLUS_PAGE_FLUSH]));\n+        }\n+        if clean_eviction {\n+            assert!(measured.iter().all(|x| x.2 == 1), \"both eviction arms must retain deferred freelist publication\");\n+            let old = measured.iter().filter(|x| !x.0).map(|x| x.3).sum::<u64>();\n+            let new = measured.iter().filter(|x| x.0).map(|x| x.3).sum::<u64>();\n+            assert!(new < old, \"clean-first must reduce actual page syncs: {new} vs {old}\");\n+        } else {\n+            assert!(measured.iter().filter(|x| !x.0).all(|x| x.2 > 1), \"seed must exercise repeated old freelist publication\");\n+            assert!(measured.iter().filter(|x| x.0).all(|x| x.2 == 1));\n         }\n-        assert!(measured.iter().filter(|x| !x.0).all(|x| x.2 > 1), \"seed must exercise repeated old freelist publication\");\n-        assert!(measured.iter().filter(|x| x.0).all(|x| x.2 == 1));\n     }\n \n     use std::assert;\ndiff --git a/src/bplus_tree/page.rs b/src/bplus_tree/page.rs\nindex 22ee350..9e80fa5 100644\n--- a/src/bplus_tree/page.rs\n+++ b/src/bplus_tree/page.rs\n@@ -94,6 +94,8 @@ pub(crate) enum ReclamationPublication {\n     ExistingBulk,\n }\n \n+enum EvictionPolicy { Lru, ReclamationCleanFirst }\n+\n /// 页管理器\n pub struct PageManager {\n     /// 单写者锁（持有即占用库；Drop 释放）\n@@ -1152,8 +1154,34 @@ impl PageManager {\n         let mut victims: Vec<PageId> = Vec::with_capacity(target_free);\n         let mut dirty_victims: Vec<PageId> = Vec::new();\n         let mut selected = HashSet::with_capacity(target_free);\n-\n-        while victims.len() < target_free {\n+        #[cfg(test)]\n+        let old_reclamation = reclamation_eviction_reference::enabled();\n+        #[cfg(not(test))]\n+        let old_reclamation = false;\n+        let policy = if self.reclamation != ReclamationState::Idle && !old_reclamation {\n+            EvictionPolicy::ReclamationCleanFirst\n+        } else { EvictionPolicy::Lru };\n+\n+        if matches!(policy, EvictionPolicy::ReclamationCleanFirst) {\n+            // Keep sparse dirty pages in the existing cache so later edits can\n+            // share a double-write batch. Examination and retained IDs are bounded;\n+            // an all-dirty cache still makes room through the ordinary durable path.\n+            let mut delayed = Vec::new();\n+            let mut examined = 0;\n+            while victims.len() < target_free && examined < target_free + dirty_limit {\n+                let Some(pid) = self.pop_lru_valid() else { break; };\n+                if !selected.insert(pid) { continue; }\n+                examined += 1;\n+                if self.cache.get(&pid).is_some_and(|e| e.state == PageState::Dirty) {\n+                    delayed.push(pid);\n+                } else { victims.push(pid); }\n+            }\n+            let take = target_free.saturating_sub(victims.len()).min(dirty_limit).min(delayed.len());\n+            let pending = delayed.split_off(take);\n+            for pid in pending.into_iter().rev() { self.lru_queue.push_front(pid); }\n+            dirty_victims.extend(delayed.iter().copied());\n+            victims.extend(delayed);\n+        } else { while victims.len() < target_free {\n             let Some(pid) = self.pop_lru_valid() else {\n                 break;\n             };\n@@ -1175,7 +1203,7 @@ impl PageManager {\n                 dirty_victims.push(pid);\n             }\n             victims.push(pid);\n-        }\n+        } }\n \n         if !dirty_victims.is_empty() {\n             // bulk：只 write 不 sync；正常：批量双写 + 一次 sync\n@@ -1276,10 +1304,84 @@ pub(crate) mod reclamation_reference {\n     impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }\n }\n \n+#[cfg(test)]\n+pub(crate) mod reclamation_eviction_reference {\n+    use std::{assert, cell::Cell, thread_local};\n+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }\n+    pub(crate) fn enabled() -> bool { ENABLED.with(Cell::get) }\n+    pub(crate) struct Scope;\n+    impl Scope { pub(crate) fn start() -> Self { ENABLED.with(|c| assert!(!c.replace(true))); Self } }\n+    impl Drop for Scope { fn drop(&mut self) { ENABLED.with(|c| c.set(false)); } }\n+}\n+\n #[cfg(test)]\n mod tests {\n     use super::*;\n     #[test]\n+    fn reclamation_clean_eviction_keeps_sparse_dirty_pages_until_publication() {\n+        use crate::common::disk::{fsync_counts, SITE_BPLUS_PAGE_FLUSH};\n+        for reference in [true, false] {\n+            let path = crate::common::ScratchPath::new(\"page\", \"clean_reclamation\", \".db\");\n+            {\n+                let mut pm = PageManager::open(&path, 512).unwrap();\n+                for i in 1..=257u64 {\n+                    let pid = pm.allocate_page(); assert_eq!(pid, PageId(i));\n+                    assert!(pm.write_page(pid, &i.to_le_bytes()));\n+                }\n+                pm.try_flush_all().unwrap();\n+                pm.begin_reclamation().unwrap();\n+                for i in 1..=10u64 { assert!(pm.write_page(PageId(i), &(i + 1000).to_le_bytes())); }\n+                assert!(pm.free_page(PageId(257)));\n+                pm.max_cache_pages = 256;\n+                // Same physical cache and LRU seed; dirty pages precede clean pages.\n+                pm.lru_queue = (1..=256).map(PageId).collect();\n+                let mode = reference.then(reclamation_eviction_reference::Scope::start);\n+                let before = fsync_counts()[SITE_BPLUS_PAGE_FLUSH];\n+                pm.evict_batch_until_room();\n+                let syncs = fsync_counts()[SITE_BPLUS_PAGE_FLUSH] - before;\n+                assert_eq!(syncs, u64::from(reference));\n+                let guard = std::panic::catch_unwind(|| assert_eq!(syncs, 0));\n+                assert_eq!(guard.is_err(), reference, \"ordinary LRU must fail the no-sparse-sync guard\");\n+                assert_eq!(pm.cache.len(), 192);\n+                if !reference {\n+                    for i in 1..=10 { assert_eq!(pm.get_page_state(PageId(i)), Some(PageState::Dirty)); }\n+                }\n+                // One isolated batch merely moves the barrier. A second real\n+                // update batch is required to prove coalescing reduces barriers.\n+                for i in 101..=110u64 { assert!(pm.write_page(PageId(i), &(i + 1000).to_le_bytes())); }\n+                pm.try_flush_all().unwrap(); pm.finish_reclamation().unwrap();\n+                assert_eq!(fsync_counts()[SITE_BPLUS_PAGE_FLUSH] - before, if reference { 2 } else { 1 });\n+                drop(mode);\n+            }\n+            let mut pm = PageManager::open(&path, 512).unwrap();\n+            for i in 1..=256u64 {\n+                let expected = if i <= 10 || (101..=110).contains(&i) { i + 1000 } else { i };\n+                assert_eq!(&pm.read_page(PageId(i)).unwrap()[..8], &expected.to_le_bytes());\n+            }\n+            assert_eq!(pm.allocate_page(), PageId(257));\n+        }\n+    }\n+\n+    #[test]\n+    fn reclamation_all_dirty_eviction_keeps_double_write_failure_boundary() {\n+        let path = crate::common::ScratchPath::new(\"page\", \"dirty_reclamation_error\", \".db\");\n+        let mut pm = PageManager::open(&path, 512).unwrap();\n+        for i in 1..=256u64 {\n+            let pid = pm.allocate_page(); assert!(pm.write_page(pid, &i.to_le_bytes()));\n+        }\n+        pm.try_flush_all().unwrap(); pm.begin_reclamation().unwrap();\n+        for i in 1..=256u64 { assert!(pm.write_page(PageId(i), &(i + 1000).to_le_bytes())); }\n+        pm.max_cache_pages = 256;\n+        pm.lru_queue = (1..=256).map(PageId).collect();\n+        let fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(1);\n+        pm.evict_batch_until_room();\n+        assert!(pm.ensure_healthy().is_err());\n+        assert_eq!(pm.cache.len(), 256);\n+        for i in 1..=256 { assert_eq!(pm.get_page_state(PageId(i)), Some(PageState::Dirty)); }\n+        assert!(pm.finish_reclamation().is_err());\n+        drop(fault);\n+    }\n+    #[test]\n     fn reclamation_defers_freelist_but_keeps_double_write_and_prevents_reuse() {\n         use crate::common::disk::{fsync_counts, SITE_BPLUS_DBLWR, SITE_BPLUS_FREELIST, SITE_BPLUS_PAGE_FLUSH};\n         let path = crate::common::ScratchPath::new(\"page\", \"reclamation_publication\", \".db\");\n"
+  },
+  "limitations": [
+    "本实验为Debug，不从墙钟对照宣称性能改善。",
+    "保留原全量回收持锁与双写/页同步合同；209s持锁问题仍需另行研究。",
+    "补丁用于复现被拒实验，包含故意严格的 ignored 性能守卫；不是正式压测入口。"
+  ]
+}

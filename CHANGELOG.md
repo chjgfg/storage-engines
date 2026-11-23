@@ -2,6 +2,15 @@
 
 ## 未发布（2026-11-23）
 
+### M160：B+ 回收干净页优先换出实验撤回
+
+- 固定检查预算、不扩大缓存、保留双写与失败门；稀疏两批写入同步 2→1 的机制守卫和256页重开验证通过，
+  Debug 回收定向 5 passed / 0 failed / 2 ignored。
+- 实际12k同种子ABBA每臂仍 **11次 page_sync / 34次 dblwr_sync / 1次freelist**，各删除并重开核对12k值。
+  `new_sync < old_sync` 守卫失败（22 == 22），实验已撤回，保留 M159 的 B+ 生产代码。
+- [performance-m160.json](docs/performance-m160.json) 保存全部四臂、严格守卫输出、测试判据修订与可重放补丁。
+  未放宽性能守卫，未宣称改善20M吞吐或全库持锁时间。
+
 ### M159：LSM flush 复用最终 manifest 发布
 
 - compaction 仍在清理输入前持久化新文件集；同步 flush 通过发布 edit_id 区分
