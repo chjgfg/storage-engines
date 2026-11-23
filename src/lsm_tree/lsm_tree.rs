@@ -406,6 +406,19 @@ pub struct Snapshot {
 
 enum MoveOutcome { Moved, Rewrite }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VacuumWriteSchedule { Immediate, Coalesced }
+
+#[cfg(test)]
+pub(crate) mod vacuum_compaction_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|c| c.set(false)); } }
+}
+
 /// LSM 存储引擎
 pub struct LSMTree {
     dir: PathBuf,
@@ -440,6 +453,7 @@ pub struct LSMTree {
     bg: Option<BgCompactCtrl>,
     /// bulk 导入：flush 不触发同步 compact，stall 放宽
     bulk_mode: bool,
+    vacuum_write_schedule: VacuumWriteSchedule,
     /// 块缓存是不是别人的（CF 模式共享一份）。true ⇒ **自动档不再动容量**：
     /// 一棵树按自己的块数改上限，会把同进程里另一棵树的驻留块换出去，那是净负收益。
     /// 共享缓存的容量由装配方（`cf.rs`）自己定。
@@ -521,6 +535,7 @@ pub(crate) mod maintenance_probe {
         pub cleanup_ns: u128,
         pub sst_finish_ns: u128,
         pub sst_sync_ns: u128,
+        pub sst_syncs: u64,
         pub delete_calls: u64,
         pub delete_write_ns: u128,
         pub threshold_flushes: u64,
@@ -570,7 +585,7 @@ pub(crate) mod maintenance_probe {
                     Kind::Guard => stats.guard_ns += ns,
                     Kind::Cleanup => stats.cleanup_ns += ns,
                     Kind::SstFinish => stats.sst_finish_ns += ns,
-                    Kind::SstSync => stats.sst_sync_ns += ns,
+                    Kind::SstSync => { stats.sst_sync_ns += ns; stats.sst_syncs += 1; }
                     Kind::DeleteWrite => { stats.delete_calls += 1; stats.delete_write_ns += ns; }
                     Kind::ThresholdFlush => { stats.threshold_flushes += 1; stats.threshold_flush_ns += ns; }
                     Kind::MemWalSync => { stats.mem_wal_syncs += 1; stats.mem_wal_sync_ns += ns; }
@@ -663,6 +678,7 @@ impl LSMTree {
             manifest_edit_id: 0,
             bg: None,
             bulk_mode: false,
+            vacuum_write_schedule: VacuumWriteSchedule::Immediate,
             cache_shared: false,
             cache_budget_bytes: 0,
         };
@@ -2444,6 +2460,24 @@ impl LSMTree {
         Ok(())
     }
 
+    /// Full vacuum already owns the storage lock. Keep every threshold SST and
+    /// manifest durable, but merge deletion files together at its final flush.
+    /// Restore the ordinary schedule on success, error, and unwinding.
+    pub(crate) fn with_vacuum_writes<T>(&mut self, full_sweep: bool,
+        run: impl FnOnce(&mut Self) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        struct ScheduleScope<'a> { tree: &'a mut LSMTree, old: VacuumWriteSchedule }
+        impl Drop for ScheduleScope<'_> {
+            fn drop(&mut self) { self.tree.vacuum_write_schedule = self.old; }
+        }
+        #[cfg(test)]
+        let full_sweep = full_sweep && !vacuum_compaction_reference::enabled();
+        let old = self.vacuum_write_schedule;
+        if full_sweep { self.vacuum_write_schedule = VacuumWriteSchedule::Coalesced; }
+        let scope = ScheduleScope { tree: self, old };
+        run(&mut *scope.tree)
+    }
+
     fn flush_mem(&mut self) -> std::io::Result<()> {
         if self.mem.is_empty() {
             return Ok(());
@@ -2456,7 +2490,10 @@ impl LSMTree {
         let before_publication = self.manifest_edit_id;
         // bulk：不在写路径 compact；非 bulk 且未开后台时同步 compact
         if !self.bulk_mode && !self.opts.enable_bg_compact {
-            self.maybe_compact()?;
+            if self.vacuum_write_schedule == VacuumWriteSchedule::Immediate
+                || self.levels[0].len() >= self.opts.l0_stop_trigger.max(1) {
+                self.maybe_compact()?;
+            }
         } else {
             self.notify_bg();
         }
@@ -3980,6 +4017,41 @@ mod tests {
         fs::remove_dir(&blocked).unwrap();
         db.flush().unwrap(); drop(db);
         assert_eq!(LSMTree::open(&dir).unwrap().get(b"key"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn vacuum_schedule_keeps_threshold_durability_and_restores_failure_paths() {
+        let dir = tmp_dir("vacuum_schedule");
+        let mut db = LSMTree::open(&dir).unwrap();
+        db.opts.mem_threshold_entries = 1;
+        db.opts.mem_threshold_bytes = usize::MAX;
+        db.opts.l0_compact_threshold = 2;
+        db.opts.l0_stop_trigger = 3;
+        db.with_vacuum_writes(true, |tree| {
+            for i in 0..8u64 {
+                tree.insert(i.to_be_bytes().to_vec(), Some(vec![i as u8; 16]));
+                assert!(tree.levels[0].len() < tree.opts.l0_stop_trigger);
+            }
+            Ok(())
+        }).unwrap();
+        assert!(db.vacuum_write_schedule == VacuumWriteSchedule::Immediate);
+        db.write_manifest().unwrap();
+        let blocked = dir.join("MANIFEST.tmp"); fs::create_dir(&blocked).unwrap();
+        let failed = db.with_vacuum_writes(true, |tree| {
+            tree.remove_vacuum_known(VacuumDelete::observed(0u64.to_be_bytes().to_vec(), 0)?)
+        });
+        assert!(failed.is_err());
+        assert!(db.vacuum_write_schedule == VacuumWriteSchedule::Immediate);
+        fs::remove_dir(&blocked).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = db.with_vacuum_writes(true, |_| -> std::io::Result<()> { panic!("scope test"); });
+        }));
+        assert!(panicked.is_err());
+        assert!(db.vacuum_write_schedule == VacuumWriteSchedule::Immediate);
+        db.flush().unwrap(); drop(db);
+        let db = LSMTree::open(&dir).unwrap();
+        assert_eq!(db.get(&0u64.to_be_bytes()), None);
+        for i in 1..8u64 { assert_eq!(db.get(&i.to_be_bytes()), Some(vec![i as u8; 16])); }
     }
 
     #[test]

@@ -4,7 +4,9 @@
   "date": "2026-11-23",
   "base_commit": "587b09efb7e34573755e715ec0a677ad7c149a97",
   "objective": "连接最新cf6985a五档压测、M157–M160改动证据和M161最终归因设施验收",
-  "authority": "本文件是最新五档分析及本轮交付的单一账本；旧里程碑保留历史读数并通过followup引用本文件",
+  "authority": "本文件保留M161历史五档分析与验收；2026-11-24起最新单一账本由followup指向M162",
+  "followup": "docs/performance-m162.json",
+  "followup_revision": "2026-11-24：a86ac6e的20261123五档已验证；M162记录本轮收尾实现与最后一次验收政策。M161的旧读数不覆盖新结论。",
   "delivery_audit": {"json_files":["docs/performance-m153.json","docs/performance-m154.json","docs/performance-m155.json","docs/performance-m156.json","docs/performance-m157.json","docs/performance-m158.json","docs/performance-m159.json","docs/performance-m160.json","docs/performance-m161.json"],"new_markdown_links":10,"artifact_hashes":43,"source_files_verified":61,"roundtrip":true,"scope":true},
   "entrypoints": {
     "README": "README.md",

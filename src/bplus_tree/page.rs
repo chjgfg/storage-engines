@@ -1178,11 +1178,26 @@ impl PageManager {
         }
 
         if !dirty_victims.is_empty() {
+            // Reclamation touches a small dirty subset while most cached pages
+            // stay clean. Use spare double-write slots for other dirty live
+            // pages before paying the existing publication barriers. Keep those
+            // pages cached; the normal LRU victims and cache budget are unchanged.
+            let mut flush = dirty_victims;
+            let coalesce = self.reclamation != ReclamationState::Idle && !self.bulk_mode;
+            #[cfg(test)]
+            let coalesce = coalesce && !reclamation_batch_reference::enabled();
+            if coalesce {
+                let mut extra: Vec<PageId> = self.cache.iter()
+                    .filter(|(pid, entry)| entry.state == PageState::Dirty && !selected.contains(pid))
+                    .map(|(pid, _)| *pid).collect();
+                extra.sort_unstable_by_key(|pid| pid.0);
+                flush.extend(extra.into_iter().take(dirty_limit.saturating_sub(flush.len())));
+            }
             // bulk：只 write 不 sync；正常：批量双写 + 一次 sync
             let sync = !self.bulk_mode;
             #[cfg(test)]
-            BATCH_FLUSHED_PAGES.with(|c| c.set(c.get() + dirty_victims.len() as u64));
-            if self.flush_pages_batch(&dirty_victims, sync).is_err() {
+            BATCH_FLUSHED_PAGES.with(|c| c.set(c.get() + flush.len() as u64));
+            if self.flush_pages_batch(&flush, sync).is_err() {
                 self.lru_queue.extend(victims);
                 return;
             }
@@ -1277,8 +1292,57 @@ pub(crate) mod reclamation_reference {
 }
 
 #[cfg(test)]
+pub(crate) mod reclamation_batch_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|c| c.set(false)); } }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reclamation_coalesces_dirty_pages_with_failure_and_old_path_control() {
+        use crate::common::disk::{fsync_counts, SITE_BPLUS_PAGE_FLUSH};
+        for old in [true, false] {
+            let path = crate::common::ScratchPath::new("page", "reclaim_coalesce", ".db");
+            {
+                let mut pm = PageManager::open(&path, 256).unwrap();
+                for _ in 0..128 { pm.allocate_page(); }
+                pm.try_flush_all().unwrap(); pm.begin_reclamation().unwrap();
+                for i in [1u64, 100] { assert!(pm.write_page(PageId(i), &i.to_le_bytes())); }
+                pm.max_cache_pages = 128;
+                let mode = old.then(reclamation_batch_reference::Scope::start);
+                let before = fsync_counts()[SITE_BPLUS_PAGE_FLUSH];
+                pm.evict_batch_until_room();
+                pm.try_flush_all().unwrap(); pm.finish_reclamation().unwrap();
+                let count = fsync_counts()[SITE_BPLUS_PAGE_FLUSH] - before;
+                let guard = std::panic::catch_unwind(|| assert_eq!(count, 1));
+                assert_eq!(guard.is_err(), old);
+                assert_eq!(count, if old { 2 } else { 1 });
+                drop(mode);
+            }
+            let mut pm = PageManager::open(&path, 256).unwrap();
+            for i in [1u64, 100] { assert_eq!(&pm.read_page(PageId(i)).unwrap()[..8], &i.to_le_bytes()); }
+        }
+        for fault in [1, 2, 3, 4, 5] {
+            let path = crate::common::ScratchPath::new("page", "reclaim_coalesce_fault", ".db");
+            let mut pm = PageManager::open(&path, 256).unwrap();
+            for _ in 0..128 { pm.allocate_page(); }
+            pm.try_flush_all().unwrap(); pm.begin_reclamation().unwrap();
+            for i in [1u64, 100] { assert!(pm.write_page(PageId(i), &i.to_le_bytes())); }
+            pm.max_cache_pages = 128;
+            let _fault = crate::bplus_tree::storage::dblwr_probe::Scope::fault(fault);
+            pm.evict_batch_until_room();
+            assert!(pm.ensure_healthy().is_err());
+            assert_eq!(pm.cache.len(), 128);
+            for i in [1u64, 100] { assert_eq!(pm.get_page_state(PageId(i)), Some(PageState::Dirty)); }
+            assert!(pm.try_flush_all().is_err());
+        }
+    }
     #[test]
     fn reclamation_defers_freelist_but_keeps_double_write_and_prevents_reuse() {
         use crate::common::disk::{fsync_counts, SITE_BPLUS_DBLWR, SITE_BPLUS_FREELIST, SITE_BPLUS_PAGE_FLUSH};

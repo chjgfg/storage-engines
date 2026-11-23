@@ -1721,6 +1721,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "memory text seed ABBA for immediate finalized-group consumption"]
+    fn search_streaming_cpu_same_seed_abba() {
+        use std::format;
+        let rows: usize = std::env::var("MEMORY_WINDOW_ROWS").map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
+        let db = MVCC::new();
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..rows {
+            assert!(tx.set_raw(format!("{i:08}#/worldquant/datafields/x.json").as_bytes(), vec![9; 64]));
+        }
+        tx.commit();
+        let tx = db.begin_transaction();
+        assert_eq!(tx.key_count(b""), rows);
+        for (arm, old) in [true, false, false, true].into_iter().enumerate() {
+            let mode = old.then(search_stream_reference::Scope::start);
+            let before = fold_keys();
+            let now = std::time::Instant::now();
+            let page = tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, 100));
+            let ms = now.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(page.total, Some(rows)); assert_eq!(page.items.len(), 100);
+            for (i, item) in page.items.iter().enumerate() {
+                assert_eq!(item.key, format!("{i:08}#/worldquant/datafields/x.json").into_bytes());
+                assert_eq!(item.value, Some(vec![9; 64]));
+            }
+            std::eprintln!("MEMORY_STREAM_ABBA rows={rows} arm={arm} old={old} ms={ms:.3} physical_visits={} all_values_verified=100", fold_keys() - before);
+            drop(mode);
+        }
+        tx.commit();
+    }
+
+    #[test]
+    fn search_streaming_removes_chunk_arrays_with_old_path_control() {
+        let db = search_seed(50_000, 64);
+        let tx = db.begin_transaction();
+        let q = crate::common::SearchQuery::contains(b"", 0, 100);
+        let reference = search_stream_reference::Scope::start();
+        let (old, old_alloc) = crate::mem_probe::count_thread_allocations(|| tx.search_keys(&q));
+        drop(reference);
+        let (new, new_alloc) = crate::mem_probe::count_thread_allocations(|| tx.search_keys(&q));
+        assert_eq!(new.items, old.items); assert_eq!(new.total, old.total);
+        assert_eq!(new.has_next, old.has_next);
+        let allocation_guard = |measured| assert!(measured < old_alloc,
+            "direct consumption must remove real allocations");
+        allocation_guard(new_alloc);
+        let guard = std::panic::catch_unwind(|| allocation_guard(old_alloc));
+        assert!(guard.is_err(), "restoring old allocation count must fail the same guard");
+        eprintln!("MEMORY_STREAM_ARRAY_GUARD rows=50000 old_allocations={old_alloc} new_allocations={new_alloc}");
+    }
+
+    #[test]
     fn search_retention_preserves_binary_snapshots_ttl_and_rejected_chunk_progress() {
         let db = MVCC::new();
         db.set_vacuum_auto_slice(0);
@@ -2854,9 +2904,93 @@ impl crate::common::VersionedStore for Transaction {
         (rows, complete)
     }
 
+    fn search_walk(&self, include_deleted: bool, pattern: Option<&[u8]>,
+        mode: crate::common::KeyMatchMode, skip: usize, page_size: usize, want_total: bool,
+    ) -> crate::common::store::SearchWalkOutcome {
+        use crate::common::store::{SearchSelection, SearchRetention, SearchWalkOutcome};
+        #[cfg(test)]
+        if search_stream_reference::enabled() || search_copy_reference::enabled()
+            || search_key_reference::enabled() || scan_reference::enabled() {
+            return SearchWalkOutcome::UseDefault;
+        }
+        let (start, end) = crate::common::search_bounds(pattern, mode);
+        let hi = end.as_deref().map(|e| crate::common::order::range_end(e, self.core.version, false));
+        let accept = |k: &[u8]| pattern.is_none_or(|p| crate::common::key_matches(k, p, mode));
+        let mut retention = SearchRetention::new(include_deleted, skip, page_size);
+        let mut items = Vec::with_capacity(page_size.min(crate::common::kernel::FOLD_CHUNK));
+        let mut total = 0usize;
+        let mut has_more = false;
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            // Keep the existing chunk-sized lock boundary; only finalized groups
+            // are consumed directly instead of filling two intermediate arrays.
+            let store = self.store.lock().unwrap();
+            let lo = crate::common::fold_lower_bound(start, after.as_deref());
+            let mut fold = crate::common::order::CandidateFold::new(
+                start, end.as_deref(), after.as_deref(), Some(&accept), self.core.version,
+                crate::common::kernel::FOLD_CHUNK);
+            let mut last: Option<&[u8]> = None;
+            let mut consume = |c: crate::common::WinCandidate<&Option<Vec<u8>>, _>| {
+                last = Some(c.key);
+                let selection = retention.select(c.row.as_deref());
+                if matches!(selection, SearchSelection::Excluded) { return true; }
+                total += 1;
+                match selection {
+                    SearchSelection::Value | SearchSelection::Deleted => {
+                        #[cfg(test)]
+                        search_key_reference::note_copy();
+                        let logical = if matches!(selection, SearchSelection::Value) {
+                            #[cfg(test)]
+                            search_copy_reference::note_copy();
+                            c.row.clone()
+                        } else { None };
+                        items.push(ExportRecord { key: c.key.to_vec(),
+                            expire_unix_secs: logical.as_deref().and_then(crate::common::codec::logical_expiry),
+                            value: logical.and_then(crate::common::logical_to_user) });
+                    }
+                    SearchSelection::Counted if total > skip.saturating_add(page_size) => {
+                        has_more = true; return want_total;
+                    }
+                    _ => {}
+                }
+                true
+            };
+            for (enc, value) in store.iter_entries_in(lo, hi.as_deref()) {
+                #[cfg(test)]
+                FOLD_KEYS.with(|c| c.set(c.get() + 1));
+                let stop = fold.push_borrowed(enc, |v| self.is_visible(v), || value);
+                for c in fold.drain_ready() {
+                    if !consume(c) {
+                        return SearchWalkOutcome::Completed { items, has_more, total };
+                    }
+                }
+                if stop { break; }
+            }
+            let (tail, complete) = fold.finish();
+            for c in tail {
+                if !consume(c) { return SearchWalkOutcome::Completed { items, has_more, total }; }
+            }
+            if complete { return SearchWalkOutcome::Completed { items, has_more, total }; }
+            let Some(last) = last else { unreachable!("incomplete chunk must have a finalized cursor"); };
+            #[cfg(test)]
+            search_key_reference::note_copy();
+            after = Some(last.to_vec());
+        }
+    }
+
     fn materialize(&self, row: Option<Vec<u8>>) -> crate::common::RowValue {
         Self::read_row(row)
     }
+}
+
+#[cfg(test)]
+pub(crate) mod search_stream_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|c| c.set(false)); } }
 }
 
 #[cfg(test)]

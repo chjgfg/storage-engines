@@ -79,13 +79,20 @@ pub(crate) fn retain_search_row<R>(
     }
 }
 
-fn classify_search_value<R>(value: RowValue, retention: &mut SearchRetention) -> SearchRow<R> {
+pub(crate) fn classify_search_value<R>(value: RowValue, retention: &mut SearchRetention) -> SearchRow<R> {
     match value {
         RowValue::Missing => SearchRow::Excluded,
         RowValue::Tombstone => retain_search_row(retention.select(None), || None),
         RowValue::Value(bytes) =>
             retain_search_row(retention.select(Some(&bytes)), || Some(bytes)),
     }
+}
+
+/// A backend may consume groups under its read boundary; fallback remains
+/// explicit so callers cannot mistake an unsupported path for an empty result.
+pub enum SearchWalkOutcome {
+    UseDefault,
+    Completed { items: Vec<ExportRecord>, has_more: bool, total: usize },
 }
 
 /// Frozen M153 whole-batch materialization, used by the negative control.
@@ -114,6 +121,12 @@ pub trait VersionedStore {
     /// 这一家的"再拿到这一行的凭据"：memory/bplus 是顺手带出的存储字节，
     /// bitcask 是编码键；LSM 普通值保留共享块，blob/同 seq 歧义保留显式点查凭据。
     type Row;
+
+    /// Optional bounded-lock walk. Visibility, grouping and retention must use
+    /// the shared predicates; unsupported engines return UseDefault explicitly.
+    fn search_walk(&self, _include_deleted: bool, _pattern: Option<&[u8]>,
+        _mode: KeyMatchMode, _skip: usize, _page_size: usize, _want_total: bool,
+    ) -> SearchWalkOutcome { SearchWalkOutcome::UseDefault }
 
     /// 折出候选组：`start`/`end` 是逻辑键界（含下、不含上），`accept` 是**键级**过滤
     /// （不命中的键一个值都不取），`after` 是续跑游标（**不含**该键），`budget` 是组数上限。
@@ -562,6 +575,10 @@ pub fn search_page_walk<S: VersionedStore>(
     page_size: usize,
     want_total: bool,
 ) -> (Vec<ExportRecord>, bool, usize) {
+    if let SearchWalkOutcome::Completed { items, has_more, total } =
+        store.search_walk(include_deleted, pattern, mode, skip, page_size, want_total) {
+        return (items, has_more, total);
+    }
     let (lo, hi) = search_bounds(pattern, mode);
     let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
     let mut items = Vec::with_capacity(page_size.min(crate::common::kernel::FOLD_CHUNK));
@@ -782,6 +799,10 @@ pub fn count_window<S: VersionedStore>(
     pattern: Option<&[u8]>,
     mode: KeyMatchMode,
 ) -> usize {
+    if let SearchWalkOutcome::Completed { total, .. } =
+        store.search_walk(include_deleted, pattern, mode, 0, 0, true) {
+        return total;
+    }
     let (lo, hi) = search_bounds(pattern, mode);
     let accept = |k: &[u8]| pattern.is_none_or(|pat| key_matches(k, pat, mode));
     fold_window_emit(
@@ -802,7 +823,7 @@ pub fn count_window<S: VersionedStore>(
 }
 
 
-/// 模式搜索 + 分页的**唯一一份实现**（M35：四家原先各抄一遍同形的 15 行）。
+/// 模式搜索 + 分页的公共入口；借用后端可直接消费已收齐组，保留共享的可见性和保留判据。
 ///
 /// `need_total` 那一条分支是全部的差别，两支都走 [`search_page_walk`]（M75b 起只有一趟折叠）：
 /// - **不要 total**：`want_total = false` ⇒ 走到第 `page_size + 1` 条就收手。

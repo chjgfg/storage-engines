@@ -8,7 +8,7 @@
 //! 读：bloom → index → block（mmap 或 pread + LRU cache）
 //! compact：[`SstEntryIter`] 流式 + [`merge_to_builder`]
 
-use std::debug_assert;
+use std::{debug_assert, unreachable};
 #[cfg(test)]
 use std::thread_local;
 use std::{
@@ -340,6 +340,11 @@ enum SourceValue<'a> {
     Borrowed(&'a EntryValue),
     Block(CachedBlock, usize),
 }
+
+pub(crate) enum SearchSourceRow {
+    Classified(crate::common::store::SearchRow<ScanRow>),
+    Lookup(ScanRow),
+}
 impl<'a> SourceRow<'a> {
     pub(crate) fn borrowed(seq: u64, value: &'a EntryValue) -> Self {
         Self { seq, value: SourceValue::Borrowed(value), ambiguous: false }
@@ -351,6 +356,22 @@ impl<'a> SourceRow<'a> {
         }
     }
     pub(crate) fn kind(&self) -> u8 { self.entry().kind }
+    pub(crate) fn select_search(self, retention: &mut crate::common::store::SearchRetention,
+        enc: impl FnOnce() -> Vec<u8>,
+    ) -> SearchSourceRow {
+        let entry = self.entry();
+        if self.ambiguous || (entry.kind == 0
+            && super::lsm_tree::LSMTree::blob_ptr_seq(entry.value).is_some()) {
+            return SearchSourceRow::Lookup(self.freeze(enc));
+        }
+        let logical = if entry.kind == 0 { Some(entry.value) } else { None };
+        let selection = retention.select(logical);
+        SearchSourceRow::Classified(crate::common::store::retain_search_row(selection,
+            || match self.entry().owned().value {
+                EntryValue::Put(value) => value,
+                EntryValue::Drop => unreachable!("dropped sources never enter the logical fold"),
+            }))
+    }
     pub(crate) fn freeze(self, enc: impl FnOnce() -> Vec<u8>) -> ScanRow {
         if self.ambiguous { return ScanRow::AmbiguousLookup(enc()); }
         let entry = self.entry();

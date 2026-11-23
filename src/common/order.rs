@@ -215,6 +215,7 @@ pub(crate) struct CandidateFold<'a, R, K = Vec<u8>> {
     accept: Option<&'a dyn Fn(&[u8]) -> bool>,
     max_version: u64,
     budget: usize,
+    emitted: usize,
     stopped: bool,
 }
 
@@ -236,12 +237,20 @@ impl<'a, R, K: Ord + Borrow<[u8]>> CandidateFold<'a, R, K> {
             accept,
             max_version,
             budget: budget.max(1),
+            emitted: 0,
             stopped: false,
         }
     }
 
     fn emit(&mut self, key: K, (version, row): (u64, R)) {
         self.out.push(WinCandidate { key, version, row });
+        self.emitted += 1;
+    }
+
+    /// Consume finalized groups immediately while preserving the original chunk
+    /// budget. The buffer is reused; overlapping binary groups stay in window.
+    pub(crate) fn drain_ready(&mut self) -> std::vec::Drain<'_, WinCandidate<R, K>> {
+        self.out.drain(..)
     }
 
     /// Returns true once the output budget is full. The caller may stop its walk.
@@ -254,7 +263,7 @@ impl<'a, R, K: Ord + Borrow<[u8]>> CandidateFold<'a, R, K> {
     ) -> bool {
         while let Some((key, winner)) = self.window.pop_before(enc, self.max_version) {
             self.emit(key, winner);
-            if self.out.len() >= self.budget {
+            if self.emitted >= self.budget {
                 self.stopped = true;
                 return true;
             }
@@ -282,7 +291,7 @@ impl<'a, R, K: Ord + Borrow<[u8]>> CandidateFold<'a, R, K> {
 
     pub(crate) fn finish(mut self) -> (Vec<WinCandidate<R, K>>, bool) {
         if !self.stopped {
-            while self.out.len() < self.budget {
+            while self.emitted < self.budget {
                 let Some((key, winner)) = self.window.pop_first() else {
                     break;
                 };
@@ -302,7 +311,7 @@ impl<'a, R> CandidateFold<'a, R> {
         if super::store::scan_cost_reference::enabled() {
             while let Some((key, winner)) = self.window.pop_before(enc, self.max_version) {
                 self.emit(key, winner);
-                if self.out.len() >= self.budget { self.stopped = true; return true; }
+                if self.emitted >= self.budget { self.stopped = true; return true; }
             }
             let Some(VersionedKey { raw_key: key, version }) = decode_key(enc) else { return false; };
             super::store::scan_cost_reference::note_key_copy();

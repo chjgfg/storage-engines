@@ -1,0 +1,4096 @@
+{
+  "milestone": "M162",
+  "date": "2026-11-24",
+  "baseline_head": "a86ac6e646c2c33f1657042d6f96e5abd9317014",
+  "objective": "收尾B+回收写回合批、memory搜索逐行中间数组、LSM借用计数与回收压实合批；封存无收益实验",
+  "authority": "最新五档分析和本次实现、验收的单一账本，接替M161。",
+  "entrypoints": {
+    "readme": "README.md",
+    "changelog": "CHANGELOG.md",
+    "manual": "docs/大规模压测手册.md",
+    "supersedes": "docs/performance-m161.json"
+  },
+  "baseline_runs": [
+    {
+      "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba",
+      "head": "cf6985a29833751781e13f2cd62e8a4187f43ef0",
+      "source_sha256": "9aea6af6f67277306c8a87f98b497f7c91dd7096d1a954e55fe2c412d820998c",
+      "executable_sha256": "846f463801a5539c6457ea93805cdcd22052f13fcd0f826349026be56c9d9dcd",
+      "total_seconds": 32198.421,
+      "source_count": 61,
+      "source_mismatch": [],
+      "cases": [
+        {
+          "summary": {
+            "rows": 600000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 606.089,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_600000_pass_1.log",
+            "diagnostics": "rows_600000_pass_1.diagnostics.json",
+            "diagnostics_count": 848,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 797,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 72005.176,
+              "cpu": "Ok(11000.0)",
+              "allocations": 9114919,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 326.898,
+              "cpu": "Ok(203.125)",
+              "allocations": 654632,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 5664.424,
+              "cpu": "Ok(5484.375)",
+              "allocations": 4800004,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 1756.32,
+              "cpu": "Ok(1703.125)",
+              "allocations": 2401764,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 12.364,
+              "cpu": "Ok(0.0)",
+              "allocations": 16397,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 1893.749,
+              "cpu": "Ok(1890.625)",
+              "allocations": 2401912,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 10566.13,
+              "cpu": "Ok(1390.625)",
+              "allocations": 1119254,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 190.65,
+              "cpu": "Ok(78.125)",
+              "allocations": 36598,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 43.525,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 2000.422,
+              "cpu": "Ok(2000.0)",
+              "allocations": 2405771,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 2685.831,
+              "cpu": "Ok(2609.375)",
+              "allocations": 4334516,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 1302.366,
+              "cpu": "Ok(234.375)",
+              "allocations": 310036,
+              "line": 196
+            },
+            "bitcask:bulk_stop": {
+              "ms": 1070.49,
+              "cpu": "Ok(234.375)",
+              "allocations": 11,
+              "line": 204
+            },
+            "bplus_tree:insert": {
+              "ms": 206950.586,
+              "cpu": "Ok(18484.375)",
+              "allocations": 46694395,
+              "line": 225
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 44.755,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 248
+            },
+            "bplus_tree:random_read": {
+              "ms": 9767.853,
+              "cpu": "Ok(9406.25)",
+              "allocations": 6624903,
+              "line": 255
+            },
+            "bplus_tree:search_first": {
+              "ms": 982.009,
+              "cpu": "Ok(968.75)",
+              "allocations": 3129007,
+              "line": 315
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 6.825,
+              "cpu": "Ok(0.0)",
+              "allocations": 21219,
+              "line": 321
+            },
+            "bplus_tree:key_count": {
+              "ms": 1278.343,
+              "cpu": "Ok(1171.875)",
+              "allocations": 3113000,
+              "line": 339
+            },
+            "bplus_tree:update": {
+              "ms": 88424.743,
+              "cpu": "Ok(2390.625)",
+              "allocations": 5239403,
+              "line": 364
+            },
+            "bplus_tree:vacuum": {
+              "ms": 38906.547,
+              "cpu": "Ok(906.25)",
+              "allocations": 776559,
+              "line": 379
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 377.975,
+              "cpu": "Ok(15.625)",
+              "allocations": 400,
+              "line": 394
+            },
+            "bplus_tree:export_stream": {
+              "ms": 1474.147,
+              "cpu": "Ok(1375.0)",
+              "allocations": 3117625,
+              "line": 420
+            },
+            "bplus_tree:migrate": {
+              "ms": 2495.465,
+              "cpu": "Ok(2328.125)",
+              "allocations": 5112246,
+              "line": 426
+            },
+            "bplus_tree:bulk": {
+              "ms": 3434.109,
+              "cpu": "Ok(1453.125)",
+              "allocations": 4053850,
+              "line": 436
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 218.495,
+              "cpu": "Ok(15.625)",
+              "allocations": 4,
+              "line": 445
+            },
+            "lsm_tree:insert": {
+              "ms": 56700.496,
+              "cpu": "Ok(8609.375)",
+              "allocations": 14466791,
+              "line": 468
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 83.216,
+              "cpu": "Ok(31.25)",
+              "allocations": 9659,
+              "line": 502
+            },
+            "lsm_tree:random_read": {
+              "ms": 8219.787,
+              "cpu": "Ok(8140.625)",
+              "allocations": 4031788,
+              "line": 509
+            },
+            "lsm_tree:search_first": {
+              "ms": 666.399,
+              "cpu": "Ok(656.25)",
+              "allocations": 3634692,
+              "line": 569
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 5.585,
+              "cpu": "Ok(0.0)",
+              "allocations": 24944,
+              "line": 575
+            },
+            "lsm_tree:key_count": {
+              "ms": 649.914,
+              "cpu": "Ok(656.25)",
+              "allocations": 3635636,
+              "line": 593
+            },
+            "lsm_tree:update": {
+              "ms": 10655.922,
+              "cpu": "Ok(1437.5)",
+              "allocations": 1892241,
+              "line": 618
+            },
+            "lsm_tree:vacuum": {
+              "ms": 580.261,
+              "cpu": "Ok(312.5)",
+              "allocations": 1202891,
+              "line": 638
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 1.396,
+              "cpu": "Ok(0.0)",
+              "allocations": 3241,
+              "line": 658
+            },
+            "lsm_tree:export_stream": {
+              "ms": 881.34,
+              "cpu": "Ok(875.0)",
+              "allocations": 4078925,
+              "line": 690
+            },
+            "lsm_tree:migrate": {
+              "ms": 1446.46,
+              "cpu": "Ok(1421.875)",
+              "allocations": 6028772,
+              "line": 696
+            },
+            "lsm_tree:bulk": {
+              "ms": 319.626,
+              "cpu": "Ok(125.0)",
+              "allocations": 603173,
+              "line": 706
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 49.196,
+              "cpu": "Ok(46.875)",
+              "allocations": 4,
+              "line": 721
+            },
+            "memory:insert": {
+              "ms": 1829.632,
+              "cpu": "Ok(1625.0)",
+              "allocations": 4312887,
+              "line": 749
+            },
+            "memory:first_reopen": {
+              "ms": 522.269,
+              "cpu": "Ok(515.625)",
+              "allocations": 1900620,
+              "line": 771
+            },
+            "memory:random_read": {
+              "ms": 1434.632,
+              "cpu": "Ok(1421.875)",
+              "allocations": 4200003,
+              "line": 778
+            },
+            "memory:search_first": {
+              "ms": 146.598,
+              "cpu": "Ok(140.625)",
+              "allocations": 602012,
+              "line": 828
+            },
+            "memory:search_first_no_total": {
+              "ms": 0.86,
+              "cpu": "Ok(0.0)",
+              "allocations": 4210,
+              "line": 833
+            },
+            "memory:key_count": {
+              "ms": 146.309,
+              "cpu": "Ok(140.625)",
+              "allocations": 602059,
+              "line": 848
+            },
+            "memory:update": {
+              "ms": 131.922,
+              "cpu": "Ok(125.0)",
+              "allocations": 456909,
+              "line": 869
+            },
+            "memory:vacuum": {
+              "ms": 85.15,
+              "cpu": "Ok(78.125)",
+              "allocations": 36591,
+              "line": 882
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.214,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 895
+            },
+            "memory:export_stream": {
+              "ms": 385.873,
+              "cpu": "Ok(390.625)",
+              "allocations": 1203914,
+              "line": 917
+            },
+            "memory:migrate": {
+              "ms": 901.537,
+              "cpu": "Ok(890.625)",
+              "allocations": 3131908,
+              "line": 922
+            },
+            "memory:bulk": {
+              "ms": 61.35,
+              "cpu": "Ok(62.5)",
+              "allocations": 310001,
+              "line": 931
+            },
+            "memory:bulk_stop": {
+              "ms": 1581.802,
+              "cpu": "Ok(250.0)",
+              "allocations": 13,
+              "line": 940
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 1000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 806.682,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_1000000_pass_1.log",
+            "diagnostics": "rows_1000000_pass_1.diagnostics.json",
+            "diagnostics_count": 848,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 797,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 101079.397,
+              "cpu": "Ok(13046.875)",
+              "allocations": 15191536,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 303.144,
+              "cpu": "Ok(234.375)",
+              "allocations": 1090998,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 8304.382,
+              "cpu": "Ok(8265.625)",
+              "allocations": 8000012,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 2688.179,
+              "cpu": "Ok(2640.625)",
+              "allocations": 4002939,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 10.264,
+              "cpu": "Ok(15.625)",
+              "allocations": 16397,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2592.239,
+              "cpu": "Ok(2578.125)",
+              "allocations": 4003185,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 14777.913,
+              "cpu": "Ok(1515.625)",
+              "allocations": 1873611,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 272.348,
+              "cpu": "Ok(109.375)",
+              "allocations": 52124,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 72.949,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 3269.711,
+              "cpu": "Ok(3093.75)",
+              "allocations": 4006946,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 3652.935,
+              "cpu": "Ok(3625.0)",
+              "allocations": 7219382,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 1882.554,
+              "cpu": "Ok(281.25)",
+              "allocations": 516701,
+              "line": 196
+            },
+            "bitcask:bulk_stop": {
+              "ms": 1306.465,
+              "cpu": "Ok(265.625)",
+              "allocations": 11,
+              "line": 204
+            },
+            "bplus_tree:insert": {
+              "ms": 350886.25,
+              "cpu": "Ok(27187.5)",
+              "allocations": 77816650,
+              "line": 225
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 57.683,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 248
+            },
+            "bplus_tree:random_read": {
+              "ms": 12966.22,
+              "cpu": "Ok(12859.375)",
+              "allocations": 11041249,
+              "line": 255
+            },
+            "bplus_tree:search_first": {
+              "ms": 1243.388,
+              "cpu": "Ok(1234.375)",
+              "allocations": 5219317,
+              "line": 315
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 5.043,
+              "cpu": "Ok(15.625)",
+              "allocations": 21249,
+              "line": 321
+            },
+            "bplus_tree:key_count": {
+              "ms": 1228.17,
+              "cpu": "Ok(1218.75)",
+              "allocations": 5188919,
+              "line": 339
+            },
+            "bplus_tree:update": {
+              "ms": 54268.83,
+              "cpu": "Ok(3265.625)",
+              "allocations": 8903224,
+              "line": 364
+            },
+            "bplus_tree:vacuum": {
+              "ms": 14676.556,
+              "cpu": "Ok(1125.0)",
+              "allocations": 1104906,
+              "line": 379
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 244.49,
+              "cpu": "Ok(0.0)",
+              "allocations": 466,
+              "line": 394
+            },
+            "bplus_tree:export_stream": {
+              "ms": 1505.752,
+              "cpu": "Ok(1484.375)",
+              "allocations": 5193408,
+              "line": 420
+            },
+            "bplus_tree:migrate": {
+              "ms": 2384.387,
+              "cpu": "Ok(2375.0)",
+              "allocations": 8527817,
+              "line": 426
+            },
+            "bplus_tree:bulk": {
+              "ms": 3086.68,
+              "cpu": "Ok(1328.125)",
+              "allocations": 6756389,
+              "line": 436
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 64.61,
+              "cpu": "Ok(0.0)",
+              "allocations": 4,
+              "line": 445
+            },
+            "lsm_tree:insert": {
+              "ms": 83590.282,
+              "cpu": "Ok(14078.125)",
+              "allocations": 24258310,
+              "line": 468
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 40.91,
+              "cpu": "Ok(15.625)",
+              "allocations": 16042,
+              "line": 502
+            },
+            "lsm_tree:random_read": {
+              "ms": 18672.349,
+              "cpu": "Ok(18265.625)",
+              "allocations": 6850862,
+              "line": 509
+            },
+            "lsm_tree:search_first": {
+              "ms": 1124.39,
+              "cpu": "Ok(1093.75)",
+              "allocations": 6059713,
+              "line": 569
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.265,
+              "cpu": "Ok(0.0)",
+              "allocations": 24953,
+              "line": 575
+            },
+            "lsm_tree:key_count": {
+              "ms": 1155.255,
+              "cpu": "Ok(1140.625)",
+              "allocations": 6062359,
+              "line": 593
+            },
+            "lsm_tree:update": {
+              "ms": 16742.988,
+              "cpu": "Ok(2250.0)",
+              "allocations": 3469747,
+              "line": 618
+            },
+            "lsm_tree:vacuum": {
+              "ms": 1010.351,
+              "cpu": "Ok(531.25)",
+              "allocations": 1837617,
+              "line": 638
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 1.117,
+              "cpu": "Ok(0.0)",
+              "allocations": 3252,
+              "line": 658
+            },
+            "lsm_tree:export_stream": {
+              "ms": 1396.488,
+              "cpu": "Ok(1343.75)",
+              "allocations": 6788910,
+              "line": 690
+            },
+            "lsm_tree:migrate": {
+              "ms": 2680.944,
+              "cpu": "Ok(2671.875)",
+              "allocations": 10042038,
+              "line": 696
+            },
+            "lsm_tree:bulk": {
+              "ms": 398.364,
+              "cpu": "Ok(265.625)",
+              "allocations": 1005204,
+              "line": 706
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 32.278,
+              "cpu": "Ok(15.625)",
+              "allocations": 4,
+              "line": 721
+            },
+            "memory:insert": {
+              "ms": 2311.854,
+              "cpu": "Ok(2171.875)",
+              "allocations": 7188144,
+              "line": 749
+            },
+            "memory:first_reopen": {
+              "ms": 969.584,
+              "cpu": "Ok(968.75)",
+              "allocations": 3167685,
+              "line": 771
+            },
+            "memory:random_read": {
+              "ms": 2790.132,
+              "cpu": "Ok(2640.625)",
+              "allocations": 7000003,
+              "line": 778
+            },
+            "memory:search_first": {
+              "ms": 227.567,
+              "cpu": "Ok(234.375)",
+              "allocations": 1003285,
+              "line": 828
+            },
+            "memory:search_first_no_total": {
+              "ms": 0.857,
+              "cpu": "Ok(0.0)",
+              "allocations": 4210,
+              "line": 833
+            },
+            "memory:key_count": {
+              "ms": 279.357,
+              "cpu": "Ok(281.25)",
+              "allocations": 1003430,
+              "line": 848
+            },
+            "memory:update": {
+              "ms": 294.455,
+              "cpu": "Ok(296.875)",
+              "allocations": 769729,
+              "line": 869
+            },
+            "memory:vacuum": {
+              "ms": 127.513,
+              "cpu": "Ok(140.625)",
+              "allocations": 52117,
+              "line": 882
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.25,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 895
+            },
+            "memory:export_stream": {
+              "ms": 649.322,
+              "cpu": "Ok(640.625)",
+              "allocations": 2005187,
+              "line": 917
+            },
+            "memory:migrate": {
+              "ms": 1503.005,
+              "cpu": "Ok(1515.625)",
+              "allocations": 5216374,
+              "line": 922
+            },
+            "memory:bulk": {
+              "ms": 116.162,
+              "cpu": "Ok(109.375)",
+              "allocations": 519908,
+              "line": 931
+            },
+            "memory:bulk_stop": {
+              "ms": 2218.429,
+              "cpu": "Ok(421.875)",
+              "allocations": 13,
+              "line": 940
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 5000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 4141.913,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_5000000_pass_1.log",
+            "diagnostics": "rows_5000000_pass_1.diagnostics.json",
+            "diagnostics_count": 848,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 797,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 504869.838,
+              "cpu": "Ok(66968.75)",
+              "allocations": 75957668,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 1694.066,
+              "cpu": "Ok(1593.75)",
+              "allocations": 5454643,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 55492.953,
+              "cpu": "Ok(53734.375)",
+              "allocations": 40000063,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 13181.789,
+              "cpu": "Ok(13109.375)",
+              "allocations": 20014653,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 10.86,
+              "cpu": "Ok(15.625)",
+              "allocations": 16397,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2750.487,
+              "cpu": "Ok(2703.125)",
+              "allocations": 4003185,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 87725.926,
+              "cpu": "Ok(8640.625)",
+              "allocations": 9368111,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 805.054,
+              "cpu": "Ok(531.25)",
+              "allocations": 256543,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 45.212,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 23757.804,
+              "cpu": "Ok(21593.75)",
+              "allocations": 20018659,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 31065.414,
+              "cpu": "Ok(29421.875)",
+              "allocations": 36068000,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 11324.393,
+              "cpu": "Ok(1828.125)",
+              "allocations": 2583369,
+              "line": 196
+            },
+            "bitcask:bulk_stop": {
+              "ms": 7128.1,
+              "cpu": "Ok(1390.625)",
+              "allocations": 11,
+              "line": 204
+            },
+            "bplus_tree:insert": {
+              "ms": 1694360.792,
+              "cpu": "Ok(134140.625)",
+              "allocations": 389052288,
+              "line": 225
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 60.568,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 248
+            },
+            "bplus_tree:random_read": {
+              "ms": 111875.888,
+              "cpu": "Ok(111031.25)",
+              "allocations": 76816188,
+              "line": 255
+            },
+            "bplus_tree:search_first": {
+              "ms": 5556.162,
+              "cpu": "Ok(5531.25)",
+              "allocations": 26116130,
+              "line": 315
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 7.917,
+              "cpu": "Ok(0.0)",
+              "allocations": 21361,
+              "line": 321
+            },
+            "bplus_tree:key_count": {
+              "ms": 1092.75,
+              "cpu": "Ok(1093.75)",
+              "allocations": 5223693,
+              "line": 339
+            },
+            "bplus_tree:update": {
+              "ms": 271906.703,
+              "cpu": "Ok(15218.75)",
+              "allocations": 44486501,
+              "line": 364
+            },
+            "bplus_tree:vacuum": {
+              "ms": 64397.082,
+              "cpu": "Ok(5125.0)",
+              "allocations": 5427436,
+              "line": 379
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 232.416,
+              "cpu": "Ok(0.0)",
+              "allocations": 396,
+              "line": 394
+            },
+            "bplus_tree:export_stream": {
+              "ms": 6109.108,
+              "cpu": "Ok(6000.0)",
+              "allocations": 26120328,
+              "line": 420
+            },
+            "bplus_tree:migrate": {
+              "ms": 10951.72,
+              "cpu": "Ok(10906.25)",
+              "allocations": 42685653,
+              "line": 426
+            },
+            "bplus_tree:bulk": {
+              "ms": 10121.855,
+              "cpu": "Ok(5859.375)",
+              "allocations": 33783757,
+              "line": 436
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 95.107,
+              "cpu": "Ok(15.625)",
+              "allocations": 4,
+              "line": 445
+            },
+            "lsm_tree:insert": {
+              "ms": 493769.192,
+              "cpu": "Ok(69015.625)",
+              "allocations": 121589763,
+              "line": 468
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 75.952,
+              "cpu": "Ok(31.25)",
+              "allocations": 79830,
+              "line": 502
+            },
+            "lsm_tree:random_read": {
+              "ms": 99939.337,
+              "cpu": "Ok(97468.75)",
+              "allocations": 35038566,
+              "line": 509
+            },
+            "lsm_tree:search_first": {
+              "ms": 5544.14,
+              "cpu": "Ok(5531.25)",
+              "allocations": 30392211,
+              "line": 569
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.655,
+              "cpu": "Ok(0.0)",
+              "allocations": 25030,
+              "line": 575
+            },
+            "lsm_tree:key_count": {
+              "ms": 1049.612,
+              "cpu": "Ok(1046.875)",
+              "allocations": 6062515,
+              "line": 593
+            },
+            "lsm_tree:update": {
+              "ms": 106271.158,
+              "cpu": "Ok(18109.375)",
+              "allocations": 39293779,
+              "line": 618
+            },
+            "lsm_tree:vacuum": {
+              "ms": 14231.094,
+              "cpu": "Ok(5562.5)",
+              "allocations": 19082065,
+              "line": 638
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 3.374,
+              "cpu": "Ok(15.625)",
+              "allocations": 3466,
+              "line": 658
+            },
+            "lsm_tree:export_stream": {
+              "ms": 10740.673,
+              "cpu": "Ok(10000.0)",
+              "allocations": 34126361,
+              "line": 690
+            },
+            "lsm_tree:migrate": {
+              "ms": 16458.753,
+              "cpu": "Ok(15703.125)",
+              "allocations": 51180820,
+              "line": 696
+            },
+            "lsm_tree:bulk": {
+              "ms": 1557.927,
+              "cpu": "Ok(1375.0)",
+              "allocations": 5025528,
+              "line": 706
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 54.752,
+              "cpu": "Ok(62.5)",
+              "allocations": 4,
+              "line": 721
+            },
+            "memory:insert": {
+              "ms": 12884.681,
+              "cpu": "Ok(12359.375)",
+              "allocations": 35940770,
+              "line": 749
+            },
+            "memory:first_reopen": {
+              "ms": 15382.913,
+              "cpu": "Ok(13609.375)",
+              "allocations": 15838353,
+              "line": 771
+            },
+            "memory:random_read": {
+              "ms": 22553.3,
+              "cpu": "Ok(20968.75)",
+              "allocations": 35000003,
+              "line": 778
+            },
+            "memory:search_first": {
+              "ms": 1446.562,
+              "cpu": "Ok(1453.125)",
+              "allocations": 5015975,
+              "line": 828
+            },
+            "memory:search_first_no_total": {
+              "ms": 1.091,
+              "cpu": "Ok(0.0)",
+              "allocations": 4210,
+              "line": 833
+            },
+            "memory:key_count": {
+              "ms": 323.48,
+              "cpu": "Ok(328.125)",
+              "allocations": 1003430,
+              "line": 848
+            },
+            "memory:update": {
+              "ms": 1200.504,
+              "cpu": "Ok(1187.5)",
+              "allocations": 3848656,
+              "line": 869
+            },
+            "memory:vacuum": {
+              "ms": 631.804,
+              "cpu": "Ok(625.0)",
+              "allocations": 256535,
+              "line": 882
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.214,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 895
+            },
+            "memory:export_stream": {
+              "ms": 4834.9,
+              "cpu": "Ok(4531.25)",
+              "allocations": 10017876,
+              "line": 917
+            },
+            "memory:migrate": {
+              "ms": 10618.048,
+              "cpu": "Ok(10218.75)",
+              "allocations": 26060992,
+              "line": 922
+            },
+            "memory:bulk": {
+              "ms": 550.995,
+              "cpu": "Ok(546.875)",
+              "allocations": 2583335,
+              "line": 931
+            },
+            "memory:bulk_stop": {
+              "ms": 9754.969,
+              "cpu": "Ok(2546.875)",
+              "allocations": 13,
+              "line": 940
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 10000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 8850.61,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_10000000_pass_1.log",
+            "diagnostics": "rows_10000000_pass_1.diagnostics.json",
+            "diagnostics_count": 848,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 797,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 1021839.615,
+              "cpu": "Ok(141906.25)",
+              "allocations": 151915284,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 5964.132,
+              "cpu": "Ok(4781.25)",
+              "allocations": 10909198,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 117820.729,
+              "cpu": "Ok(110375.0)",
+              "allocations": 80000120,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 33467.328,
+              "cpu": "Ok(31609.375)",
+              "allocations": 40029304,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 13.032,
+              "cpu": "Ok(15.625)",
+              "allocations": 16397,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2926.419,
+              "cpu": "Ok(2875.0)",
+              "allocations": 4003185,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 185393.736,
+              "cpu": "Ok(20281.25)",
+              "allocations": 18744425,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 2261.605,
+              "cpu": "Ok(1734.375)",
+              "allocations": 503873,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 52.227,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 45654.57,
+              "cpu": "Ok(42437.5)",
+              "allocations": 40033311,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 57870.42,
+              "cpu": "Ok(54875.0)",
+              "allocations": 72128772,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 15369.35,
+              "cpu": "Ok(3453.125)",
+              "allocations": 5166719,
+              "line": 196
+            },
+            "bitcask:bulk_stop": {
+              "ms": 12448.144,
+              "cpu": "Ok(3437.5)",
+              "allocations": 11,
+              "line": 204
+            },
+            "bplus_tree:insert": {
+              "ms": 3798923.305,
+              "cpu": "Ok(334921.875)",
+              "allocations": 778100061,
+              "line": 225
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 126.423,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 248
+            },
+            "bplus_tree:random_read": {
+              "ms": 327987.726,
+              "cpu": "Ok(314546.875)",
+              "allocations": 164377147,
+              "line": 255
+            },
+            "bplus_tree:search_first": {
+              "ms": 16497.516,
+              "cpu": "Ok(15718.75)",
+              "allocations": 52242105,
+              "line": 315
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 8.056,
+              "cpu": "Ok(0.0)",
+              "allocations": 21361,
+              "line": 321
+            },
+            "bplus_tree:key_count": {
+              "ms": 2368.692,
+              "cpu": "Ok(2171.875)",
+              "allocations": 5224471,
+              "line": 339
+            },
+            "bplus_tree:update": {
+              "ms": 628016.41,
+              "cpu": "Ok(43390.625)",
+              "allocations": 89146659,
+              "line": 364
+            },
+            "bplus_tree:vacuum": {
+              "ms": 139077.67,
+              "cpu": "Ok(14796.875)",
+              "allocations": 10658666,
+              "line": 379
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 266.932,
+              "cpu": "Ok(0.0)",
+              "allocations": 417,
+              "line": 394
+            },
+            "bplus_tree:export_stream": {
+              "ms": 20425.397,
+              "cpu": "Ok(19687.5)",
+              "allocations": 52245295,
+              "line": 420
+            },
+            "bplus_tree:migrate": {
+              "ms": 32759.285,
+              "cpu": "Ok(32015.625)",
+              "allocations": 85385921,
+              "line": 426
+            },
+            "bplus_tree:bulk": {
+              "ms": 22832.407,
+              "cpu": "Ok(15187.5)",
+              "allocations": 66787845,
+              "line": 436
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 54.758,
+              "cpu": "Ok(15.625)",
+              "allocations": 4,
+              "line": 445
+            },
+            "lsm_tree:insert": {
+              "ms": 972981.57,
+              "cpu": "Ok(136750.0)",
+              "allocations": 243632006,
+              "line": 468
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 153.57,
+              "cpu": "Ok(46.875)",
+              "allocations": 159571,
+              "line": 502
+            },
+            "lsm_tree:random_read": {
+              "ms": 177985.947,
+              "cpu": "Ok(176875.0)",
+              "allocations": 70271426,
+              "line": 509
+            },
+            "lsm_tree:search_first": {
+              "ms": 10092.414,
+              "cpu": "Ok(10046.875)",
+              "allocations": 61004069,
+              "line": 569
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 6.086,
+              "cpu": "Ok(0.0)",
+              "allocations": 25120,
+              "line": 575
+            },
+            "lsm_tree:key_count": {
+              "ms": 1038.06,
+              "cpu": "Ok(1031.25)",
+              "allocations": 6062515,
+              "line": 593
+            },
+            "lsm_tree:update": {
+              "ms": 201457.693,
+              "cpu": "Ok(27953.125)",
+              "allocations": 76219921,
+              "line": 618
+            },
+            "lsm_tree:vacuum": {
+              "ms": 23280.409,
+              "cpu": "Ok(8906.25)",
+              "allocations": 33141472,
+              "line": 638
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 2.057,
+              "cpu": "Ok(0.0)",
+              "allocations": 3623,
+              "line": 658
+            },
+            "lsm_tree:export_stream": {
+              "ms": 17188.984,
+              "cpu": "Ok(16546.875)",
+              "allocations": 68353997,
+              "line": 690
+            },
+            "lsm_tree:migrate": {
+              "ms": 25139.481,
+              "cpu": "Ok(25031.25)",
+              "allocations": 102792069,
+              "line": 696
+            },
+            "lsm_tree:bulk": {
+              "ms": 1668.201,
+              "cpu": "Ok(1609.375)",
+              "allocations": 10050921,
+              "line": 706
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 82.034,
+              "cpu": "Ok(93.75)",
+              "allocations": 4,
+              "line": 721
+            },
+            "memory:insert": {
+              "ms": 18768.842,
+              "cpu": "Ok(18640.625)",
+              "allocations": 71881542,
+              "line": 749
+            },
+            "memory:first_reopen": {
+              "ms": 11225.781,
+              "cpu": "Ok(11140.625)",
+              "allocations": 31676685,
+              "line": 771
+            },
+            "memory:random_read": {
+              "ms": 29693.359,
+              "cpu": "Ok(29468.75)",
+              "allocations": 70000003,
+              "line": 778
+            },
+            "memory:search_first": {
+              "ms": 4592.334,
+              "cpu": "Ok(4562.5)",
+              "allocations": 10031847,
+              "line": 828
+            },
+            "memory:search_first_no_total": {
+              "ms": 2.564,
+              "cpu": "Ok(0.0)",
+              "allocations": 4210,
+              "line": 833
+            },
+            "memory:key_count": {
+              "ms": 572.679,
+              "cpu": "Ok(562.5)",
+              "allocations": 1003430,
+              "line": 848
+            },
+            "memory:update": {
+              "ms": 3051.826,
+              "cpu": "Ok(3015.625)",
+              "allocations": 7705530,
+              "line": 869
+            },
+            "memory:vacuum": {
+              "ms": 1329.113,
+              "cpu": "Ok(1328.125)",
+              "allocations": 503865,
+              "line": 882
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.225,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 895
+            },
+            "memory:export_stream": {
+              "ms": 9418.93,
+              "cpu": "Ok(9156.25)",
+              "allocations": 20033749,
+              "line": 917
+            },
+            "memory:migrate": {
+              "ms": 22432.91,
+              "cpu": "Ok(22359.375)",
+              "allocations": 52116764,
+              "line": 922
+            },
+            "memory:bulk": {
+              "ms": 3173.525,
+              "cpu": "Ok(3171.875)",
+              "allocations": 5166666,
+              "line": 931
+            },
+            "memory:bulk_stop": {
+              "ms": 19474.106,
+              "cpu": "Ok(8234.375)",
+              "allocations": 13,
+              "line": 940
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 20000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 17793.127,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_20000000_pass_1.log",
+            "diagnostics": "rows_20000000_pass_1.diagnostics.json",
+            "diagnostics_count": 848,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 797,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 2051221.82,
+              "cpu": "Ok(277468.75)",
+              "allocations": 303830518,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 8050.569,
+              "cpu": "Ok(7671.875)",
+              "allocations": 21818304,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 215337.981,
+              "cpu": "Ok(208843.75)",
+              "allocations": 160000233,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 64919.591,
+              "cpu": "Ok(63062.5)",
+              "allocations": 80058597,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 12.616,
+              "cpu": "Ok(0.0)",
+              "allocations": 16397,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2818.748,
+              "cpu": "Ok(2812.5)",
+              "allocations": 4003185,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 352275.782,
+              "cpu": "Ok(41421.875)",
+              "allocations": 37488861,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 2764.526,
+              "cpu": "Ok(2234.375)",
+              "allocations": 1006723,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 32.959,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 76198.473,
+              "cpu": "Ok(72593.75)",
+              "allocations": 80062611,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 89083.951,
+              "cpu": "Ok(87437.5)",
+              "allocations": 144250320,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 27148.333,
+              "cpu": "Ok(6437.5)",
+              "allocations": 10333425,
+              "line": 196
+            },
+            "bitcask:bulk_stop": {
+              "ms": 27335.258,
+              "cpu": "Ok(6875.0)",
+              "allocations": 11,
+              "line": 204
+            },
+            "bplus_tree:insert": {
+              "ms": 7066623.937,
+              "cpu": "Ok(556859.375)",
+              "allocations": 1536201730,
+              "line": 225
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 40.116,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 248
+            },
+            "bplus_tree:random_read": {
+              "ms": 719345.455,
+              "cpu": "Ok(703906.25)",
+              "allocations": 360971232,
+              "line": 255
+            },
+            "bplus_tree:search_first": {
+              "ms": 27918.081,
+              "cpu": "Ok(27671.875)",
+              "allocations": 104499277,
+              "line": 315
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 5.725,
+              "cpu": "Ok(0.0)",
+              "allocations": 21361,
+              "line": 321
+            },
+            "bplus_tree:key_count": {
+              "ms": 1329.078,
+              "cpu": "Ok(1328.125)",
+              "allocations": 5225395,
+              "line": 339
+            },
+            "bplus_tree:update": {
+              "ms": 1515395.424,
+              "cpu": "Ok(87843.75)",
+              "allocations": 182081168,
+              "line": 364
+            },
+            "bplus_tree:vacuum": {
+              "ms": 209882.086,
+              "cpu": "Ok(26328.125)",
+              "allocations": 27824843,
+              "line": 379
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 299.085,
+              "cpu": "Ok(15.625)",
+              "allocations": 462,
+              "line": 394
+            },
+            "bplus_tree:export_stream": {
+              "ms": 32272.463,
+              "cpu": "Ok(31500.0)",
+              "allocations": 104442075,
+              "line": 420
+            },
+            "bplus_tree:migrate": {
+              "ms": 60653.154,
+              "cpu": "Ok(60281.25)",
+              "allocations": 170767060,
+              "line": 426
+            },
+            "bplus_tree:bulk": {
+              "ms": 58897.726,
+              "cpu": "Ok(27671.875)",
+              "allocations": 134351998,
+              "line": 436
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 76.257,
+              "cpu": "Ok(31.25)",
+              "allocations": 4,
+              "line": 445
+            },
+            "lsm_tree:insert": {
+              "ms": 1881361.604,
+              "cpu": "Ok(283265.625)",
+              "allocations": 487682889,
+              "line": 468
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 136.954,
+              "cpu": "Ok(93.75)",
+              "allocations": 318965,
+              "line": 502
+            },
+            "lsm_tree:random_read": {
+              "ms": 346608.35,
+              "cpu": "Ok(345406.25)",
+              "allocations": 140741319,
+              "line": 509
+            },
+            "lsm_tree:search_first": {
+              "ms": 21987.941,
+              "cpu": "Ok(21984.375)",
+              "allocations": 122872375,
+              "line": 569
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 6.236,
+              "cpu": "Ok(0.0)",
+              "allocations": 25297,
+              "line": 575
+            },
+            "lsm_tree:key_count": {
+              "ms": 1083.02,
+              "cpu": "Ok(1078.125)",
+              "allocations": 6062515,
+              "line": 593
+            },
+            "lsm_tree:update": {
+              "ms": 448473.77,
+              "cpu": "Ok(67312.5)",
+              "allocations": 174177648,
+              "line": 618
+            },
+            "lsm_tree:vacuum": {
+              "ms": 53076.011,
+              "cpu": "Ok(22203.125)",
+              "allocations": 69362242,
+              "line": 638
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 1.216,
+              "cpu": "Ok(0.0)",
+              "allocations": 3953,
+              "line": 658
+            },
+            "lsm_tree:export_stream": {
+              "ms": 33857.101,
+              "cpu": "Ok(33093.75)",
+              "allocations": 137446274,
+              "line": 690
+            },
+            "lsm_tree:migrate": {
+              "ms": 77379.467,
+              "cpu": "Ok(76546.875)",
+              "allocations": 208625076,
+              "line": 696
+            },
+            "lsm_tree:bulk": {
+              "ms": 3979.928,
+              "cpu": "Ok(3859.375)",
+              "allocations": 20101704,
+              "line": 706
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 210.695,
+              "cpu": "Ok(203.125)",
+              "allocations": 4,
+              "line": 721
+            },
+            "memory:insert": {
+              "ms": 49963.442,
+              "cpu": "Ok(48765.625)",
+              "allocations": 143763091,
+              "line": 749
+            },
+            "memory:first_reopen": {
+              "ms": 30686.5,
+              "cpu": "Ok(30218.75)",
+              "allocations": 63353354,
+              "line": 771
+            },
+            "memory:random_read": {
+              "ms": 68009.847,
+              "cpu": "Ok(67234.375)",
+              "allocations": 140000003,
+              "line": 778
+            },
+            "memory:search_first": {
+              "ms": 19732.455,
+              "cpu": "Ok(19703.125)",
+              "allocations": 20063581,
+              "line": 828
+            },
+            "memory:search_first_no_total": {
+              "ms": 3.768,
+              "cpu": "Ok(0.0)",
+              "allocations": 4210,
+              "line": 833
+            },
+            "memory:key_count": {
+              "ms": 1185.19,
+              "cpu": "Ok(1109.375)",
+              "allocations": 1003430,
+              "line": 848
+            },
+            "memory:update": {
+              "ms": 5293.372,
+              "cpu": "Ok(5218.75)",
+              "allocations": 15411068,
+              "line": 869
+            },
+            "memory:vacuum": {
+              "ms": 2949.85,
+              "cpu": "Ok(2828.125)",
+              "allocations": 1006715,
+              "line": 882
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.234,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 895
+            },
+            "memory:export_stream": {
+              "ms": 43143.339,
+              "cpu": "Ok(39796.875)",
+              "allocations": 40065491,
+              "line": 917
+            },
+            "memory:migrate": {
+              "ms": 122562.942,
+              "cpu": "Ok(114984.375)",
+              "allocations": 104228312,
+              "line": 922
+            },
+            "memory:bulk": {
+              "ms": 2178.004,
+              "cpu": "Ok(2156.25)",
+              "allocations": 10341273,
+              "line": 931
+            },
+            "memory:bulk_stop": {
+              "ms": 44659.296,
+              "cpu": "Ok(32015.625)",
+              "allocations": 13,
+              "line": 940
+            }
+          }
+        }
+      ]
+    },
+    {
+      "path": "data/bench-results/20261123-145727-e1183d371905474ab9484d80df9ac6fe",
+      "head": "a86ac6e646c2c33f1657042d6f96e5abd9317014",
+      "source_sha256": "865c613ff28919915bd7e5364874042b17d977747d6fe6cb55c4b3ea577df45e",
+      "executable_sha256": "159de33e2755d608373dcef96c2920bdbd202080dd2cfe1f72fca1c33a0fbe35",
+      "total_seconds": 33488.603,
+      "source_count": 61,
+      "source_mismatch": [],
+      "cases": [
+        {
+          "summary": {
+            "rows": 600000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 528.607,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_600000_pass_1.log",
+            "diagnostics": "rows_600000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 837,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 66301.024,
+              "cpu": "Ok(10656.25)",
+              "allocations": 9114919,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 278.905,
+              "cpu": "Ok(125.0)",
+              "allocations": 654632,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 4254.851,
+              "cpu": "Ok(4187.5)",
+              "allocations": 4800004,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 1625.795,
+              "cpu": "Ok(1609.375)",
+              "allocations": 2401912,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 1.688,
+              "cpu": "Ok(0.0)",
+              "allocations": 8408,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2516.722,
+              "cpu": "Ok(2187.5)",
+              "allocations": 2402059,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 9500.017,
+              "cpu": "Ok(1171.875)",
+              "allocations": 1119254,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 255.068,
+              "cpu": "Ok(93.75)",
+              "allocations": 36598,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 65.954,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 1893.504,
+              "cpu": "Ok(1875.0)",
+              "allocations": 2405771,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 2157.324,
+              "cpu": "Ok(2156.25)",
+              "allocations": 4334516,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 1313.185,
+              "cpu": "Ok(156.25)",
+              "allocations": 310036,
+              "line": 197
+            },
+            "bitcask:bulk_stop": {
+              "ms": 824.722,
+              "cpu": "Ok(109.375)",
+              "allocations": 11,
+              "line": 205
+            },
+            "bplus_tree:insert": {
+              "ms": 206091.325,
+              "cpu": "Ok(19109.375)",
+              "allocations": 46694395,
+              "line": 226
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 56.035,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 249
+            },
+            "bplus_tree:random_read": {
+              "ms": 10243.463,
+              "cpu": "Ok(9718.75)",
+              "allocations": 6624903,
+              "line": 256
+            },
+            "bplus_tree:search_first": {
+              "ms": 903.774,
+              "cpu": "Ok(875.0)",
+              "allocations": 3129154,
+              "line": 316
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 4.398,
+              "cpu": "Ok(15.625)",
+              "allocations": 17225,
+              "line": 322
+            },
+            "bplus_tree:key_count": {
+              "ms": 826.659,
+              "cpu": "Ok(812.5)",
+              "allocations": 3113147,
+              "line": 340
+            },
+            "bplus_tree:update": {
+              "ms": 28701.148,
+              "cpu": "Ok(2812.5)",
+              "allocations": 5239403,
+              "line": 365
+            },
+            "bplus_tree:vacuum": {
+              "ms": 12037.886,
+              "cpu": "Ok(1031.25)",
+              "allocations": 776559,
+              "line": 380
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 231.711,
+              "cpu": "Ok(15.625)",
+              "allocations": 400,
+              "line": 395
+            },
+            "bplus_tree:export_stream": {
+              "ms": 1151.673,
+              "cpu": "Ok(1062.5)",
+              "allocations": 3117625,
+              "line": 421
+            },
+            "bplus_tree:migrate": {
+              "ms": 1625.032,
+              "cpu": "Ok(1578.125)",
+              "allocations": 5112246,
+              "line": 427
+            },
+            "bplus_tree:bulk": {
+              "ms": 2001.341,
+              "cpu": "Ok(953.125)",
+              "allocations": 4053850,
+              "line": 438
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 83.082,
+              "cpu": "Ok(15.625)",
+              "allocations": 4,
+              "line": 447
+            },
+            "lsm_tree:insert": {
+              "ms": 62646.673,
+              "cpu": "Ok(10390.625)",
+              "allocations": 14466798,
+              "line": 470
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 43.411,
+              "cpu": "Ok(15.625)",
+              "allocations": 9659,
+              "line": 504
+            },
+            "lsm_tree:random_read": {
+              "ms": 12779.378,
+              "cpu": "Ok(11843.75)",
+              "allocations": 4031788,
+              "line": 511
+            },
+            "lsm_tree:search_first": {
+              "ms": 835.719,
+              "cpu": "Ok(843.75)",
+              "allocations": 3634545,
+              "line": 571
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.56,
+              "cpu": "Ok(0.0)",
+              "allocations": 20948,
+              "line": 577
+            },
+            "lsm_tree:key_count": {
+              "ms": 1229.773,
+              "cpu": "Ok(1125.0)",
+              "allocations": 3635489,
+              "line": 595
+            },
+            "lsm_tree:update": {
+              "ms": 9762.835,
+              "cpu": "Ok(1609.375)",
+              "allocations": 1892241,
+              "line": 620
+            },
+            "lsm_tree:vacuum": {
+              "ms": 738.126,
+              "cpu": "Ok(484.375)",
+              "allocations": 1202896,
+              "line": 640
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 1.509,
+              "cpu": "Ok(0.0)",
+              "allocations": 3241,
+              "line": 660
+            },
+            "lsm_tree:export_stream": {
+              "ms": 2614.852,
+              "cpu": "Ok(1828.125)",
+              "allocations": 4078925,
+              "line": 692
+            },
+            "lsm_tree:migrate": {
+              "ms": 3494.626,
+              "cpu": "Ok(2859.375)",
+              "allocations": 6028772,
+              "line": 698
+            },
+            "lsm_tree:bulk": {
+              "ms": 253.031,
+              "cpu": "Ok(156.25)",
+              "allocations": 603173,
+              "line": 709
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 21.251,
+              "cpu": "Ok(31.25)",
+              "allocations": 4,
+              "line": 724
+            },
+            "memory:insert": {
+              "ms": 1868.996,
+              "cpu": "Ok(1625.0)",
+              "allocations": 4312887,
+              "line": 753
+            },
+            "memory:first_reopen": {
+              "ms": 1344.649,
+              "cpu": "Ok(1078.125)",
+              "allocations": 1900620,
+              "line": 778
+            },
+            "memory:random_read": {
+              "ms": 2221.713,
+              "cpu": "Ok(2046.875)",
+              "allocations": 4200003,
+              "line": 786
+            },
+            "memory:search_first": {
+              "ms": 73.245,
+              "cpu": "Ok(78.125)",
+              "allocations": 2259,
+              "line": 846
+            },
+            "memory:search_first_no_total": {
+              "ms": 0.473,
+              "cpu": "Ok(0.0)",
+              "allocations": 215,
+              "line": 852
+            },
+            "memory:key_count": {
+              "ms": 95.063,
+              "cpu": "Ok(93.75)",
+              "allocations": 2205,
+              "line": 870
+            },
+            "memory:update": {
+              "ms": 202.963,
+              "cpu": "Ok(187.5)",
+              "allocations": 456909,
+              "line": 895
+            },
+            "memory:vacuum": {
+              "ms": 159.239,
+              "cpu": "Ok(156.25)",
+              "allocations": 36591,
+              "line": 910
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.371,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 925
+            },
+            "memory:export_stream": {
+              "ms": 436.055,
+              "cpu": "Ok(406.25)",
+              "allocations": 1203914,
+              "line": 951
+            },
+            "memory:migrate": {
+              "ms": 1740.51,
+              "cpu": "Ok(1500.0)",
+              "allocations": 3131908,
+              "line": 957
+            },
+            "memory:bulk": {
+              "ms": 203.849,
+              "cpu": "Ok(125.0)",
+              "allocations": 310001,
+              "line": 968
+            },
+            "memory:bulk_stop": {
+              "ms": 1913.003,
+              "cpu": "Ok(515.625)",
+              "allocations": 13,
+              "line": 978
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 1000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 923.758,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_1000000_pass_1.log",
+            "diagnostics": "rows_1000000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 837,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 114257.787,
+              "cpu": "Ok(18687.5)",
+              "allocations": 15191536,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 329.64,
+              "cpu": "Ok(265.625)",
+              "allocations": 1090998,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 13283.489,
+              "cpu": "Ok(11640.625)",
+              "allocations": 8000012,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 3312.548,
+              "cpu": "Ok(3109.375)",
+              "allocations": 4003185,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 2.167,
+              "cpu": "Ok(0.0)",
+              "allocations": 8408,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 4263.947,
+              "cpu": "Ok(4078.125)",
+              "allocations": 4003430,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 16545.003,
+              "cpu": "Ok(1828.125)",
+              "allocations": 1873611,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 291.599,
+              "cpu": "Ok(156.25)",
+              "allocations": 52124,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 66.255,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 3428.324,
+              "cpu": "Ok(3375.0)",
+              "allocations": 4006946,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 4199.028,
+              "cpu": "Ok(4109.375)",
+              "allocations": 7219382,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 1755.996,
+              "cpu": "Ok(406.25)",
+              "allocations": 516701,
+              "line": 197
+            },
+            "bitcask:bulk_stop": {
+              "ms": 1338.417,
+              "cpu": "Ok(281.25)",
+              "allocations": 11,
+              "line": 205
+            },
+            "bplus_tree:insert": {
+              "ms": 381221.376,
+              "cpu": "Ok(37015.625)",
+              "allocations": 77816650,
+              "line": 226
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 58.972,
+              "cpu": "Ok(15.625)",
+              "allocations": 64,
+              "line": 249
+            },
+            "bplus_tree:random_read": {
+              "ms": 19950.797,
+              "cpu": "Ok(18781.25)",
+              "allocations": 11041249,
+              "line": 256
+            },
+            "bplus_tree:search_first": {
+              "ms": 2003.199,
+              "cpu": "Ok(1781.25)",
+              "allocations": 5219562,
+              "line": 316
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 6.869,
+              "cpu": "Ok(0.0)",
+              "allocations": 17255,
+              "line": 322
+            },
+            "bplus_tree:key_count": {
+              "ms": 1774.913,
+              "cpu": "Ok(1718.75)",
+              "allocations": 5189164,
+              "line": 340
+            },
+            "bplus_tree:update": {
+              "ms": 53823.266,
+              "cpu": "Ok(4031.25)",
+              "allocations": 8903224,
+              "line": 365
+            },
+            "bplus_tree:vacuum": {
+              "ms": 14950.744,
+              "cpu": "Ok(1390.625)",
+              "allocations": 1104906,
+              "line": 380
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 232.147,
+              "cpu": "Ok(0.0)",
+              "allocations": 466,
+              "line": 395
+            },
+            "bplus_tree:export_stream": {
+              "ms": 4555.702,
+              "cpu": "Ok(2937.5)",
+              "allocations": 5193408,
+              "line": 421
+            },
+            "bplus_tree:migrate": {
+              "ms": 6187.42,
+              "cpu": "Ok(5343.75)",
+              "allocations": 8527817,
+              "line": 427
+            },
+            "bplus_tree:bulk": {
+              "ms": 3678.839,
+              "cpu": "Ok(2109.375)",
+              "allocations": 6756389,
+              "line": 438
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 106.593,
+              "cpu": "Ok(31.25)",
+              "allocations": 4,
+              "line": 447
+            },
+            "lsm_tree:insert": {
+              "ms": 91901.741,
+              "cpu": "Ok(17546.875)",
+              "allocations": 24258338,
+              "line": 470
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 91.775,
+              "cpu": "Ok(15.625)",
+              "allocations": 16042,
+              "line": 504
+            },
+            "lsm_tree:random_read": {
+              "ms": 23364.983,
+              "cpu": "Ok(21640.625)",
+              "allocations": 6850862,
+              "line": 511
+            },
+            "lsm_tree:search_first": {
+              "ms": 1688.719,
+              "cpu": "Ok(1531.25)",
+              "allocations": 6059468,
+              "line": 571
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 6.933,
+              "cpu": "Ok(0.0)",
+              "allocations": 20957,
+              "line": 577
+            },
+            "lsm_tree:key_count": {
+              "ms": 1311.549,
+              "cpu": "Ok(1281.25)",
+              "allocations": 6062114,
+              "line": 595
+            },
+            "lsm_tree:update": {
+              "ms": 16250.116,
+              "cpu": "Ok(2671.875)",
+              "allocations": 3469747,
+              "line": 620
+            },
+            "lsm_tree:vacuum": {
+              "ms": 1196.228,
+              "cpu": "Ok(796.875)",
+              "allocations": 1837623,
+              "line": 640
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 5.937,
+              "cpu": "Ok(15.625)",
+              "allocations": 3252,
+              "line": 660
+            },
+            "lsm_tree:export_stream": {
+              "ms": 2671.665,
+              "cpu": "Ok(2390.625)",
+              "allocations": 6788910,
+              "line": 692
+            },
+            "lsm_tree:migrate": {
+              "ms": 3422.606,
+              "cpu": "Ok(3281.25)",
+              "allocations": 10042038,
+              "line": 698
+            },
+            "lsm_tree:bulk": {
+              "ms": 357.047,
+              "cpu": "Ok(234.375)",
+              "allocations": 1005204,
+              "line": 709
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 56.561,
+              "cpu": "Ok(31.25)",
+              "allocations": 4,
+              "line": 724
+            },
+            "memory:insert": {
+              "ms": 3171.842,
+              "cpu": "Ok(2843.75)",
+              "allocations": 7188144,
+              "line": 753
+            },
+            "memory:first_reopen": {
+              "ms": 1652.458,
+              "cpu": "Ok(1515.625)",
+              "allocations": 3167685,
+              "line": 778
+            },
+            "memory:random_read": {
+              "ms": 3770.511,
+              "cpu": "Ok(3546.875)",
+              "allocations": 7000003,
+              "line": 786
+            },
+            "memory:search_first": {
+              "ms": 168.361,
+              "cpu": "Ok(156.25)",
+              "allocations": 3630,
+              "line": 846
+            },
+            "memory:search_first_no_total": {
+              "ms": 0.533,
+              "cpu": "Ok(0.0)",
+              "allocations": 215,
+              "line": 852
+            },
+            "memory:key_count": {
+              "ms": 147.292,
+              "cpu": "Ok(156.25)",
+              "allocations": 3674,
+              "line": 870
+            },
+            "memory:update": {
+              "ms": 317.227,
+              "cpu": "Ok(312.5)",
+              "allocations": 769729,
+              "line": 895
+            },
+            "memory:vacuum": {
+              "ms": 191.76,
+              "cpu": "Ok(171.875)",
+              "allocations": 52117,
+              "line": 910
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.427,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 925
+            },
+            "memory:export_stream": {
+              "ms": 959.426,
+              "cpu": "Ok(906.25)",
+              "allocations": 2005187,
+              "line": 951
+            },
+            "memory:migrate": {
+              "ms": 1910.488,
+              "cpu": "Ok(1796.875)",
+              "allocations": 5216374,
+              "line": 957
+            },
+            "memory:bulk": {
+              "ms": 130.809,
+              "cpu": "Ok(109.375)",
+              "allocations": 519908,
+              "line": 968
+            },
+            "memory:bulk_stop": {
+              "ms": 2154.257,
+              "cpu": "Ok(531.25)",
+              "allocations": 13,
+              "line": 978
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 5000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 4522.705,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_5000000_pass_1.log",
+            "diagnostics": "rows_5000000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 837,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 548948.691,
+              "cpu": "Ok(74906.25)",
+              "allocations": 75957668,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 1700.457,
+              "cpu": "Ok(1546.875)",
+              "allocations": 5454643,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 75678.218,
+              "cpu": "Ok(69203.125)",
+              "allocations": 40000063,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 19442.899,
+              "cpu": "Ok(17953.125)",
+              "allocations": 20015875,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 3.546,
+              "cpu": "Ok(0.0)",
+              "allocations": 8408,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2947.254,
+              "cpu": "Ok(2890.625)",
+              "allocations": 4003430,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 93874.88,
+              "cpu": "Ok(11187.5)",
+              "allocations": 9368111,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 965.646,
+              "cpu": "Ok(593.75)",
+              "allocations": 256543,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 59.134,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 21954.916,
+              "cpu": "Ok(20656.25)",
+              "allocations": 20018659,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 22143.39,
+              "cpu": "Ok(21250.0)",
+              "allocations": 36068000,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 7879.366,
+              "cpu": "Ok(1734.375)",
+              "allocations": 2583369,
+              "line": 197
+            },
+            "bitcask:bulk_stop": {
+              "ms": 6033.374,
+              "cpu": "Ok(1265.625)",
+              "allocations": 11,
+              "line": 205
+            },
+            "bplus_tree:insert": {
+              "ms": 1912707.156,
+              "cpu": "Ok(164390.625)",
+              "allocations": 389052288,
+              "line": 226
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 29.58,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 249
+            },
+            "bplus_tree:random_read": {
+              "ms": 140063.76,
+              "cpu": "Ok(136187.5)",
+              "allocations": 76816188,
+              "line": 256
+            },
+            "bplus_tree:search_first": {
+              "ms": 8895.85,
+              "cpu": "Ok(8500.0)",
+              "allocations": 26117351,
+              "line": 316
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 9.374,
+              "cpu": "Ok(15.625)",
+              "allocations": 17367,
+              "line": 322
+            },
+            "bplus_tree:key_count": {
+              "ms": 1400.852,
+              "cpu": "Ok(1375.0)",
+              "allocations": 5223938,
+              "line": 340
+            },
+            "bplus_tree:update": {
+              "ms": 301745.234,
+              "cpu": "Ok(19703.125)",
+              "allocations": 44486501,
+              "line": 365
+            },
+            "bplus_tree:vacuum": {
+              "ms": 73561.396,
+              "cpu": "Ok(6843.75)",
+              "allocations": 5427436,
+              "line": 380
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 255.957,
+              "cpu": "Ok(0.0)",
+              "allocations": 396,
+              "line": 395
+            },
+            "bplus_tree:export_stream": {
+              "ms": 9361.234,
+              "cpu": "Ok(9031.25)",
+              "allocations": 26120328,
+              "line": 421
+            },
+            "bplus_tree:migrate": {
+              "ms": 14595.898,
+              "cpu": "Ok(14125.0)",
+              "allocations": 42685653,
+              "line": 427
+            },
+            "bplus_tree:bulk": {
+              "ms": 11321.453,
+              "cpu": "Ok(7078.125)",
+              "allocations": 33783757,
+              "line": 438
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 44.613,
+              "cpu": "Ok(15.625)",
+              "allocations": 4,
+              "line": 447
+            },
+            "lsm_tree:insert": {
+              "ms": 520083.22,
+              "cpu": "Ok(84656.25)",
+              "allocations": 121590352,
+              "line": 470
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 65.612,
+              "cpu": "Ok(31.25)",
+              "allocations": 79830,
+              "line": 504
+            },
+            "lsm_tree:random_read": {
+              "ms": 92870.024,
+              "cpu": "Ok(91265.625)",
+              "allocations": 35038566,
+              "line": 511
+            },
+            "lsm_tree:search_first": {
+              "ms": 5892.483,
+              "cpu": "Ok(5890.625)",
+              "allocations": 30390990,
+              "line": 571
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.03,
+              "cpu": "Ok(0.0)",
+              "allocations": 21034,
+              "line": 577
+            },
+            "lsm_tree:key_count": {
+              "ms": 1117.084,
+              "cpu": "Ok(1109.375)",
+              "allocations": 6062270,
+              "line": 595
+            },
+            "lsm_tree:update": {
+              "ms": 105563.674,
+              "cpu": "Ok(16781.25)",
+              "allocations": 39294036,
+              "line": 620
+            },
+            "lsm_tree:vacuum": {
+              "ms": 13805.535,
+              "cpu": "Ok(5125.0)",
+              "allocations": 19082168,
+              "line": 640
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 3.342,
+              "cpu": "Ok(0.0)",
+              "allocations": 3466,
+              "line": 660
+            },
+            "lsm_tree:export_stream": {
+              "ms": 10829.96,
+              "cpu": "Ok(10421.875)",
+              "allocations": 34126361,
+              "line": 692
+            },
+            "lsm_tree:migrate": {
+              "ms": 14153.116,
+              "cpu": "Ok(13828.125)",
+              "allocations": 51180820,
+              "line": 698
+            },
+            "lsm_tree:bulk": {
+              "ms": 1006.432,
+              "cpu": "Ok(968.75)",
+              "allocations": 5025528,
+              "line": 709
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 71.146,
+              "cpu": "Ok(46.875)",
+              "allocations": 4,
+              "line": 724
+            },
+            "memory:insert": {
+              "ms": 9360.361,
+              "cpu": "Ok(9328.125)",
+              "allocations": 35940770,
+              "line": 753
+            },
+            "memory:first_reopen": {
+              "ms": 5194.082,
+              "cpu": "Ok(5171.875)",
+              "allocations": 15838353,
+              "line": 778
+            },
+            "memory:random_read": {
+              "ms": 14935.008,
+              "cpu": "Ok(14734.375)",
+              "allocations": 35000003,
+              "line": 786
+            },
+            "memory:search_first": {
+              "ms": 1012.047,
+              "cpu": "Ok(984.375)",
+              "allocations": 17296,
+              "line": 846
+            },
+            "memory:search_first_no_total": {
+              "ms": 1.417,
+              "cpu": "Ok(15.625)",
+              "allocations": 215,
+              "line": 852
+            },
+            "memory:key_count": {
+              "ms": 195.903,
+              "cpu": "Ok(187.5)",
+              "allocations": 3674,
+              "line": 870
+            },
+            "memory:update": {
+              "ms": 1167.302,
+              "cpu": "Ok(1156.25)",
+              "allocations": 3848656,
+              "line": 895
+            },
+            "memory:vacuum": {
+              "ms": 592.279,
+              "cpu": "Ok(593.75)",
+              "allocations": 256535,
+              "line": 910
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.292,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 925
+            },
+            "memory:export_stream": {
+              "ms": 3721.934,
+              "cpu": "Ok(3718.75)",
+              "allocations": 10017876,
+              "line": 951
+            },
+            "memory:migrate": {
+              "ms": 8348.044,
+              "cpu": "Ok(8187.5)",
+              "allocations": 26060992,
+              "line": 957
+            },
+            "memory:bulk": {
+              "ms": 634.118,
+              "cpu": "Ok(640.625)",
+              "allocations": 2583335,
+              "line": 968
+            },
+            "memory:bulk_stop": {
+              "ms": 9144.786,
+              "cpu": "Ok(2687.5)",
+              "allocations": 13,
+              "line": 978
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 10000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 8325.44,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_10000000_pass_1.log",
+            "diagnostics": "rows_10000000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 837,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 1031205.393,
+              "cpu": "Ok(128062.5)",
+              "allocations": 151915284,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 4123.098,
+              "cpu": "Ok(3765.625)",
+              "allocations": 10909198,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 105905.5,
+              "cpu": "Ok(103109.375)",
+              "allocations": 80000120,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 28999.113,
+              "cpu": "Ok(28406.25)",
+              "allocations": 40031747,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 1.626,
+              "cpu": "Ok(0.0)",
+              "allocations": 8408,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2739.791,
+              "cpu": "Ok(2734.375)",
+              "allocations": 4003430,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 177503.771,
+              "cpu": "Ok(20546.875)",
+              "allocations": 18744425,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 1510.797,
+              "cpu": "Ok(1093.75)",
+              "allocations": 503873,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 43.504,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 30674.089,
+              "cpu": "Ok(30281.25)",
+              "allocations": 40033311,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 42565.037,
+              "cpu": "Ok(42000.0)",
+              "allocations": 72128772,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 13620.743,
+              "cpu": "Ok(2656.25)",
+              "allocations": 5166719,
+              "line": 197
+            },
+            "bitcask:bulk_stop": {
+              "ms": 12335.468,
+              "cpu": "Ok(2484.375)",
+              "allocations": 11,
+              "line": 205
+            },
+            "bplus_tree:insert": {
+              "ms": 3414195.111,
+              "cpu": "Ok(307000.0)",
+              "allocations": 778100061,
+              "line": 226
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 43.055,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 249
+            },
+            "bplus_tree:random_read": {
+              "ms": 333494.215,
+              "cpu": "Ok(318000.0)",
+              "allocations": 164377147,
+              "line": 256
+            },
+            "bplus_tree:search_first": {
+              "ms": 15571.197,
+              "cpu": "Ok(15031.25)",
+              "allocations": 52244547,
+              "line": 316
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 5.837,
+              "cpu": "Ok(0.0)",
+              "allocations": 17367,
+              "line": 322
+            },
+            "bplus_tree:key_count": {
+              "ms": 1477.056,
+              "cpu": "Ok(1375.0)",
+              "allocations": 5224716,
+              "line": 340
+            },
+            "bplus_tree:update": {
+              "ms": 578426.533,
+              "cpu": "Ok(41500.0)",
+              "allocations": 89146659,
+              "line": 365
+            },
+            "bplus_tree:vacuum": {
+              "ms": 128834.385,
+              "cpu": "Ok(11593.75)",
+              "allocations": 10658666,
+              "line": 380
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 254.438,
+              "cpu": "Ok(15.625)",
+              "allocations": 417,
+              "line": 395
+            },
+            "bplus_tree:export_stream": {
+              "ms": 16268.457,
+              "cpu": "Ok(15921.875)",
+              "allocations": 52245295,
+              "line": 421
+            },
+            "bplus_tree:migrate": {
+              "ms": 32329.943,
+              "cpu": "Ok(31515.625)",
+              "allocations": 85385921,
+              "line": 427
+            },
+            "bplus_tree:bulk": {
+              "ms": 21315.248,
+              "cpu": "Ok(13546.875)",
+              "allocations": 66787845,
+              "line": 438
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 61.846,
+              "cpu": "Ok(15.625)",
+              "allocations": 4,
+              "line": 447
+            },
+            "lsm_tree:insert": {
+              "ms": 943326.789,
+              "cpu": "Ok(177000.0)",
+              "allocations": 243633560,
+              "line": 470
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 102.823,
+              "cpu": "Ok(46.875)",
+              "allocations": 159571,
+              "line": 504
+            },
+            "lsm_tree:random_read": {
+              "ms": 211620.726,
+              "cpu": "Ok(205765.625)",
+              "allocations": 70271426,
+              "line": 511
+            },
+            "lsm_tree:search_first": {
+              "ms": 15970.702,
+              "cpu": "Ok(15171.875)",
+              "allocations": 61001627,
+              "line": 571
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 3.613,
+              "cpu": "Ok(0.0)",
+              "allocations": 21124,
+              "line": 577
+            },
+            "lsm_tree:key_count": {
+              "ms": 1074.959,
+              "cpu": "Ok(1078.125)",
+              "allocations": 6062270,
+              "line": 595
+            },
+            "lsm_tree:update": {
+              "ms": 213381.521,
+              "cpu": "Ok(30296.875)",
+              "allocations": 76220510,
+              "line": 620
+            },
+            "lsm_tree:vacuum": {
+              "ms": 22864.004,
+              "cpu": "Ok(9218.75)",
+              "allocations": 33141637,
+              "line": 640
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 1.157,
+              "cpu": "Ok(15.625)",
+              "allocations": 3623,
+              "line": 660
+            },
+            "lsm_tree:export_stream": {
+              "ms": 15394.903,
+              "cpu": "Ok(15062.5)",
+              "allocations": 68353997,
+              "line": 692
+            },
+            "lsm_tree:migrate": {
+              "ms": 26979.448,
+              "cpu": "Ok(26750.0)",
+              "allocations": 102792069,
+              "line": 698
+            },
+            "lsm_tree:bulk": {
+              "ms": 1944.286,
+              "cpu": "Ok(1796.875)",
+              "allocations": 10050921,
+              "line": 709
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 106.198,
+              "cpu": "Ok(109.375)",
+              "allocations": 4,
+              "line": 724
+            },
+            "memory:insert": {
+              "ms": 22099.853,
+              "cpu": "Ok(21562.5)",
+              "allocations": 71881542,
+              "line": 753
+            },
+            "memory:first_reopen": {
+              "ms": 11181.418,
+              "cpu": "Ok(11093.75)",
+              "allocations": 31676685,
+              "line": 778
+            },
+            "memory:random_read": {
+              "ms": 33519.187,
+              "cpu": "Ok(32687.5)",
+              "allocations": 70000003,
+              "line": 786
+            },
+            "memory:search_first": {
+              "ms": 3867.43,
+              "cpu": "Ok(3843.75)",
+              "allocations": 34389,
+              "line": 846
+            },
+            "memory:search_first_no_total": {
+              "ms": 1.539,
+              "cpu": "Ok(0.0)",
+              "allocations": 215,
+              "line": 852
+            },
+            "memory:key_count": {
+              "ms": 388.346,
+              "cpu": "Ok(390.625)",
+              "allocations": 3674,
+              "line": 870
+            },
+            "memory:update": {
+              "ms": 1962.622,
+              "cpu": "Ok(1953.125)",
+              "allocations": 7705530,
+              "line": 895
+            },
+            "memory:vacuum": {
+              "ms": 1166.12,
+              "cpu": "Ok(1156.25)",
+              "allocations": 503865,
+              "line": 910
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.206,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 925
+            },
+            "memory:export_stream": {
+              "ms": 9098.244,
+              "cpu": "Ok(8781.25)",
+              "allocations": 20033749,
+              "line": 951
+            },
+            "memory:migrate": {
+              "ms": 20094.325,
+              "cpu": "Ok(19859.375)",
+              "allocations": 52116764,
+              "line": 957
+            },
+            "memory:bulk": {
+              "ms": 944.161,
+              "cpu": "Ok(921.875)",
+              "allocations": 5166666,
+              "line": 968
+            },
+            "memory:bulk_stop": {
+              "ms": 18756.979,
+              "cpu": "Ok(7734.375)",
+              "allocations": 13,
+              "line": 978
+            }
+          }
+        },
+        {
+          "summary": {
+            "rows": 20000000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 19188.093,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_20000000_pass_1.log",
+            "diagnostics": "rows_20000000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 837,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "phases": {
+            "bitcask:insert": {
+              "ms": 2132603.372,
+              "cpu": "Ok(287109.375)",
+              "allocations": 303830518,
+              "line": 17
+            },
+            "bitcask:first_reopen": {
+              "ms": 5468.577,
+              "cpu": "Ok(5343.75)",
+              "allocations": 21818304,
+              "line": 37
+            },
+            "bitcask:random_read": {
+              "ms": 198598.974,
+              "cpu": "Ok(196656.25)",
+              "allocations": 160000233,
+              "line": 43
+            },
+            "bitcask:search_first": {
+              "ms": 55327.993,
+              "cpu": "Ok(54921.875)",
+              "allocations": 80063481,
+              "line": 93
+            },
+            "bitcask:search_first_no_total": {
+              "ms": 1.917,
+              "cpu": "Ok(0.0)",
+              "allocations": 8408,
+              "line": 98
+            },
+            "bitcask:key_count": {
+              "ms": 2540.596,
+              "cpu": "Ok(2531.25)",
+              "allocations": 4003430,
+              "line": 113
+            },
+            "bitcask:update": {
+              "ms": 348786.309,
+              "cpu": "Ok(32062.5)",
+              "allocations": 37488861,
+              "line": 134
+            },
+            "bitcask:vacuum": {
+              "ms": 2946.322,
+              "cpu": "Ok(2093.75)",
+              "allocations": 1006723,
+              "line": 147
+            },
+            "bitcask:vacuum_bounded": {
+              "ms": 78.839,
+              "cpu": "Ok(0.0)",
+              "allocations": 26,
+              "line": 160
+            },
+            "bitcask:export_stream": {
+              "ms": 75457.014,
+              "cpu": "Ok(74171.875)",
+              "allocations": 80062611,
+              "line": 182
+            },
+            "bitcask:migrate": {
+              "ms": 87256.674,
+              "cpu": "Ok(86109.375)",
+              "allocations": 144250320,
+              "line": 187
+            },
+            "bitcask:bulk": {
+              "ms": 25905.896,
+              "cpu": "Ok(5718.75)",
+              "allocations": 10333425,
+              "line": 197
+            },
+            "bitcask:bulk_stop": {
+              "ms": 25257.482,
+              "cpu": "Ok(6906.25)",
+              "allocations": 11,
+              "line": 205
+            },
+            "bplus_tree:insert": {
+              "ms": 8129734.782,
+              "cpu": "Ok(632718.75)",
+              "allocations": 1536201730,
+              "line": 226
+            },
+            "bplus_tree:first_reopen": {
+              "ms": 65.211,
+              "cpu": "Ok(0.0)",
+              "allocations": 64,
+              "line": 249
+            },
+            "bplus_tree:random_read": {
+              "ms": 681625.586,
+              "cpu": "Ok(666125.0)",
+              "allocations": 360971232,
+              "line": 256
+            },
+            "bplus_tree:search_first": {
+              "ms": 30982.464,
+              "cpu": "Ok(30343.75)",
+              "allocations": 104504160,
+              "line": 316
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 7.764,
+              "cpu": "Ok(15.625)",
+              "allocations": 17367,
+              "line": 322
+            },
+            "bplus_tree:key_count": {
+              "ms": 1510.679,
+              "cpu": "Ok(1515.625)",
+              "allocations": 5225640,
+              "line": 340
+            },
+            "bplus_tree:update": {
+              "ms": 1684833.946,
+              "cpu": "Ok(92171.875)",
+              "allocations": 182081168,
+              "line": 365
+            },
+            "bplus_tree:vacuum": {
+              "ms": 230242.974,
+              "cpu": "Ok(30843.75)",
+              "allocations": 27824843,
+              "line": 380
+            },
+            "bplus_tree:vacuum_bounded": {
+              "ms": 321.815,
+              "cpu": "Ok(0.0)",
+              "allocations": 462,
+              "line": 395
+            },
+            "bplus_tree:export_stream": {
+              "ms": 32306.294,
+              "cpu": "Ok(31500.0)",
+              "allocations": 104442075,
+              "line": 421
+            },
+            "bplus_tree:migrate": {
+              "ms": 65791.368,
+              "cpu": "Ok(64515.625)",
+              "allocations": 170767060,
+              "line": 427
+            },
+            "bplus_tree:bulk": {
+              "ms": 61397.732,
+              "cpu": "Ok(27796.875)",
+              "allocations": 134351998,
+              "line": 438
+            },
+            "bplus_tree:bulk_stop": {
+              "ms": 98.347,
+              "cpu": "Ok(31.25)",
+              "allocations": 4,
+              "line": 447
+            },
+            "lsm_tree:insert": {
+              "ms": 2185015.529,
+              "cpu": "Ok(349734.375)",
+              "allocations": 487686592,
+              "line": 470
+            },
+            "lsm_tree:first_reopen": {
+              "ms": 140.327,
+              "cpu": "Ok(78.125)",
+              "allocations": 318965,
+              "line": 504
+            },
+            "lsm_tree:random_read": {
+              "ms": 392303.047,
+              "cpu": "Ok(387812.5)",
+              "allocations": 140741319,
+              "line": 511
+            },
+            "lsm_tree:search_first": {
+              "ms": 24695.314,
+              "cpu": "Ok(24484.375)",
+              "allocations": 122867492,
+              "line": 571
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 5.663,
+              "cpu": "Ok(0.0)",
+              "allocations": 21301,
+              "line": 577
+            },
+            "lsm_tree:key_count": {
+              "ms": 1320.94,
+              "cpu": "Ok(1312.5)",
+              "allocations": 6062270,
+              "line": 595
+            },
+            "lsm_tree:update": {
+              "ms": 435555.105,
+              "cpu": "Ok(68078.125)",
+              "allocations": 174178897,
+              "line": 620
+            },
+            "lsm_tree:vacuum": {
+              "ms": 48392.569,
+              "cpu": "Ok(19109.375)",
+              "allocations": 69362589,
+              "line": 640
+            },
+            "lsm_tree:vacuum_bounded": {
+              "ms": 1.106,
+              "cpu": "Ok(0.0)",
+              "allocations": 3953,
+              "line": 660
+            },
+            "lsm_tree:export_stream": {
+              "ms": 37856.134,
+              "cpu": "Ok(37000.0)",
+              "allocations": 137446274,
+              "line": 692
+            },
+            "lsm_tree:migrate": {
+              "ms": 76962.827,
+              "cpu": "Ok(76125.0)",
+              "allocations": 208625076,
+              "line": 698
+            },
+            "lsm_tree:bulk": {
+              "ms": 4055.157,
+              "cpu": "Ok(4000.0)",
+              "allocations": 20101704,
+              "line": 709
+            },
+            "lsm_tree:bulk_stop": {
+              "ms": 189.557,
+              "cpu": "Ok(171.875)",
+              "allocations": 4,
+              "line": 724
+            },
+            "memory:insert": {
+              "ms": 50653.266,
+              "cpu": "Ok(50218.75)",
+              "allocations": 143763091,
+              "line": 753
+            },
+            "memory:first_reopen": {
+              "ms": 32957.57,
+              "cpu": "Ok(32375.0)",
+              "allocations": 63353354,
+              "line": 778
+            },
+            "memory:random_read": {
+              "ms": 66760.004,
+              "cpu": "Ok(66000.0)",
+              "allocations": 140000003,
+              "line": 786
+            },
+            "memory:search_first": {
+              "ms": 17604.004,
+              "cpu": "Ok(17375.0)",
+              "allocations": 68564,
+              "line": 846
+            },
+            "memory:search_first_no_total": {
+              "ms": 5.282,
+              "cpu": "Ok(0.0)",
+              "allocations": 215,
+              "line": 852
+            },
+            "memory:key_count": {
+              "ms": 862.946,
+              "cpu": "Ok(875.0)",
+              "allocations": 3674,
+              "line": 870
+            },
+            "memory:update": {
+              "ms": 4191.535,
+              "cpu": "Ok(4125.0)",
+              "allocations": 15411068,
+              "line": 895
+            },
+            "memory:vacuum": {
+              "ms": 2142.677,
+              "cpu": "Ok(2140.625)",
+              "allocations": 1006715,
+              "line": 910
+            },
+            "memory:vacuum_bounded": {
+              "ms": 0.197,
+              "cpu": "Ok(0.0)",
+              "allocations": 21,
+              "line": 925
+            },
+            "memory:export_stream": {
+              "ms": 29724.182,
+              "cpu": "Ok(29531.25)",
+              "allocations": 40065491,
+              "line": 951
+            },
+            "memory:migrate": {
+              "ms": 61696.691,
+              "cpu": "Ok(61406.25)",
+              "allocations": 104228312,
+              "line": 957
+            },
+            "memory:bulk": {
+              "ms": 2535.033,
+              "cpu": "Ok(2531.25)",
+              "allocations": 10341273,
+              "line": 968
+            },
+            "memory:bulk_stop": {
+              "ms": 42173.091,
+              "cpu": "Ok(31515.625)",
+              "allocations": 13,
+              "line": 978
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "changes": [
+    {
+      "engine": "bplus_tree",
+      "implementation": "回收非bulk换出时，使用同一64页双写容量的余位写回其它驻留脏页。额外页留在缓存，原LRU换出和元页容量预留不变。",
+      "limits": "普通插入及逐事务WAL提交屏障不改变。双写数据、发布、主文件同步、clear失败封锁保持。"
+    },
+    {
+      "engine": "memory",
+      "implementation": "CandidateFold独立记录已完成组数，允许即时消费已收齐组。搜索/计数按原4096组锁边界直接累计，不再经过两份逐行候选数组；保留页键/值及每块一个游标。",
+      "limits": "仍需逐物理行检查MVCC、二进制组边界和TTL，精确total不改成估算。"
+    },
+    {
+      "engine": "lsm_tree",
+      "implementation": "锁内借用mem/SST值判断可见性，仅保留的页值复制；blob与同seq歧义显式点查。全库vacuum延后阈值flush的同步压实，结束后按原策略合批；达到原l0_stop_trigger仍压实。每次SST与manifest同步不减少保证。",
+      "limits": "bounded与普通事务调度不改。WAL每commit同步保证不改。1M对照实际14次阈值flush一致、42→8次压实、141→61次SST同步；不外推20M完整吞吐。"
+    }
+  ],
+  "rejected_experiments": [
+    {
+      "rows": [
+        1000000,
+        5000000
+      ],
+      "old_ms": [
+        [
+          368.15,
+          348.305
+        ],
+        [
+          3212.839,
+          3108.02
+        ]
+      ],
+      "new_ms": [
+        [
+          389.27,
+          316.09
+        ],
+        [
+          3476.049,
+          3004.696
+        ]
+      ],
+      "decision": "撤回：文本真实种子ABBA无稳定CPU收益；5M均值慢2.53%。窗口判断恢复M161生产实现。"
+    }
+  ],
+  "debug_controls": {
+    "bplus": {
+      "rows": 12000,
+      "page_syncs": [
+        11,
+        7,
+        7,
+        11
+      ],
+      "dblwr_syncs": [
+        34,
+        22,
+        22,
+        34
+      ],
+      "freelist_syncs": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "ms": [
+        4594.116,
+        4330.075,
+        3766.359,
+        2664.211
+      ],
+      "verified_values_per_arm": 12000
+    },
+    "lsm_small": {
+      "rows": 1024,
+      "threshold_flushes": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "compactions": [
+        4,
+        1,
+        1,
+        4
+      ],
+      "merge_rows": [
+        3072,
+        3072,
+        3072,
+        3072
+      ],
+      "sst_syncs": [
+        12,
+        9,
+        9,
+        12
+      ],
+      "ms": [
+        216.837,
+        353.727,
+        248.778,
+        200.167
+      ]
+    },
+    "memory_arrays": {
+      "rows": 50000,
+      "old_allocations": 390,
+      "new_allocations": 227
+    },
+    "revised_lsm_guard": {
+      "original": "new_merge_rows < old_merge_rows",
+      "observations": "小种子四臂输入行均3072；200k四臂输入行均64730，threshold_flushes仅2次，均压实5次。",
+      "judgement": "实现未少读该种子的行；原判据不能证明文件合批的同步收益。改为真实sync_all调用次数new<old，不改阈值或持久化屏障。保留无重写收益证据，最终大种子按足够触发重复阈值flush验收。"
+    }
+  },
+  "stopping_rule": {
+    "final_user_run": "仅再运行原正式默认五档一次，按源码/可执行指纹、132格/档、迁移重开及真实bounded删除判断。",
+    "after_pass": "结束本轮性能优化，保留该版本使用；总耗时波动或新增更低优先级热点不自动开启下一轮改测。",
+    "durability": "不能用取消同步、近似total或放宽正确性阈值换取性能通过。"
+  },
+  "risk_and_attribution": [
+    "20M插入增量不能归因B+新算法：两轮B+源码没有改动，双写19424批和WAL20000次不变，同步平均时延72.875→84.301ms。",
+    "B+/LSM串行20k事务的WAL约1686/1696秒，正常同步保证下不能承诺消除。",
+    "C盘专项数据与D盘HDD正式五档分开；同种子ABBA不能替代机器上的最终五档吞吐。",
+    "正常重开未清Windows页缓存；不能宣称等于断电实验。",
+    "memory文本种子保持键和值形状，事务建库方式与原五档不完全相同；不直接外推20M加速比例。"
+  ],
+  "validation": {
+    "check_all_targets": {
+      "command": "cargo check --all-targets --offline --quiet",
+      "exit_code": 0
+    },
+    "source_fingerprint": {
+      "files": 61,
+      "sha256": "b837e35fe6b05d4c0c51583906ba06ff4fb5bb1207d7d4b7693d82316d13ab5d"
+    },
+    "release": {
+      "command": "cargo test --release --lib --offline --quiet -- --test-threads=1",
+      "passed": 556,
+      "failed": 0,
+      "ignored": 86,
+      "seconds": 140.08,
+      "exit_code": 0,
+      "output": ".............................iii....................... 435/642\n............i.......i.iiii...i.i...................i.......................i..ii....... 522/642\n.........................i...........................i....ii........................... 609/642\ni................................\ntest result: ok. 556 passed; 0 failed; 86 ignored; 0 measured; 0 filtered out; finished in 140.08s\n\n"
+    },
+    "executable_sha256": "34cd5891f7856cc42227c989c92519879c5d4a146da1c7f2ebb9535124bf3233",
+    "performance": {
+      "memory_1m": {
+        "command": "MEMORY_WINDOW_ROWS=1000000; cargo test --release --lib --offline search_streaming_cpu_same_seed_abba -- --ignored --nocapture --test-threads=1",
+        "ms": [
+          122.692,
+          107.682,
+          140.676,
+          133.155
+        ],
+        "physical_visits": [
+          1000488,
+          1000488,
+          1000488,
+          1000488
+        ],
+        "passed": 1,
+        "failed": 0,
+        "seconds": 2.66,
+        "old_mean_ms": 127.92349999999999,
+        "new_mean_ms": 124.179,
+        "change_percent": -2.9271400485446297
+      },
+      "memory_5m": {
+        "output": "MEMORY_STREAM_ABBA rows=5000000 arm=0 old=true ms=1951.836 physical_visits=5002440 all_values_verified=100\nMEMORY_STREAM_ABBA rows=5000000 arm=1 old=false ms=616.104 physical_visits=5002440 all_values_verified=100\nMEMORY_STREAM_ABBA rows=5000000 arm=2 old=false ms=696.832 physical_visits=5002440 all_values_verified=100\nMEMORY_STREAM_ABBA rows=5000000 arm=3 old=true ms=2102.500 physical_visits=5002440 all_values_verified=100\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 641 filtered out; finished in 20.01s\n\n",
+        "exit_code": 0,
+        "ms": [
+          1951.836,
+          616.104,
+          696.832,
+          2102.5
+        ],
+        "rows": 5000000,
+        "physical_visits": 5002440,
+        "verified_values_per_arm": 100,
+        "seconds": 20.01,
+        "old_mean_ms": 2027.1680000000001,
+        "new_mean_ms": 656.4680000000001,
+        "change_percent": -67.61649749798734
+      },
+      "bplus_12k": {
+        "ms": [
+          312.584,
+          286.503,
+          306.46,
+          250.69
+        ],
+        "rows": 12000,
+        "page_syncs": [
+          11,
+          7,
+          7,
+          11
+        ],
+        "dblwr_syncs": [
+          34,
+          22,
+          22,
+          34
+        ],
+        "freelist_syncs": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "verified_values_per_arm": 12000,
+        "reopened_values_per_arm": 12000,
+        "exit_code": 0,
+        "passed": 1,
+        "seconds": 3.45,
+        "old_mean_ms": 281.637,
+        "new_mean_ms": 296.4815,
+        "change_percent": 5.27079183487964,
+        "interpretation": "实际同步数下降；C盘墙钟均值281.637→296.4815ms，慢5.27%，不能宣称所有档位提速。"
+      },
+      "lsm_search_1m": {
+        "command": "LSM_SEARCH_ROWS=1000000; cargo test --release --lib --offline search_inline_count_same_seed_abba -- --ignored --nocapture --test-threads=1",
+        "output": "LSM_SEARCH_ABBA rows=1000000 task=count arm=0 old=true ms=1312.483 copies=1000000\nLSM_SEARCH_ABBA rows=1000000 task=count arm=1 old=false ms=1592.242 copies=0\nLSM_SEARCH_ABBA rows=1000000 task=count arm=2 old=false ms=1337.186 copies=0\nLSM_SEARCH_ABBA rows=1000000 task=count arm=3 old=true ms=1361.567 copies=1000000\nLSM_SEARCH_ABBA rows=1000000 task=first arm=0 old=true ms=1272.926 copies=1000000\nLSM_SEARCH_ABBA rows=1000000 task=first arm=1 old=false ms=1144.283 copies=100\nLSM_SEARCH_ABBA rows=1000000 task=first arm=2 old=false ms=1218.357 copies=100\nLSM_SEARCH_ABBA rows=1000000 task=first arm=3 old=true ms=1937.182 copies=1000000\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 641 filtered out; finished in 28.67s\n\n",
+        "exit_code": 0,
+        "results": [
+          {
+            "rows": 1000000,
+            "task": "count",
+            "arm": 0,
+            "old": true,
+            "ms": 1312.483,
+            "copies": 1000000
+          },
+          {
+            "rows": 1000000,
+            "task": "count",
+            "arm": 1,
+            "old": false,
+            "ms": 1592.242,
+            "copies": 0
+          },
+          {
+            "rows": 1000000,
+            "task": "count",
+            "arm": 2,
+            "old": false,
+            "ms": 1337.186,
+            "copies": 0
+          },
+          {
+            "rows": 1000000,
+            "task": "count",
+            "arm": 3,
+            "old": true,
+            "ms": 1361.567,
+            "copies": 1000000
+          },
+          {
+            "rows": 1000000,
+            "task": "first",
+            "arm": 0,
+            "old": true,
+            "ms": 1272.926,
+            "copies": 1000000
+          },
+          {
+            "rows": 1000000,
+            "task": "first",
+            "arm": 1,
+            "old": false,
+            "ms": 1144.283,
+            "copies": 100
+          },
+          {
+            "rows": 1000000,
+            "task": "first",
+            "arm": 2,
+            "old": false,
+            "ms": 1218.357,
+            "copies": 100
+          },
+          {
+            "rows": 1000000,
+            "task": "first",
+            "arm": 3,
+            "old": true,
+            "ms": 1937.182,
+            "copies": 1000000
+          }
+        ],
+        "comparison": {
+          "count": {
+            "old_mean_ms": 1337.025,
+            "new_mean_ms": 1464.714,
+            "change_percent": 9.550232792954505
+          },
+          "first": {
+            "old_mean_ms": 1605.054,
+            "new_mean_ms": 1181.32,
+            "change_percent": -26.399984050380866
+          }
+        },
+        "interpretation": "计数复制1M→0、首页复制1M→100。count均值慢9.55%，首页均值快26.40%，保留全部不利读数，不宣称全面CPU提速。"
+      },
+      "lsm_vacuum_1m": {
+        "command": "LSM_VACUUM_BATCH_ROWS=1000000; cargo test --release --lib --offline vacuum_compaction_same_seed_abba -- --ignored --nocapture --test-threads=1",
+        "exit_code": 0,
+        "output": "LSM_VACUUM_BATCH_ABBA rows=1000000 arm=0 old=true ms=9714.668 threshold_flushes=14 compactions=42 merge_rows=2641986 sst_syncs=141 sst_sync_ms=1302.778 all_values_verified=1000000 reopened_values_verified=1000000\nLSM_VACUUM_BATCH_ABBA rows=1000000 arm=1 old=false ms=7281.829 threshold_flushes=14 compactions=8 merge_rows=1463933 sst_syncs=61 sst_sync_ms=557.894 all_values_verified=1000000 reopened_values_verified=1000000\nLSM_VACUUM_BATCH_ABBA rows=1000000 arm=2 old=false ms=5785.999 threshold_flushes=14 compactions=8 merge_rows=1463933 sst_syncs=61 sst_sync_ms=480.339 all_values_verified=1000000 reopened_values_verified=1000000\nLSM_VACUUM_BATCH_ABBA rows=1000000 arm=3 old=true ms=10284.172 threshold_flushes=14 compactions=42 merge_rows=2641986 sst_syncs=141 sst_sync_ms=1132.264 all_values_verified=1000000 reopened_values_verified=1000000\n\nthread 'lsm_tree::lsm_tree_mvcc::tests::vacuum_compaction_same_seed_abba' (22164) panicked at src\\lsm_tree\\lsm_tree_mvcc.rs:1659:32:\ncoalescing must reduce actual SST syncs: old=282 new=282\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 641 filtered out; finished in 134.02s\n\n",
+        "results": [
+          {
+            "rows": 1000000,
+            "arm": 0,
+            "old": true,
+            "ms": 9714.668,
+            "threshold_flushes": 14,
+            "compactions": 42,
+            "merge_rows": 2641986,
+            "sst_syncs": 141,
+            "sst_sync_ms": 1302.778
+          },
+          {
+            "rows": 1000000,
+            "arm": 1,
+            "old": false,
+            "ms": 7281.829,
+            "threshold_flushes": 14,
+            "compactions": 8,
+            "merge_rows": 1463933,
+            "sst_syncs": 61,
+            "sst_sync_ms": 557.894
+          },
+          {
+            "rows": 1000000,
+            "arm": 2,
+            "old": false,
+            "ms": 5785.999,
+            "threshold_flushes": 14,
+            "compactions": 8,
+            "merge_rows": 1463933,
+            "sst_syncs": 61,
+            "sst_sync_ms": 480.339
+          },
+          {
+            "rows": 1000000,
+            "arm": 3,
+            "old": true,
+            "ms": 10284.172,
+            "threshold_flushes": 14,
+            "compactions": 42,
+            "merge_rows": 2641986,
+            "sst_syncs": 141,
+            "sst_sync_ms": 1132.264
+          }
+        ],
+        "old_mean_ms": 9999.42,
+        "new_mean_ms": 6533.914,
+        "change_percent": -34.65707011006639,
+        "seconds": 134.02,
+        "verified_values_per_arm": 1000000,
+        "reopened_values_per_arm": 1000000
+      }
+    },
+    "small_bench": {
+      "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e",
+      "source_files": 61,
+      "source_sha256": "b837e35fe6b05d4c0c51583906ba06ff4fb5bb1207d7d4b7693d82316d13ab5d",
+      "run": {
+        "tool": "storage-engines-scale-v1",
+        "harness_schema": 3,
+        "runner_sha256": "fde062aa9f8fffc04a71ff333906e97caf6956ee306bf002edd10587fa59c3ed",
+        "repo": "D:\\develop\\workspace\\rust_workspace\\storage-engines",
+        "started_utc": "2026-11-23T20:30:27.8447387Z",
+        "head": "a86ac6e646c2c33f1657042d6f96e5abd9317014",
+        "git_status": [
+          " M src/bplus_tree/bplus_tree_mvcc.rs",
+          " M src/bplus_tree/page.rs",
+          " M src/common/order.rs",
+          " M src/common/store.rs",
+          " M src/engine.rs",
+          " M src/lsm_tree/lsm_tree.rs",
+          " M src/lsm_tree/lsm_tree_mvcc.rs",
+          " M src/lsm_tree/sst.rs",
+          " M src/memory/memory_mvcc.rs",
+          "?? docs/test10.txt",
+          "?? docs/test11.txt",
+          "?? docs/test12.txt",
+          "?? docs/test13.txt",
+          "?? docs/test14.txt",
+          "?? docs/test15.txt",
+          "?? docs/test16.txt",
+          "?? docs/test17.txt",
+          "?? docs/test18.txt",
+          "?? docs/test19.txt",
+          "?? docs/test20.txt",
+          "?? docs/test21.txt",
+          "?? docs/test4.txt",
+          "?? docs/test5.txt",
+          "?? docs/test6.txt",
+          "?? docs/test7.txt",
+          "?? docs/test8.txt",
+          "?? docs/test9.txt"
+        ],
+        "source_sha256": "b837e35fe6b05d4c0c51583906ba06ff4fb5bb1207d7d4b7693d82316d13ab5d",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "powershell": "5.1.19041.6456",
+        "cpu": [
+          {
+            "Name": "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
+            "NumberOfCores": 4,
+            "NumberOfLogicalProcessors": 8
+          }
+        ],
+        "memory_total_bytes": 68596707328,
+        "memory_free_bytes": 43334893568,
+        "scratch_root": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data",
+        "output_root": "D:\\develop\\workspace\\rust_workspace\\storage-engines\\data\\bench-results",
+        "cases": [
+          {
+            "rows": 2000,
+            "pass": 1,
+            "token": "824da0ee162b4e9ea33af2a34b2d10ba",
+            "scratch": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data\\scale-824da0ee162b4e9ea33af2a34b2d10ba"
+          },
+          {
+            "rows": 3000,
+            "pass": 1,
+            "token": "b486ca6b943548a88b9fc8793164847c",
+            "scratch": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data\\scale-b486ca6b943548a88b9fc8793164847c"
+          }
+        ],
+        "memory_metric": "Rust allocator live/peak delta, decimal MB; NOT process RSS",
+        "reopen_policy": "normal close then reopen; Windows page cache not cleared; not a power-loss test",
+        "bounded_policy": "full vacuum first; seed 2 old versions for up to 8 existing keys outside timing; latest values unchanged",
+        "diagnostic_schema": "SCALE token fields are literal strings; raw preserves the complete line",
+        "public_contract": "same API/parameters/transaction+TTL semantics/disk format; verify internal changes",
+        "benchmark_policy": "TTL read/write measured; then auxiliary keys persisted outside timing; independent migration manifest",
+        "executable_sha256": "34cd5891f7856cc42227c989c92519879c5d4a146da1c7f2ebb9535124bf3233",
+        "cargo_lock_sha256": "06a642091be8fcaa23f7e46dc42abe41d174ec29509cc79fcfcb22325d639dfd"
+      },
+      "cases": [
+        {
+          "summary": {
+            "rows": 2000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 5.002,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_2000_pass_1.log",
+            "diagnostics": "rows_2000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_lines": 837,
+          "derived_lines": 51,
+          "migration_verified": 4,
+          "bulk_reopen_verified": 4,
+          "bounded_verified": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "copies_and_stages": [
+            "SCALE_LSM_READ engine=lsm_tree phase=search_first block_accesses=32 block_cache_misses=0 sst_probes=0 index_comparisons=0 entry_comparisons=0 packed_promotions=0 value_clones=100",
+            "SCALE_LSM_READ engine=lsm_tree phase=vacuum block_accesses=0 block_cache_misses=32 sst_probes=0 index_comparisons=0 entry_comparisons=0 packed_promotions=0 value_clones=0",
+            "SCALE_LSM_MOVES phase=vacuum files=0 bytes=0",
+            "SCALE_LSM_REWRITE_INPUTS phase=vacuum cumulative=true files=0 bytes=0 excludes_trivial_moves=true",
+            "SCALE_LSM_REWRITE_OUTPUTS phase=vacuum cumulative=true files=0 bytes=0 includes_overlap_repair=true scope=merge_generated_sst",
+            "SCALE_LSM_DELETE_STAGES phase=vacuum cumulative=true delete_calls=1200 write_ms=0.701 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000",
+            "SCALE_LSM_STAGES phase=vacuum merge_ms=0.000 repair_ms=0.000 manifest_ms=12.600 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=10.272 sst_sync_ms=6.303 manifest_reuses=2 sst_syncs=2",
+            "SCALE_MEMORY_READ engine=memory phase=search_first search_key_copies=100 candidate_value_copies=100",
+            "SCALE_MEMORY_READ engine=memory phase=vacuum search_key_copies=0 candidate_value_copies=0"
+          ]
+        },
+        {
+          "summary": {
+            "rows": 3000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 3.688,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_3000_pass_1.log",
+            "diagnostics": "rows_3000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_lines": 837,
+          "derived_lines": 51,
+          "migration_verified": 4,
+          "bulk_reopen_verified": 4,
+          "bounded_verified": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "copies_and_stages": [
+            "SCALE_LSM_READ engine=lsm_tree phase=search_first block_accesses=47 block_cache_misses=0 sst_probes=0 index_comparisons=0 entry_comparisons=0 packed_promotions=0 value_clones=100",
+            "SCALE_LSM_READ engine=lsm_tree phase=vacuum block_accesses=0 block_cache_misses=47 sst_probes=0 index_comparisons=0 entry_comparisons=0 packed_promotions=0 value_clones=0",
+            "SCALE_LSM_MOVES phase=vacuum files=0 bytes=0",
+            "SCALE_LSM_REWRITE_INPUTS phase=vacuum cumulative=true files=0 bytes=0 excludes_trivial_moves=true",
+            "SCALE_LSM_REWRITE_OUTPUTS phase=vacuum cumulative=true files=0 bytes=0 includes_overlap_repair=true scope=merge_generated_sst",
+            "SCALE_LSM_DELETE_STAGES phase=vacuum cumulative=true delete_calls=1300 write_ms=0.995 threshold_flushes=0 threshold_flush_ms=0.000 mem_wal_syncs=0 mem_wal_sync_ms=0.000",
+            "SCALE_LSM_STAGES phase=vacuum merge_ms=0.000 repair_ms=0.000 manifest_ms=11.732 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=11.532 sst_sync_ms=6.503 manifest_reuses=2 sst_syncs=2",
+            "SCALE_MEMORY_READ engine=memory phase=search_first search_key_copies=100 candidate_value_copies=100",
+            "SCALE_MEMORY_READ engine=memory phase=vacuum search_key_copies=0 candidate_value_copies=0"
+          ]
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/build.log",
+          "sha256": "a9a7f8202c36e34b5729aa1c54fa83e5ab4a9ae1a5274c85d0b994cf58c14677"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/rows_2000_pass_1.csv",
+          "sha256": "ecdc1731de45d0796cce07886eaa0d7056731e3cbd6e9a13deacee8e9d761195"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/rows_2000_pass_1.diagnostics.json",
+          "sha256": "5f6b0225862fbd001021a94612d75ef5b42eb71ecb0b458cc9d8ea6d076e1654"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/rows_2000_pass_1.log",
+          "sha256": "2c9e41a3bf4215b30bdf7dc1dfd63ff0458270582843e63f5dfaa86b0012c7ed"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/rows_3000_pass_1.csv",
+          "sha256": "c279a4de0957ab3b63619378cea0d89d183bba01c5cc24739c9de2fe11bee608"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/rows_3000_pass_1.diagnostics.json",
+          "sha256": "f92168574724aec01d70eeaaf168c810d1011862f054528f82e702b157946605"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/rows_3000_pass_1.log",
+          "sha256": "3fe14b3eaf6c076858139d00ac0b475c0b74a798f019dc76258a677e35e55d25"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/run.json",
+          "sha256": "bec1d46274287293d7aecf3f433575ba21213dc4c4400dcd755131da1cc44968"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/source.json",
+          "sha256": "e248b499bd3d2d029907c24b34fe8133bbdd6a123dac5e6bab84b9ac0d3ea63a"
+        },
+        {
+          "path": "data/bench-results/20261124-043024-68c432f815ba4fbd9d9b4722fb30cc4e/summary.json",
+          "sha256": "ac229c46c462a3af039967affbe75f2b335b544cf10fb388f4ed67abacb13932"
+        }
+      ],
+      "roundtrip_raw_verified": true,
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -Rows '2000,3000' -Repeat 1 -ScratchRoot C:/Users/Administrator/.cache/storage-engines/test-data",
+      "exit_code": 0
+    }
+  },
+  "status": "verified",
+  "delivery_audit": {
+    "coverage": "三项授权范围均有生产实现、真实旧路径对照和故障/语义守卫。",
+    "evidence_levels": {
+      "official_contract": "src/common/wal.rs commit_transaction、VersionedStore与共享TTL/MVCC判据；同步/磁盘格式保证保留。",
+      "mechanism": "实际复制、分配、page/dblwr/SST同步与归并行计数；恢复旧路径会触发同一守卫失败。",
+      "performance": "最终同一Release可执行文件上的ABBA，不外推D盘20M全程。",
+      "correctness": "556项Release回归、all-targets、正式2k/3k各132格及逐值重开。"
+    },
+    "raw_roundtrip_lines": 1674,
+    "delta_roundtrip_records": 102,
+    "json_roundtrip": true,
+    "markdown_local_links_verified": 57,
+    "withdrawn_experiment_absent": true,
+    "artifact_hashes": 10,
+    "source_files": 61,
+    "scope": "封版收尾；不新增并行代理、定时任务、第五项优化或改变压测阈值。",
+    "incremental_date": "2026-11-24"
+  },
+  "latest_findings": {
+    "bplus": {
+      "old_insert_s": 7066.624,
+      "new_insert_s": 8129.735,
+      "additional_s": 1063.111,
+      "dblwr_batches": 19424,
+      "wal_commit_syncs": 20000,
+      "old_avg_commit_ms": 72.875,
+      "new_avg_commit_ms": 84.301,
+      "vacuum_s": 230.243,
+      "vacuum_page_syncs": 561,
+      "bounded_wall_ms": 321.81,
+      "bounded_sync_ms": 319.922,
+      "evidence": {
+        "path": "data/bench-results/20261123-145727-e1183d371905474ab9484d80df9ac6fe/rows_20000000_pass_1.log",
+        "lines": [
+          231,
+          380,
+          385,
+          399
+        ]
+      }
+    },
+    "memory": {
+      "search_first_s": 17.604,
+      "search_first_cpu_s": 17.375,
+      "search_first_5m_10m_20m_s": [
+        1.012,
+        3.867,
+        17.604
+      ],
+      "migration_source_scan_s": 28.989,
+      "migration_target_write_s": 27.944,
+      "migration_target_commit_s": 2.657,
+      "evidence": {
+        "path": "data/bench-results/20261123-145727-e1183d371905474ab9484d80df9ac6fe/rows_20000000_pass_1.log",
+        "lines": [
+          846,
+          848,
+          960
+        ]
+      }
+    },
+    "lsm": {
+      "exact_first_value_clones": 20000000,
+      "prefix_count_value_clones": 1000000,
+      "vacuum_delete_write_s": 0.423511,
+      "vacuum_threshold_flush_s": 34.244,
+      "vacuum_threshold_flushes": 15,
+      "wal_commit_syncs": 20000,
+      "wal_commit_sync_s": 1696.229,
+      "evidence": {
+        "path": "data/bench-results/20261123-145727-e1183d371905474ab9484d80df9ac6fe/rows_20000000_pass_1.log",
+        "lines": [
+          475,
+          573,
+          640,
+          645,
+          652
+        ]
+      }
+    }
+  },
+  "revision_history": [
+    {
+      "date": "2026-11-24",
+      "event": "小种子归并行数守卫红后先改判：种子覆盖独立范围文件合批，实际输入未减；保留全部失败与无重写收益读数。新增真实sync_all计数后，以严格new<old验证同步成本；没有改变flush阈值。1M真实14次阈值flush对照最终同时减少同步和输入行。"
+    },
+    {
+      "date": "2026-11-24",
+      "event": "单次字节比较在文本ABBA无稳定收益，撤回并保持原二进制窗口判据；改为即时消费共享分组结果。"
+    }
+  ]
+}

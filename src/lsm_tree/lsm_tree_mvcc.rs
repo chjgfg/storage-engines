@@ -32,6 +32,7 @@ use std::eprintln;
 #[cfg(test)]
 use std::thread_local;
 use std::format;
+use std::unreachable;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -678,6 +679,7 @@ impl MVCC {
         let mut cur_raw: Option<Vec<u8>> = None;
         let mut budget_cut = false;
         let mut lower: Option<Vec<u8>> = after.map(|k| k.to_vec());
+        kv.with_vacuum_writes(full_sweep, |kv| {
         loop {
             #[cfg(test)]
             let scan_timer = crate::common::maintenance_probe::Timer::start(crate::common::maintenance_probe::Stage::VacuumScan);
@@ -754,6 +756,8 @@ impl MVCC {
                 _ => break,
             }
         }
+        Ok(())
+        })?;
         let next_cursor = if budget_cut { cur_raw } else { None };
         #[cfg(test)]
         {
@@ -1591,6 +1595,83 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
 
+    fn compare_vacuum_compaction_schedule(rows: usize, small: bool) {
+        use crate::lsm_tree::lsm_tree::{maintenance_probe, vacuum_compaction_reference};
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for e in std::fs::read_dir(from).unwrap() {
+                let e = e.unwrap(); let dest = to.join(e.file_name());
+                if e.file_type().unwrap().is_dir() { copy_tree(&e.path(), &dest); }
+                else { std::fs::copy(e.path(), dest).unwrap(); }
+            }
+        }
+        fn value(i: usize, round: u8) -> Vec<u8> {
+            let mut value = vec![round; 128];
+            value[..8].copy_from_slice(&(i as u64).to_le_bytes()); value
+        }
+        let mut opts = LSMTreeOptions::for_mvcc();
+        if small { opts.mem_threshold_entries = 128; opts.mem_threshold_bytes = usize::MAX;
+            opts.l0_compact_threshold = 2; }
+        let seed = tmp_db("vacuum_compaction_seed");
+        {
+            let db = MVCC::try_open_with(&seed, Some(opts.clone())).unwrap();
+            db.set_vacuum_auto_slice(0);
+            for round in 0..2u8 {
+                for base in (0..rows).step_by(1000) {
+                    let tx = db.begin_transaction();
+                    for i in base..(base + 1000).min(rows) {
+                        assert!(tx.set_raw(&(i as u64).to_be_bytes(), value(i, round)));
+                    }
+                    tx.commit();
+                }
+            }
+            db.checkpoint();
+        }
+        let mut measured = Vec::new();
+        for (arm, old) in [true, false, false, true].into_iter().enumerate() {
+            let target = tmp_db("vacuum_compaction_arm"); copy_tree(&seed, &target);
+            let db = MVCC::try_open_with(&target, Some(opts.clone())).unwrap();
+            db.set_vacuum_auto_slice(0);
+            let reference = old.then(vacuum_compaction_reference::Scope::start);
+            let probe = maintenance_probe::Scope::start();
+            let now = std::time::Instant::now();
+            assert_eq!(db.vacuum().unwrap().versions_removed, rows);
+            let ms = now.elapsed().as_secs_f64() * 1000.0;
+            let stats = probe.stats(); drop(probe); drop(reference);
+            assert!(stats.threshold_flushes > 0);
+            let tx = db.begin_transaction();
+            for i in 0..rows { assert_eq!(tx.get(&(i as u64).to_be_bytes()), Some(value(i, 1))); }
+            tx.commit(); drop(tx);
+            drop(db);
+            let db = MVCC::try_open_with(&target, Some(opts.clone())).unwrap();
+            let tx = db.begin_transaction();
+            for i in 0..rows { assert_eq!(tx.get(&(i as u64).to_be_bytes()), Some(value(i, 1))); }
+            tx.commit(); drop(tx); drop(db);
+            eprintln!("LSM_VACUUM_BATCH_ABBA rows={rows} arm={arm} old={old} ms={ms:.3} threshold_flushes={} compactions={} merge_rows={} sst_syncs={} sst_sync_ms={:.3} all_values_verified={rows} reopened_values_verified={rows}",
+                stats.threshold_flushes, stats.compactions, stats.owned_input_rows, stats.sst_syncs, stats.sst_sync_ns as f64 / 1e6);
+            measured.push((old, stats));
+        }
+        assert!(measured.iter().all(|x| x.1.threshold_flushes == measured[0].1.threshold_flushes));
+        // Disjoint deletion ranges can read the same row count while producing
+        // fewer output files. Count the actual sync calls, our persistence target.
+        let old: u64 = measured.iter().filter(|x| x.0).map(|x| x.1.sst_syncs).sum();
+        let new: u64 = measured.iter().filter(|x| !x.0).map(|x| x.1.sst_syncs).sum();
+        let guard = |measured| assert!(measured < old,
+            "coalescing must reduce actual SST syncs: old={old} new={measured}");
+        guard(new);
+        assert!(std::panic::catch_unwind(|| guard(old)).is_err());
+    }
+
+    #[test]
+    fn vacuum_compaction_coalesces_real_deletion_files() { compare_vacuum_compaction_schedule(1024, true); }
+
+    #[test]
+    #[ignore = "same closed SST seed ABBA for full vacuum compaction scheduling"]
+    fn vacuum_compaction_same_seed_abba() {
+        let rows = std::env::var("LSM_VACUUM_BATCH_ROWS").map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
+        compare_vacuum_compaction_schedule(rows, false);
+    }
+
     fn measure_vacuum_delete_stages(rows: usize, small_threshold: bool) {
         use std::{assert, assert_eq, eprintln, vec};
         use crate::lsm_tree::lsm_tree::maintenance_probe::{Scope, Timer, Kind};
@@ -1771,12 +1852,118 @@ mod tests {
             let copies = crate::lsm_tree::sst::entry_value_clones() - before;
             assert_eq!(page.items.len(), 100); assert!(page.has_next);
             assert_eq!(page.items[99].value, Some(vec![9; 128]));
-            assert_eq!(copies, if eager { 4096 } else { 101 });
-            let guard = std::panic::catch_unwind(|| assert_eq!(copies, 101));
+            assert_eq!(copies, if eager { 4096 } else { 100 });
+            let guard = std::panic::catch_unwind(|| assert_eq!(copies, 100));
             assert_eq!(guard.is_err(), eager);
             drop(mode);
         }
         tx.commit();
+    }
+
+    #[test]
+    fn search_inline_count_borrows_values_with_real_old_path_control() {
+        use crate::lsm_tree::sst::entry_value_clones;
+        let path = tmp_db("search_borrow_count");
+        let db = MVCC::open(&path);
+        db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..10_000u64 { assert!(tx.set_raw(&i.to_be_bytes(), vec![9; 128])); }
+        tx.commit(); db.flush();
+        let tx = db.begin_transaction();
+        for old in [true, false] {
+            let mode = old.then(search_borrow_reference::Scope::start);
+            let before = entry_value_clones();
+            assert_eq!(tx.key_count(b""), 10_000);
+            let copies = entry_value_clones() - before;
+            let guard = std::panic::catch_unwind(|| assert_eq!(copies, 0));
+            assert_eq!(guard.is_err(), old, "restoring actual owned count must fail zero-copy guard");
+            assert_eq!(copies, if old { 10_000 } else { 0 });
+            let before = entry_value_clones();
+            let page = tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, 100));
+            assert_eq!(page.total, Some(10_000)); assert_eq!(page.items.len(), 100);
+            assert_eq!(page.items[99].value, Some(vec![9; 128]));
+            assert_eq!(entry_value_clones() - before, if old { 10_000 } else { 100 });
+            drop(mode);
+        }
+        tx.commit();
+    }
+
+    #[test]
+    #[ignore = "same SST seed count/first ABBA for borrowed search classification"]
+    fn search_inline_count_same_seed_abba() {
+        let rows: usize = std::env::var("LSM_SEARCH_ROWS").map(|s| s.parse().unwrap()).unwrap_or(200_000);
+        let path = tmp_db("search_inline_abba");
+        let db = MVCC::open(&path); db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        for i in 0..rows { assert!(tx.set_raw(&(i as u64).to_be_bytes(), vec![9; 128])); }
+        tx.commit(); db.flush();
+        let tx = db.begin_transaction();
+        assert_eq!(tx.key_count(b""), rows);
+        for task in ["count", "first"] {
+            for (arm, old) in [true, false, false, true].into_iter().enumerate() {
+                let mode = old.then(search_borrow_reference::Scope::start);
+                let before = crate::lsm_tree::sst::entry_value_clones();
+                let now = std::time::Instant::now();
+                if task == "count" { assert_eq!(tx.key_count(b""), rows); }
+                else {
+                    let page = tx.search_keys(&crate::common::SearchQuery::contains(b"", 0, 100));
+                    assert_eq!(page.total, Some(rows)); assert_eq!(page.items.len(), 100);
+                    assert_eq!(page.items[99].key, 99u64.to_be_bytes());
+                    assert_eq!(page.items[99].value, Some(vec![9; 128]));
+                }
+                let ms = now.elapsed().as_secs_f64() * 1000.0;
+                let copies = crate::lsm_tree::sst::entry_value_clones() - before;
+                assert_eq!(copies, if old { rows as u64 } else if task == "count" { 0 } else { 100 });
+                std::eprintln!("LSM_SEARCH_ABBA rows={rows} task={task} arm={arm} old={old} ms={ms:.3} copies={copies}");
+                drop(mode);
+            }
+        }
+        tx.commit();
+    }
+
+    #[test]
+    fn search_borrow_preserves_blob_ttl_binary_and_snapshot_fallbacks() {
+        let path = tmp_db("search_borrow_fallbacks");
+        let db = MVCC::open(&path); db.set_vacuum_auto_slice(0);
+        let tx = db.begin_transaction();
+        let mut keys: Vec<Vec<u8>> = (0..4200u64).map(|i| i.to_be_bytes().to_vec()).collect();
+        keys.extend([vec![], b"a".to_vec(), b"a\0".to_vec(), b"a\0\0".to_vec(), vec![255]]);
+        for (i, key) in keys.iter().enumerate() {
+            let value = if i < 4100 { crate::common::codec::pack_ttl(b"expired", 0) }
+                else if i % 3 == 0 { crate::common::codec::pack_ttl(&vec![7; 8192], u64::MAX) }
+                else { crate::common::codec::pack_plain(b"live") };
+            assert!(tx.set(key, value));
+        }
+        tx.commit(); db.flush();
+        let snapshot = db.begin_transaction();
+        let writer = db.begin_transaction();
+        for key in keys.iter().skip(4100).step_by(3) { assert!(writer.delete(key)); }
+        fn verify(tx: &Transaction) {
+            for deleted in [false, true] {
+                for page in [0, 1, 247] {
+                    for total in [false, true] {
+                        let q = crate::common::SearchQuery { pattern: vec![],
+                            mode: crate::common::KeyMatchMode::Prefix, include_deleted: deleted,
+                            page, page_size: 17, need_total: total };
+                        let reference = search_borrow_reference::Scope::start();
+                        let old = tx.search_keys(&q);
+                        let count = crate::common::count_window(tx, deleted, None, q.mode);
+                        drop(reference);
+                        let actual = tx.search_keys(&q);
+                        assert_eq!(actual.items, old.items);
+                        assert_eq!(actual.total, old.total);
+                        assert_eq!(actual.has_next, old.has_next);
+                        assert_eq!(crate::common::count_window(tx, deleted, None, q.mode), count);
+                    }
+                }
+            }
+        }
+        verify(&writer); verify(&snapshot); writer.commit(); verify(&snapshot);
+        drop(snapshot);
+        let tx = db.begin_transaction(); verify(&tx); tx.commit();
+        db.flush(); drop(db);
+        let db = MVCC::open(&path);
+        let tx = db.begin_transaction(); verify(&tx); tx.commit();
     }
 
     #[test]
@@ -1798,7 +1985,7 @@ mod tests {
             let (page, allocations) = crate::mem_probe::count_thread_allocations(|| tx.search_keys(&q));
             let ms = now.elapsed().as_secs_f64() * 1000.0;
             let copies = crate::lsm_tree::sst::entry_value_clones() - before;
-            assert_eq!(copies, if eager { 4096 } else { 101 });
+            assert_eq!(copies, if eager { 4096 } else { 100 });
             assert_eq!(page.items.len(), 100); assert!(page.has_next);
             assert_eq!(page.items[0].key, 0u64.to_be_bytes());
             assert_eq!(page.items[99].value, Some(vec![9; 512]));
@@ -5227,6 +5414,62 @@ impl crate::common::VersionedStore for Transaction {
         }
     }
 
+    fn scan_search_candidates(
+        &self, start: Option<&[u8]>, end: Option<&[u8]>,
+        accept: Option<&dyn Fn(&[u8]) -> bool>, after: Option<&[u8]>, budget: usize,
+        mut retention: crate::common::store::SearchRetention,
+    ) -> (Vec<crate::common::WinCandidate<crate::common::store::SearchRow<Self::Row>>>, bool) {
+        #[cfg(test)]
+        if search_borrow_reference::enabled()
+            || crate::common::store::search_materialize_reference::enabled()
+            || scan_row_reference::enabled() {
+            return crate::common::store::owned_search_candidates(
+                self, start, end, accept, after, budget, retention);
+        }
+        let hi = end.map(|e| crate::common::order::range_end(e, self.core.version, false));
+        let lo = crate::common::fold_lower_bound(start, after);
+        let kv = self.kv.lock().unwrap();
+        let mut fold = crate::common::order::CandidateFold::new(
+            start, end, after, accept, self.core.version, budget);
+        for (enc, row) in kv.row_iter_range(lo, hi.as_deref(), u64::MAX) {
+            #[cfg(test)]
+            crate::lsm_tree::sst::note_light_visit();
+            if row.kind() == 2 { continue; }
+            if fold.push(&enc, |v| self.is_visible(v), || row) { break; }
+        }
+        let (rows, complete) = fold.finish();
+        let rows = rows.into_iter().map(|c| {
+            use crate::lsm_tree::sst::{ScanRow, SearchSourceRow};
+            let row = match c.row.select_search(&mut retention, || encode_key(&c.key, c.version)) {
+                SearchSourceRow::Classified(row) => row,
+                SearchSourceRow::Lookup(row) => {
+                    let enc = match row {
+                        ScanRow::BlobLookup(enc) | ScanRow::AmbiguousLookup(enc) => enc,
+                        _ => unreachable!("only blob and ambiguous records need locked lookup"),
+                    };
+                    let value = match kv.get_value_at(&enc, u64::MAX) {
+                        None => crate::common::RowValue::Missing,
+                        Some(None) => crate::common::RowValue::Tombstone,
+                        Some(Some(bytes)) => crate::common::RowValue::Value(bytes),
+                    };
+                    crate::common::store::classify_search_value(value, &mut retention)
+                }
+            };
+            crate::common::WinCandidate { key: c.key, version: c.version, row }
+        }).collect();
+        (rows, complete)
+    }
+
+}
+
+#[cfg(test)]
+pub(crate) mod search_borrow_reference {
+    use std::{assert, cell::Cell, thread_local};
+    thread_local! { static OLD: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) fn enabled() -> bool { OLD.with(Cell::get) }
+    pub(crate) struct Scope;
+    impl Scope { pub(crate) fn start() -> Self { OLD.with(|c| assert!(!c.replace(true))); Self } }
+    impl Drop for Scope { fn drop(&mut self) { OLD.with(|c| c.set(false)); } }
 }
 
 #[cfg(test)]
