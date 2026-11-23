@@ -1,6 +1,11 @@
 {
   "schema": "storage-engines.performance.v1",
   "milestone": "M153",
+  "followup": {
+    "date": "2026-11-23",
+    "ledger": "docs/performance-m161.json",
+    "statement": "已收到cf6985a五档：20M首页21.834→19.732 s，导出/迁移/停止仍变慢；后续M158借用页外键的收益只由1M/2M暖读ABBA证明。"
+  },
   "date": "2026-11-22",
   "base_commit": "8fff8f5d42a4b18e4c57f8e1caa1ac4ad5c6632c",
   "objective": "memory 在存储锁内借用胜出行判定存活，仅复制所需搜索页；计数和页外行不复制值",

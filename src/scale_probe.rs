@@ -122,6 +122,7 @@ pub(crate) struct Phase {
     process: io::Result<ProcessMemory>,
     bplus: [u64; 8],
     lsm: [u64; 7],
+    memory_search: [u64; 2],
 }
 fn bplus_counts() -> [u64; 8] {
     use crate::bplus_tree::{bplus_tree as tree, page};
@@ -134,6 +135,10 @@ fn lsm_counts() -> [u64; 7] {
     [sst::block_reads(), sst::block_misses(), sst::sst_probes(), sst::index_probes(),
         sst::sst_entry_walks(), sst::packed_promotions(), sst::entry_value_clones()]
 }
+fn memory_search_counts() -> [u64; 2] {
+    use crate::memory::memory_mvcc::{search_copy_reference, search_key_reference};
+    [search_key_reference::copies(), search_copy_reference::copies()]
+}
 impl Phase {
     pub(crate) fn begin(engine: &str, phase: &str) -> Self {
         eprintln!("SCALE_PHASE_BEGIN engine={engine} phase={phase} pid={} unix_ms={}", std::process::id(), unix_ms());
@@ -144,7 +149,7 @@ impl Phase {
         let process = read_memory();
         let cpu = cpu_ns();
         Self { wall: std::time::Instant::now(), cpu, process, allocations: crate::mem_probe::allocations(),
-            bplus: bplus_counts(), lsm: lsm_counts() }
+            bplus: bplus_counts(), lsm: lsm_counts(), memory_search: memory_search_counts() }
     }
     pub(crate) fn finish(self, engine: &str, phase: &str) {
         let wall_ms = self.wall.elapsed().as_secs_f64() * 1e3;
@@ -167,6 +172,12 @@ impl Phase {
             let [accesses, misses, probes, index_comparisons, entry_comparisons, promotions, value_clones] =
                 std::array::from_fn(|i| now[i].saturating_sub(self.lsm[i]));
             eprintln!("SCALE_LSM_READ engine={engine} phase={phase} block_accesses={accesses} block_cache_misses={misses} sst_probes={probes} index_comparisons={index_comparisons} entry_comparisons={entry_comparisons} packed_promotions={promotions} value_clones={value_clones}");
+        }
+        if engine == "memory" {
+            let now = memory_search_counts();
+            let [search_key_copies, candidate_value_copies] =
+                std::array::from_fn(|i| now[i].saturating_sub(self.memory_search[i]));
+            eprintln!("SCALE_MEMORY_READ engine={engine} phase={phase} search_key_copies={search_key_copies} candidate_value_copies={candidate_value_copies}");
         }
     }
 }

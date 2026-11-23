@@ -1,6 +1,11 @@
 {
   "schema": "storage-engines.performance.v1",
   "milestone": "M155",
+  "followup": {
+    "date": "2026-11-23",
+    "ledger": "docs/performance-m161.json",
+    "statement": "cf6985a完整五档已验证真实bounded删除、迁移和正常重开；M161小档补齐迁移与memory复制诊断，完整新代码五档仍待复测。"
+  },
   "date": "2026-11-22",
   "base_commit": "1f44a26e253650fda30b7b83d63185647c94d0a5",
   "objective": "压测要求真正 bounded 删除；分开堆/RSS、锁等待/持有、停止、累计维护采样区间差分",

@@ -1,6 +1,11 @@
 {
   "schema": "storage-engines.performance.v1",
   "milestone": "M154",
+  "followup": {
+    "date": "2026-11-23",
+    "ledger": "docs/performance-m161.json",
+    "statement": "cf6985a五档已具备实际删除/阈值flush分段；20M删除写入约0.547 s、15次flush约37.061 s，M159复用最终manifest，不改变阈值。"
+  },
   "date": "2026-11-22",
   "base_commit": "11b985de242f38e420af32699bd9ff0b504fb6db",
   "objective": "LSM vacuum 真实删除写入与阈值 flush 分段，避免把嵌套维护成本混作删除算法成本",

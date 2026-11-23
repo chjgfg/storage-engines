@@ -7872,7 +7872,15 @@ mod tests {
             // 绝不问源库 health 要期望：源端非 TTL 丢失也必须红，不能一起少而自洽。
             let want = (rows + ttl_rows + 1) as u64;
             let target = open_engine(EngineKind::Memory, None).unwrap();
+            let migration_scope = migration_probe::Scope::start();
             let (d, live, peak, ms) = timed_phase(label, "migrate", || migrate(&*db, &*target, 1000).unwrap());
+            let stages = migration_scope.stats();
+            drop(migration_scope);
+            let residual = d.as_nanos().checked_sub(stages.ns.iter().sum()).expect("migration substages overlap");
+            eprintln!("SCALE_MIGRATION_STAGES engine={label} phase=migrate source_begin_ms={:.3} source_scan_ms={:.3} projection_ms={:.3} source_commit_ms={:.3} target_begin_ms={:.3} target_write_ms={:.3} target_commit_ms={:.3} target_rollback_ms={:.3} residual_ms={:.3} scope=disjoint_substages",
+                stages.ns[0] as f64 / 1e6, stages.ns[1] as f64 / 1e6, stages.ns[2] as f64 / 1e6,
+                stages.ns[3] as f64 / 1e6, stages.ns[4] as f64 / 1e6, stages.ns[5] as f64 / 1e6,
+                stages.ns[6] as f64 / 1e6, stages.ns[7] as f64 / 1e6, residual as f64 / 1e6);
             line(label, "migrate → memory", d.as_secs_f64() * 1e6 / rows.max(1) as f64, "µs/行", live, peak,
                  &format!("搬 {} 行 / {} 页 / {} B", ms.rows, ms.pages, ms.bytes));
             // 验收在计时外逐行流过目标，不在 O(N) 内存的目标旁再攒第二份全库 Vec。
@@ -8385,8 +8393,18 @@ pub fn migrate(
         // `scan_page` already returns the source-side absolute expiry. Keep it
         // with the value so each source row is visited only once.
         let (rows, next) = {
+            #[cfg(test)]
+            let begin_probe = migration_probe::Timer::start(migration_probe::Stage::SourceBegin);
             let tx = from.begin();
+            #[cfg(test)]
+            std::mem::drop(begin_probe);
+            #[cfg(test)]
+            let scan_probe = migration_probe::Timer::start(migration_probe::Stage::SourceScan);
             let (page, next) = tx.scan_page(cursor.as_deref(), page_rows);
+            #[cfg(test)]
+            std::mem::drop(scan_probe);
+            #[cfg(test)]
+            let projection_probe = migration_probe::Timer::start(migration_probe::Stage::Projection);
             let page: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> = page
                 .into_iter()
                 .filter_map(|rec| {
@@ -8394,11 +8412,23 @@ pub fn migrate(
                         .map(|value| (rec.key, value, rec.expire_unix_secs))
                 })
                 .collect();
+            #[cfg(test)]
+            std::mem::drop(projection_probe);
+            #[cfg(test)]
+            let commit_probe = migration_probe::Timer::start(migration_probe::Stage::SourceCommit);
             tx.commit();
+            #[cfg(test)]
+            std::mem::drop(commit_probe);
             (page, next)
         };
         if !rows.is_empty() {
+            #[cfg(test)]
+            let begin_probe = migration_probe::Timer::start(migration_probe::Stage::TargetBegin);
             let tx = to.begin();
+            #[cfg(test)]
+            std::mem::drop(begin_probe);
+            #[cfg(test)]
+            let write_probe = migration_probe::Timer::start(migration_probe::Stage::TargetWrite);
             for (key, value, ttl) in rows {
                 stats.rows += 1;
                 stats.bytes += value.len() as u64;
@@ -8412,6 +8442,10 @@ pub fn migrate(
                     None => tx.set_raw(&key, value),
                 };
                 if !ok {
+                    #[cfg(test)]
+                    std::mem::drop(write_probe);
+                    #[cfg(test)]
+                    let _rollback_probe = migration_probe::Timer::start(migration_probe::Stage::TargetRollback);
                     tx.rollback();
                     return Err(EngineError::MigrateAborted {
                         key,
@@ -8419,7 +8453,13 @@ pub fn migrate(
                     });
                 }
             }
+            #[cfg(test)]
+            std::mem::drop(write_probe);
+            #[cfg(test)]
+            let commit_probe = migration_probe::Timer::start(migration_probe::Stage::TargetCommit);
             tx.commit();
+            #[cfg(test)]
+            std::mem::drop(commit_probe);
         }
         stats.pages += 1;
         match next {
@@ -8428,4 +8468,85 @@ pub fn migrate(
         }
     }
     Ok(stats)
+}
+
+#[cfg(test)]
+pub(crate) mod migration_probe {
+    use std::{assert, cell::RefCell, thread_local, time::Instant};
+    #[derive(Clone, Copy)]
+    pub(crate) enum Stage { SourceBegin, SourceScan, Projection, SourceCommit,
+        TargetBegin, TargetWrite, TargetCommit, TargetRollback }
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Stats { pub ns: [u128; 8], pub calls: [u64; 8] }
+    thread_local! { static ACTIVE: RefCell<Option<Stats>> = const { RefCell::new(None) }; }
+    pub(crate) struct Scope;
+    impl Scope {
+        pub(crate) fn start() -> Self {
+            ACTIVE.with(|s| { assert!(s.borrow().is_none()); *s.borrow_mut() = Some(Stats::default()); }); Self
+        }
+        pub(crate) fn stats(&self) -> Stats { ACTIVE.with(|s| s.borrow().as_ref().unwrap().clone()) }
+    }
+    impl Drop for Scope { fn drop(&mut self) { ACTIVE.with(|s| *s.borrow_mut() = None); } }
+    pub(crate) struct Timer { stage: Stage, start: Instant }
+    impl Timer {
+        pub(crate) fn start(stage: Stage) -> Option<Self> {
+            ACTIVE.with(|s| s.borrow().is_some()).then(|| Self { stage, start: Instant::now() })
+        }
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            let elapsed = self.start.elapsed().as_nanos();
+            ACTIVE.with(|s| if let Some(stats) = s.borrow_mut().as_mut() {
+                stats.ns[self.stage as usize] += elapsed; stats.calls[self.stage as usize] += 1;
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod migration_stage_tests {
+    use super::*;
+    use std::{assert, assert_eq, eprintln, vec};
+    fn run(rows: usize, print: bool) {
+        use migration_probe::{Scope, Stage, Timer};
+        assert!(Timer::start(Stage::SourceScan).is_none());
+        let source = open_engine(EngineKind::Memory, None).unwrap();
+        source.set_vacuum_auto_slice(0);
+        let tx = source.begin();
+        for i in 0..rows { assert!(tx.set_raw(&(i as u64).to_be_bytes(), vec![i as u8; 128])); }
+        tx.commit(); drop(tx);
+        let target = open_engine(EngineKind::Memory, None).unwrap();
+        target.set_vacuum_auto_slice(0);
+        let scope = Scope::start();
+        let now = std::time::Instant::now();
+        let migrated = migrate(&*source, &*target, 1000).unwrap();
+        let total_ns = now.elapsed().as_nanos();
+        let s = scope.stats();
+        let residual = total_ns.checked_sub(s.ns.iter().sum()).expect("migration stages overlap");
+        assert_eq!(migrated.rows, rows as u64);
+        assert_eq!(s.calls[Stage::SourceScan as usize], migrated.pages);
+        assert_eq!(s.calls[Stage::SourceBegin as usize], migrated.pages);
+        assert_eq!(s.calls[Stage::SourceCommit as usize], migrated.pages);
+        assert_eq!(s.calls[Stage::TargetWrite as usize], s.calls[Stage::TargetCommit as usize]);
+        assert_eq!(s.calls[Stage::TargetWrite as usize], rows.div_ceil(1000) as u64);
+        assert_eq!(s.calls[Stage::TargetRollback as usize], 0);
+        drop(scope);
+        assert!(Timer::start(Stage::TargetWrite).is_none());
+        let mut seen = 0;
+        target.export_latest_visible_for_each(false, &mut |rec| {
+            assert_eq!(rec.key, (seen as u64).to_be_bytes());
+            assert_eq!(rec.value, Some(vec![seen as u8; 128])); seen += 1; true
+        });
+        assert_eq!(seen, rows);
+        if print { eprintln!("MIGRATION_COST rows={rows} total_ms={:.3} stages_ns={:?} calls={:?} residual_ms={:.3} all_values_verified={seen}",
+            total_ns as f64 / 1e6, s.ns, s.calls, residual as f64 / 1e6); }
+    }
+    #[test]
+    fn migration_stage_accounting_uses_actual_scan_write_commit_gates() { run(2050, false); }
+    #[test]
+    #[ignore = "memory migration source/target cost, release single thread"]
+    fn memory_migration_stage_cost() {
+        let rows = std::env::var("MEMORY_MIGRATION_ROWS").map(|s| s.parse().unwrap()).unwrap_or(200_000usize);
+        run(rows, true);
+    }
 }

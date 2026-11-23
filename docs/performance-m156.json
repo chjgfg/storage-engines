@@ -1,6 +1,12 @@
 {
   "schema": "storage-engines.performance.v1",
   "milestone": "M156",
+  "followup": {
+    "date": "2026-11-23",
+    "ledger": "docs/performance-m161.json",
+    "statement": "原最新M151五档口径已过时；cf6985a五档已收齐，历史数字保留，最新权威分析入口迁至M161。"
+  },
+  "superseded_by": "docs/performance-m161.json",
   "date": "2026-11-22",
   "base_commit": "866d04996cf6f1ae860ff06cbe7c51d5124da3a2",
   "objective": "最新五档结果的单一分析账本，连接原始证据与 M152-M155 修复/诊断验证",

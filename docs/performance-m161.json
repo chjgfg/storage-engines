@@ -1,0 +1,6480 @@
+{
+  "schema": "storage-engines.performance.v1",
+  "milestone": "M161",
+  "date": "2026-11-23",
+  "base_commit": "587b09efb7e34573755e715ec0a677ad7c149a97",
+  "objective": "连接最新cf6985a五档压测、M157–M160改动证据和M161最终归因设施验收",
+  "authority": "本文件是最新五档分析及本轮交付的单一账本；旧里程碑保留历史读数并通过followup引用本文件",
+  "delivery_audit": {"json_files":["docs/performance-m153.json","docs/performance-m154.json","docs/performance-m155.json","docs/performance-m156.json","docs/performance-m157.json","docs/performance-m158.json","docs/performance-m159.json","docs/performance-m160.json","docs/performance-m161.json"],"new_markdown_links":10,"artifact_hashes":43,"source_files_verified":61,"roundtrip":true,"scope":true},
+  "entrypoints": {
+    "README": "README.md",
+    "changelog": "CHANGELOG.md",
+    "manual": "docs/大规模压测手册.md",
+    "implementation_ledger": [
+      "docs/performance-m157.json",
+      "docs/performance-m158.json",
+      "docs/performance-m159.json",
+      "docs/performance-m160.json"
+    ],
+    "supersedes": "docs/performance-m156.json"
+  },
+  "runs": [
+    {
+      "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713",
+      "head": "4da7450fc280909591402e678762cb14db86924c",
+      "total_seconds": 30724.75,
+      "scales": [
+        {
+          "rows": 600000,
+          "seconds": 494.834,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 1.84,
+              "allocations": 8407
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 4.065,
+              "allocations": 17224
+            },
+            "bplus_tree:vacuum": {
+              "ms": 13556.95,
+              "allocations": 776588
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.302,
+              "allocations": 20948
+            },
+            "lsm_tree:vacuum": {
+              "ms": 574.286,
+              "allocations": 1202891
+            },
+            "memory:search_first": {
+              "ms": 205.688,
+              "allocations": 1201911
+            },
+            "memory:search_first_no_total": {
+              "ms": 1.397,
+              "allocations": 8206
+            },
+            "memory:key_count": {
+              "ms": 205.06,
+              "allocations": 1202059
+            },
+            "memory:export_stream": {
+              "ms": 380.001,
+              "allocations": 1203914
+            },
+            "memory:migrate": {
+              "ms": 819.313,
+              "allocations": 3131908
+            },
+            "memory:bulk_stop": {
+              "ms": 1564.276,
+              "allocations": 13
+            }
+          },
+          "bounded": [],
+          "metrics_count": 132
+        },
+        {
+          "rows": 1000000,
+          "seconds": 800.7,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 1.677,
+              "allocations": 8407
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 4.512,
+              "allocations": 17254
+            },
+            "bplus_tree:vacuum": {
+              "ms": 18166.103,
+              "allocations": 1104943
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 3.837,
+              "allocations": 20957
+            },
+            "lsm_tree:vacuum": {
+              "ms": 982.796,
+              "allocations": 1837617
+            },
+            "memory:search_first": {
+              "ms": 323.976,
+              "allocations": 2003184
+            },
+            "memory:search_first_no_total": {
+              "ms": 1.492,
+              "allocations": 8206
+            },
+            "memory:key_count": {
+              "ms": 324.2,
+              "allocations": 2003430
+            },
+            "memory:export_stream": {
+              "ms": 639.094,
+              "allocations": 2005187
+            },
+            "memory:migrate": {
+              "ms": 1320.081,
+              "allocations": 5216374
+            },
+            "memory:bulk_stop": {
+              "ms": 2320.481,
+              "allocations": 13
+            }
+          },
+          "bounded": [],
+          "metrics_count": 132
+        },
+        {
+          "rows": 5000000,
+          "seconds": 4259.242,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 2.037,
+              "allocations": 8407
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 4.056,
+              "allocations": 17366
+            },
+            "bplus_tree:vacuum": {
+              "ms": 84409.894,
+              "allocations": 5427668
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 3.539,
+              "allocations": 21034
+            },
+            "lsm_tree:vacuum": {
+              "ms": 12804.287,
+              "allocations": 19082065
+            },
+            "memory:search_first": {
+              "ms": 2059.407,
+              "allocations": 10015874
+            },
+            "memory:search_first_no_total": {
+              "ms": 2.391,
+              "allocations": 8206
+            },
+            "memory:key_count": {
+              "ms": 409.033,
+              "allocations": 2003430
+            },
+            "memory:export_stream": {
+              "ms": 4221.772,
+              "allocations": 10017876
+            },
+            "memory:migrate": {
+              "ms": 10236.889,
+              "allocations": 26060992
+            },
+            "memory:bulk_stop": {
+              "ms": 10610.986,
+              "allocations": 13
+            }
+          },
+          "bounded": [],
+          "metrics_count": 132
+        },
+        {
+          "rows": 10000000,
+          "seconds": 8000.459,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 2.446,
+              "allocations": 8407
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 4.322,
+              "allocations": 17366
+            },
+            "bplus_tree:vacuum": {
+              "ms": 132825.446,
+              "allocations": 10659122
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 3.771,
+              "allocations": 21124
+            },
+            "lsm_tree:vacuum": {
+              "ms": 22376.539,
+              "allocations": 33141472
+            },
+            "memory:search_first": {
+              "ms": 5283.85,
+              "allocations": 20031746
+            },
+            "memory:search_first_no_total": {
+              "ms": 2.57,
+              "allocations": 8206
+            },
+            "memory:key_count": {
+              "ms": 535.445,
+              "allocations": 2003430
+            },
+            "memory:export_stream": {
+              "ms": 8683.051,
+              "allocations": 20033749
+            },
+            "memory:migrate": {
+              "ms": 19809.8,
+              "allocations": 52116764
+            },
+            "memory:bulk_stop": {
+              "ms": 18437.648,
+              "allocations": 13
+            }
+          },
+          "bounded": [],
+          "metrics_count": 132
+        },
+        {
+          "rows": 20000000,
+          "seconds": 17169.515,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 1.714,
+              "allocations": 8407
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 4.427,
+              "allocations": 17366
+            },
+            "bplus_tree:vacuum": {
+              "ms": 276212.117,
+              "allocations": 27825387
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.825,
+              "allocations": 21301
+            },
+            "lsm_tree:vacuum": {
+              "ms": 46713.857,
+              "allocations": 69362242
+            },
+            "memory:search_first": {
+              "ms": 21833.808,
+              "allocations": 40063480
+            },
+            "memory:search_first_no_total": {
+              "ms": 4.775,
+              "allocations": 8206
+            },
+            "memory:key_count": {
+              "ms": 1091.133,
+              "allocations": 2003430
+            },
+            "memory:export_stream": {
+              "ms": 27603.952,
+              "allocations": 40065491
+            },
+            "memory:migrate": {
+              "ms": 104168.757,
+              "allocations": 104228312
+            },
+            "memory:bulk_stop": {
+              "ms": 37695.004,
+              "allocations": 13
+            }
+          },
+          "bounded": [],
+          "metrics_count": 132
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/build.log",
+          "sha256": "fd296c9b89ac1aff6733026b386e6dc7fcf5d1ed4a8a114830aaeb5d9a78a854"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_10000000_pass_1.csv",
+          "sha256": "85e29137af6b4a45395bed97648592180514c456a1757ca151f3f6f96dc7b193"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_10000000_pass_1.log",
+          "sha256": "7070ae1686d9e4334216de697f3578c9310f23ce65f3a4703471c12891987107"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_1000000_pass_1.csv",
+          "sha256": "7f47b76f2663a6aeda6e1221f29093cc10bbc2719b5aae53cdf055b0971a7089"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_1000000_pass_1.log",
+          "sha256": "e1272d588d7e2030f5dd440275370474f8b926c9aecb198689d1639e519ca2d5"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_20000000_pass_1.csv",
+          "sha256": "82c37c717489785c594b1149ebeffb9c54d98a186c11d9d35958e548ba14e59e"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_20000000_pass_1.log",
+          "sha256": "f64748c42222827fefab23898e418fe01fcd646e5326bfb31926cdb7c608f407"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_5000000_pass_1.csv",
+          "sha256": "8f15f6d27574c0f74a1ef2f671bd2b5a8e20e2be7c0e0ca2cdf1b37bb654d63e"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_5000000_pass_1.log",
+          "sha256": "b39c8075e426d3c1c064ad6b91eaedfd7331c668ea83a3f83c4adb4683a97e35"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_600000_pass_1.csv",
+          "sha256": "92b4fe9b97d184ced0faa56a180da833bde0f1fef04010997f75a326d7df4a0a"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/rows_600000_pass_1.log",
+          "sha256": "150803098bc38394ed14169652a9ba05751f9ce97d4a6d418c23daac0cd36b8e"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/run.json",
+          "sha256": "7e801fc67434b2e90664d9fe72db631193f934996b7d491e3648cc1c1ed0ab54"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/source.json",
+          "sha256": "39afc434a1f7280dac9ac8708c15e8eef76a39ca03af075029b1ad4b55abe808"
+        },
+        {
+          "path": "data/bench-results/20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713/summary.json",
+          "sha256": "3a7e39004b0b1f0a76a615e0950ebd7e7fd4a9fd9006143b0a8782d167032f57"
+        }
+      ]
+    },
+    {
+      "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba",
+      "head": "cf6985a29833751781e13f2cd62e8a4187f43ef0",
+      "total_seconds": 32198.421000000002,
+      "scales": [
+        {
+          "rows": 600000,
+          "seconds": 606.089,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 12.364,
+              "allocations": 16397
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 6.825,
+              "allocations": 21219
+            },
+            "bplus_tree:vacuum": {
+              "ms": 38906.547,
+              "allocations": 776559
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 5.585,
+              "allocations": 24944
+            },
+            "lsm_tree:vacuum": {
+              "ms": 580.261,
+              "allocations": 1202891
+            },
+            "memory:search_first": {
+              "ms": 146.598,
+              "allocations": 602012
+            },
+            "memory:search_first_no_total": {
+              "ms": 0.86,
+              "allocations": 4210
+            },
+            "memory:key_count": {
+              "ms": 146.309,
+              "allocations": 602059
+            },
+            "memory:export_stream": {
+              "ms": 385.873,
+              "allocations": 1203914
+            },
+            "memory:migrate": {
+              "ms": 901.537,
+              "allocations": 3131908
+            },
+            "memory:bulk_stop": {
+              "ms": 1581.802,
+              "allocations": 13
+            }
+          },
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "metrics_count": 132
+        },
+        {
+          "rows": 1000000,
+          "seconds": 806.682,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 10.264,
+              "allocations": 16397
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 5.043,
+              "allocations": 21249
+            },
+            "bplus_tree:vacuum": {
+              "ms": 14676.556,
+              "allocations": 1104906
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.265,
+              "allocations": 24953
+            },
+            "lsm_tree:vacuum": {
+              "ms": 1010.351,
+              "allocations": 1837617
+            },
+            "memory:search_first": {
+              "ms": 227.567,
+              "allocations": 1003285
+            },
+            "memory:search_first_no_total": {
+              "ms": 0.857,
+              "allocations": 4210
+            },
+            "memory:key_count": {
+              "ms": 279.357,
+              "allocations": 1003430
+            },
+            "memory:export_stream": {
+              "ms": 649.322,
+              "allocations": 2005187
+            },
+            "memory:migrate": {
+              "ms": 1503.005,
+              "allocations": 5216374
+            },
+            "memory:bulk_stop": {
+              "ms": 2218.429,
+              "allocations": 13
+            }
+          },
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "metrics_count": 132
+        },
+        {
+          "rows": 5000000,
+          "seconds": 4141.913,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 10.86,
+              "allocations": 16397
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 7.917,
+              "allocations": 21361
+            },
+            "bplus_tree:vacuum": {
+              "ms": 64397.082,
+              "allocations": 5427436
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 4.655,
+              "allocations": 25030
+            },
+            "lsm_tree:vacuum": {
+              "ms": 14231.094,
+              "allocations": 19082065
+            },
+            "memory:search_first": {
+              "ms": 1446.562,
+              "allocations": 5015975
+            },
+            "memory:search_first_no_total": {
+              "ms": 1.091,
+              "allocations": 4210
+            },
+            "memory:key_count": {
+              "ms": 323.48,
+              "allocations": 1003430
+            },
+            "memory:export_stream": {
+              "ms": 4834.9,
+              "allocations": 10017876
+            },
+            "memory:migrate": {
+              "ms": 10618.048,
+              "allocations": 26060992
+            },
+            "memory:bulk_stop": {
+              "ms": 9754.969,
+              "allocations": 13
+            }
+          },
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "metrics_count": 132
+        },
+        {
+          "rows": 10000000,
+          "seconds": 8850.61,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 13.032,
+              "allocations": 16397
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 8.056,
+              "allocations": 21361
+            },
+            "bplus_tree:vacuum": {
+              "ms": 139077.67,
+              "allocations": 10658666
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 6.086,
+              "allocations": 25120
+            },
+            "lsm_tree:vacuum": {
+              "ms": 23280.409,
+              "allocations": 33141472
+            },
+            "memory:search_first": {
+              "ms": 4592.334,
+              "allocations": 10031847
+            },
+            "memory:search_first_no_total": {
+              "ms": 2.564,
+              "allocations": 4210
+            },
+            "memory:key_count": {
+              "ms": 572.679,
+              "allocations": 1003430
+            },
+            "memory:export_stream": {
+              "ms": 9418.93,
+              "allocations": 20033749
+            },
+            "memory:migrate": {
+              "ms": 22432.91,
+              "allocations": 52116764
+            },
+            "memory:bulk_stop": {
+              "ms": 19474.106,
+              "allocations": 13
+            }
+          },
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "metrics_count": 132
+        },
+        {
+          "rows": 20000000,
+          "seconds": 17793.127,
+          "status": "PASS",
+          "phases": {
+            "bitcask:search_first_no_total": {
+              "ms": 12.616,
+              "allocations": 16397
+            },
+            "bplus_tree:search_first_no_total": {
+              "ms": 5.725,
+              "allocations": 21361
+            },
+            "bplus_tree:vacuum": {
+              "ms": 209882.086,
+              "allocations": 27824843
+            },
+            "lsm_tree:search_first_no_total": {
+              "ms": 6.236,
+              "allocations": 25297
+            },
+            "lsm_tree:vacuum": {
+              "ms": 53076.011,
+              "allocations": 69362242
+            },
+            "memory:search_first": {
+              "ms": 19732.455,
+              "allocations": 20063581
+            },
+            "memory:search_first_no_total": {
+              "ms": 3.768,
+              "allocations": 4210
+            },
+            "memory:key_count": {
+              "ms": 1185.19,
+              "allocations": 1003430
+            },
+            "memory:export_stream": {
+              "ms": 43143.339,
+              "allocations": 40065491
+            },
+            "memory:migrate": {
+              "ms": 122562.942,
+              "allocations": 104228312
+            },
+            "memory:bulk_stop": {
+              "ms": 44659.296,
+              "allocations": 13
+            }
+          },
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "metrics_count": 132
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/build.log",
+          "sha256": "c67e981a406edaa1bdc4c3f44b68881fb313b7d00619d74511c0b28881c57852"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_10000000_pass_1.csv",
+          "sha256": "58f53a5c43d861f397c8232c9f8957756a6a07593bf779283aa2393ce53b6688"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_10000000_pass_1.diagnostics.json",
+          "sha256": "ec7c210269207a379cbc91bdf0faf2541f282e4c02d2d0a4bd9d8b916ace8636"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_10000000_pass_1.log",
+          "sha256": "b09da8b04c7739536c5179055f00b853caf1be5daf93e1a4c24e04f99e0ffb12"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_1000000_pass_1.csv",
+          "sha256": "c0c1680d201ede15dc215c36c113494787da54004e34498ac7f467231eb4fc7c"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_1000000_pass_1.diagnostics.json",
+          "sha256": "3a898977e125ad697f03c3f987596691f79bac50edd373b7e47f1c06884912af"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_1000000_pass_1.log",
+          "sha256": "bab5ce5dfc1ff7b54d601c0067f511c13c6604ba2d36ff92cd93b2b3e93ba34b"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_20000000_pass_1.csv",
+          "sha256": "e5c4cffc80d776368a3e9a4de9f439ab8f5977cd3f5ba766bef7f7d3b8ffb517"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_20000000_pass_1.diagnostics.json",
+          "sha256": "6c42c4e6d8d63377ea17bdd40057360e3562774cdce1e38d7442a55214f2d5c7"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_20000000_pass_1.log",
+          "sha256": "76e2f2b222cc428bf4232a93822a53c57ec328a19d0703ab066d596415e470e2"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_5000000_pass_1.csv",
+          "sha256": "0cfff1d2e6c39fca951ee3f70150d154ac5ded9b9bd3bb8eab97ff339a334b1a"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_5000000_pass_1.diagnostics.json",
+          "sha256": "5c271e3da83c32d0a07eab71aa797222d4306ebeb76e0c55b6641b4f88588194"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_5000000_pass_1.log",
+          "sha256": "e41947703118acc61bf3e8801c6845ce40c42faece14857dbe9856bb644ce35d"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_600000_pass_1.csv",
+          "sha256": "bb1f9cd477738071d1290b4953477e1177d31768b64e6b414b969b97d90ec2a6"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_600000_pass_1.diagnostics.json",
+          "sha256": "f26d6823ff95041607937915dc189adac79503763a3d1ce787a6fc472a29a0bf"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/rows_600000_pass_1.log",
+          "sha256": "668576de90488eca80295f5b1f21cf66acc5bdccb936b57b8a132c20f50c7907"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/run.json",
+          "sha256": "c46848a7f83deae91946f3319c809b4d602f9801c0a497179ed4201640877fdb"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/source.json",
+          "sha256": "a85f34bc2ad5087ff99bb1ea6051bc475b095f87f12ba8a49c06fc1f5e367e2f"
+        },
+        {
+          "path": "data/bench-results/20261122-163044-6cf857c118bc406ba1ea73fab3779bba/summary.json",
+          "sha256": "0ff6cade2cacdfd564b949b3e4b740919ab2066dd7fd406f7199582351232f97"
+        }
+      ]
+    }
+  ],
+  "integrity": [
+    {
+      "name": "20261122-163044-6cf857c118bc406ba1ea73fab3779bba",
+      "head": "cf6985a29833751781e13f2cd62e8a4187f43ef0",
+      "source_count": 61,
+      "mismatch": [],
+      "total_seconds": 32198.421000000002,
+      "cases": [
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "diagnostics": 848,
+          "raw_roundtrip": true,
+          "rows": 600000,
+          "seconds": 606.089
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "diagnostics": 848,
+          "raw_roundtrip": true,
+          "rows": 1000000,
+          "seconds": 806.682
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "diagnostics": 848,
+          "raw_roundtrip": true,
+          "rows": 5000000,
+          "seconds": 4141.913
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "diagnostics": 848,
+          "raw_roundtrip": true,
+          "rows": 10000000,
+          "seconds": 8850.61
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [
+            "SCALE_BOUNDED_VACUUM engine=bitcask seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=bplus_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=lsm_tree seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16",
+            "SCALE_BOUNDED_VACUUM engine=memory seed_keys=8 added_versions=16 rows_scanned=2048 versions_removed=16"
+          ],
+          "diagnostics": 848,
+          "raw_roundtrip": true,
+          "rows": 20000000,
+          "seconds": 17793.127
+        }
+      ]
+    },
+    {
+      "name": "20261121-235802-d0e1fd17a6d247ab93e48bd014c5a713",
+      "head": "4da7450fc280909591402e678762cb14db86924c",
+      "source_count": 61,
+      "mismatch": [],
+      "total_seconds": 30724.75,
+      "cases": [
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [],
+          "rows": 600000,
+          "seconds": 494.834
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [],
+          "rows": 1000000,
+          "seconds": 800.7
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [],
+          "rows": 5000000,
+          "seconds": 4259.242
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [],
+          "rows": 10000000,
+          "seconds": 8000.459
+        },
+        {
+          "metrics": 132,
+          "engine_done": 4,
+          "migration": 4,
+          "bulk_reopen": 4,
+          "bounded": [],
+          "rows": 20000000,
+          "seconds": 17169.515
+        }
+      ]
+    }
+  ],
+  "phase_pairs": [
+    {
+      "rows": 600000,
+      "name": "bitcask:insert",
+      "old": {
+        "wall_ms": 57646.087,
+        "cpu_ms": 7640.625,
+        "allocations": 9114919
+      },
+      "new": {
+        "wall_ms": 72005.176,
+        "cpu_ms": 11000,
+        "allocations": 9114919
+      },
+      "change_percent": 24.909043696235635
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:first_stop",
+      "old": {
+        "wall_ms": 2439.068,
+        "cpu_ms": 125,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 860.528,
+        "cpu_ms": 156.25,
+        "allocations": 11
+      },
+      "change_percent": -64.7189828245871
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:search_first",
+      "old": {
+        "wall_ms": 1665.61,
+        "cpu_ms": 1656.25,
+        "allocations": 2401764
+      },
+      "new": {
+        "wall_ms": 1756.32,
+        "cpu_ms": 1703.125,
+        "allocations": 2401764
+      },
+      "change_percent": 5.446052797473611
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:search_last",
+      "old": {
+        "wall_ms": 1624.409,
+        "cpu_ms": 1609.375,
+        "allocations": 2401764
+      },
+      "new": {
+        "wall_ms": 1641.312,
+        "cpu_ms": 1609.375,
+        "allocations": 2401764
+      },
+      "change_percent": 1.040563060165245
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:key_count",
+      "old": {
+        "wall_ms": 1677.719,
+        "cpu_ms": 1671.875,
+        "allocations": 2401912
+      },
+      "new": {
+        "wall_ms": 1893.749,
+        "cpu_ms": 1890.625,
+        "allocations": 2401912
+      },
+      "change_percent": 12.876411365669703
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:update",
+      "old": {
+        "wall_ms": 10043.615,
+        "cpu_ms": 968.75,
+        "allocations": 1119254
+      },
+      "new": {
+        "wall_ms": 10566.13,
+        "cpu_ms": 1390.625,
+        "allocations": 1119254
+      },
+      "change_percent": 5.202459473008458
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:vacuum",
+      "old": {
+        "wall_ms": 199.1,
+        "cpu_ms": 78.125,
+        "allocations": 36598
+      },
+      "new": {
+        "wall_ms": 190.65,
+        "cpu_ms": 78.125,
+        "allocations": 36598
+      },
+      "change_percent": -4.24409844299346
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:export_stream",
+      "old": {
+        "wall_ms": 1756.305,
+        "cpu_ms": 1703.125,
+        "allocations": 2405771
+      },
+      "new": {
+        "wall_ms": 2000.422,
+        "cpu_ms": 2000,
+        "allocations": 2405771
+      },
+      "change_percent": 13.899465070133022
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:migrate",
+      "old": {
+        "wall_ms": 2388.175,
+        "cpu_ms": 2375,
+        "allocations": 4334516
+      },
+      "new": {
+        "wall_ms": 2685.831,
+        "cpu_ms": 2609.375,
+        "allocations": 4334516
+      },
+      "change_percent": 12.46374323489694
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:bulk",
+      "old": {
+        "wall_ms": 1588.289,
+        "cpu_ms": 187.5,
+        "allocations": 310036
+      },
+      "new": {
+        "wall_ms": 1302.366,
+        "cpu_ms": 234.375,
+        "allocations": 310036
+      },
+      "change_percent": -18.00195052663589
+    },
+    {
+      "rows": 600000,
+      "name": "bitcask:bulk_stop",
+      "old": {
+        "wall_ms": 975.42,
+        "cpu_ms": 109.375,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 1070.49,
+        "cpu_ms": 234.375,
+        "allocations": 11
+      },
+      "change_percent": 9.74657070800271
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:insert",
+      "old": {
+        "wall_ms": 215716.854,
+        "cpu_ms": 16078.125,
+        "allocations": 46694395
+      },
+      "new": {
+        "wall_ms": 206950.586,
+        "cpu_ms": 18484.375,
+        "allocations": 46694395
+      },
+      "change_percent": -4.063784464425757
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:first_stop",
+      "old": {
+        "wall_ms": 68.397,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 155.025,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 126.65467783674723
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:search_first",
+      "old": {
+        "wall_ms": 744.147,
+        "cpu_ms": 734.375,
+        "allocations": 3129007
+      },
+      "new": {
+        "wall_ms": 982.009,
+        "cpu_ms": 968.75,
+        "allocations": 3129007
+      },
+      "change_percent": 31.964383381240523
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:search_last",
+      "old": {
+        "wall_ms": 699.283,
+        "cpu_ms": 703.125,
+        "allocations": 3112733
+      },
+      "new": {
+        "wall_ms": 1266.992,
+        "cpu_ms": 1218.75,
+        "allocations": 3112733
+      },
+      "change_percent": 81.1844417782214
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:key_count",
+      "old": {
+        "wall_ms": 743.731,
+        "cpu_ms": 734.375,
+        "allocations": 3113000
+      },
+      "new": {
+        "wall_ms": 1278.343,
+        "cpu_ms": 1171.875,
+        "allocations": 3113000
+      },
+      "change_percent": 71.88244136656938
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:update",
+      "old": {
+        "wall_ms": 28379.063,
+        "cpu_ms": 1796.875,
+        "allocations": 5239415
+      },
+      "new": {
+        "wall_ms": 88424.743,
+        "cpu_ms": 2390.625,
+        "allocations": 5239403
+      },
+      "change_percent": 211.58443462351104
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:vacuum",
+      "old": {
+        "wall_ms": 13556.95,
+        "cpu_ms": 765.625,
+        "allocations": 776588
+      },
+      "new": {
+        "wall_ms": 38906.547,
+        "cpu_ms": 906.25,
+        "allocations": 776559
+      },
+      "change_percent": 186.98598873640452
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:export_stream",
+      "old": {
+        "wall_ms": 778.884,
+        "cpu_ms": 765.625,
+        "allocations": 3117625
+      },
+      "new": {
+        "wall_ms": 1474.147,
+        "cpu_ms": 1375,
+        "allocations": 3117625
+      },
+      "change_percent": 89.26399823336979
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:migrate",
+      "old": {
+        "wall_ms": 1212.568,
+        "cpu_ms": 1218.75,
+        "allocations": 5112246
+      },
+      "new": {
+        "wall_ms": 2495.465,
+        "cpu_ms": 2328.125,
+        "allocations": 5112246
+      },
+      "change_percent": 105.80000461829772
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:bulk",
+      "old": {
+        "wall_ms": 1418.973,
+        "cpu_ms": 656.25,
+        "allocations": 4053850
+      },
+      "new": {
+        "wall_ms": 3434.109,
+        "cpu_ms": 1453.125,
+        "allocations": 4053850
+      },
+      "change_percent": 142.0136958208507
+    },
+    {
+      "rows": 600000,
+      "name": "bplus_tree:bulk_stop",
+      "old": {
+        "wall_ms": 81.591,
+        "cpu_ms": 0,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 218.495,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 167.7930163866113
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:insert",
+      "old": {
+        "wall_ms": 51078.336,
+        "cpu_ms": 8343.75,
+        "allocations": 14466791
+      },
+      "new": {
+        "wall_ms": 56700.496,
+        "cpu_ms": 8609.375,
+        "allocations": 14466791
+      },
+      "change_percent": 11.006936482817276
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:first_stop",
+      "old": {
+        "wall_ms": 2.619,
+        "cpu_ms": 0,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 3.772,
+        "cpu_ms": 0,
+        "allocations": 4
+      },
+      "change_percent": 44.024436807941946
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:search_first",
+      "old": {
+        "wall_ms": 638.385,
+        "cpu_ms": 640.625,
+        "allocations": 3634545
+      },
+      "new": {
+        "wall_ms": 666.399,
+        "cpu_ms": 656.25,
+        "allocations": 3634692
+      },
+      "change_percent": 4.388261002373173
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:search_last",
+      "old": {
+        "wall_ms": 624.545,
+        "cpu_ms": 625,
+        "allocations": 3626030
+      },
+      "new": {
+        "wall_ms": 681.182,
+        "cpu_ms": 687.5,
+        "allocations": 3626177
+      },
+      "change_percent": 9.068521883931503
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:key_count",
+      "old": {
+        "wall_ms": 665.123,
+        "cpu_ms": 671.875,
+        "allocations": 3635489
+      },
+      "new": {
+        "wall_ms": 649.914,
+        "cpu_ms": 656.25,
+        "allocations": 3635636
+      },
+      "change_percent": -2.286644725862741
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:update",
+      "old": {
+        "wall_ms": 12353.108,
+        "cpu_ms": 1250,
+        "allocations": 1892241
+      },
+      "new": {
+        "wall_ms": 10655.922,
+        "cpu_ms": 1437.5,
+        "allocations": 1892241
+      },
+      "change_percent": -13.738939220801761
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:vacuum",
+      "old": {
+        "wall_ms": 574.286,
+        "cpu_ms": 328.125,
+        "allocations": 1202891
+      },
+      "new": {
+        "wall_ms": 580.261,
+        "cpu_ms": 312.5,
+        "allocations": 1202891
+      },
+      "change_percent": 1.0404223679490787
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:export_stream",
+      "old": {
+        "wall_ms": 1109.399,
+        "cpu_ms": 1031.25,
+        "allocations": 4078809
+      },
+      "new": {
+        "wall_ms": 881.34,
+        "cpu_ms": 875,
+        "allocations": 4078925
+      },
+      "change_percent": -20.55698626012822
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:migrate",
+      "old": {
+        "wall_ms": 1440.87,
+        "cpu_ms": 1421.875,
+        "allocations": 6028656
+      },
+      "new": {
+        "wall_ms": 1446.46,
+        "cpu_ms": 1421.875,
+        "allocations": 6028772
+      },
+      "change_percent": 0.38796005191308325
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:bulk",
+      "old": {
+        "wall_ms": 207.948,
+        "cpu_ms": 109.375,
+        "allocations": 603173
+      },
+      "new": {
+        "wall_ms": 319.626,
+        "cpu_ms": 125,
+        "allocations": 603173
+      },
+      "change_percent": 53.70477234693287
+    },
+    {
+      "rows": 600000,
+      "name": "lsm_tree:bulk_stop",
+      "old": {
+        "wall_ms": 38.06,
+        "cpu_ms": 31.25,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 49.196,
+        "cpu_ms": 46.875,
+        "allocations": 4
+      },
+      "change_percent": 29.25906463478716
+    },
+    {
+      "rows": 600000,
+      "name": "memory:insert",
+      "old": {
+        "wall_ms": 1080.456,
+        "cpu_ms": 1078.125,
+        "allocations": 4312887
+      },
+      "new": {
+        "wall_ms": 1829.632,
+        "cpu_ms": 1625,
+        "allocations": 4312887
+      },
+      "change_percent": 69.33887173563758
+    },
+    {
+      "rows": 600000,
+      "name": "memory:first_stop",
+      "old": {
+        "wall_ms": 1206.715,
+        "cpu_ms": 234.375,
+        "allocations": 19
+      },
+      "new": {
+        "wall_ms": 1442.606,
+        "cpu_ms": 328.125,
+        "allocations": 19
+      },
+      "change_percent": 19.548194892746018
+    },
+    {
+      "rows": 600000,
+      "name": "memory:search_first",
+      "old": {
+        "wall_ms": 205.688,
+        "cpu_ms": 203.125,
+        "allocations": 1201911
+      },
+      "new": {
+        "wall_ms": 146.598,
+        "cpu_ms": 140.625,
+        "allocations": 602012
+      },
+      "change_percent": -28.727976352533922
+    },
+    {
+      "rows": 600000,
+      "name": "memory:search_last",
+      "old": {
+        "wall_ms": 205.069,
+        "cpu_ms": 203.125,
+        "allocations": 1201911
+      },
+      "new": {
+        "wall_ms": 144.679,
+        "cpu_ms": 140.625,
+        "allocations": 602011
+      },
+      "change_percent": -29.44862460927785
+    },
+    {
+      "rows": 600000,
+      "name": "memory:key_count",
+      "old": {
+        "wall_ms": 205.06,
+        "cpu_ms": 218.75,
+        "allocations": 1202059
+      },
+      "new": {
+        "wall_ms": 146.309,
+        "cpu_ms": 140.625,
+        "allocations": 602059
+      },
+      "change_percent": -28.650638837413446
+    },
+    {
+      "rows": 600000,
+      "name": "memory:update",
+      "old": {
+        "wall_ms": 141.095,
+        "cpu_ms": 140.625,
+        "allocations": 456909
+      },
+      "new": {
+        "wall_ms": 131.922,
+        "cpu_ms": 125,
+        "allocations": 456909
+      },
+      "change_percent": -6.501293454764523
+    },
+    {
+      "rows": 600000,
+      "name": "memory:vacuum",
+      "old": {
+        "wall_ms": 84.725,
+        "cpu_ms": 78.125,
+        "allocations": 36591
+      },
+      "new": {
+        "wall_ms": 85.15,
+        "cpu_ms": 78.125,
+        "allocations": 36591
+      },
+      "change_percent": 0.5016228976099324
+    },
+    {
+      "rows": 600000,
+      "name": "memory:export_stream",
+      "old": {
+        "wall_ms": 380.001,
+        "cpu_ms": 343.75,
+        "allocations": 1203914
+      },
+      "new": {
+        "wall_ms": 385.873,
+        "cpu_ms": 390.625,
+        "allocations": 1203914
+      },
+      "change_percent": 1.5452590914234454
+    },
+    {
+      "rows": 600000,
+      "name": "memory:migrate",
+      "old": {
+        "wall_ms": 819.313,
+        "cpu_ms": 812.5,
+        "allocations": 3131908
+      },
+      "new": {
+        "wall_ms": 901.537,
+        "cpu_ms": 890.625,
+        "allocations": 3131908
+      },
+      "change_percent": 10.035725052574552
+    },
+    {
+      "rows": 600000,
+      "name": "memory:bulk",
+      "old": {
+        "wall_ms": 61.751,
+        "cpu_ms": 62.5,
+        "allocations": 310001
+      },
+      "new": {
+        "wall_ms": 61.35,
+        "cpu_ms": 62.5,
+        "allocations": 310001
+      },
+      "change_percent": -0.6493821962397339
+    },
+    {
+      "rows": 600000,
+      "name": "memory:bulk_stop",
+      "old": {
+        "wall_ms": 1564.276,
+        "cpu_ms": 250,
+        "allocations": 13
+      },
+      "new": {
+        "wall_ms": 1581.802,
+        "cpu_ms": 250,
+        "allocations": 13
+      },
+      "change_percent": 1.1203905193201136
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:insert",
+      "old": {
+        "wall_ms": 100402.496,
+        "cpu_ms": 14593.75,
+        "allocations": 15191536
+      },
+      "new": {
+        "wall_ms": 101079.397,
+        "cpu_ms": 13046.875,
+        "allocations": 15191536
+      },
+      "change_percent": 0.6741874225915545
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:first_stop",
+      "old": {
+        "wall_ms": 1540.01,
+        "cpu_ms": 281.25,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 1239.432,
+        "cpu_ms": 234.375,
+        "allocations": 11
+      },
+      "change_percent": -19.517925208277866
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:search_first",
+      "old": {
+        "wall_ms": 2578.231,
+        "cpu_ms": 2546.875,
+        "allocations": 4002939
+      },
+      "new": {
+        "wall_ms": 2688.179,
+        "cpu_ms": 2640.625,
+        "allocations": 4002939
+      },
+      "change_percent": 4.264474362460136
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:search_last",
+      "old": {
+        "wall_ms": 3676.887,
+        "cpu_ms": 3531.25,
+        "allocations": 4002939
+      },
+      "new": {
+        "wall_ms": 2784.865,
+        "cpu_ms": 2671.875,
+        "allocations": 4002939
+      },
+      "change_percent": -24.260250586977527
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:key_count",
+      "old": {
+        "wall_ms": 2920.868,
+        "cpu_ms": 2890.625,
+        "allocations": 4003185
+      },
+      "new": {
+        "wall_ms": 2592.239,
+        "cpu_ms": 2578.125,
+        "allocations": 4003185
+      },
+      "change_percent": -11.251073311084237
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:update",
+      "old": {
+        "wall_ms": 15711.638,
+        "cpu_ms": 1703.125,
+        "allocations": 1873611
+      },
+      "new": {
+        "wall_ms": 14777.913,
+        "cpu_ms": 1515.625,
+        "allocations": 1873611
+      },
+      "change_percent": -5.942887686185239
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:vacuum",
+      "old": {
+        "wall_ms": 230.036,
+        "cpu_ms": 125,
+        "allocations": 52124
+      },
+      "new": {
+        "wall_ms": 272.348,
+        "cpu_ms": 109.375,
+        "allocations": 52124
+      },
+      "change_percent": 18.393642734180737
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:export_stream",
+      "old": {
+        "wall_ms": 2871.162,
+        "cpu_ms": 2859.375,
+        "allocations": 4006946
+      },
+      "new": {
+        "wall_ms": 3269.711,
+        "cpu_ms": 3093.75,
+        "allocations": 4006946
+      },
+      "change_percent": 13.881104584137006
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:migrate",
+      "old": {
+        "wall_ms": 3631.637,
+        "cpu_ms": 3609.375,
+        "allocations": 7219382
+      },
+      "new": {
+        "wall_ms": 3652.935,
+        "cpu_ms": 3625,
+        "allocations": 7219382
+      },
+      "change_percent": 0.5864572918493627
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:bulk",
+      "old": {
+        "wall_ms": 1921.357,
+        "cpu_ms": 250,
+        "allocations": 516701
+      },
+      "new": {
+        "wall_ms": 1882.554,
+        "cpu_ms": 281.25,
+        "allocations": 516701
+      },
+      "change_percent": -2.0195622156631954
+    },
+    {
+      "rows": 1000000,
+      "name": "bitcask:bulk_stop",
+      "old": {
+        "wall_ms": 1461.617,
+        "cpu_ms": 250,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 1306.465,
+        "cpu_ms": 265.625,
+        "allocations": 11
+      },
+      "change_percent": -10.615092736332432
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:insert",
+      "old": {
+        "wall_ms": 342419.117,
+        "cpu_ms": 28484.375,
+        "allocations": 77816650
+      },
+      "new": {
+        "wall_ms": 350886.25,
+        "cpu_ms": 27187.5,
+        "allocations": 77816650
+      },
+      "change_percent": 2.4727395696192866
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:first_stop",
+      "old": {
+        "wall_ms": 64.33,
+        "cpu_ms": 0,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 83.712,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 30.129022229131053
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:search_first",
+      "old": {
+        "wall_ms": 1217.006,
+        "cpu_ms": 1203.125,
+        "allocations": 5219317
+      },
+      "new": {
+        "wall_ms": 1243.388,
+        "cpu_ms": 1234.375,
+        "allocations": 5219317
+      },
+      "change_percent": 2.1677789591834307
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:search_last",
+      "old": {
+        "wall_ms": 1169.861,
+        "cpu_ms": 1171.875,
+        "allocations": 5188672
+      },
+      "new": {
+        "wall_ms": 1232.907,
+        "cpu_ms": 1218.75,
+        "allocations": 5188672
+      },
+      "change_percent": 5.389187262418349
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:key_count",
+      "old": {
+        "wall_ms": 1204.818,
+        "cpu_ms": 1187.5,
+        "allocations": 5188919
+      },
+      "new": {
+        "wall_ms": 1228.17,
+        "cpu_ms": 1218.75,
+        "allocations": 5188919
+      },
+      "change_percent": 1.9382180545111538
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:update",
+      "old": {
+        "wall_ms": 53355.085,
+        "cpu_ms": 3906.25,
+        "allocations": 8903257
+      },
+      "new": {
+        "wall_ms": 54268.83,
+        "cpu_ms": 3265.625,
+        "allocations": 8903224
+      },
+      "change_percent": 1.7125734126372416
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:vacuum",
+      "old": {
+        "wall_ms": 18166.103,
+        "cpu_ms": 1234.375,
+        "allocations": 1104943
+      },
+      "new": {
+        "wall_ms": 14676.556,
+        "cpu_ms": 1125,
+        "allocations": 1104906
+      },
+      "change_percent": -19.209111607481244
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:export_stream",
+      "old": {
+        "wall_ms": 1495.806,
+        "cpu_ms": 1281.25,
+        "allocations": 5193408
+      },
+      "new": {
+        "wall_ms": 1505.752,
+        "cpu_ms": 1484.375,
+        "allocations": 5193408
+      },
+      "change_percent": 0.6649257992012325
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:migrate",
+      "old": {
+        "wall_ms": 1991.309,
+        "cpu_ms": 2000,
+        "allocations": 8527817
+      },
+      "new": {
+        "wall_ms": 2384.387,
+        "cpu_ms": 2375,
+        "allocations": 8527817
+      },
+      "change_percent": 19.73967877411291
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:bulk",
+      "old": {
+        "wall_ms": 2292.871,
+        "cpu_ms": 1046.875,
+        "allocations": 6756167
+      },
+      "new": {
+        "wall_ms": 3086.68,
+        "cpu_ms": 1328.125,
+        "allocations": 6756389
+      },
+      "change_percent": 34.62074403662481
+    },
+    {
+      "rows": 1000000,
+      "name": "bplus_tree:bulk_stop",
+      "old": {
+        "wall_ms": 70.563,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 64.61,
+        "cpu_ms": 0,
+        "allocations": 4
+      },
+      "change_percent": -8.436432691353835
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:insert",
+      "old": {
+        "wall_ms": 91291.577,
+        "cpu_ms": 13625,
+        "allocations": 24258310
+      },
+      "new": {
+        "wall_ms": 83590.282,
+        "cpu_ms": 14078.125,
+        "allocations": 24258310
+      },
+      "change_percent": -8.435931608454961
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:first_stop",
+      "old": {
+        "wall_ms": 6.954,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 9.706,
+        "cpu_ms": 0,
+        "allocations": 4
+      },
+      "change_percent": 39.57434570031637
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:search_first",
+      "old": {
+        "wall_ms": 983.976,
+        "cpu_ms": 968.75,
+        "allocations": 6059468
+      },
+      "new": {
+        "wall_ms": 1124.39,
+        "cpu_ms": 1093.75,
+        "allocations": 6059713
+      },
+      "change_percent": 14.270063497483697
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:search_last",
+      "old": {
+        "wall_ms": 978.077,
+        "cpu_ms": 968.75,
+        "allocations": 6050953
+      },
+      "new": {
+        "wall_ms": 1106.275,
+        "cpu_ms": 1093.75,
+        "allocations": 6051198
+      },
+      "change_percent": 13.10714800572963
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:key_count",
+      "old": {
+        "wall_ms": 1037.025,
+        "cpu_ms": 1046.875,
+        "allocations": 6062114
+      },
+      "new": {
+        "wall_ms": 1155.255,
+        "cpu_ms": 1140.625,
+        "allocations": 6062359
+      },
+      "change_percent": 11.400882331669916
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:update",
+      "old": {
+        "wall_ms": 15367.647,
+        "cpu_ms": 2093.75,
+        "allocations": 3469747
+      },
+      "new": {
+        "wall_ms": 16742.988,
+        "cpu_ms": 2250,
+        "allocations": 3469747
+      },
+      "change_percent": 8.949587402677839
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:vacuum",
+      "old": {
+        "wall_ms": 982.796,
+        "cpu_ms": 468.75,
+        "allocations": 1837617
+      },
+      "new": {
+        "wall_ms": 1010.351,
+        "cpu_ms": 531.25,
+        "allocations": 1837617
+      },
+      "change_percent": 2.8037354649387947
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:export_stream",
+      "old": {
+        "wall_ms": 1248.36,
+        "cpu_ms": 1250,
+        "allocations": 6788794
+      },
+      "new": {
+        "wall_ms": 1396.488,
+        "cpu_ms": 1343.75,
+        "allocations": 6788910
+      },
+      "change_percent": 11.865807940017326
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:migrate",
+      "old": {
+        "wall_ms": 1924.081,
+        "cpu_ms": 1921.875,
+        "allocations": 10041922
+      },
+      "new": {
+        "wall_ms": 2680.944,
+        "cpu_ms": 2671.875,
+        "allocations": 10042038
+      },
+      "change_percent": 39.33633771135416
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:bulk",
+      "old": {
+        "wall_ms": 203.511,
+        "cpu_ms": 140.625,
+        "allocations": 1005204
+      },
+      "new": {
+        "wall_ms": 398.364,
+        "cpu_ms": 265.625,
+        "allocations": 1005204
+      },
+      "change_percent": 95.74568450845409
+    },
+    {
+      "rows": 1000000,
+      "name": "lsm_tree:bulk_stop",
+      "old": {
+        "wall_ms": 17.655,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 32.278,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 82.82639478901159
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:insert",
+      "old": {
+        "wall_ms": 1609.193,
+        "cpu_ms": 1609.375,
+        "allocations": 7188144
+      },
+      "new": {
+        "wall_ms": 2311.854,
+        "cpu_ms": 2171.875,
+        "allocations": 7188144
+      },
+      "change_percent": 43.665427329102215
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:first_stop",
+      "old": {
+        "wall_ms": 2044.796,
+        "cpu_ms": 328.125,
+        "allocations": 27
+      },
+      "new": {
+        "wall_ms": 1827.318,
+        "cpu_ms": 343.75,
+        "allocations": 27
+      },
+      "change_percent": -10.635681994683088
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:search_first",
+      "old": {
+        "wall_ms": 323.976,
+        "cpu_ms": 328.125,
+        "allocations": 2003184
+      },
+      "new": {
+        "wall_ms": 227.567,
+        "cpu_ms": 234.375,
+        "allocations": 1003285
+      },
+      "change_percent": -29.758068498901146
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:search_last",
+      "old": {
+        "wall_ms": 301.02,
+        "cpu_ms": 296.875,
+        "allocations": 2003184
+      },
+      "new": {
+        "wall_ms": 269.863,
+        "cpu_ms": 250,
+        "allocations": 1003284
+      },
+      "change_percent": -10.350475051491593
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:key_count",
+      "old": {
+        "wall_ms": 324.2,
+        "cpu_ms": 328.125,
+        "allocations": 2003430
+      },
+      "new": {
+        "wall_ms": 279.357,
+        "cpu_ms": 281.25,
+        "allocations": 1003430
+      },
+      "change_percent": -13.831893892658842
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:update",
+      "old": {
+        "wall_ms": 217.671,
+        "cpu_ms": 218.75,
+        "allocations": 769729
+      },
+      "new": {
+        "wall_ms": 294.455,
+        "cpu_ms": 296.875,
+        "allocations": 769729
+      },
+      "change_percent": 35.275254857100855
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:vacuum",
+      "old": {
+        "wall_ms": 125.712,
+        "cpu_ms": 125,
+        "allocations": 52117
+      },
+      "new": {
+        "wall_ms": 127.513,
+        "cpu_ms": 140.625,
+        "allocations": 52117
+      },
+      "change_percent": 1.4326396843578948
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:export_stream",
+      "old": {
+        "wall_ms": 639.094,
+        "cpu_ms": 609.375,
+        "allocations": 2005187
+      },
+      "new": {
+        "wall_ms": 649.322,
+        "cpu_ms": 640.625,
+        "allocations": 2005187
+      },
+      "change_percent": 1.6003905528764184
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:migrate",
+      "old": {
+        "wall_ms": 1320.081,
+        "cpu_ms": 1328.125,
+        "allocations": 5216374
+      },
+      "new": {
+        "wall_ms": 1503.005,
+        "cpu_ms": 1515.625,
+        "allocations": 5216374
+      },
+      "change_percent": 13.857028470222676
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:bulk",
+      "old": {
+        "wall_ms": 109.012,
+        "cpu_ms": 109.375,
+        "allocations": 519908
+      },
+      "new": {
+        "wall_ms": 116.162,
+        "cpu_ms": 109.375,
+        "allocations": 519908
+      },
+      "change_percent": 6.5589109455839845
+    },
+    {
+      "rows": 1000000,
+      "name": "memory:bulk_stop",
+      "old": {
+        "wall_ms": 2320.481,
+        "cpu_ms": 406.25,
+        "allocations": 13
+      },
+      "new": {
+        "wall_ms": 2218.429,
+        "cpu_ms": 421.875,
+        "allocations": 13
+      },
+      "change_percent": -4.39788130133365
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:insert",
+      "old": {
+        "wall_ms": 495613.244,
+        "cpu_ms": 66125,
+        "allocations": 75957668
+      },
+      "new": {
+        "wall_ms": 504869.838,
+        "cpu_ms": 66968.75,
+        "allocations": 75957668
+      },
+      "change_percent": 1.8677051334003547
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:first_stop",
+      "old": {
+        "wall_ms": 5926.333,
+        "cpu_ms": 1093.75,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 5670.839,
+        "cpu_ms": 1171.875,
+        "allocations": 11
+      },
+      "change_percent": -4.311165099902414
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:search_first",
+      "old": {
+        "wall_ms": 15378.267,
+        "cpu_ms": 15156.25,
+        "allocations": 20014653
+      },
+      "new": {
+        "wall_ms": 13181.789,
+        "cpu_ms": 13109.375,
+        "allocations": 20014653
+      },
+      "change_percent": -14.283000808868774
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:search_last",
+      "old": {
+        "wall_ms": 15236.217,
+        "cpu_ms": 15000,
+        "allocations": 20014653
+      },
+      "new": {
+        "wall_ms": 12873.667,
+        "cpu_ms": 12765.625,
+        "allocations": 20014653
+      },
+      "change_percent": -15.506145652821834
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:key_count",
+      "old": {
+        "wall_ms": 2876.947,
+        "cpu_ms": 2843.75,
+        "allocations": 4003185
+      },
+      "new": {
+        "wall_ms": 2750.487,
+        "cpu_ms": 2703.125,
+        "allocations": 4003185
+      },
+      "change_percent": -4.395631897285557
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:update",
+      "old": {
+        "wall_ms": 88035.164,
+        "cpu_ms": 9468.75,
+        "allocations": 9368111
+      },
+      "new": {
+        "wall_ms": 87725.926,
+        "cpu_ms": 8640.625,
+        "allocations": 9368111
+      },
+      "change_percent": -0.35126645529960365
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:vacuum",
+      "old": {
+        "wall_ms": 797.313,
+        "cpu_ms": 531.25,
+        "allocations": 256543
+      },
+      "new": {
+        "wall_ms": 805.054,
+        "cpu_ms": 531.25,
+        "allocations": 256543
+      },
+      "change_percent": 0.9708859632289846
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:export_stream",
+      "old": {
+        "wall_ms": 17055.176,
+        "cpu_ms": 16812.5,
+        "allocations": 20018659
+      },
+      "new": {
+        "wall_ms": 23757.804,
+        "cpu_ms": 21593.75,
+        "allocations": 20018659
+      },
+      "change_percent": 39.29967066889255
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:migrate",
+      "old": {
+        "wall_ms": 20785.745,
+        "cpu_ms": 20515.625,
+        "allocations": 36068000
+      },
+      "new": {
+        "wall_ms": 31065.414,
+        "cpu_ms": 29421.875,
+        "allocations": 36068000
+      },
+      "change_percent": 49.45537915528166
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:bulk",
+      "old": {
+        "wall_ms": 8482.789,
+        "cpu_ms": 1468.75,
+        "allocations": 2583369
+      },
+      "new": {
+        "wall_ms": 11324.393,
+        "cpu_ms": 1828.125,
+        "allocations": 2583369
+      },
+      "change_percent": 33.49846377176184
+    },
+    {
+      "rows": 5000000,
+      "name": "bitcask:bulk_stop",
+      "old": {
+        "wall_ms": 6373.072,
+        "cpu_ms": 1156.25,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 7128.1,
+        "cpu_ms": 1390.625,
+        "allocations": 11
+      },
+      "change_percent": 11.847159423273435
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:insert",
+      "old": {
+        "wall_ms": 1843750.725,
+        "cpu_ms": 142703.125,
+        "allocations": 389052288
+      },
+      "new": {
+        "wall_ms": 1694360.792,
+        "cpu_ms": 134140.625,
+        "allocations": 389052288
+      },
+      "change_percent": -8.10250165460953
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:first_stop",
+      "old": {
+        "wall_ms": 64.136,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 70.722,
+        "cpu_ms": 0,
+        "allocations": 4
+      },
+      "change_percent": 10.268803791942126
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:search_first",
+      "old": {
+        "wall_ms": 5782.405,
+        "cpu_ms": 5765.625,
+        "allocations": 26116130
+      },
+      "new": {
+        "wall_ms": 5556.162,
+        "cpu_ms": 5531.25,
+        "allocations": 26116130
+      },
+      "change_percent": -3.912610756251067
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:search_last",
+      "old": {
+        "wall_ms": 5796.87,
+        "cpu_ms": 5781.25,
+        "allocations": 26115979
+      },
+      "new": {
+        "wall_ms": 5455.746,
+        "cpu_ms": 5468.75,
+        "allocations": 26115979
+      },
+      "change_percent": -5.884623943610945
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:key_count",
+      "old": {
+        "wall_ms": 1166.197,
+        "cpu_ms": 1171.875,
+        "allocations": 5223693
+      },
+      "new": {
+        "wall_ms": 1092.75,
+        "cpu_ms": 1093.75,
+        "allocations": 5223693
+      },
+      "change_percent": -6.297992534708962
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:update",
+      "old": {
+        "wall_ms": 304130.509,
+        "cpu_ms": 17562.5,
+        "allocations": 44486676
+      },
+      "new": {
+        "wall_ms": 271906.703,
+        "cpu_ms": 15218.75,
+        "allocations": 44486501
+      },
+      "change_percent": -10.595387521611666
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:vacuum",
+      "old": {
+        "wall_ms": 84409.894,
+        "cpu_ms": 5828.125,
+        "allocations": 5427668
+      },
+      "new": {
+        "wall_ms": 64397.082,
+        "cpu_ms": 5125,
+        "allocations": 5427436
+      },
+      "change_percent": -23.70908320297144
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:export_stream",
+      "old": {
+        "wall_ms": 7238.496,
+        "cpu_ms": 7156.25,
+        "allocations": 26120328
+      },
+      "new": {
+        "wall_ms": 6109.108,
+        "cpu_ms": 6000,
+        "allocations": 26120328
+      },
+      "change_percent": -15.602522955044806
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:migrate",
+      "old": {
+        "wall_ms": 13759.491,
+        "cpu_ms": 13562.5,
+        "allocations": 42685653
+      },
+      "new": {
+        "wall_ms": 10951.72,
+        "cpu_ms": 10906.25,
+        "allocations": 42685653
+      },
+      "change_percent": -20.40606734653194
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:bulk",
+      "old": {
+        "wall_ms": 10609.537,
+        "cpu_ms": 6296.875,
+        "allocations": 33783757
+      },
+      "new": {
+        "wall_ms": 10121.855,
+        "cpu_ms": 5859.375,
+        "allocations": 33783757
+      },
+      "change_percent": -4.59663791172038
+    },
+    {
+      "rows": 5000000,
+      "name": "bplus_tree:bulk_stop",
+      "old": {
+        "wall_ms": 71.19,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 95.107,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 33.59601067565669
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:insert",
+      "old": {
+        "wall_ms": 501859.152,
+        "cpu_ms": 69656.25,
+        "allocations": 121589763
+      },
+      "new": {
+        "wall_ms": 493769.192,
+        "cpu_ms": 69015.625,
+        "allocations": 121589763
+      },
+      "change_percent": -1.6119981010130124
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:first_stop",
+      "old": {
+        "wall_ms": 13.947,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 16.373,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 17.39442173944219
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:search_first",
+      "old": {
+        "wall_ms": 5338.72,
+        "cpu_ms": 5343.75,
+        "allocations": 30390990
+      },
+      "new": {
+        "wall_ms": 5544.14,
+        "cpu_ms": 5531.25,
+        "allocations": 30392211
+      },
+      "change_percent": 3.847738783828336
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:search_last",
+      "old": {
+        "wall_ms": 5117.158,
+        "cpu_ms": 5093.75,
+        "allocations": 30382475
+      },
+      "new": {
+        "wall_ms": 5397.219,
+        "cpu_ms": 5406.25,
+        "allocations": 30383696
+      },
+      "change_percent": 5.47297933735873
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:key_count",
+      "old": {
+        "wall_ms": 984.541,
+        "cpu_ms": 984.375,
+        "allocations": 6062270
+      },
+      "new": {
+        "wall_ms": 1049.612,
+        "cpu_ms": 1046.875,
+        "allocations": 6062515
+      },
+      "change_percent": 6.609272747402084
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:update",
+      "old": {
+        "wall_ms": 105480.62,
+        "cpu_ms": 14468.75,
+        "allocations": 39293779
+      },
+      "new": {
+        "wall_ms": 106271.158,
+        "cpu_ms": 18109.375,
+        "allocations": 39293779
+      },
+      "change_percent": 0.7494627923119834
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:vacuum",
+      "old": {
+        "wall_ms": 12804.287,
+        "cpu_ms": 4296.875,
+        "allocations": 19082065
+      },
+      "new": {
+        "wall_ms": 14231.094,
+        "cpu_ms": 5562.5,
+        "allocations": 19082065
+      },
+      "change_percent": 11.143197586870702
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:export_stream",
+      "old": {
+        "wall_ms": 6986.418,
+        "cpu_ms": 6937.5,
+        "allocations": 34125024
+      },
+      "new": {
+        "wall_ms": 10740.673,
+        "cpu_ms": 10000,
+        "allocations": 34126361
+      },
+      "change_percent": 53.736478407103625
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:migrate",
+      "old": {
+        "wall_ms": 12219.653,
+        "cpu_ms": 12140.625,
+        "allocations": 51175702
+      },
+      "new": {
+        "wall_ms": 16458.753,
+        "cpu_ms": 15703.125,
+        "allocations": 51180820
+      },
+      "change_percent": 34.69083778401891
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:bulk",
+      "old": {
+        "wall_ms": 930.124,
+        "cpu_ms": 859.375,
+        "allocations": 5025529
+      },
+      "new": {
+        "wall_ms": 1557.927,
+        "cpu_ms": 1375,
+        "allocations": 5025528
+      },
+      "change_percent": 67.49669936481585
+    },
+    {
+      "rows": 5000000,
+      "name": "lsm_tree:bulk_stop",
+      "old": {
+        "wall_ms": 35.279,
+        "cpu_ms": 31.25,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 54.752,
+        "cpu_ms": 62.5,
+        "allocations": 4
+      },
+      "change_percent": 55.19714277615577
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:insert",
+      "old": {
+        "wall_ms": 8873.381,
+        "cpu_ms": 8859.375,
+        "allocations": 35940770
+      },
+      "new": {
+        "wall_ms": 12884.681,
+        "cpu_ms": 12359.375,
+        "allocations": 35940770
+      },
+      "change_percent": 45.205993070735964
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:first_stop",
+      "old": {
+        "wall_ms": 9028.164,
+        "cpu_ms": 1671.875,
+        "allocations": 19
+      },
+      "new": {
+        "wall_ms": 10585.178,
+        "cpu_ms": 3234.375,
+        "allocations": 19
+      },
+      "change_percent": 17.246186489301696
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:search_first",
+      "old": {
+        "wall_ms": 2059.407,
+        "cpu_ms": 2000,
+        "allocations": 10015874
+      },
+      "new": {
+        "wall_ms": 1446.562,
+        "cpu_ms": 1453.125,
+        "allocations": 5015975
+      },
+      "change_percent": -29.7583236339393
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:search_last",
+      "old": {
+        "wall_ms": 2096.465,
+        "cpu_ms": 2093.75,
+        "allocations": 10015874
+      },
+      "new": {
+        "wall_ms": 1480.772,
+        "cpu_ms": 1437.5,
+        "allocations": 5015974
+      },
+      "change_percent": -29.36815067267997
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:key_count",
+      "old": {
+        "wall_ms": 409.033,
+        "cpu_ms": 406.25,
+        "allocations": 2003430
+      },
+      "new": {
+        "wall_ms": 323.48,
+        "cpu_ms": 328.125,
+        "allocations": 1003430
+      },
+      "change_percent": -20.91591631971015
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:update",
+      "old": {
+        "wall_ms": 1218.486,
+        "cpu_ms": 1187.5,
+        "allocations": 3848656
+      },
+      "new": {
+        "wall_ms": 1200.504,
+        "cpu_ms": 1187.5,
+        "allocations": 3848656
+      },
+      "change_percent": -1.4757658274284768
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:vacuum",
+      "old": {
+        "wall_ms": 719.644,
+        "cpu_ms": 703.125,
+        "allocations": 256535
+      },
+      "new": {
+        "wall_ms": 631.804,
+        "cpu_ms": 625,
+        "allocations": 256535
+      },
+      "change_percent": -12.20603520629645
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:export_stream",
+      "old": {
+        "wall_ms": 4221.772,
+        "cpu_ms": 4109.375,
+        "allocations": 10017876
+      },
+      "new": {
+        "wall_ms": 4834.9,
+        "cpu_ms": 4531.25,
+        "allocations": 10017876
+      },
+      "change_percent": 14.523001242132437
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:migrate",
+      "old": {
+        "wall_ms": 10236.889,
+        "cpu_ms": 9828.125,
+        "allocations": 26060992
+      },
+      "new": {
+        "wall_ms": 10618.048,
+        "cpu_ms": 10218.75,
+        "allocations": 26060992
+      },
+      "change_percent": 3.723387056360594
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:bulk",
+      "old": {
+        "wall_ms": 868.879,
+        "cpu_ms": 828.125,
+        "allocations": 2583335
+      },
+      "new": {
+        "wall_ms": 550.995,
+        "cpu_ms": 546.875,
+        "allocations": 2583335
+      },
+      "change_percent": -36.58553147216126
+    },
+    {
+      "rows": 5000000,
+      "name": "memory:bulk_stop",
+      "old": {
+        "wall_ms": 10610.986,
+        "cpu_ms": 3625,
+        "allocations": 13
+      },
+      "new": {
+        "wall_ms": 9754.969,
+        "cpu_ms": 2546.875,
+        "allocations": 13
+      },
+      "change_percent": -8.067271034001944
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:insert",
+      "old": {
+        "wall_ms": 977085.487,
+        "cpu_ms": 141718.75,
+        "allocations": 151915284
+      },
+      "new": {
+        "wall_ms": 1021839.615,
+        "cpu_ms": 141906.25,
+        "allocations": 151915284
+      },
+      "change_percent": 4.580369741997825
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:first_stop",
+      "old": {
+        "wall_ms": 11537.586,
+        "cpu_ms": 2156.25,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 13454.29,
+        "cpu_ms": 2375,
+        "allocations": 11
+      },
+      "change_percent": 16.612695237981345
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:search_first",
+      "old": {
+        "wall_ms": 27140.824,
+        "cpu_ms": 27093.75,
+        "allocations": 40029304
+      },
+      "new": {
+        "wall_ms": 33467.328,
+        "cpu_ms": 31609.375,
+        "allocations": 40029304
+      },
+      "change_percent": 23.30991866717089
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:search_last",
+      "old": {
+        "wall_ms": 29011.914,
+        "cpu_ms": 28812.5,
+        "allocations": 40029304
+      },
+      "new": {
+        "wall_ms": 30064.675,
+        "cpu_ms": 29031.25,
+        "allocations": 40029304
+      },
+      "change_percent": 3.628719566726968
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:key_count",
+      "old": {
+        "wall_ms": 2694.375,
+        "cpu_ms": 2687.5,
+        "allocations": 4003185
+      },
+      "new": {
+        "wall_ms": 2926.419,
+        "cpu_ms": 2875,
+        "allocations": 4003185
+      },
+      "change_percent": 8.612164231036878
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:update",
+      "old": {
+        "wall_ms": 163841.928,
+        "cpu_ms": 18140.625,
+        "allocations": 18744425
+      },
+      "new": {
+        "wall_ms": 185393.736,
+        "cpu_ms": 20281.25,
+        "allocations": 18744425
+      },
+      "change_percent": 13.154024896484362
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:vacuum",
+      "old": {
+        "wall_ms": 1711.598,
+        "cpu_ms": 1140.625,
+        "allocations": 503873
+      },
+      "new": {
+        "wall_ms": 2261.605,
+        "cpu_ms": 1734.375,
+        "allocations": 503873
+      },
+      "change_percent": 32.134122615240265
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:export_stream",
+      "old": {
+        "wall_ms": 40263.817,
+        "cpu_ms": 39578.125,
+        "allocations": 40033311
+      },
+      "new": {
+        "wall_ms": 45654.57,
+        "cpu_ms": 42437.5,
+        "allocations": 40033311
+      },
+      "change_percent": 13.3885791304883
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:migrate",
+      "old": {
+        "wall_ms": 45916.84,
+        "cpu_ms": 44953.125,
+        "allocations": 72128772
+      },
+      "new": {
+        "wall_ms": 57870.42,
+        "cpu_ms": 54875,
+        "allocations": 72128772
+      },
+      "change_percent": 26.033106807872674
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:bulk",
+      "old": {
+        "wall_ms": 17056.688,
+        "cpu_ms": 3421.875,
+        "allocations": 5166719
+      },
+      "new": {
+        "wall_ms": 15369.35,
+        "cpu_ms": 3453.125,
+        "allocations": 5166719
+      },
+      "change_percent": -9.892530132461808
+    },
+    {
+      "rows": 10000000,
+      "name": "bitcask:bulk_stop",
+      "old": {
+        "wall_ms": 12921.235,
+        "cpu_ms": 2906.25,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 12448.144,
+        "cpu_ms": 3437.5,
+        "allocations": 11
+      },
+      "change_percent": -3.6613450649260693
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:insert",
+      "old": {
+        "wall_ms": 3136383.007,
+        "cpu_ms": 304656.25,
+        "allocations": 778100061
+      },
+      "new": {
+        "wall_ms": 3798923.305,
+        "cpu_ms": 334921.875,
+        "allocations": 778100061
+      },
+      "change_percent": 21.124342802562566
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:first_stop",
+      "old": {
+        "wall_ms": 33.763,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 73.928,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 118.96158516719488
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:search_first",
+      "old": {
+        "wall_ms": 11941.549,
+        "cpu_ms": 11906.25,
+        "allocations": 52242105
+      },
+      "new": {
+        "wall_ms": 16497.516,
+        "cpu_ms": 15718.75,
+        "allocations": 52242105
+      },
+      "change_percent": 38.152227989852896
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:search_last",
+      "old": {
+        "wall_ms": 12199.722,
+        "cpu_ms": 11984.375,
+        "allocations": 52241972
+      },
+      "new": {
+        "wall_ms": 16959.52,
+        "cpu_ms": 16390.625,
+        "allocations": 52241972
+      },
+      "change_percent": 39.015626749527584
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:key_count",
+      "old": {
+        "wall_ms": 1305.155,
+        "cpu_ms": 1265.625,
+        "allocations": 5224471
+      },
+      "new": {
+        "wall_ms": 2368.692,
+        "cpu_ms": 2171.875,
+        "allocations": 5224471
+      },
+      "change_percent": 81.48740954139546
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:update",
+      "old": {
+        "wall_ms": 548044.119,
+        "cpu_ms": 37609.375,
+        "allocations": 89147028
+      },
+      "new": {
+        "wall_ms": 628016.41,
+        "cpu_ms": 43390.625,
+        "allocations": 89146659
+      },
+      "change_percent": 14.59230894511252
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:vacuum",
+      "old": {
+        "wall_ms": 132825.446,
+        "cpu_ms": 10859.375,
+        "allocations": 10659122
+      },
+      "new": {
+        "wall_ms": 139077.67,
+        "cpu_ms": 14796.875,
+        "allocations": 10658666
+      },
+      "change_percent": 4.707098066134119
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:export_stream",
+      "old": {
+        "wall_ms": 14549.058,
+        "cpu_ms": 14375,
+        "allocations": 52245295
+      },
+      "new": {
+        "wall_ms": 20425.397,
+        "cpu_ms": 19687.5,
+        "allocations": 52245295
+      },
+      "change_percent": 40.38982455084032
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:migrate",
+      "old": {
+        "wall_ms": 25392.685,
+        "cpu_ms": 25328.125,
+        "allocations": 85385885
+      },
+      "new": {
+        "wall_ms": 32759.285,
+        "cpu_ms": 32015.625,
+        "allocations": 85385921
+      },
+      "change_percent": 29.010717062807643
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:bulk",
+      "old": {
+        "wall_ms": 22842.192,
+        "cpu_ms": 14937.5,
+        "allocations": 66787859
+      },
+      "new": {
+        "wall_ms": 22832.407,
+        "cpu_ms": 15187.5,
+        "allocations": 66787845
+      },
+      "change_percent": -0.0428373949400318
+    },
+    {
+      "rows": 10000000,
+      "name": "bplus_tree:bulk_stop",
+      "old": {
+        "wall_ms": 35.627,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 54.758,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "change_percent": 53.69803800488393
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:insert",
+      "old": {
+        "wall_ms": 996891.562,
+        "cpu_ms": 181906.25,
+        "allocations": 243632006
+      },
+      "new": {
+        "wall_ms": 972981.57,
+        "cpu_ms": 136750,
+        "allocations": 243632006
+      },
+      "change_percent": -2.3984546475677826
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:first_stop",
+      "old": {
+        "wall_ms": 36.541,
+        "cpu_ms": 31.25,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 28.476,
+        "cpu_ms": 31.25,
+        "allocations": 4
+      },
+      "change_percent": -22.071098218439555
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:search_first",
+      "old": {
+        "wall_ms": 10280.339,
+        "cpu_ms": 10203.125,
+        "allocations": 61001627
+      },
+      "new": {
+        "wall_ms": 10092.414,
+        "cpu_ms": 10046.875,
+        "allocations": 61004069
+      },
+      "change_percent": -1.8280039208823706
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:search_last",
+      "old": {
+        "wall_ms": 10136.823,
+        "cpu_ms": 10062.5,
+        "allocations": 60993112
+      },
+      "new": {
+        "wall_ms": 9933.343,
+        "cpu_ms": 9906.25,
+        "allocations": 60995554
+      },
+      "change_percent": -2.007335039785141
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:key_count",
+      "old": {
+        "wall_ms": 1022.314,
+        "cpu_ms": 1015.625,
+        "allocations": 6062270
+      },
+      "new": {
+        "wall_ms": 1038.06,
+        "cpu_ms": 1031.25,
+        "allocations": 6062515
+      },
+      "change_percent": 1.5402312792351491
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:update",
+      "old": {
+        "wall_ms": 205805.913,
+        "cpu_ms": 31062.5,
+        "allocations": 76219921
+      },
+      "new": {
+        "wall_ms": 201457.693,
+        "cpu_ms": 27953.125,
+        "allocations": 76219921
+      },
+      "change_percent": -2.112777002670474
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:vacuum",
+      "old": {
+        "wall_ms": 22376.539,
+        "cpu_ms": 8906.25,
+        "allocations": 33141472
+      },
+      "new": {
+        "wall_ms": 23280.409,
+        "cpu_ms": 8906.25,
+        "allocations": 33141472
+      },
+      "change_percent": 4.039364622026653
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:export_stream",
+      "old": {
+        "wall_ms": 16494.762,
+        "cpu_ms": 16328.125,
+        "allocations": 68350310
+      },
+      "new": {
+        "wall_ms": 17188.984,
+        "cpu_ms": 16546.875,
+        "allocations": 68353997
+      },
+      "change_percent": 4.208742144930633
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:migrate",
+      "old": {
+        "wall_ms": 25182.521,
+        "cpu_ms": 25093.75,
+        "allocations": 102777396
+      },
+      "new": {
+        "wall_ms": 25139.481,
+        "cpu_ms": 25031.25,
+        "allocations": 102792069
+      },
+      "change_percent": -0.17091219739279184
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:bulk",
+      "old": {
+        "wall_ms": 1747.191,
+        "cpu_ms": 1687.5,
+        "allocations": 10050922
+      },
+      "new": {
+        "wall_ms": 1668.201,
+        "cpu_ms": 1609.375,
+        "allocations": 10050921
+      },
+      "change_percent": -4.520971090167015
+    },
+    {
+      "rows": 10000000,
+      "name": "lsm_tree:bulk_stop",
+      "old": {
+        "wall_ms": 65.537,
+        "cpu_ms": 62.5,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 82.034,
+        "cpu_ms": 93.75,
+        "allocations": 4
+      },
+      "change_percent": 25.172040221554237
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:insert",
+      "old": {
+        "wall_ms": 17554.18,
+        "cpu_ms": 17531.25,
+        "allocations": 71881542
+      },
+      "new": {
+        "wall_ms": 18768.842,
+        "cpu_ms": 18640.625,
+        "allocations": 71881542
+      },
+      "change_percent": 6.919502933204513
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:first_stop",
+      "old": {
+        "wall_ms": 16671.231,
+        "cpu_ms": 3578.125,
+        "allocations": 19
+      },
+      "new": {
+        "wall_ms": 17045.266,
+        "cpu_ms": 3421.875,
+        "allocations": 19
+      },
+      "change_percent": 2.243595568917489
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:search_first",
+      "old": {
+        "wall_ms": 5283.85,
+        "cpu_ms": 5281.25,
+        "allocations": 20031746
+      },
+      "new": {
+        "wall_ms": 4592.334,
+        "cpu_ms": 4562.5,
+        "allocations": 10031847
+      },
+      "change_percent": -13.087351079232013
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:search_last",
+      "old": {
+        "wall_ms": 5353.698,
+        "cpu_ms": 5328.125,
+        "allocations": 20031746
+      },
+      "new": {
+        "wall_ms": 4695.151,
+        "cpu_ms": 4671.875,
+        "allocations": 10031846
+      },
+      "change_percent": -12.300787231554722
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:key_count",
+      "old": {
+        "wall_ms": 535.445,
+        "cpu_ms": 546.875,
+        "allocations": 2003430
+      },
+      "new": {
+        "wall_ms": 572.679,
+        "cpu_ms": 562.5,
+        "allocations": 1003430
+      },
+      "change_percent": 6.953842131311316
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:update",
+      "old": {
+        "wall_ms": 2282.881,
+        "cpu_ms": 2281.25,
+        "allocations": 7705530
+      },
+      "new": {
+        "wall_ms": 3051.826,
+        "cpu_ms": 3015.625,
+        "allocations": 7705530
+      },
+      "change_percent": 33.683096052750905
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:vacuum",
+      "old": {
+        "wall_ms": 1122.119,
+        "cpu_ms": 1125,
+        "allocations": 503865
+      },
+      "new": {
+        "wall_ms": 1329.113,
+        "cpu_ms": 1328.125,
+        "allocations": 503865
+      },
+      "change_percent": 18.446706632719014
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:export_stream",
+      "old": {
+        "wall_ms": 8683.051,
+        "cpu_ms": 8515.625,
+        "allocations": 20033749
+      },
+      "new": {
+        "wall_ms": 9418.93,
+        "cpu_ms": 9156.25,
+        "allocations": 20033749
+      },
+      "change_percent": 8.47488975937145
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:migrate",
+      "old": {
+        "wall_ms": 19809.8,
+        "cpu_ms": 19765.625,
+        "allocations": 52116764
+      },
+      "new": {
+        "wall_ms": 22432.91,
+        "cpu_ms": 22359.375,
+        "allocations": 52116764
+      },
+      "change_percent": 13.24147644095348
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:bulk",
+      "old": {
+        "wall_ms": 945.227,
+        "cpu_ms": 953.125,
+        "allocations": 5166666
+      },
+      "new": {
+        "wall_ms": 3173.525,
+        "cpu_ms": 3171.875,
+        "allocations": 5166666
+      },
+      "change_percent": 235.742102161703
+    },
+    {
+      "rows": 10000000,
+      "name": "memory:bulk_stop",
+      "old": {
+        "wall_ms": 18437.648,
+        "cpu_ms": 6703.125,
+        "allocations": 13
+      },
+      "new": {
+        "wall_ms": 19474.106,
+        "cpu_ms": 8234.375,
+        "allocations": 13
+      },
+      "change_percent": 5.621421994822762
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:insert",
+      "old": {
+        "wall_ms": 1976052.541,
+        "cpu_ms": 229328.125,
+        "allocations": 303830518
+      },
+      "new": {
+        "wall_ms": 2051221.82,
+        "cpu_ms": 277468.75,
+        "allocations": 303830518
+      },
+      "change_percent": 3.8040121626502943
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:first_stop",
+      "old": {
+        "wall_ms": 20384.03,
+        "cpu_ms": 3875,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 27272.905,
+        "cpu_ms": 4593.75,
+        "allocations": 11
+      },
+      "change_percent": 33.79545163542244
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:search_first",
+      "old": {
+        "wall_ms": 50034.863,
+        "cpu_ms": 49968.75,
+        "allocations": 80058597
+      },
+      "new": {
+        "wall_ms": 64919.591,
+        "cpu_ms": 63062.5,
+        "allocations": 80058597
+      },
+      "change_percent": 29.748713412086293
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:search_last",
+      "old": {
+        "wall_ms": 50100.676,
+        "cpu_ms": 49906.25,
+        "allocations": 80058597
+      },
+      "new": {
+        "wall_ms": 77576.134,
+        "cpu_ms": 72656.25,
+        "allocations": 80058597
+      },
+      "change_percent": 54.84049356938818
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:key_count",
+      "old": {
+        "wall_ms": 2436.859,
+        "cpu_ms": 2437.5,
+        "allocations": 4003185
+      },
+      "new": {
+        "wall_ms": 2818.748,
+        "cpu_ms": 2812.5,
+        "allocations": 4003185
+      },
+      "change_percent": 15.67136219206775
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:update",
+      "old": {
+        "wall_ms": 299063.034,
+        "cpu_ms": 31937.5,
+        "allocations": 37488861
+      },
+      "new": {
+        "wall_ms": 352275.782,
+        "cpu_ms": 41421.875,
+        "allocations": 37488861
+      },
+      "change_percent": 17.793154602985805
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:vacuum",
+      "old": {
+        "wall_ms": 2505.76,
+        "cpu_ms": 2000,
+        "allocations": 1006723
+      },
+      "new": {
+        "wall_ms": 2764.526,
+        "cpu_ms": 2234.375,
+        "allocations": 1006723
+      },
+      "change_percent": 10.326846944639545
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:export_stream",
+      "old": {
+        "wall_ms": 55757.006,
+        "cpu_ms": 55359.375,
+        "allocations": 80062611
+      },
+      "new": {
+        "wall_ms": 76198.473,
+        "cpu_ms": 72593.75,
+        "allocations": 80062611
+      },
+      "change_percent": 36.661701311580465
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:migrate",
+      "old": {
+        "wall_ms": 78227.009,
+        "cpu_ms": 78046.875,
+        "allocations": 144250320
+      },
+      "new": {
+        "wall_ms": 89083.951,
+        "cpu_ms": 87437.5,
+        "allocations": 144250320
+      },
+      "change_percent": 13.878764046826841
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:bulk",
+      "old": {
+        "wall_ms": 26646.649,
+        "cpu_ms": 5625,
+        "allocations": 10333425
+      },
+      "new": {
+        "wall_ms": 27148.333,
+        "cpu_ms": 6437.5,
+        "allocations": 10333425
+      },
+      "change_percent": 1.8827282935276246
+    },
+    {
+      "rows": 20000000,
+      "name": "bitcask:bulk_stop",
+      "old": {
+        "wall_ms": 23948.577,
+        "cpu_ms": 6250,
+        "allocations": 11
+      },
+      "new": {
+        "wall_ms": 27335.258,
+        "cpu_ms": 6875,
+        "allocations": 11
+      },
+      "change_percent": 14.141470701996205
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:insert",
+      "old": {
+        "wall_ms": 7251557.671,
+        "cpu_ms": 521171.875,
+        "allocations": 1536201730
+      },
+      "new": {
+        "wall_ms": 7066623.937,
+        "cpu_ms": 556859.375,
+        "allocations": 1536201730
+      },
+      "change_percent": -2.5502621973148787
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:first_stop",
+      "old": {
+        "wall_ms": 78.409,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 80.651,
+        "cpu_ms": 31.25,
+        "allocations": 4
+      },
+      "change_percent": 2.859365634047095
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:search_first",
+      "old": {
+        "wall_ms": 22829.291,
+        "cpu_ms": 22781.25,
+        "allocations": 104499277
+      },
+      "new": {
+        "wall_ms": 27918.081,
+        "cpu_ms": 27671.875,
+        "allocations": 104499277
+      },
+      "change_percent": 22.29061778572097
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:search_last",
+      "old": {
+        "wall_ms": 22324.505,
+        "cpu_ms": 22250,
+        "allocations": 104499144
+      },
+      "new": {
+        "wall_ms": 26462.851,
+        "cpu_ms": 26250,
+        "allocations": 104499144
+      },
+      "change_percent": 18.537235204095225
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:key_count",
+      "old": {
+        "wall_ms": 1091.507,
+        "cpu_ms": 1078.125,
+        "allocations": 5225395
+      },
+      "new": {
+        "wall_ms": 1329.078,
+        "cpu_ms": 1328.125,
+        "allocations": 5225395
+      },
+      "change_percent": 21.76541240688332
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:update",
+      "old": {
+        "wall_ms": 1614809.157,
+        "cpu_ms": 72281.25,
+        "allocations": 182081934
+      },
+      "new": {
+        "wall_ms": 1515395.424,
+        "cpu_ms": 87843.75,
+        "allocations": 182081168
+      },
+      "change_percent": -6.1563765952808325
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:vacuum",
+      "old": {
+        "wall_ms": 276212.117,
+        "cpu_ms": 22171.875,
+        "allocations": 27825387
+      },
+      "new": {
+        "wall_ms": 209882.086,
+        "cpu_ms": 26328.125,
+        "allocations": 27824843
+      },
+      "change_percent": -24.014164085350398
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:export_stream",
+      "old": {
+        "wall_ms": 27407.102,
+        "cpu_ms": 27250,
+        "allocations": 104442111
+      },
+      "new": {
+        "wall_ms": 32272.463,
+        "cpu_ms": 31500,
+        "allocations": 104442075
+      },
+      "change_percent": 17.752190654816413
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:migrate",
+      "old": {
+        "wall_ms": 50794.535,
+        "cpu_ms": 50750,
+        "allocations": 170767060
+      },
+      "new": {
+        "wall_ms": 60653.154,
+        "cpu_ms": 60281.25,
+        "allocations": 170767060
+      },
+      "change_percent": 19.40881829118033
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:bulk",
+      "old": {
+        "wall_ms": 60628.321,
+        "cpu_ms": 23843.75,
+        "allocations": 134351998
+      },
+      "new": {
+        "wall_ms": 58897.726,
+        "cpu_ms": 27671.875,
+        "allocations": 134351998
+      },
+      "change_percent": -2.854433326629646
+    },
+    {
+      "rows": 20000000,
+      "name": "bplus_tree:bulk_stop",
+      "old": {
+        "wall_ms": 82.713,
+        "cpu_ms": 15.625,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 76.257,
+        "cpu_ms": 31.25,
+        "allocations": 4
+      },
+      "change_percent": -7.805302673098535
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:insert",
+      "old": {
+        "wall_ms": 1833911.452,
+        "cpu_ms": 279718.75,
+        "allocations": 487682889
+      },
+      "new": {
+        "wall_ms": 1881361.604,
+        "cpu_ms": 283265.625,
+        "allocations": 487682889
+      },
+      "change_percent": 2.587374213092586
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:first_stop",
+      "old": {
+        "wall_ms": 60.482,
+        "cpu_ms": 62.5,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 81.957,
+        "cpu_ms": 93.75,
+        "allocations": 4
+      },
+      "change_percent": 35.50643166561951
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:search_first",
+      "old": {
+        "wall_ms": 20108.456,
+        "cpu_ms": 20046.875,
+        "allocations": 122867492
+      },
+      "new": {
+        "wall_ms": 21987.941,
+        "cpu_ms": 21984.375,
+        "allocations": 122872375
+      },
+      "change_percent": 9.346739501033795
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:search_last",
+      "old": {
+        "wall_ms": 20528.576,
+        "cpu_ms": 20421.875,
+        "allocations": 122858977
+      },
+      "new": {
+        "wall_ms": 22272.215,
+        "cpu_ms": 22187.5,
+        "allocations": 122863860
+      },
+      "change_percent": 8.49371627140625
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:key_count",
+      "old": {
+        "wall_ms": 951.109,
+        "cpu_ms": 953.125,
+        "allocations": 6062270
+      },
+      "new": {
+        "wall_ms": 1083.02,
+        "cpu_ms": 1078.125,
+        "allocations": 6062515
+      },
+      "change_percent": 13.869177980652058
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:update",
+      "old": {
+        "wall_ms": 419923.472,
+        "cpu_ms": 63203.125,
+        "allocations": 174177648
+      },
+      "new": {
+        "wall_ms": 448473.77,
+        "cpu_ms": 67312.5,
+        "allocations": 174177648
+      },
+      "change_percent": 6.798928829584461
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:vacuum",
+      "old": {
+        "wall_ms": 46713.857,
+        "cpu_ms": 17140.625,
+        "allocations": 69362242
+      },
+      "new": {
+        "wall_ms": 53076.011,
+        "cpu_ms": 22203.125,
+        "allocations": 69362242
+      },
+      "change_percent": 13.619414898667003
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:export_stream",
+      "old": {
+        "wall_ms": 28421.385,
+        "cpu_ms": 28296.875,
+        "allocations": 137441406
+      },
+      "new": {
+        "wall_ms": 33857.101,
+        "cpu_ms": 33093.75,
+        "allocations": 137446274
+      },
+      "change_percent": 19.125443745968052
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:migrate",
+      "old": {
+        "wall_ms": 57243.602,
+        "cpu_ms": 57171.875,
+        "allocations": 208605490
+      },
+      "new": {
+        "wall_ms": 77379.467,
+        "cpu_ms": 76546.875,
+        "allocations": 208625076
+      },
+      "change_percent": 35.17574767569658
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:bulk",
+      "old": {
+        "wall_ms": 3405.58,
+        "cpu_ms": 3359.375,
+        "allocations": 20101705
+      },
+      "new": {
+        "wall_ms": 3979.928,
+        "cpu_ms": 3859.375,
+        "allocations": 20101704
+      },
+      "change_percent": 16.86490994191885
+    },
+    {
+      "rows": 20000000,
+      "name": "lsm_tree:bulk_stop",
+      "old": {
+        "wall_ms": 152.76,
+        "cpu_ms": 156.25,
+        "allocations": 4
+      },
+      "new": {
+        "wall_ms": 210.695,
+        "cpu_ms": 203.125,
+        "allocations": 4
+      },
+      "change_percent": 37.92550405865409
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:insert",
+      "old": {
+        "wall_ms": 39448.392,
+        "cpu_ms": 39406.25,
+        "allocations": 143763091
+      },
+      "new": {
+        "wall_ms": 49963.442,
+        "cpu_ms": 48765.625,
+        "allocations": 143763091
+      },
+      "change_percent": 26.655205616492573
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:first_stop",
+      "old": {
+        "wall_ms": 30983.183,
+        "cpu_ms": 10375,
+        "allocations": 19
+      },
+      "new": {
+        "wall_ms": 30612.898,
+        "cpu_ms": 10859.375,
+        "allocations": 19
+      },
+      "change_percent": -1.1951160731290877
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:search_first",
+      "old": {
+        "wall_ms": 21833.808,
+        "cpu_ms": 21812.5,
+        "allocations": 40063480
+      },
+      "new": {
+        "wall_ms": 19732.455,
+        "cpu_ms": 19703.125,
+        "allocations": 20063581
+      },
+      "change_percent": -9.624308320380937
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:search_last",
+      "old": {
+        "wall_ms": 21761.74,
+        "cpu_ms": 21703.125,
+        "allocations": 40063480
+      },
+      "new": {
+        "wall_ms": 19867.628,
+        "cpu_ms": 19828.125,
+        "allocations": 20063580
+      },
+      "change_percent": -8.703862834497611
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:key_count",
+      "old": {
+        "wall_ms": 1091.133,
+        "cpu_ms": 1093.75,
+        "allocations": 2003430
+      },
+      "new": {
+        "wall_ms": 1185.19,
+        "cpu_ms": 1109.375,
+        "allocations": 1003430
+      },
+      "change_percent": 8.620122386546836
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:update",
+      "old": {
+        "wall_ms": 4278.871,
+        "cpu_ms": 4281.25,
+        "allocations": 15411068
+      },
+      "new": {
+        "wall_ms": 5293.372,
+        "cpu_ms": 5218.75,
+        "allocations": 15411068
+      },
+      "change_percent": 23.70954861691321
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:vacuum",
+      "old": {
+        "wall_ms": 2088.442,
+        "cpu_ms": 2078.125,
+        "allocations": 1006715
+      },
+      "new": {
+        "wall_ms": 2949.85,
+        "cpu_ms": 2828.125,
+        "allocations": 1006715
+      },
+      "change_percent": 41.24644112692619
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:export_stream",
+      "old": {
+        "wall_ms": 27603.952,
+        "cpu_ms": 27437.5,
+        "allocations": 40065491
+      },
+      "new": {
+        "wall_ms": 43143.339,
+        "cpu_ms": 39796.875,
+        "allocations": 40065491
+      },
+      "change_percent": 56.29406615400576
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:migrate",
+      "old": {
+        "wall_ms": 104168.757,
+        "cpu_ms": 103859.375,
+        "allocations": 104228312
+      },
+      "new": {
+        "wall_ms": 122562.942,
+        "cpu_ms": 114984.375,
+        "allocations": 104228312
+      },
+      "change_percent": 17.6580632521131
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:bulk",
+      "old": {
+        "wall_ms": 1791.534,
+        "cpu_ms": 1796.875,
+        "allocations": 10341273
+      },
+      "new": {
+        "wall_ms": 2178.004,
+        "cpu_ms": 2156.25,
+        "allocations": 10341273
+      },
+      "change_percent": 21.572015937180076
+    },
+    {
+      "rows": 20000000,
+      "name": "memory:bulk_stop",
+      "old": {
+        "wall_ms": 37695.004,
+        "cpu_ms": 25890.625,
+        "allocations": 13
+      },
+      "new": {
+        "wall_ms": 44659.296,
+        "cpu_ms": 32015.625,
+        "allocations": 13
+      },
+      "change_percent": 18.475371431184897
+    }
+  ],
+  "metrics_20m": [
+    {
+      "engine": "bitcask",
+      "operation": "灌 20000000 行(事务)",
+      "unit": "µs/行",
+      "old": "98.8",
+      "new": "102.6",
+      "old_peak": "2783.6",
+      "new_peak": "2783.6",
+      "extra": ""
+    },
+    {
+      "engine": "bitcask",
+      "operation": "点读×N 乱序",
+      "unit": "µs/次",
+      "old": "8.8",
+      "new": "10.8",
+      "old_peak": "0.0",
+      "new_peak": "0.0",
+      "extra": ""
+    },
+    {
+      "engine": "bitcask",
+      "operation": "点读×N 有序",
+      "unit": "µs/次",
+      "old": "3.6",
+      "new": "4.4",
+      "old_peak": "0.0",
+      "new_peak": "0.0",
+      "extra": ""
+    },
+    {
+      "engine": "bitcask",
+      "operation": "search 首页",
+      "unit": "µs/次",
+      "old": "50034858.1",
+      "new": "64919587.9",
+      "old_peak": "0.6",
+      "new_peak": "0.6",
+      "extra": "命中 20000000"
+    },
+    {
+      "engine": "bitcask",
+      "operation": "search 首页(免 total)",
+      "unit": "µs/次",
+      "old": "1708.3",
+      "new": "12611.7",
+      "old_peak": "0.6",
+      "new_peak": "0.6",
+      "extra": "拿了 100 条, has_next=true"
+    },
+    {
+      "engine": "bitcask",
+      "operation": "search 末页(深翻)",
+      "unit": "µs/次",
+      "old": "50100674.3",
+      "new": "77576130.2",
+      "old_peak": "0.6",
+      "new_peak": "0.6",
+      "extra": "命中 20000000，末页 100 条（已逐值验收）"
+    },
+    {
+      "engine": "bitcask",
+      "operation": "key_count 2B前缀",
+      "unit": "µs/次",
+      "old": "2436858.5",
+      "new": "2818747.0",
+      "old_peak": "0.6",
+      "new_peak": "0.6",
+      "extra": "1000000 键"
+    },
+    {
+      "engine": "bitcask",
+      "operation": "更新 2000000 键",
+      "unit": "µs/次",
+      "old": "149.5",
+      "new": "176.1",
+      "old_peak": "180.6",
+      "new_peak": "180.6",
+      "extra": ""
+    },
+    {
+      "engine": "bitcask",
+      "operation": "vacuum() 全库",
+      "unit": "µs/次",
+      "old": "2505756.7",
+      "new": "2764522.1",
+      "old_peak": "0.3",
+      "new_peak": "0.3",
+      "extra": "裁掉 1001576 行"
+    },
+    {
+      "engine": "bitcask",
+      "operation": "export 流式(逐行落地)",
+      "unit": "µs/行",
+      "old": "2.8",
+      "new": "3.8",
+      "old_peak": "0.6",
+      "new_peak": "0.6",
+      "extra": "20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒"
+    },
+    {
+      "engine": "bitcask",
+      "operation": "migrate → memory",
+      "unit": "µs/行",
+      "old": "3.9",
+      "new": "4.5",
+      "old_peak": "3891.4",
+      "new_peak": "3891.4",
+      "extra": "搬 20001001 行 / 20002 页 / 1092049894 B"
+    },
+    {
+      "engine": "bitcask",
+      "operation": "bulk 灌 2000000 行",
+      "unit": "µs/行",
+      "old": "13.3",
+      "new": "13.6",
+      "old_peak": "382.5",
+      "new_peak": "382.5",
+      "extra": ""
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "灌 20000000 行(事务)",
+      "unit": "µs/行",
+      "old": "362.6",
+      "new": "353.3",
+      "old_peak": "70.4",
+      "new_peak": "70.4",
+      "extra": ""
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "点读×N 乱序",
+      "unit": "µs/次",
+      "old": "27.2",
+      "new": "36.0",
+      "old_peak": "14.0",
+      "new_peak": "14.0",
+      "extra": ""
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "点读×N 有序",
+      "unit": "µs/次",
+      "old": "3.3",
+      "new": "4.3",
+      "old_peak": "1.7",
+      "new_peak": "1.7",
+      "extra": ""
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "search 首页",
+      "unit": "µs/次",
+      "old": "22829288.3",
+      "new": "27918078.1",
+      "old_peak": "1.5",
+      "new_peak": "1.5",
+      "extra": "命中 20000000"
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "search 首页(免 total)",
+      "unit": "µs/次",
+      "old": "4424.3",
+      "new": "5721.1",
+      "old_peak": "0.6",
+      "new_peak": "0.6",
+      "extra": "拿了 100 条, has_next=true"
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "search 末页(深翻)",
+      "unit": "µs/次",
+      "old": "22324502.2",
+      "new": "26462848.5",
+      "old_peak": "1.2",
+      "new_peak": "1.2",
+      "extra": "命中 20000000，末页 100 条（已逐值验收）"
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "key_count 2B前缀",
+      "unit": "µs/次",
+      "old": "1091506.1",
+      "new": "1329076.8",
+      "old_peak": "1.2",
+      "new_peak": "1.2",
+      "extra": "1000000 键"
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "更新 2000000 键",
+      "unit": "µs/次",
+      "old": "807.4",
+      "new": "757.7",
+      "old_peak": "11.7",
+      "new_peak": "11.7",
+      "extra": ""
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "vacuum() 全库",
+      "unit": "µs/次",
+      "old": "276212114.0",
+      "new": "209882083.8",
+      "old_peak": "7.1",
+      "new_peak": "6.6",
+      "extra": "裁掉 1001576 行"
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "export 流式(逐行落地)",
+      "unit": "µs/行",
+      "old": "1.4",
+      "new": "1.6",
+      "old_peak": "2.6",
+      "new_peak": "2.6",
+      "extra": "20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒"
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "migrate → memory",
+      "unit": "µs/行",
+      "old": "2.5",
+      "new": "3.0",
+      "old_peak": "3892.3",
+      "new_peak": "3892.3",
+      "extra": "搬 20001001 行 / 20002 页 / 1092049894 B"
+    },
+    {
+      "engine": "bplus_tree",
+      "operation": "bulk 灌 2000000 行",
+      "unit": "µs/行",
+      "old": "30.3",
+      "new": "29.4",
+      "old_peak": "368.4",
+      "new_peak": "368.4",
+      "extra": ""
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "灌 20000000 行(事务)",
+      "unit": "µs/行",
+      "old": "91.7",
+      "new": "94.1",
+      "old_peak": "86.8",
+      "new_peak": "86.8",
+      "extra": ""
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "点读×N 乱序",
+      "unit": "µs/次",
+      "old": "17.0",
+      "new": "17.3",
+      "old_peak": "10.2",
+      "new_peak": "10.2",
+      "extra": ""
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "点读×N 有序",
+      "unit": "µs/次",
+      "old": "1.7",
+      "new": "1.8",
+      "old_peak": "0.0",
+      "new_peak": "0.0",
+      "extra": ""
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "search 首页",
+      "unit": "µs/次",
+      "old": "20108452.9",
+      "new": "21987937.6",
+      "old_peak": "0.6",
+      "new_peak": "0.8",
+      "extra": "命中 20000000"
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "search 首页(免 total)",
+      "unit": "µs/次",
+      "old": "4822.5",
+      "new": "6233.4",
+      "old_peak": "0.6",
+      "new_peak": "0.7",
+      "extra": "拿了 100 条, has_next=true"
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "search 末页(深翻)",
+      "unit": "µs/次",
+      "old": "20528573.6",
+      "new": "22272212.6",
+      "old_peak": "0.6",
+      "new_peak": "0.8",
+      "extra": "命中 20000000，末页 100 条（已逐值验收）"
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "key_count 2B前缀",
+      "unit": "µs/次",
+      "old": "951108.5",
+      "new": "1083018.8",
+      "old_peak": "0.5",
+      "new_peak": "0.7",
+      "extra": "1000000 键"
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "更新 2000000 键",
+      "unit": "µs/次",
+      "old": "210.0",
+      "new": "224.2",
+      "old_peak": "41.0",
+      "new_peak": "41.0",
+      "extra": ""
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "vacuum() 全库",
+      "unit": "µs/次",
+      "old": "46713854.0",
+      "new": "53076004.1",
+      "old_peak": "22.7",
+      "new_peak": "22.7",
+      "extra": "裁掉 1001576 行"
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "export 流式(逐行落地)",
+      "unit": "µs/行",
+      "old": "1.4",
+      "new": "1.7",
+      "old_peak": "0.6",
+      "new_peak": "0.6",
+      "extra": "20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒"
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "migrate → memory",
+      "unit": "µs/行",
+      "old": "2.9",
+      "new": "3.9",
+      "old_peak": "3891.4",
+      "new_peak": "3891.4",
+      "extra": "搬 20001001 行 / 20002 页 / 1092049894 B"
+    },
+    {
+      "engine": "lsm_tree",
+      "operation": "bulk 灌 2000000 行",
+      "unit": "µs/行",
+      "old": "1.7",
+      "new": "2.0",
+      "old_peak": "464.0",
+      "new_peak": "464.0",
+      "extra": ""
+    },
+    {
+      "engine": "memory",
+      "operation": "灌 20000000 行(事务)",
+      "unit": "µs/行",
+      "old": "2.0",
+      "new": "2.5",
+      "old_peak": "3888.3",
+      "new_peak": "3888.3",
+      "extra": ""
+    },
+    {
+      "engine": "memory",
+      "operation": "点读×N 乱序",
+      "unit": "µs/次",
+      "old": "2.9",
+      "new": "3.4",
+      "old_peak": "0.0",
+      "new_peak": "0.0",
+      "extra": ""
+    },
+    {
+      "engine": "memory",
+      "operation": "点读×N 有序",
+      "unit": "µs/次",
+      "old": "1.3",
+      "new": "1.5",
+      "old_peak": "0.0",
+      "new_peak": "0.0",
+      "extra": ""
+    },
+    {
+      "engine": "memory",
+      "operation": "search 首页",
+      "unit": "µs/次",
+      "old": "21833804.2",
+      "new": "19732451.0",
+      "old_peak": "0.8",
+      "new_peak": "0.6",
+      "extra": "命中 20000000"
+    },
+    {
+      "engine": "memory",
+      "operation": "search 首页(免 total)",
+      "unit": "µs/次",
+      "old": "4771.2",
+      "new": "3763.9",
+      "old_peak": "0.8",
+      "new_peak": "0.6",
+      "extra": "拿了 100 条, has_next=true"
+    },
+    {
+      "engine": "memory",
+      "operation": "search 末页(深翻)",
+      "unit": "µs/次",
+      "old": "21761735.4",
+      "new": "19867625.2",
+      "old_peak": "0.8",
+      "new_peak": "0.6",
+      "extra": "命中 20000000，末页 100 条（已逐值验收）"
+    },
+    {
+      "engine": "memory",
+      "operation": "key_count 2B前缀",
+      "unit": "µs/次",
+      "old": "1091132.3",
+      "new": "1185189.0",
+      "old_peak": "0.8",
+      "new_peak": "0.5",
+      "extra": "1000000 键"
+    },
+    {
+      "engine": "memory",
+      "operation": "更新 2000000 键",
+      "unit": "µs/次",
+      "old": "2.1",
+      "new": "2.6",
+      "old_peak": "186.4",
+      "new_peak": "186.4",
+      "extra": ""
+    },
+    {
+      "engine": "memory",
+      "operation": "vacuum() 全库",
+      "unit": "µs/次",
+      "old": "2088437.6",
+      "new": "2949846.7",
+      "old_peak": "0.3",
+      "new_peak": "0.3",
+      "extra": "裁掉 1001576 行"
+    },
+    {
+      "engine": "memory",
+      "operation": "export 流式(逐行落地)",
+      "unit": "µs/行",
+      "old": "1.4",
+      "new": "2.2",
+      "old_peak": "0.8",
+      "new_peak": "0.8",
+      "extra": "20001001 行 → 磁盘 2012.1 MB，内存里一行都不攒"
+    },
+    {
+      "engine": "memory",
+      "operation": "migrate → memory",
+      "unit": "µs/行",
+      "old": "5.2",
+      "new": "6.1",
+      "old_peak": "3891.4",
+      "new_peak": "3891.4",
+      "extra": "搬 20001001 行 / 20002 页 / 1092049894 B"
+    },
+    {
+      "engine": "memory",
+      "operation": "bulk 灌 2000000 行",
+      "unit": "µs/行",
+      "old": "0.9",
+      "new": "1.1",
+      "old_peak": "531.0",
+      "new_peak": "531.0",
+      "extra": ""
+    }
+  ],
+  "raw_field_hex": [
+    [
+      "rows",
+      "726f7773"
+    ],
+    [
+      "pass",
+      "70617373"
+    ],
+    [
+      "engine",
+      "656e67696e65"
+    ],
+    [
+      "operation",
+      "6f7065726174696f6e"
+    ],
+    [
+      "operation_key",
+      "6f7065726174696f6e5f6b6579"
+    ],
+    [
+      "time_per_unit",
+      "74696d655f7065725f756e6974"
+    ],
+    [
+      "unit",
+      "756e6974"
+    ],
+    [
+      "heap_live_delta_mb",
+      "686561705f6c6976655f64656c74615f6d62"
+    ],
+    [
+      "heap_peak_delta_mb",
+      "686561705f7065616b5f64656c74615f6d62"
+    ],
+    [
+      "extra",
+      "6578747261"
+    ]
+  ],
+  "analysis": {
+    "total_seconds": {
+      "old": 30724.75,
+      "new": 32198.421,
+      "change_percent": 4.796364494422245,
+      "role": "单轮跨构建总体观察；包含新增真实bounded工作，不能冒充同种子ABBA"
+    },
+    "bplus_vacuum": {
+      "seconds_by_scale": [
+        [
+          {
+            "rows": 600000,
+            "seconds": 13.55695
+          },
+          {
+            "rows": 1000000,
+            "seconds": 18.166103
+          },
+          {
+            "rows": 5000000,
+            "seconds": 84.409894
+          },
+          {
+            "rows": 10000000,
+            "seconds": 132.825446
+          },
+          {
+            "rows": 20000000,
+            "seconds": 276.21211700000003
+          }
+        ],
+        [
+          {
+            "rows": 600000,
+            "seconds": 38.906546999999996
+          },
+          {
+            "rows": 1000000,
+            "seconds": 14.676556
+          },
+          {
+            "rows": 5000000,
+            "seconds": 64.397082
+          },
+          {
+            "rows": 10000000,
+            "seconds": 139.07767
+          },
+          {
+            "rows": 20000000,
+            "seconds": 209.88208600000002
+          }
+        ]
+      ],
+      "at_20m": {
+        "old_seconds": 276.212117,
+        "new_seconds": 209.882086,
+        "freelist_sync_calls": [
+          545,
+          1
+        ],
+        "freelist_sync_seconds_rounded": [
+          68.67,
+          0.2
+        ],
+        "page_sync_calls": 561,
+        "page_sync_seconds_rounded": 84.673,
+        "registry_and_storage_hold_seconds_rounded": 209.882,
+        "bounded2048_ms_rounded": 299,
+        "bounded_sync_ms_rounded": 297
+      },
+      "variance": "600k同46次page_sync，4.195→12.413 s；不能把同步时延波动解释成必然算法退化",
+      "decision": "M152 freelist减少已在最新五档观察到；M160干净页优先实验实际12k同步不减少，已撤回，不放宽守卫"
+    },
+    "memory": {
+      "precise_first_20m_seconds": [
+        21.833808,
+        19.732455
+      ],
+      "precise_first_allocations": [
+        40063480,
+        20063581
+      ],
+      "count_2b_prefix_matches": 1000000,
+      "count_20m_seconds": [
+        1.091133,
+        1.18519
+      ],
+      "export_20m_seconds": [
+        27.603952,
+        43.143339
+      ],
+      "migration_20m_seconds": [
+        104.168757,
+        122.562942
+      ],
+      "bulk_stop_20m_seconds": [
+        37.695004,
+        44.659296
+      ],
+      "decision": "以上为M158之前的用户压测读数。M158同种子暖读1M/2M才是借用键收益证据，不外推导出/迁移/快照与20M"
+    },
+    "lsm": {
+      "vacuum_20m_seconds": [
+        46.713857,
+        53.076011
+      ],
+      "scan_ms_rounded": 11067,
+      "delete_ms_rounded": 37707,
+      "sync_ms_rounded": 4300,
+      "actual_delete_write_ms_rounded": 547,
+      "threshold_flush_ms_rounded": 37061,
+      "threshold_flush_calls": 15,
+      "total_flushes": 16,
+      "total_compactions": 68,
+      "mem_wal_sync": 0,
+      "decision": "两轮归并输入字节/行/块相同，嵌套merge/SST/manifest不相加。M159省重复最终manifest，SST同步仍保留，未改阈值"
+    },
+    "environment": "用户五档D盘HDD；物理内存68.6GB，开跑可用约40.8GB，不断言内存不足。正常重开未清Windows页缓存，不等于断电恢复或冷读"
+  },
+  "implementation_summary": [
+    {
+      "milestone": "M157",
+      "commit": "e0c3bcd57e37791866aa3fa61222004160b23e57",
+      "change": "SearchRow Deferred恢复共享驱动逐条取值",
+      "mechanism": "实际SST首页100条值复制4096→101；旧物化负向控制失败",
+      "ledger": "docs/performance-m157.json"
+    },
+    {
+      "milestone": "M158",
+      "commit": "baf7954337e57f473945f80e9764b3310dc9d4c8",
+      "change": "memory锁内借用页外候选键",
+      "mechanism": "16384键count复制16384→3；首页16384→103；旧copy_all负向控制失败",
+      "two_m_warm_abba_ms": {
+        "count": [
+          635.36,
+          326.3935
+        ],
+        "first_total": [
+          715.166,
+          308.6475
+        ],
+        "deep_total": [
+          650.9955,
+          354.0305
+        ]
+      },
+      "ledger": "docs/performance-m158.json"
+    },
+    {
+      "milestone": "M159",
+      "commit": "7e5316a26685be7e80098ca02350bf314fd184b6",
+      "change": "LSM同步flush复用已经发布的最终manifest状态",
+      "mechanism": "真实16键flush fsync3→1；旧行为守卫失败；发布失败重试重开通过",
+      "ledger": "docs/performance-m159.json"
+    },
+    {
+      "milestone": "M160",
+      "commit": "587b09efb7e34573755e715ec0a677ad7c149a97",
+      "status": "rejected",
+      "change": "撤回B+干净页优先换出实验",
+      "mechanism": "12k四臂均11 page_sync /34 dblwr_sync；严格收益守卫22 ==22失败",
+      "ledger": "docs/performance-m160.json"
+    },
+    {
+      "milestone": "M161",
+      "change": "仅增加cfg(test)迁移分段与memory复制诊断，更新分析和验收入口",
+      "production_algorithm": "迁移算法、参数与提交/TTL语义保留"
+    }
+  ],
+  "validation": {
+    "release_library": {
+      "passed": 550,
+      "failed": 0,
+      "ignored": 82,
+      "seconds": 119.04,
+      "exit_code": 0,
+      "command": "cargo test --release --lib --offline --quiet -- --test-threads=1",
+      "output": "\nrunning 632 tests\ni.i......................iii...............i...................i..............i........ 87/632\n...............iiii.....i....i......................................................... 174/632\n.........................................................i...............i............. 261/632\n.......i............i.....iiiiiiiiiii.i.i....ii...........ii.iiiiii..iii.i...iiiiiiii.. 348/632\niiiiiiii......i.......ii.....i.............................iii......................... 435/632\n..........i......i.iiii..i...................i........................ii............... 522/632\n.................i...........................i....i..........................i......... 609/632\n.......................\ntest result: ok. 550 passed; 0 failed; 82 ignored; 0 measured; 0 filtered out; finished in 119.04s\n\n"
+    },
+    "all_targets_check": {
+      "exit_code": 0,
+      "output": "",
+      "command": "cargo check --all-targets --offline --quiet"
+    },
+    "migration_guard": {
+      "command": "cargo test --lib --offline --quiet migration_stage_accounting_uses_actual_scan_write_commit_gates -- --nocapture --test-threads=1",
+      "passed": 1,
+      "failed": 0,
+      "seconds": 0.05,
+      "rows": 2050,
+      "contract": "actual scan/source begin/commit次数=pages；target write/commit次数=ceil(rows/1000)；逐值验证；关闭scope Timer=None"
+    },
+    "migration_diagnostics": {
+      "command": "cargo test --release --lib --offline --quiet memory_migration_stage_cost -- --ignored --nocapture --test-threads=1",
+      "stage_order": [
+        "source_begin",
+        "source_scan",
+        "projection",
+        "source_commit",
+        "target_begin",
+        "target_write",
+        "target_commit",
+        "target_rollback"
+      ],
+      "runs": [
+        {
+          "chunk_id": "e401a8",
+          "wall_time_seconds": 5.1319677,
+          "exit_code": 0,
+          "original_token_count": 85,
+          "output": "\nrunning 1 test\nMIGRATION_COST rows=1000000 total_ms=1530.989 stages_ns=[677000, 441853500, 3062700, 343100, 537100, 1035773600, 47307400, 0] calls=[1000, 1000, 1000, 1000, 1000, 1000, 1000, 0] residual_ms=1.435 all_values_verified=1000000\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 631 filtered out; finished in 4.02s\n\n"
+        },
+        {
+          "exit_code": 0,
+          "output": "\nrunning 1 test\nMIGRATION_COST rows=2000000 total_ms=4625.008 stages_ns=[1996800, 1385577000, 8364700, 1236100, 1803000, 3028966100, 192136200, 0] calls=[2000, 2000, 2000, 2000, 2000, 2000, 2000, 0] residual_ms=4.928 all_values_verified=2000000\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 631 filtered out; finished in 11.82s\n",
+          "limitation": "2M诊断与all-targets check短暂重叠，不作为隔离性能/规模比例结论"
+        }
+      ],
+      "role": "仅归因诊断；2M与编译检查短暂重叠，不作为隔离性能结论"
+    },
+    "formal_smoke": {
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -Rows '2000,3000' -Repeat 1 -ScratchRoot 'C:/Users/Administrator/.cache/storage-engines/test-data'",
+      "exit_code": 0,
+      "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374",
+      "source_manifest": {
+        "hash": "865c613ff28919915bd7e5364874042b17d977747d6fe6cb55c4b3ea577df45e",
+        "files": [
+          {
+            "path": "Cargo.toml",
+            "sha256": "2a55091d1fd2c82443525a5c4f168c75afcfbdf4cc8d462c5773acfeeb65be66"
+          },
+          {
+            "path": "src/bin/bitcask-bench-bulk.rs",
+            "sha256": "04a0f01d9087ccffe304eb73173dcf03b86740808f8a854bb72b7326f8f28a92"
+          },
+          {
+            "path": "src/bin/bplus-bench.rs",
+            "sha256": "b03d85f1efd1923aecacd248432de52738be7e26598ace8c458f4537525c236e"
+          },
+          {
+            "path": "src/bin/export-kv.rs",
+            "sha256": "aaf9a4c02c4a1b84ee1071f854bcb1f05eeec822bf01e011c25e509dfceb616f"
+          },
+          {
+            "path": "src/bin/import-kv.rs",
+            "sha256": "36536f3ca44c8a68378e9b715ec57c777afc435240e560cb286ca9fb675e8561"
+          },
+          {
+            "path": "src/bin/lsm-bench-bulk.rs",
+            "sha256": "810ef34a67cbaa69273ceda7943579893fbcd34aadca0fc34feec88f3a15097a"
+          },
+          {
+            "path": "src/bin/memory-bench.rs",
+            "sha256": "3eff085e0ea457ee29328fb6046f852a5aa53bb732ba67898f996aea2f1178b1"
+          },
+          {
+            "path": "src/bin/shell.rs",
+            "sha256": "2becf0668d7808ebfa5236aaa42d92febe77535b6a327014901d667234ef42f0"
+          },
+          {
+            "path": "src/bin/web.rs",
+            "sha256": "6adb352a1d5aea167bddd9efb42fcc61f96a383161e0710bba0096699ab03379"
+          },
+          {
+            "path": "src/bitcask/bitcask.rs",
+            "sha256": "1abe7e4f2a9da69dd320a844847c75b2d24980374fe24c0ea79eae496484d99e"
+          },
+          {
+            "path": "src/bitcask/bitcask_mvcc.rs",
+            "sha256": "72a800c722d17438dcef1ba759b1c467e8646d14719640b49e06f389863aa3bc"
+          },
+          {
+            "path": "src/bitcask/checkpoint_probe.rs",
+            "sha256": "410aae99b6fb620bd3b2339e8adca9c6132ef1b9a15e0b37b7114c8c376c6c09"
+          },
+          {
+            "path": "src/bitcask/error.rs",
+            "sha256": "a75039a5dc999bcc25724160f3a860b49c799aeda6d5ff9283aa8ecc82f333ff"
+          },
+          {
+            "path": "src/bitcask/kv_ops.rs",
+            "sha256": "c565ebc9ee323a2160afb4cd7f1b49bb6e3886a28a76449772b685598e0dd134"
+          },
+          {
+            "path": "src/bitcask/mod.rs",
+            "sha256": "f8280b336926eb4fb99083c4fad8a63f9924f841bf7d38278933001584d7f84c"
+          },
+          {
+            "path": "src/bitcask/storage.rs",
+            "sha256": "ff4f2e136d955ee8d5fc34b90ebb7b0d505c95179aa03c08b49b095ddee3eba0"
+          },
+          {
+            "path": "src/bitcask/wal.rs",
+            "sha256": "b30fcf36dc249eea6f9b2b9b256959949dab7d9ddec9f696199975af5ad5a4db"
+          },
+          {
+            "path": "src/bplus_tree/bplus_tree.rs",
+            "sha256": "6e75e8c40c9945c6c8831217a1838e18a152de5c40a136448cc0da349c57a520"
+          },
+          {
+            "path": "src/bplus_tree/bplus_tree_mvcc.rs",
+            "sha256": "9676badae7fe3c9f33621b5600cae284b9f2578a501f83f3a858c0f210613991"
+          },
+          {
+            "path": "src/bplus_tree/kv_ops.rs",
+            "sha256": "b5591a94f1f2633f9ffab0ce9c2863342013de3529169e2d841bd419d1d6afe4"
+          },
+          {
+            "path": "src/bplus_tree/mod.rs",
+            "sha256": "73edb97227ab56971dbe5f62a3282ab444da1eb1336c52c859e968699155191b"
+          },
+          {
+            "path": "src/bplus_tree/page.rs",
+            "sha256": "b40990820f5f1bf0175613b7548bd67d255e46c1665577a49dd14cbdf959c00d"
+          },
+          {
+            "path": "src/bplus_tree/storage.rs",
+            "sha256": "25449c9072981c14b510c2abccb79af95d02d17faef4bfe7c37d9f1f6f8481a8"
+          },
+          {
+            "path": "src/bplus_tree/wal.rs",
+            "sha256": "d248f7f6e8658c80ffafa6146e59f156b575bb986d7d76938b9a9b53b302c21b"
+          },
+          {
+            "path": "src/common/codec.rs",
+            "sha256": "41dbd91017d77d1a55d62157adeab6c4694f0bd5da6a7d192d26fcd8d235bc91"
+          },
+          {
+            "path": "src/common/disk.rs",
+            "sha256": "6716f01e35f034ae4cc15e4340580b5e77f5aaf0d8d86e24e28144bfeb972164"
+          },
+          {
+            "path": "src/common/kernel.rs",
+            "sha256": "0c95335e0a1bd9496089976a40744d48bce49122e31f31c098045b72181a42c7"
+          },
+          {
+            "path": "src/common/kv_snapshot.rs",
+            "sha256": "48f372d5165be2cf039afc0db4fa2e4e0565463489723bf8b5f811dbd581f258"
+          },
+          {
+            "path": "src/common/maintenance_probe.rs",
+            "sha256": "6300da4a9219e414290a61313151e979bee1731791147a29dba1279d25af30fe"
+          },
+          {
+            "path": "src/common/mod.rs",
+            "sha256": "bac30297f91c1e790d7cabc72a3c1b9c7a95bb091d1fe21d649065102f9e8843"
+          },
+          {
+            "path": "src/common/order.rs",
+            "sha256": "df5c6d495596dbd1f9b7916a50c8239149af51effcc2405264bbd42f4ffabeca"
+          },
+          {
+            "path": "src/common/store.rs",
+            "sha256": "cd71630929939c5558f86a5147b4961d6af05a3985d9117aa7b00e2caf849cdb"
+          },
+          {
+            "path": "src/common/transaction_error.rs",
+            "sha256": "a1a14d4a92b3caac9a10f56c03316063c1eca758dc3294a2e25e89c05cfee20a"
+          },
+          {
+            "path": "src/common/txn.rs",
+            "sha256": "7827695e4c20f607886bb21d99f7e43dfbe8fa90cf1538448b90580d524cd038"
+          },
+          {
+            "path": "src/common/types.rs",
+            "sha256": "8bcdec8965215144359724e8b963101b3c05aa6a5de8125cc255151f4503dd42"
+          },
+          {
+            "path": "src/common/version.rs",
+            "sha256": "e8881d10d2a44354f8af1688f78e18a1274a0a80f139bbcdeb7d2eb491694c09"
+          },
+          {
+            "path": "src/common/wal.rs",
+            "sha256": "704bd8f11bd23a40174126230275fda799866158c6ad8f0c5df721dfd237f102"
+          },
+          {
+            "path": "src/engine.rs",
+            "sha256": "9aa80100233e3c638cd72c24d51123e580900c2ebde7574fc74473059d947a45"
+          },
+          {
+            "path": "src/lib.rs",
+            "sha256": "f96acc7de93f98575b085c66a375984f42e00d81c114e0af68b3cd9910023f25"
+          },
+          {
+            "path": "src/lsm_allocation_bench.rs",
+            "sha256": "b460abf4769abec9b3e4ba9f58f03ffda1ce0d05ebaa63cabdefc0abab130be9"
+          },
+          {
+            "path": "src/lsm_tree/bloom.rs",
+            "sha256": "ab7197d8246006da52261d3226340395ae367a3422d8abacdaa7f154eb0e97f4"
+          },
+          {
+            "path": "src/lsm_tree/cf.rs",
+            "sha256": "8268519d236fdee89456cf6b0cc2d37eeb5376c05e40024b47dcfc23f8ab61dc"
+          },
+          {
+            "path": "src/lsm_tree/kv_ops.rs",
+            "sha256": "d163b9699d5bf00589b349d76f82a673a961e9a3caed4ea14e795fda50e45711"
+          },
+          {
+            "path": "src/lsm_tree/lsm_tree.rs",
+            "sha256": "0b910a290ae3ce6fad4607f2eb5eb9f40e0f54fd236b5366f47b23d7abfe35e0"
+          },
+          {
+            "path": "src/lsm_tree/lsm_tree_mvcc.rs",
+            "sha256": "ed8895ef8b74e70ddf8d23c64c6229780e9b60e2c3b297844d3df2289ef91d1b"
+          },
+          {
+            "path": "src/lsm_tree/mem_wal.rs",
+            "sha256": "360fecda096aeb4bcd468410ef23f1fd5759c4af4d7eb83a055dc4b76511693f"
+          },
+          {
+            "path": "src/lsm_tree/mod.rs",
+            "sha256": "f274d4cc70924ce7eb950f86db5c549cad9483ba42d65eed963aa40c6efc51b8"
+          },
+          {
+            "path": "src/lsm_tree/sst.rs",
+            "sha256": "370d30b8daf01971d2cc28d67a90c27a6ce4343a42c37e356b9fa2cbce701be5"
+          },
+          {
+            "path": "src/lsm_tree/storage.rs",
+            "sha256": "bc6b3dc1f27b92fde7bf086b07d9ebea7300aa8e4dc8c4dc9a3b0ff621df4e00"
+          },
+          {
+            "path": "src/lsm_tree/wal.rs",
+            "sha256": "0b7f36528f05a6f778e0e196c97c2814e00e75d420020d42cd6d1f680cb7368a"
+          },
+          {
+            "path": "src/main.rs",
+            "sha256": "676551ccc9139ad373db3369def2396eeb1fbc47a7c20854534175c7b517d57b"
+          },
+          {
+            "path": "src/maintenance.rs",
+            "sha256": "aa9a1675e10ea9e9724778f7f93cb2c411282758c6fe845939c02ebe0faa017b"
+          },
+          {
+            "path": "src/memory/kv_ops.rs",
+            "sha256": "2258b5667ef53bfe7f94cfac4c5296185e273dcdc56dc06f895a9ca7ece5191a"
+          },
+          {
+            "path": "src/memory/mem_store.rs",
+            "sha256": "b16c47f445074c0078ed1ad9f549a1681285b940d41e96e022076a78eb3ab5f9"
+          },
+          {
+            "path": "src/memory/memory_mvcc.rs",
+            "sha256": "0ed1b4e5f67aadcd1ab146f61ed85fc651df2d3a1e2b32346405b5febec19fa7"
+          },
+          {
+            "path": "src/memory/mod.rs",
+            "sha256": "e19312536377d63fc41d8ec576bff0bca2b621cd74514508ef83d40af3a63424"
+          },
+          {
+            "path": "src/scale_bench.rs",
+            "sha256": "79ef1b792971228b573b1e485313bc15f52a9d8e02557d02a6853c13413a2ea8"
+          },
+          {
+            "path": "src/scale_probe.rs",
+            "sha256": "96141f29335b946174fee708804a0d8bb280a50afdc87109d0a82b885173468f"
+          },
+          {
+            "path": "src/terminal.rs",
+            "sha256": "0e7a27b817f831991f53986e1111ec5bf4b3106f07aa16ddd05dac815976871a"
+          },
+          {
+            "path": "src/tools/migrate.rs",
+            "sha256": "8cc3f9a3c3b5455d9ffa56e47dcc8f34281174d094e7fcbdee1e46d1ce0bd403"
+          },
+          {
+            "path": "src/tools/mod.rs",
+            "sha256": "43b154fbb416ee6ce9cb2989819671b0422cfc5b5847c5f25f80c33ff3a5e607"
+          }
+        ]
+      },
+      "run_manifest": {
+        "tool": "storage-engines-scale-v1",
+        "harness_schema": 3,
+        "runner_sha256": "fde062aa9f8fffc04a71ff333906e97caf6956ee306bf002edd10587fa59c3ed",
+        "repo": "D:\\develop\\workspace\\rust_workspace\\storage-engines",
+        "started_utc": "2026-11-23T05:52:08.6264675Z",
+        "head": "587b09efb7e34573755e715ec0a677ad7c149a97",
+        "git_status": [
+          " M src/engine.rs",
+          " M src/scale_probe.rs",
+          "?? docs/test10.txt",
+          "?? docs/test11.txt",
+          "?? docs/test12.txt",
+          "?? docs/test13.txt",
+          "?? docs/test14.txt",
+          "?? docs/test15.txt",
+          "?? docs/test16.txt",
+          "?? docs/test17.txt",
+          "?? docs/test18.txt",
+          "?? docs/test19.txt",
+          "?? docs/test20.txt",
+          "?? docs/test21.txt",
+          "?? docs/test4.txt",
+          "?? docs/test5.txt",
+          "?? docs/test6.txt",
+          "?? docs/test7.txt",
+          "?? docs/test8.txt",
+          "?? docs/test9.txt"
+        ],
+        "source_sha256": "865c613ff28919915bd7e5364874042b17d977747d6fe6cb55c4b3ea577df45e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "powershell": "5.1.19041.6456",
+        "cpu": [
+          {
+            "Name": "Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz",
+            "NumberOfCores": 4,
+            "NumberOfLogicalProcessors": 8
+          }
+        ],
+        "memory_total_bytes": 68596707328,
+        "memory_free_bytes": 40139939840,
+        "scratch_root": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data",
+        "output_root": "D:\\develop\\workspace\\rust_workspace\\storage-engines\\data\\bench-results",
+        "cases": [
+          {
+            "rows": 2000,
+            "pass": 1,
+            "token": "96841149bd174a93924201ea8696f69a",
+            "scratch": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data\\scale-96841149bd174a93924201ea8696f69a"
+          },
+          {
+            "rows": 3000,
+            "pass": 1,
+            "token": "8695a6d3451e4751bf2ecf5aa3962e6f",
+            "scratch": "C:\\Users\\Administrator\\.cache\\storage-engines\\test-data\\scale-8695a6d3451e4751bf2ecf5aa3962e6f"
+          }
+        ],
+        "memory_metric": "Rust allocator live/peak delta, decimal MB; NOT process RSS",
+        "reopen_policy": "normal close then reopen; Windows page cache not cleared; not a power-loss test",
+        "bounded_policy": "full vacuum first; seed 2 old versions for up to 8 existing keys outside timing; latest values unchanged",
+        "diagnostic_schema": "SCALE token fields are literal strings; raw preserves the complete line",
+        "public_contract": "same API/parameters/transaction+TTL semantics/disk format; verify internal changes",
+        "benchmark_policy": "TTL read/write measured; then auxiliary keys persisted outside timing; independent migration manifest",
+        "executable_sha256": "159de33e2755d608373dcef96c2920bdbd202080dd2cfe1f72fca1c33a0fbe35",
+        "cargo_lock_sha256": "06a642091be8fcaa23f7e46dc42abe41d174ec29509cc79fcfcb22325d639dfd"
+      },
+      "cases": [
+        {
+          "summary": {
+            "rows": 2000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 4.217,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_2000_pass_1.log",
+            "diagnostics": "rows_2000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 837,
+          "delta_count": 51,
+          "migration": [
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "bitcask",
+                "phase": "migrate",
+                "source_begin_ms": "0.010",
+                "source_scan_ms": "17.735",
+                "projection_ms": "0.015",
+                "source_commit_ms": "0.096",
+                "target_begin_ms": "0.015",
+                "target_write_ms": "4.210",
+                "target_commit_ms": "0.376",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.067",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=bitcask phase=migrate source_begin_ms=0.010 source_scan_ms=17.735 projection_ms=0.015 source_commit_ms=0.096 target_begin_ms=0.015 target_write_ms=4.210 target_commit_ms=0.376 target_rollback_ms=0.000 residual_ms=0.067 scope=disjoint_substages"
+            },
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "bplus_tree",
+                "phase": "migrate",
+                "source_begin_ms": "0.009",
+                "source_scan_ms": "4.396",
+                "projection_ms": "0.014",
+                "source_commit_ms": "0.143",
+                "target_begin_ms": "0.009",
+                "target_write_ms": "3.717",
+                "target_commit_ms": "0.176",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.018",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=bplus_tree phase=migrate source_begin_ms=0.009 source_scan_ms=4.396 projection_ms=0.014 source_commit_ms=0.143 target_begin_ms=0.009 target_write_ms=3.717 target_commit_ms=0.176 target_rollback_ms=0.000 residual_ms=0.018 scope=disjoint_substages"
+            },
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "migrate",
+                "source_begin_ms": "0.010",
+                "source_scan_ms": "6.397",
+                "projection_ms": "0.014",
+                "source_commit_ms": "0.122",
+                "target_begin_ms": "0.010",
+                "target_write_ms": "3.529",
+                "target_commit_ms": "0.175",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.017",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=lsm_tree phase=migrate source_begin_ms=0.010 source_scan_ms=6.397 projection_ms=0.014 source_commit_ms=0.122 target_begin_ms=0.010 target_write_ms=3.529 target_commit_ms=0.175 target_rollback_ms=0.000 residual_ms=0.017 scope=disjoint_substages"
+            },
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "memory",
+                "phase": "migrate",
+                "source_begin_ms": "0.007",
+                "source_scan_ms": "1.612",
+                "projection_ms": "0.014",
+                "source_commit_ms": "0.003",
+                "target_begin_ms": "0.006",
+                "target_write_ms": "3.057",
+                "target_commit_ms": "0.213",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.015",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=memory phase=migrate source_begin_ms=0.007 source_scan_ms=1.612 projection_ms=0.014 source_commit_ms=0.003 target_begin_ms=0.006 target_write_ms=3.057 target_commit_ms=0.213 target_rollback_ms=0.000 residual_ms=0.015 scope=disjoint_substages"
+            }
+          ],
+          "memory": [
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "open",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=open search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "insert",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=insert search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "checkpoint",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=checkpoint search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "first_stop",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=first_stop search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "first_reopen",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=first_reopen search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "random_read",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=random_read search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "ordered_read",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=ordered_read search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "multi_get",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=multi_get search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "multi_miss",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=multi_miss search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "2000"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=scan search_key_copies=0 candidate_value_copies=2000"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "window_scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "20"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=window_scan search_key_copies=0 candidate_value_copies=20"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "prefix_scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "2000"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=prefix_scan search_key_copies=0 candidate_value_copies=2000"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "scan_page",
+                "search_key_copies": "0",
+                "candidate_value_copies": "2003"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=scan_page search_key_copies=0 candidate_value_copies=2003"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "seek_prev",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=seek_prev search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "reverse_scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "20"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=reverse_scan search_key_copies=0 candidate_value_copies=20"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_first",
+                "search_key_copies": "100",
+                "candidate_value_copies": "100"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_first search_key_copies=100 candidate_value_copies=100"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_first_no_total",
+                "search_key_copies": "100",
+                "candidate_value_copies": "100"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_first_no_total search_key_copies=100 candidate_value_copies=100"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_last",
+                "search_key_copies": "100",
+                "candidate_value_copies": "100"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_last search_key_copies=100 candidate_value_copies=100"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_last_no_total",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_last_no_total search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "key_count",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=key_count search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "set_ttl",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=set_ttl search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "get_ttl",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=get_ttl search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "incr",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=incr search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "update",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=update search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "health",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=health search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "vacuum",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=vacuum search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bounded_prepare",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bounded_prepare search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "vacuum_bounded",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=vacuum_bounded search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "flush",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=flush search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "merge",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=merge search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "export_owned",
+                "search_key_copies": "0",
+                "candidate_value_copies": "3001"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=export_owned search_key_copies=0 candidate_value_copies=3001"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "export_stream",
+                "search_key_copies": "0",
+                "candidate_value_copies": "3001"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=export_stream search_key_copies=0 candidate_value_copies=3001"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "migrate",
+                "search_key_copies": "0",
+                "candidate_value_copies": "3004"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=migrate search_key_copies=0 candidate_value_copies=3004"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bulk",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bulk search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bulk_stop",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bulk_stop search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bulk_reopen",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bulk_reopen search_key_copies=0 candidate_value_copies=0"
+            }
+          ],
+          "manifest_reuse_deltas": [
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "scope_start",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "insert",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 0,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 0,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=insert merge_ms=0.000 repair_ms=0.000 manifest_ms=0.000 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=0.000 sst_sync_ms=0.000 manifest_reuses=0"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "insert",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "checkpoint",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 6.15,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 5.137,
+                "sst_sync_ms": 3.382,
+                "manifest_reuses": 1
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=checkpoint merge_ms=0.000 repair_ms=0.000 manifest_ms=6.150 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=5.137 sst_sync_ms=3.382 manifest_reuses=1"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "checkpoint",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "update",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 0,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 0,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=update merge_ms=0.000 repair_ms=0.000 manifest_ms=6.150 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=5.137 sst_sync_ms=3.382 manifest_reuses=1"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "update",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "vacuum",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 3.469,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 6.65,
+                "sst_sync_ms": 3.968,
+                "manifest_reuses": 1
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=vacuum merge_ms=0.000 repair_ms=0.000 manifest_ms=9.619 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=11.787 sst_sync_ms=7.350 manifest_reuses=2"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "vacuum",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "flush",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 3.369,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 5.239,
+                "sst_sync_ms": 2.788,
+                "manifest_reuses": 1
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=flush merge_ms=0.000 repair_ms=0.000 manifest_ms=12.988 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=17.026 sst_sync_ms=10.138 manifest_reuses=3"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "flush",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "bulk",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 3.286,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 1.926,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=bulk merge_ms=0.000 repair_ms=0.000 manifest_ms=16.274 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=18.952 sst_sync_ms=10.138 manifest_reuses=3"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "bulk",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "bulk_reopen",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 0,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 0,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=bulk_reopen merge_ms=0.000 repair_ms=0.000 manifest_ms=16.274 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=18.952 sst_sync_ms=10.138 manifest_reuses=3"
+            }
+          ],
+          "missing_diagnostic_rejected": true
+        },
+        {
+          "summary": {
+            "rows": 3000,
+            "pass": 1,
+            "status": "PASS",
+            "exit_code": 0,
+            "elapsed_seconds": 3.735,
+            "metrics": 132,
+            "cleanup": "OK",
+            "error": null,
+            "log": "rows_3000_pass_1.log",
+            "diagnostics": "rows_3000_pass_1.diagnostics.json",
+            "diagnostics_count": 888,
+            "bounded_vacuum_verified": true
+          },
+          "raw_count": 837,
+          "delta_count": 51,
+          "migration": [
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "bitcask",
+                "phase": "migrate",
+                "source_begin_ms": "0.012",
+                "source_scan_ms": "29.136",
+                "projection_ms": "0.022",
+                "source_commit_ms": "0.153",
+                "target_begin_ms": "0.017",
+                "target_write_ms": "7.705",
+                "target_commit_ms": "0.347",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.072",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=bitcask phase=migrate source_begin_ms=0.012 source_scan_ms=29.136 projection_ms=0.022 source_commit_ms=0.153 target_begin_ms=0.017 target_write_ms=7.705 target_commit_ms=0.347 target_rollback_ms=0.000 residual_ms=0.072 scope=disjoint_substages"
+            },
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "bplus_tree",
+                "phase": "migrate",
+                "source_begin_ms": "0.009",
+                "source_scan_ms": "5.730",
+                "projection_ms": "0.016",
+                "source_commit_ms": "0.125",
+                "target_begin_ms": "0.010",
+                "target_write_ms": "4.923",
+                "target_commit_ms": "0.212",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.017",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=bplus_tree phase=migrate source_begin_ms=0.009 source_scan_ms=5.730 projection_ms=0.016 source_commit_ms=0.125 target_begin_ms=0.010 target_write_ms=4.923 target_commit_ms=0.212 target_rollback_ms=0.000 residual_ms=0.017 scope=disjoint_substages"
+            },
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "migrate",
+                "source_begin_ms": "0.010",
+                "source_scan_ms": "6.457",
+                "projection_ms": "0.019",
+                "source_commit_ms": "0.130",
+                "target_begin_ms": "0.011",
+                "target_write_ms": "6.153",
+                "target_commit_ms": "0.242",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.019",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=lsm_tree phase=migrate source_begin_ms=0.010 source_scan_ms=6.457 projection_ms=0.019 source_commit_ms=0.130 target_begin_ms=0.011 target_write_ms=6.153 target_commit_ms=0.242 target_rollback_ms=0.000 residual_ms=0.019 scope=disjoint_substages"
+            },
+            {
+              "kind": "SCALE_MIGRATION_STAGES",
+              "fields": {
+                "engine": "memory",
+                "phase": "migrate",
+                "source_begin_ms": "0.007",
+                "source_scan_ms": "1.603",
+                "projection_ms": "0.014",
+                "source_commit_ms": "0.003",
+                "target_begin_ms": "0.005",
+                "target_write_ms": "4.215",
+                "target_commit_ms": "0.177",
+                "target_rollback_ms": "0.000",
+                "residual_ms": "0.013",
+                "scope": "disjoint_substages"
+              },
+              "raw": "SCALE_MIGRATION_STAGES engine=memory phase=migrate source_begin_ms=0.007 source_scan_ms=1.603 projection_ms=0.014 source_commit_ms=0.003 target_begin_ms=0.005 target_write_ms=4.215 target_commit_ms=0.177 target_rollback_ms=0.000 residual_ms=0.013 scope=disjoint_substages"
+            }
+          ],
+          "memory": [
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "open",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=open search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "insert",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=insert search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "checkpoint",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=checkpoint search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "first_stop",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=first_stop search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "first_reopen",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=first_reopen search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "random_read",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=random_read search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "ordered_read",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=ordered_read search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "multi_get",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=multi_get search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "multi_miss",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=multi_miss search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "3000"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=scan search_key_copies=0 candidate_value_copies=3000"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "window_scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "30"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=window_scan search_key_copies=0 candidate_value_copies=30"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "prefix_scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "3000"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=prefix_scan search_key_copies=0 candidate_value_copies=3000"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "scan_page",
+                "search_key_copies": "0",
+                "candidate_value_copies": "3005"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=scan_page search_key_copies=0 candidate_value_copies=3005"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "seek_prev",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=seek_prev search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "reverse_scan",
+                "search_key_copies": "0",
+                "candidate_value_copies": "30"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=reverse_scan search_key_copies=0 candidate_value_copies=30"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_first",
+                "search_key_copies": "100",
+                "candidate_value_copies": "100"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_first search_key_copies=100 candidate_value_copies=100"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_first_no_total",
+                "search_key_copies": "100",
+                "candidate_value_copies": "100"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_first_no_total search_key_copies=100 candidate_value_copies=100"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_last",
+                "search_key_copies": "100",
+                "candidate_value_copies": "100"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_last search_key_copies=100 candidate_value_copies=100"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "search_last_no_total",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=search_last_no_total search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "key_count",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=key_count search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "set_ttl",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=set_ttl search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "get_ttl",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=get_ttl search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "incr",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=incr search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "update",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=update search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "health",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=health search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "vacuum",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=vacuum search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bounded_prepare",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bounded_prepare search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "vacuum_bounded",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=vacuum_bounded search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "flush",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=flush search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "merge",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=merge search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "export_owned",
+                "search_key_copies": "0",
+                "candidate_value_copies": "4001"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=export_owned search_key_copies=0 candidate_value_copies=4001"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "export_stream",
+                "search_key_copies": "0",
+                "candidate_value_copies": "4001"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=export_stream search_key_copies=0 candidate_value_copies=4001"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "migrate",
+                "search_key_copies": "0",
+                "candidate_value_copies": "4005"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=migrate search_key_copies=0 candidate_value_copies=4005"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bulk",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bulk search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bulk_stop",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bulk_stop search_key_copies=0 candidate_value_copies=0"
+            },
+            {
+              "kind": "SCALE_MEMORY_READ",
+              "fields": {
+                "engine": "memory",
+                "phase": "bulk_reopen",
+                "search_key_copies": "0",
+                "candidate_value_copies": "0"
+              },
+              "raw": "SCALE_MEMORY_READ engine=memory phase=bulk_reopen search_key_copies=0 candidate_value_copies=0"
+            }
+          ],
+          "manifest_reuse_deltas": [
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "scope_start",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "insert",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 0,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 0,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=insert merge_ms=0.000 repair_ms=0.000 manifest_ms=0.000 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=0.000 sst_sync_ms=0.000 manifest_reuses=0"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "insert",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "checkpoint",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 8.648,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 5.106,
+                "sst_sync_ms": 3.455,
+                "manifest_reuses": 1
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=checkpoint merge_ms=0.000 repair_ms=0.000 manifest_ms=8.648 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=5.106 sst_sync_ms=3.455 manifest_reuses=1"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "checkpoint",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "update",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 0,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 0,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=update merge_ms=0.000 repair_ms=0.000 manifest_ms=8.648 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=5.106 sst_sync_ms=3.455 manifest_reuses=1"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "update",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "vacuum",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 3.002,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 6.38,
+                "sst_sync_ms": 4.573,
+                "manifest_reuses": 1
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=vacuum merge_ms=0.000 repair_ms=0.000 manifest_ms=11.650 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=11.486 sst_sync_ms=8.028 manifest_reuses=2"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "vacuum",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "flush",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 3.305,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 2.178,
+                "sst_sync_ms": 0.476,
+                "manifest_reuses": 1
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=flush merge_ms=0.000 repair_ms=0.000 manifest_ms=14.955 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=13.664 sst_sync_ms=8.504 manifest_reuses=3"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "flush",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "bulk",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 2.269,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 1.533,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=bulk merge_ms=0.000 repair_ms=0.000 manifest_ms=17.224 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=15.197 sst_sync_ms=8.504 manifest_reuses=3"
+            },
+            {
+              "kind": "SCALE_LSM_STAGES_DELTA",
+              "derived": true,
+              "previous_phase": "bulk",
+              "fields": {
+                "engine": "lsm_tree",
+                "phase": "bulk_reopen",
+                "merge_ms": 0,
+                "repair_ms": 0,
+                "manifest_ms": 0,
+                "guard_ms": 0,
+                "cleanup_ms": 0,
+                "sst_finish_ms": 0,
+                "sst_sync_ms": 0,
+                "manifest_reuses": 0
+              },
+              "source_raw": "SCALE_LSM_STAGES phase=bulk_reopen merge_ms=0.000 repair_ms=0.000 manifest_ms=17.224 guard_ms=0.000 cleanup_ms=0.000 sst_finish_ms=15.197 sst_sync_ms=8.504 manifest_reuses=3"
+            }
+          ],
+          "missing_diagnostic_rejected": true
+        }
+      ],
+      "artifacts": [
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/build.log",
+          "sha256": "f2d6bde14711610a14b65022d1ec922b1957527458f7c3b938594f858045d7de"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/rows_2000_pass_1.csv",
+          "sha256": "4f584e5443410c37b512265bd002e9bacf568e4266037524243c1461718ed8af"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/rows_2000_pass_1.diagnostics.json",
+          "sha256": "73e1b84e822ba711479ac74b6a3bd23031117d21c468a800ca51334942a9a717"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/rows_2000_pass_1.log",
+          "sha256": "5289ca702adece968de76e683c01636b5f94ea63e4acb8cb55c7d4f8c0bbe8c0"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/rows_3000_pass_1.csv",
+          "sha256": "4a08d0fa3de8bf0c1f71aadbd87f4b88469aa86b8ceb22024e12289e8f34f089"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/rows_3000_pass_1.diagnostics.json",
+          "sha256": "4aa99994b09aefb9ab1831ed4eb21da6a818e76bf33df001917a8cfcb12c8f30"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/rows_3000_pass_1.log",
+          "sha256": "1400e5092bb71975a6e7886352387df0863c18d063cfc7981fbc9737fb1e2ffe"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/run.json",
+          "sha256": "c3f5f2bff001f65ea9b200ec83da36e566fc82d390527ce22888c4f9e3d61851"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/source.json",
+          "sha256": "606296d70580e643fcc4cbd45b87b0a7f87c43e8d98443e5ec43a1bf44ce843b"
+        },
+        {
+          "path": "data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374/summary.json",
+          "sha256": "20960d2a2d8f14212db386921e19bcbdd3f5eea7b9ceaf52e168fbbdb34f0456"
+        }
+      ],
+      "source_files_verified": 61,
+      "json_roundtrip": true
+    },
+    "roundtrip_audit": {
+      "command": "$auditCode = @'\nimport csv, decimal, hashlib, json, pathlib, re\nroot=pathlib.Path.cwd()\np=root/'data/bench-results/20261123-135205-4553ca4ba70d4504b56ade66a2f39374'\nread=lambda f:json.loads(f.read_text(encoding='utf-8-sig'))\nsha=lambda f:hashlib.sha256(f.read_bytes()).hexdigest()\nmanifest=read(p/'source.json'); run=read(p/'run.json'); summary=read(p/'summary.json')\nassert all(sha(root/f['path'])==f['sha256'] for f in manifest['files'])\njoined='\\n'.join(f[\"path\"]+' '+f[\"sha256\"] for f in manifest['files'])\nassert hashlib.sha256(joined.encode()).hexdigest()==manifest['hash']==run['source_sha256']\nassert sha(root/'scripts/run-scale-bench.ps1')==run['runner_sha256']\ndef assert_raw(lines, records):\n    assert [x['raw'] for x in records if 'raw' in x]==[s for s in lines if re.match(r'^SCALE_[A-Z_]+(?: |$)',s)]\ncases=[]\nfor case in summary:\n    assert case['status']=='PASS' and case['metrics']==132 and case['cleanup']=='OK' and case['exit_code']==0\n    lines=(p/case['log']).read_text(encoding='utf-8-sig').splitlines()\n    d=read(p/case['diagnostics']); assert_raw(lines,d)\n    assert json.loads(json.dumps(d,ensure_ascii=False))==d\n    assert len(d)==case['diagnostics_count']\n    metrics=list(csv.DictReader((p/('rows_'+str(case['rows'])+'_pass_1.csv')).read_text(encoding='utf-8-sig').splitlines()))\n    assert len(metrics)==132 and all(sum(r['engine']==e for r in metrics)==33 for e in ['bitcask','bplus_tree','lsm_tree','memory'])\n    bounded=[s for s in lines if s.startswith('SCALE_BOUNDED_VACUUM ')]\n    assert len(bounded)==4 and all('added_versions=16' in s and 'versions_removed=16' in s for s in bounded)\n    assert sum('migrate 验收通过' in s for s in lines)==4 and sum('bulk 重开验收通过' in s for s in lines)==4\n    assert sum(s.startswith('SCALE_ENGINE_DONE ') for s in lines)==4\n    migration=[x for x in d if x['kind']=='SCALE_MIGRATION_STAGES']\n    memory=[x for x in d if x['kind']=='SCALE_MEMORY_READ']\n    assert len(migration)==4 and len(memory)==36\n    for x in migration:\n        total=decimal.Decimal(next(y['fields']['wall_ms'] for y in d if y['kind']=='SCALE_PHASE' and y['fields']['phase']=='migrate' and y['fields']['engine']==x['fields']['engine']))\n        subtotal=sum(decimal.Decimal(v) for k,v in x['fields'].items() if k.endswith('_ms'))\n        assert abs(subtotal-total)<decimal.Decimal('.006')\n    for phase, want in [('key_count',0),('search_first',100)]:\n        x=next(x for x in memory if x['fields']['phase']==phase)\n        assert int(x['fields']['candidate_value_copies'])==want\n        assert int(x['fields']['search_key_copies'])<=want+3\n    reuses=[x for x in d if x['kind']=='SCALE_LSM_STAGES_DELTA']\n    actual=[x for x in d if x['kind']=='SCALE_LSM_STAGES']\n    assert len(actual)==len(reuses)\n    previous=decimal.Decimal(0)\n    for a,b in zip(actual,reuses):\n        now=decimal.Decimal(a['fields']['manifest_reuses'])\n        assert decimal.Decimal(b['fields']['manifest_reuses'])==now-previous\n        previous=now\n    missing=[x for x in d if x is not migration[0]]\n    try: assert_raw(lines,missing)\n    except AssertionError: negative=True\n    else: raise AssertionError('missing diagnostic escaped raw roundtrip gate')\n    cases.append(dict(summary=case,raw_count=sum('raw' in x for x in d),delta_count=sum(x.get('derived',False) for x in d),migration=migration,memory=memory,manifest_reuse_deltas=reuses,missing_diagnostic_rejected=negative))\nresult=dict(path=p.relative_to(root).as_posix(),source_manifest=manifest,run_manifest=run,cases=cases,artifacts=[dict(path=f.relative_to(root).as_posix(),sha256=sha(f)) for f in sorted(p.iterdir()) if f.is_file()],source_files_verified=len(manifest['files']),json_roundtrip=True)\nprint(json.dumps(result,ensure_ascii=False))\n'@\npython -u -X utf8 -c $auditCode",
+      "expected": "全部源码和runner指纹一致；每档132格、8次迁移/重开，raw逐字一致，缺新增诊断必须失败；精确count值clone0/首页100；manifest_reuses累计差分逐项相符"
+    }
+  },
+  "diagnostic_semantics": {
+    "migration": "8个互斥真实调用段加residual覆盖总计时；逐值验收在计时外；探针仅测试构建",
+    "memory": "search_key_copies只计search拥有键入口；candidate_value_copies只计候选值clone入口，不能作scan/export/migrate全部复制计数",
+    "manifest": "manifest_reuses为累计计数；_DELTA只代表相邻采样区间，可能含未单独采样操作",
+    "source": "正式小档 runtime_git=M160，tracked_dirty=true；61个SHA匹配M161实际测试工作区，不能宣称与M160 HEAD源码一致"
+  },
+  "evidence_levels": {
+    "causal": "M157/M158/M159实际旧行为负向控制及M158同种子ABBA详见各账本",
+    "observational": "用户两次完整五档跨构建及本轮迁移专项，不作稳定吞吐归因",
+    "rejected": "M160的严格实际同步收益守卫失败，生产策略撤回"
+  },
+  "revision_log": [
+    {
+      "date": "2026-11-23",
+      "statement": "M156/M155在交付时未复测的口径已过时，cf6985a五档现已收齐；M157–M161仍待完整五档",
+      "preserved": "历史数字和原构建来源保留"
+    },
+    {
+      "date": "2026-11-23",
+      "statement": "初次产物审计误用中文“迁移验收通过”字符串，日志实际为“migrate 验收通过”；读真实门后修订字面标签，8次验证不变"
+    }
+  ],
+  "remaining": "下一轮用户完整五档确认M157–M161实际大档收益，重点看免total页复制、memory精确total CPU、LSM manifest_reuses和迁移source/target分段；B+页同步/全库持锁、memory导出/停机仍未证明解决"
+}
