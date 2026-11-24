@@ -1,0 +1,238 @@
+{
+  "schema": 1,
+  "crate_version": "0.5.2",
+  "status": "PASS",
+  "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+  "scope": "仅文档及小库用法验证，无引擎源码修改，无新五档压测",
+  "archive_original_sha256": "a406bf7b65b76698e8ec90aa554458e120a3a9dcffcc85dbb781b929fb5d1b85",
+  "published_manifest": "target/package/storage-engines-0.5.2/Cargo.toml",
+  "run_dir": "target/test-data/readme-052-e026173ba1684900a8bae8c462dca9ff",
+  "rust_blocks": [
+    {
+      "block": 1,
+      "sha256": "c7babdb783315fc190b33d5eb63a15ff354b4dbc2329e45963fa2e8a0ecc0c89",
+      "compile_exit": 0
+    },
+    {
+      "block": 2,
+      "sha256": "b3e0bc9f2dc35e589f395d8cc8ba0bac447b9a735f7b4f7af17a1a524f503f25",
+      "compile_exit": 0
+    },
+    {
+      "block": 3,
+      "sha256": "0d423dbe6fe5204c00c4fe29fd3f8da996d4069adfaebb9264eaa0392bbe0437",
+      "compile_exit": 0
+    },
+    {
+      "block": 4,
+      "sha256": "12495e8bd369a884e5edd80a0ea8259f5094efea70319f2394fd5d77cc65d2f5",
+      "compile_exit": 0
+    },
+    {
+      "block": 5,
+      "sha256": "1e5e8aabad12f851ed11bd42d9e04a20fe423a5b53ab049f59ef7abf088f5fe4",
+      "compile_exit": 0
+    },
+    {
+      "block": 6,
+      "sha256": "d26fc02c66b7e7fa0d500140a4fae2e055572ead838c0f8965adbc7bbc8c948b",
+      "compile_exit": 0
+    },
+    {
+      "block": 7,
+      "sha256": "886caf0ec7932a5807c4228090fa780da09efbb1e3074149b3392010a60e984e",
+      "compile_exit": 0
+    },
+    {
+      "block": 8,
+      "sha256": "26a3d7a6f5658d683aab7fd355f490db68e11165820d0fcc8e64547f2b514446",
+      "compile_exit": 0
+    },
+    {
+      "block": 9,
+      "sha256": "af7be70412ef38daa558b7f7908abb18f17232572b01986b17ad1230e9065824",
+      "compile_exit": 0
+    },
+    {
+      "block": 10,
+      "sha256": "24f807909cb10597d0e1c965dc2dd70133187f8c68e879774d0651ff8c827fc5",
+      "compile_exit": 0
+    },
+    {
+      "block": 11,
+      "sha256": "059a2ab9cbcddc88ca798e076429b2df1695ae7a89601e3345b49aab3601951d",
+      "compile_exit": 0
+    }
+  ],
+  "main_reopen_runs": 2,
+  "four_engine_runtime": {
+    "exit_code": 0,
+    "output": "bitcask: CRUD/TTL/3-page scan/search/serialize/migrate/reopen/bulk binary PASS\nbplus_tree: CRUD/TTL/3-page scan/search/serialize/migrate/reopen/bulk binary PASS\nlsm_tree: CRUD/TTL/3-page scan/search/serialize/migrate/reopen/bulk binary PASS\nmemory: CRUD/TTL/3-page scan/search/serialize/migrate/reopen/bulk binary PASS\nenvironment/config/maintenance PASS\n",
+    "rows_per_engine": 2008,
+    "bulk_binary_reopen_verified": true
+  },
+  "script_selftest": {
+    "exit_code": 0,
+    "output": "SELFTEST PASS: exit=7 captured, stdout+stderr captured, ownership checked, scratch removed."
+  },
+  "all_targets_all_features_check": {
+    "command": "cargo check --all-targets --all-features --offline",
+    "exit_code": 0
+  },
+  "cli_checks": [
+    {
+      "command": "cargo run --release --bin shell -- --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask",
+      "exit_code": 0,
+      "stdout": "kv:bitcask> BEGIN (version 7)\nkv:bitcask> OK\nkv:bitcask> OK\nkv:bitcask> COMMIT (version 7)\nkv:bitcask> 1 行\nkey              | value\n-----------------+------\nposition:BTCUSDT | 0.025\nkv:bitcask> OK（60s 后过期）\nkv:bitcask> 剩 60s（60s）\nkv:bitcask> PREFIX「position:」 1 行\nkey              | value\n-----------------+------\nposition:BTCUSDT | 0.025\nkv:bitcask> FIND 第 0 页 / 共 1 页（本页 1 行，全库匹配 1）\nkey              | value\n-----------------+------\nposition:BTCUSDT | 0.025\nkv:bitcask> checkpoint OK\nkv:bitcask> 再见。\n",
+      "stderr": "    Finished `release` profile [optimized] target(s) in 0.30s\n     Running `target\\release\\shell.exe --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask`\n引擎: bitcask  路径: D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask（help 看命令表，exit 退出）\n(0.04 ms)\n(0.12 ms)\n(0.05 ms)\n(66.30 ms)\n(0.15 ms)\n(66.54 ms)\n(0.10 ms)\n(0.05 ms)\n(0.05 ms)\n(362.21 ms)\n"
+    },
+    {
+      "command": "cargo run --release --bin shell -- --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask",
+      "exit_code": 0,
+      "stdout": "kv:bitcask> OK（3600s 后过期）\nkv:bitcask> 1 行\nkey          | value\n-------------+------\nsession:demo | token\nkv:bitcask> 再见。\n",
+      "stderr": "    Finished `release` profile [optimized] target(s) in 0.16s\n     Running `target\\release\\shell.exe --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask`\n引擎: bitcask  路径: D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask（help 看命令表，exit 退出）\n(68.83 ms)\n(0.18 ms)\n"
+    },
+    {
+      "command": "cargo run --bin export-kv -- --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin --format bin",
+      "exit_code": 0,
+      "stdout": "导出 bitcask → D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin：3 行（活 3 / 墓碑 0）\n",
+      "stderr": "   Compiling storage-engines v0.5.2 (D:\\develop\\workspace\\rust_workspace\\storage-engines)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 34.17s\n     Running `target\\debug\\export-kv.exe --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin --format bin`\n"
+    },
+    {
+      "command": "cargo run --bin import-kv -- --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --in D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin --format bin",
+      "exit_code": 0,
+      "stdout": "导入 lsm_tree ← D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin：3 行（活 3 / 墓碑 0）\n",
+      "stderr": "   Compiling storage-engines v0.5.2 (D:\\develop\\workspace\\rust_workspace\\storage-engines)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.93s\n     Running `target\\debug\\import-kv.exe --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --in D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin --format bin`\n"
+    },
+    {
+      "command": "cargo run --bin export-kv -- --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\restored.bin --format bin",
+      "exit_code": 0,
+      "stdout": "导出 lsm_tree → D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\restored.bin：3 行（活 3 / 墓碑 0）\n",
+      "stderr": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s\n     Running `target\\debug\\export-kv.exe --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\restored.bin --format bin`\n"
+    },
+    {
+      "command": "cargo run --bin export-kv -- --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.jsonl --format jsonl",
+      "exit_code": 0,
+      "stdout": "导出 bitcask → D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.jsonl：3 行（活 3 / 墓碑 0）\n",
+      "stderr": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s\n     Running `target\\debug\\export-kv.exe --engine bitcask --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\bitcask --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.jsonl --format jsonl`\n"
+    },
+    {
+      "command": "cargo run --bin import-kv -- --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\jsonl-lsm --in D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.jsonl --format jsonl",
+      "exit_code": 0,
+      "stdout": "导入 lsm_tree ← D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.jsonl：3 行（活 3 / 墓碑 0）\n",
+      "stderr": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s\n     Running `target\\debug\\import-kv.exe --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\jsonl-lsm --in D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.jsonl --format jsonl`\n"
+    },
+    {
+      "command": "cargo run --bin export-kv -- --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\jsonl-lsm --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\restored.jsonl --format jsonl",
+      "exit_code": 0,
+      "stdout": "导出 lsm_tree → D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\restored.jsonl：3 行（活 3 / 墓碑 0）\n",
+      "stderr": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s\n     Running `target\\debug\\export-kv.exe --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\jsonl-lsm --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\restored.jsonl --format jsonl`\n"
+    },
+    {
+      "command": "cargo run --release --bin shell -- --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm",
+      "exit_code": 0,
+      "stdout": "kv:lsm_tree> OK\nkv:lsm_tree> OK（写墓碑）\nkv:lsm_tree> OK\nkv:lsm_tree> 再见。\n",
+      "stderr": "    Finished `release` profile [optimized] target(s) in 0.21s\n     Running `target\\release\\shell.exe --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm`\n引擎: lsm_tree  路径: D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm（help 看命令表，exit 退出）\n(81.59 ms)\n(102.61 ms)\n(101.21 ms)\n"
+    },
+    {
+      "command": "cargo run --bin import-kv -- --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --in D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin --format bin --skip-existing",
+      "exit_code": 0,
+      "stdout": "补齐 lsm_tree ← D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin：文件 3 行 ⇒ 插入 0（带 TTL 0）/ 已见过 3 / 过期未插 0\n",
+      "stderr": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s\n     Running `target\\debug\\import-kv.exe --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --in D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\state.bin --format bin --skip-existing`\n"
+    },
+    {
+      "command": "cargo run --bin export-kv -- --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\after-skip.jsonl --format jsonl --include-deleted",
+      "exit_code": 0,
+      "stdout": "导出 lsm_tree → D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\after-skip.jsonl：4 行（活 3 / 墓碑 1）\n",
+      "stderr": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.59s\n     Running `target\\debug\\export-kv.exe --engine lsm_tree --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\lsm --out D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\cli\\after-skip.jsonl --format jsonl --include-deleted`\n"
+    },
+    {
+      "command": "cargo run --features web --bin web -- --help",
+      "exit_code": 0,
+      "stdout": "用法: web [-e 引擎] [-d 目录] [-p 端口] [-h]\n  -e, --engine <名>   memory | bitcask | bplus_tree | lsm_tree（含别名，默认 memory）\n  -d, --dir <目录>    盘引擎的库目录（默认 ./data/web/<引擎名>）\n  -p, --port <端口>   监听端口（默认 8083）\n  -h, --help          本帮助\n",
+      "stderr": "   Compiling storage-engines v0.5.2 (D:\\develop\\workspace\\rust_workspace\\storage-engines)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 46.93s\n     Running `target\\debug\\web.exe --help`\n"
+    }
+  ],
+  "snapshot_roundtrip": {
+    "bin_magic": "BPEXP003",
+    "bin_bytes_equal": true,
+    "jsonl_bytes_equal": true,
+    "ttl_absolute_expiry_preserved": true
+  },
+  "skip_existing": {
+    "target_value_preserved": true,
+    "tombstone_preserved": true,
+    "local_only_preserved": true
+  },
+  "validation_notes": [
+    "shell 示例中的 ttl 只输出剩余时间；另用 get session:demo 核对值，修正验证驱动最初错误地要求 ttl 输出 token 的判据。",
+    "shell 使用 Release 实跑；文件工具与 Web 帮助使用 Debug 实跑，全目标全 feature 编译另行通过。",
+    "四个单引擎工具用 Debug 10k 数据验证参数与正常退出；原始工具输出中的吞吐外推只作日志保留，不作为本次性能结论。"
+  ],
+  "single_engine_smoke": [
+    {
+      "binary": "bitcask-bench-bulk",
+      "command": "cargo run --bin bitcask-bench-bulk -- --n 10000 --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\bitcask --batch 1000 --vlen 32 --flush-every 0",
+      "exit_code": 0,
+      "stdout": "=== bitcask bench_bulk ===\nn=10000 batch=1000 vlen=32 dir=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\bitcask\ntarget: 10 min for 10M ≈ 16667 ops/s\n  finishing (flush + checkpoint)...\n=== result ===\nwrote 10000 keys in 0.32s  (31009 ops/s)\nverify 3 keys: 0 ms\npass 10min target? YES\n  data.log             660000 B\n  data.hint            490040 B\n  data.blob                 8 B\n  bitcask.wal              76 B\n  bitcask.lock             10 B\n",
+      "stderr": "   Compiling storage-engines v0.5.2 (D:\\develop\\workspace\\rust_workspace\\storage-engines)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.90s\n     Running `target\\debug\\bitcask-bench-bulk.exe --n 10000 --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\bitcask --batch 1000 --vlen 32 --flush-every 0`\n"
+    },
+    {
+      "binary": "lsm-bench-bulk",
+      "command": "cargo run --bin lsm-bench-bulk -- --n 10000 --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\lsm --batch 1000 --vlen 32",
+      "exit_code": 0,
+      "stdout": "=== bench_bulk (direct L0 SST) ===\nn=10000 batch=1000 vlen=32 dir=D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\lsm\ntarget ≥ 16667 ops/s (10M / 10min)\n  finish...\n\n=== result ===\nwrote 10000 in 0.355s  →  28150 ops/s\n10M 等价: 5.9 min\nsst files ≈ 10\nPASS ≥ 10M/10min\n",
+      "stderr": "   Compiling storage-engines v0.5.2 (D:\\develop\\workspace\\rust_workspace\\storage-engines)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.22s\n     Running `target\\debug\\lsm-bench-bulk.exe --n 10000 --dir D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\lsm --batch 1000 --vlen 32`\n"
+    },
+    {
+      "binary": "bplus-bench",
+      "command": "cargo run --bin bplus-bench -- --n 10000 --db D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\bplus\\test.db --order 64 --cache 1024 --batch 1000 --value-size 32 --bulk",
+      "exit_code": 0,
+      "stdout": "=== bplus-tree bench ===\nn=10000 order=64 cache=1024 batch=1000 value_size=32 bulk=true mode=write-read db=\"D:\\\\develop\\\\workspace\\\\rust_workspace\\\\storage-engines\\\\target\\\\test-data\\\\readme-052-e026173ba1684900a8bae8c462dca9ff\\\\single-bench\\\\bplus\\\\test.db\"\n提示: 务必 --release；千万级请加 --bulk\n\nWRITE  10000 ops in 9.419s  →  1062 ops/s  [bulk]\nREAD   10000/10000 hits in 0.214s  →  46650 ops/s\nSIZE   data=1.46 MB  wal=0.00 MB  dblwr=0.01 MB\nREOPEN ok in 0.065s (抽样校验通过)\n已清理临时文件（加 --keep 可保留）\n",
+      "stderr": "   Compiling storage-engines v0.5.2 (D:\\develop\\workspace\\rust_workspace\\storage-engines)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.69s\n     Running `target\\debug\\bplus-bench.exe --n 10000 --db D:\\develop\\workspace\\rust_workspace\\storage-engines\\target\\test-data\\readme-052-e026173ba1684900a8bae8c462dca9ff\\single-bench\\bplus\\test.db --order 64 --cache 1024 --batch 1000 --value-size 32 --bulk`\n  ... 1000/10000 (10.0%)  1989 ops/s  elapsed=0.5s\n  ... 2000/10000 (20.0%)  957 ops/s  elapsed=2.1s\n  ... 3000/10000 (30.0%)  1137 ops/s  elapsed=2.6s\n  ... 4000/10000 (40.0%)  1225 ops/s  elapsed=3.3s\n  ... 5000/10000 (50.0%)  1168 ops/s  elapsed=4.3s\n  ... 6000/10000 (60.0%)  1073 ops/s  elapsed=5.6s\n  ... 7000/10000 (70.0%)  1009 ops/s  elapsed=6.9s\n  ... 8000/10000 (80.0%)  1069 ops/s  elapsed=7.5s\n  ... 9000/10000 (90.0%)  1127 ops/s  elapsed=8.0s\n"
+    },
+    {
+      "binary": "memory-bench",
+      "command": "cargo run --bin memory-bench -- --n 10000 --bulk",
+      "exit_code": 0,
+      "stdout": "memory bench: n=10000 bulk=true\nbulk put: 10000 keys in 91.152ms → 109707 ops/s\nget:      10000 keys in 122.8899ms → 81374 ops/s\nprefix_scan all: 10000 rows in 38.7663ms\nraw_len (versions) = 10000\n",
+      "stderr": "   Compiling storage-engines v0.5.2 (D:\\develop\\workspace\\rust_workspace\\storage-engines)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.96s\n     Running `target\\debug\\memory-bench.exe --n 10000 --bulk`\n"
+    }
+  ],
+  "completed_utc": "2026-11-24T15:46:09.758968+00:00",
+  "baseline_head": "a5e8709eb19fbe7d8a63e15e8310106746269162",
+  "readme_lines": 599,
+  "link_audit": [
+    {
+      "file": "README.md",
+      "checked_local_links_and_anchors": 25,
+      "broken": 0
+    },
+    {
+      "file": "CHANGELOG.md",
+      "checked_local_links_and_anchors": 25,
+      "broken": 0
+    },
+    {
+      "file": "docs/大规模压测手册.md",
+      "checked_local_links_and_anchors": 19,
+      "broken": 0
+    },
+    {
+      "file": "docs/readme-history-20261124.md",
+      "checked_local_links_and_anchors": 36,
+      "broken": 0
+    }
+  ],
+  "published_rust_sources_equal": 481,
+  "engine_source_and_benchmark_script_unchanged": true,
+  "user_exact_batch_command": "& 'D:\\develop\\workspace\\rust_workspace\\storage-engines\\scripts\\run-scale-bench.ps1' -Rows '600000,1000000,5000000,10000000,20000000'",
+  "new_full_scale_run": false,
+  "archive_body_preserved_except_relative_markdown_links": true,
+  "document_hashes_lf": {
+    "README.md": "ab6f86d550d7695b899544cc720c0ac61c907de99f702260c4297a35c62cd9d5",
+    "CHANGELOG.md": "7fe859bafc5a315a91fc3e4096ed5d7e74c203d09f3b920d8d4f8736f7a580b0",
+    "docs/大规模压测手册.md": "b65083df3a54913239b61d374c6e1fc428ed5e6455698b182a106d71037cc733",
+    "docs/readme-history-20261124.md": "73885c6daea5f3d11c0ba0c6119976d7cfae6a7aaa77d600ef7f541039d34459"
+  }
+}
