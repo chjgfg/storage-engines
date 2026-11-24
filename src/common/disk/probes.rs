@@ -56,7 +56,8 @@ pub(crate) fn note_file_open() {
 }
 
 #[cfg(unix)]
-unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
+// 父模块需要导入此封装，供文件锁实现获取和释放 Unix 独占锁。
+pub(super) unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
     // edition 2024：extern 块必须 unsafe、unsafe fn 体内不再隐式 unsafe。
     unsafe extern "C" {
         pub(super) fn flock(fd: i32, op: i32) -> i32;
