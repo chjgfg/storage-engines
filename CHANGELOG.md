@@ -1,5 +1,13 @@
 # 更新日志
 
+## 0.5.4（2026-11-25）
+
+- 修复 Unix 文件锁封装拆分后的模块可见性遗漏：`probes::libc_flock` 增加 `pub(super)`，父模块与文件锁实现可以按原路径调用，解决 Linux 构建的 `E0603: function libc_flock is private`。
+- 增加中文注释说明父模块访问的用途。公开接口、锁的获取与释放行为、磁盘格式和性能策略保持原样；无需重复五档压测。
+- README 依赖示例、crates.io/API 文档链接和压测手册同步到 0.5.4；历史性能与用法验证保留实际版本及指纹。
+- 验证范围补充 Linux 目标，避免只在 Windows 编译时跳过 `#[cfg(unix)]` 分支。
+- 发布前验证：工作区与解包源码均通过 Linux（`x86_64-unknown-linux-gnu`）和 Windows（`x86_64-pc-windows-gnu`）的全目标、全 feature 编译检查；`cargo publish --dry-run` 默认构建验证通过；解包文档用例 6 passed / 0 failed / 1 ignored。Linux 为跨目标编译检查，未在本机运行 Linux 测试。发布包 528 个文件，481 个 Rust 源文件中仅 `src/common/disk/probes.rs` 修改了可见性与注释，其余 480 个源文件及 6 个集成测试文件与 0.5.3 逐字一致；README 完整五档命令与 15 个包内相对文件链接已核对。
+
 ## 0.5.3（2026-11-25）
 
 - 按 0.5.2 实际接口重写 README，将混入使用说明的历次调优正文移至 [历史存档](docs/readme-history-20261124.md)，保留原文指纹和历史溯源。
@@ -7,7 +15,8 @@
 - 修正 B+ 文件路径、bulk 值编码、工具 API 路径、memory 快照与事务持久化差异、B+ --keep 的真实作用等旧用法；压测手册更新为 11 月 24 日最终五档，并将旧专项过程标为历史。
 - 本版将整理后的 README 随包发布到 crates.io；481 个 Rust 源文件、公开接口、磁盘格式和性能策略与 0.5.2 一致，无需重新进行五档压测。已有 11 个 Rust 示例、四引擎用法、备份往返、CLI 与脚本自检证据见 [README 用法验证](docs/readme-usage-052.json)，其版本及指纹保留为实际验证的 0.5.2 基线。
 
-- 发布前验证：工作区与解包源码的全目标、全 feature 编译检查通过，`cargo publish --dry-run` 默认构建验证通过；解包文档用例 6 passed / 0 failed / 1 ignored。发布包 528 个文件，`src/` 下 481 个 Rust 文件及 6 个集成测试文件均与 0.5.2 逐字一致，包内 README 包含更新的 0.5.3 用法和原样五档命令。
+- 发布前验证：工作区与解包源码在 Windows 上的全目标、全 feature 编译检查通过，`cargo publish --dry-run` 默认构建验证通过；解包文档用例 6 passed / 0 failed / 1 ignored。发布包 528 个文件，`src/` 下 481 个 Rust 文件及 6 个集成测试文件均与 0.5.2 逐字一致，包内 README 包含更新的 0.5.3 用法和原样五档命令。
+- 2026-11-25 修订：上述 Windows 发布检查没有覆盖 Unix 条件编译分支；服务器实测发现 `libc_flock` 可见性错误，已由 0.5.4 修复并补充 Linux 目标检查。
 
 ## 0.5.2（2026-11-24）
 
