@@ -3999,6 +3999,98 @@
       "roundtrip_raw_verified": true,
       "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-scale-bench.ps1 -Rows '2000,3000' -Repeat 1 -ScratchRoot C:/Users/Administrator/.cache/storage-engines/test-data",
       "exit_code": 0
+    },
+    "final_user_bench": {
+      "path": "data/bench-results/20261124-123608-5ea79b86a6e946fb8e138abfe63bf3f7",
+      "head": "32e5fdbaadcac691abe8ae168878e4cb81dd9209",
+      "source_sha256": "3a71e7895f97f3f4af9dd143ff933ea2f9d3b84bd1f08747730b01152a7a5555",
+      "executable_sha256": "72d090a3bce1e0262a7aefba264aa230e2db0f51bc8490494ae35b470a0c0a6d",
+      "source_files": 482,
+      "cases": [
+        {
+          "rows": 600000,
+          "elapsed_seconds": 580.638,
+          "previous_elapsed_seconds": 528.607,
+          "status": "PASS",
+          "metrics": 132,
+          "migration_verifications": 4,
+          "bulk_reopen_verifications": 4,
+          "bounded_verifications": 4,
+          "bounded_removed_per_engine": 16,
+          "raw_diagnostics": 837,
+          "delta_diagnostics": 51,
+          "cleanup": "OK"
+        },
+        {
+          "rows": 1000000,
+          "elapsed_seconds": 879.532,
+          "previous_elapsed_seconds": 923.758,
+          "status": "PASS",
+          "metrics": 132,
+          "migration_verifications": 4,
+          "bulk_reopen_verifications": 4,
+          "bounded_verifications": 4,
+          "bounded_removed_per_engine": 16,
+          "raw_diagnostics": 837,
+          "delta_diagnostics": 51,
+          "cleanup": "OK"
+        },
+        {
+          "rows": 5000000,
+          "elapsed_seconds": 5013.574,
+          "previous_elapsed_seconds": 4522.705,
+          "status": "PASS",
+          "metrics": 132,
+          "migration_verifications": 4,
+          "bulk_reopen_verifications": 4,
+          "bounded_verifications": 4,
+          "bounded_removed_per_engine": 16,
+          "raw_diagnostics": 837,
+          "delta_diagnostics": 51,
+          "cleanup": "OK"
+        },
+        {
+          "rows": 10000000,
+          "elapsed_seconds": 9589.138,
+          "previous_elapsed_seconds": 8325.44,
+          "status": "PASS",
+          "metrics": 132,
+          "migration_verifications": 4,
+          "bulk_reopen_verifications": 4,
+          "bounded_verifications": 4,
+          "bounded_removed_per_engine": 16,
+          "raw_diagnostics": 837,
+          "delta_diagnostics": 51,
+          "cleanup": "OK"
+        },
+        {
+          "rows": 20000000,
+          "elapsed_seconds": 19780.143,
+          "previous_elapsed_seconds": 19188.093,
+          "status": "PASS",
+          "metrics": 132,
+          "migration_verifications": 4,
+          "bulk_reopen_verifications": 4,
+          "bounded_verifications": 4,
+          "bounded_removed_per_engine": 16,
+          "raw_diagnostics": 837,
+          "delta_diagnostics": 51,
+          "cleanup": "OK"
+        }
+      ],
+      "total_seconds": 35843.025,
+      "previous_total_seconds": 33488.603,
+      "verification": {
+        "source_files_matched_m163": true,
+        "raw_roundtrip_verified": true,
+        "delta_roundtrip_verified": true,
+        "csv_cells": 660,
+        "migration_verifications": 20,
+        "bulk_reopen_verifications": 20,
+        "real_bounded_verifications": 20
+      },
+      "conclusion": "最终五档正确性验收通过，按约定结束本轮性能优化；memory搜索和LSM大档回收改善，B+同步仍昂贵，不宣称整体提速。",
+      "attribution": "上一轮到本轮同时包含M162性能修改和M163重构；Windows/D盘全套总耗时上涨7.03%，不能据此独立判定重构退化或环境原因。"
     }
   },
   "status": "verified",
@@ -4021,6 +4113,76 @@
     "incremental_date": "2026-11-24"
   },
   "latest_findings": {
+    "bplus": {
+      "insert_s": 7653.344004,
+      "vacuum_s": 225.012682,
+      "vacuum_page_syncs": 559,
+      "bounded_wall_ms": 278.574,
+      "wal_commit_syncs": 20000,
+      "wal_commit_sync_s": 1406.499823,
+      "wal_commit_sync_avg_ms": 70.324991,
+      "evidence": {
+        "path": "data/bench-results/20261124-123608-5ea79b86a6e946fb8e138abfe63bf3f7/rows_20000000_pass_1.log",
+        "lines": [
+          226,
+          231,
+          380,
+          385,
+          399
+        ]
+      }
+    },
+    "memory": {
+      "search_first_s": 2.340057,
+      "key_count_s": 0.140329,
+      "migration_s": 76.09058,
+      "evidence": {
+        "path": "data/bench-results/20261124-123608-5ea79b86a6e946fb8e138abfe63bf3f7/rows_20000000_pass_1.log",
+        "lines": [
+          846,
+          870,
+          960
+        ]
+      }
+    },
+    "lsm": {
+      "search_first_s": 28.598829000000002,
+      "exact_first_value_clones": 100,
+      "prefix_count_value_clones": 0,
+      "vacuum_s": 28.161925,
+      "vacuum_threshold_flushes": 15,
+      "vacuum_threshold_flush_s": 4.451244,
+      "vacuum_compactions": 8,
+      "vacuum_owned_input_rows": 1500468,
+      "evidence": {
+        "path": "data/bench-results/20261124-123608-5ea79b86a6e946fb8e138abfe63bf3f7/rows_20000000_pass_1.log",
+        "lines": [
+          571,
+          573,
+          597,
+          640,
+          647,
+          651,
+          652
+        ]
+      }
+    }
+  },
+  "revision_history": [
+    {
+      "date": "2026-11-24",
+      "event": "小种子归并行数守卫红后先改判：种子覆盖独立范围文件合批，实际输入未减；保留全部失败与无重写收益读数。新增真实sync_all计数后，以严格new<old验证同步成本；没有改变flush阈值。1M真实14次阈值flush对照最终同时减少同步和输入行。"
+    },
+    {
+      "date": "2026-11-24",
+      "event": "单次字节比较在文本ABBA无稳定收益，撤回并保持原二进制窗口判据；改为即时消费共享分组结果。"
+    },
+    {
+      "date": "2026-11-24",
+      "event": "登记32e5fdb最终五档验收，旧latest_findings移至pre_m162_findings保留溯源；最新结果成为性能权威口径，本轮按约定收尾。"
+    }
+  ],
+  "pre_m162_findings": {
     "bplus": {
       "old_insert_s": 7066.624,
       "new_insert_s": 8129.735,
@@ -4082,15 +4244,5 @@
         ]
       }
     }
-  },
-  "revision_history": [
-    {
-      "date": "2026-11-24",
-      "event": "小种子归并行数守卫红后先改判：种子覆盖独立范围文件合批，实际输入未减；保留全部失败与无重写收益读数。新增真实sync_all计数后，以严格new<old验证同步成本；没有改变flush阈值。1M真实14次阈值flush对照最终同时减少同步和输入行。"
-    },
-    {
-      "date": "2026-11-24",
-      "event": "单次字节比较在文本ABBA无稳定收益，撤回并保持原二进制窗口判据；改为即时消费共享分组结果。"
-    }
-  ]
+  }
 }

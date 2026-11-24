@@ -2915,5 +2915,15 @@
       "reason": "首次小档构建期间修正了中文测试注释",
       "resolution": "保留失败构建记录，固定源码后重建；最终 2k/3k 对应同一个已核对源码指纹。"
     }
-  ]
+  ],
+  "final_scale": {
+    "authority": "docs/performance-m162.json",
+    "record": "validation.final_user_bench",
+    "path": "data/bench-results/20261124-123608-5ea79b86a6e946fb8e138abfe63bf3f7",
+    "head": "32e5fdbaadcac691abe8ae168878e4cb81dd9209",
+    "source_sha256": "3a71e7895f97f3f4af9dd143ff933ea2f9d3b84bd1f08747730b01152a7a5555",
+    "executable_sha256": "72d090a3bce1e0262a7aefba264aa230e2db0f51bc8490494ae35b470a0c0a6d",
+    "source_matches_small_scale": true,
+    "status": "五档全部通过，详细数字由M162账本单一维护"
+  }
 }
