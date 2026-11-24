@@ -2,9 +2,11 @@
 
 四个手写 Rust KV 引擎，共享 MVCC 快照隔离事务和统一的 `KvEngine` 门面，可通过枚举或配置选择引擎。
 
-当前发布版本：**[0.5.2](https://crates.io/crates/storage-engines/0.5.2)**。本文按该版本的实际接口整理，文档更新日期为 2026-11-24。项目定位为教学与存储实现研究；用于实际业务时，应结合下面的持久化差异、错误处理和维护成本做选择。
+当前发布版本：**[0.5.3](https://crates.io/crates/storage-engines/0.5.3)**。本文按该版本的实际接口整理，文档更新日期为 2026-11-25。项目定位为教学与存储实现研究；用于实际业务时，应结合下面的持久化差异、错误处理和维护成本做选择。
 
-[API 文档](https://docs.rs/storage-engines/0.5.2/storage_engines/) · [更新日志](CHANGELOG.md) · [源码职责索引](docs/module-layout.md) · [压测手册](docs/大规模压测手册.md)
+0.5.3 是文档修订版：整理使用指南和压测入口，`src/` 下 481 个 Rust 源文件、公开接口与磁盘格式均与 0.5.2 一致。
+
+[API 文档](https://docs.rs/storage-engines/0.5.3/storage_engines/) · [更新日志](CHANGELOG.md) · [源码职责索引](docs/module-layout.md) · [压测手册](docs/大规模压测手册.md)
 
 ## 阅读入口
 
@@ -42,10 +44,10 @@
 
 ```toml
 [dependencies]
-storage-engines = "0.5.2"
+storage-engines = "0.5.3"
 ```
 
-如果要固定这次已经验证的版本，写成 `storage-engines = "=0.5.2"`；普通的 `"0.5.2"` 允许 Cargo 选择兼容的后续版本。应用项目应保存 `Cargo.lock`。
+如果要固定这次已经验证的版本，写成 `storage-engines = "=0.5.3"`；普通的 `"0.5.3"` 允许 Cargo 选择兼容的后续版本。应用项目应保存 `Cargo.lock`。
 
 当前仓库使用 edition 2024，验证工具链为 Rust **1.92.0**；尚未声明或验证最低支持 Rust 版本。默认功能包含库和 shell 所需依赖；Web 工具需要额外启用 `web` feature。
 
@@ -335,7 +337,7 @@ fn open_history(path: &Path) -> Result<Box<dyn KvEngine>, EngineError> {
 | `cache_auto_max` | B+ / LSM | 自动缓存档上限；给 Bitcask / memory 设置会报错 |
 | `cache_budget_bytes` | B+ / LSM | 估算缓存容量预算；默认不设；给 Bitcask / memory 设置会报错 |
 
-缓存预算不包含事务写集、扫描返回值、内存表、索引、blob 重写和操作系统文件缓存，**不是进程 RSS 或总内存的硬上限**。字段之间的实际效果用 `db.tuning()` 核对，详细契约见 [EngineConfig](https://docs.rs/storage-engines/0.5.2/storage_engines/struct.EngineConfig.html)。
+缓存预算不包含事务写集、扫描返回值、内存表、索引、blob 重写和操作系统文件缓存，**不是进程 RSS 或总内存的硬上限**。字段之间的实际效果用 `db.tuning()` 核对，详细契约见 [EngineConfig](https://docs.rs/storage-engines/0.5.3/storage_engines/struct.EngineConfig.html)。
 
 ## 长跑维护
 
@@ -591,7 +593,7 @@ cargo test --doc
 | [性能账本 M162](docs/performance-m162.json) | 本轮最终五档、性能结论、原始证据与限制 |
 | [重构验收 M163](docs/refactor-m163.json) | 源码职责拆分、接口与格式保持、验收溯源 |
 | [大规模压测手册](docs/大规模压测手册.md) | 正式脚本、诊断字段、专项复现与历史实验 |
-| [README 用法验证](docs/readme-usage-052.json) | 本文 Rust 示例编译运行、工具小库往返和链接审计结果 |
+| [README 用法验证](docs/readme-usage-052.json) | 0.5.2 源码基线上的 Rust 示例编译运行、工具小库往返和链接审计结果；0.5.3 保持同一份源码 |
 | [旧 README 历史存档](docs/readme-history-20261124.md) | 整理前的 4356 行正文，保留历史过程；旧接口与阶段结论不作为当前指南 |
 
 当前 README 只维护可操作的使用说明。历史调优细节留在更新日志、专项账本和旧 README 存档；新证据应更新对应的权威账本，避免在多个文档堆出互相矛盾的“最新结果”。
